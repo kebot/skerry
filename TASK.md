@@ -61,6 +61,23 @@ crates/app      GPUI application
 | T16 | Agent CDP proxy: per-Connection local proxy on `127.0.0.1`, off by default, injects the Manager token, tags Tabs the Agent touched; fake-CDP tests | T1, T15 |
 | T17 | Agent marker UI on Tabs and Connection chips | T16, mock |
 
+## Milestone 6: match window (optional)
+
+| ID | Task | Depends on | Status |
+|----|------|------------|--------|
+| T18 | **Match window**: an opt-in per-Connection toggle that resizes the Remote Browser's real window to the Mirror's aspect ratio, so the page fills the Mirror instead of showing letterbox bars | T8, T15 | todo |
+
+T18 details (from the product owner's request, option 2 of the resize discussion):
+
+- **Mechanism:** `Browser.getWindowForTarget` then `Browser.setWindowBounds` on the Active Tab's window, sized so its aspect ratio matches the Mirror's. This changes the real browser window. It does **not** use `Emulation.setDeviceMetricsOverride` (ADR 0002 stays in force).
+- **Off by default.** Config key per `[[connection]]`: `match_window = true|false` (default false), plus a toggle in the Connection chip popover. When turned off, restore the window bounds saved before the first resize.
+- **Fingerprint warning:** the Profile has a fixed `screen_width` / `screen_height`. A window size that does not fit the screen, or that differs from what the Profile normally uses, may be detectable. Show a one-line warning next to the toggle and in `docs/running.md`. Clamp the target size to the Profile's screen size (never larger than the screen) and keep a sane minimum.
+- **Behaviour:** debounce Mirror resizes (about 300 ms), ignore tiny changes, never resize while the user is dragging the rb window edge, and skip Tabs whose window is minimised or full-screen. A browser that refuses the call (for example a Manager-hosted browser without a movable window) shows a status-bar note and leaves the toggle off.
+- **Shared window:** the same Chrome window may be in use by the Agent or by someone using the Manager's VNC view. Resizing affects them too. Document it; no arbitration in v1.
+- **Tests:** fake CDP server tests for the bounds calls (aspect maths, clamping, restore-on-disable, refusal handling, debounce); a real check against a local headed Chrome and against the real Manager Profile, reporting what the page and `window.innerWidth/innerHeight` actually do.
+- **Docs:** add an addendum to ADR 0002 and a note to `docs/running.md`.
+- **Open question:** whether the Manager's browser honours `Browser.setWindowBounds` at all (it runs headed on a KasmVNC X display, so probably yes). Unverified.
+
 ## Open (product decisions)
 
 - Q36 and Q37 (Connection vs Group colour, and the Connection status / new-Tab location) resolve in the mock at `design/`. Tasks marked "mock" wait for that decision.
