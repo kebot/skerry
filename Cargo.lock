@@ -4322,6 +4322,8 @@ dependencies = [
  "gpui",
  "image",
  "rb-cdp",
+ "rb-manager",
+ "rb-store",
  "serde_json",
  "smallvec",
  "tokio",
