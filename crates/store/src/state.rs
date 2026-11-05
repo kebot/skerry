@@ -53,8 +53,14 @@ pub struct State {
 
 #[derive(Debug)]
 pub enum StateError {
-    Io { path: PathBuf, source: std::io::Error },
-    Parse { path: PathBuf, message: String },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        message: String,
+    },
     Serialize(String),
 }
 
@@ -107,13 +113,17 @@ impl State {
             path: path.to_path_buf(),
             source,
         };
-        let text = toml::to_string_pretty(self).map_err(|e| StateError::Serialize(e.to_string()))?;
+        let text =
+            toml::to_string_pretty(self).map_err(|e| StateError::Serialize(e.to_string()))?;
         let dir = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
         std::fs::create_dir_all(dir).map_err(io)?;
-        let file_name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
         let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
         let result = (|| {
             let mut f = std::fs::File::create(&tmp)?;
@@ -160,7 +170,11 @@ pub fn match_tab(
     (0..entries.len())
         .filter(free)
         .find(|&i| entries[i].target_id.as_deref() == Some(target_id))
-        .or_else(|| (0..entries.len()).filter(free).find(|&i| entries[i].url == url))
+        .or_else(|| {
+            (0..entries.len())
+                .filter(free)
+                .find(|&i| entries[i].url == url)
+        })
 }
 
 /// Match all live Tabs at once: first pass by target id for every Tab, second
@@ -185,7 +199,9 @@ pub fn match_tabs(entries: &[TabEntry], live: &[LiveTab]) -> Vec<Option<usize>> 
             continue;
         }
         let hit = (0..entries.len()).find(|&i| {
-            !claimed.contains(&i) && entries[i].connection == t.connection && entries[i].url == t.url
+            !claimed.contains(&i)
+                && entries[i].connection == t.connection
+                && entries[i].url == t.url
         });
         if let Some(i) = hit {
             claimed.insert(i);
@@ -219,16 +235,28 @@ mod tests {
 
     #[test]
     fn match_by_target_id_first() {
-        let e = vec![tab("a", Some("T1"), "http://x"), tab("a", Some("T2"), "http://y")];
+        let e = vec![
+            tab("a", Some("T1"), "http://x"),
+            tab("a", Some("T2"), "http://y"),
+        ];
         // URL says entry 0, target id says entry 1: target id wins.
-        assert_eq!(match_tab(&e, &HashSet::new(), "a", "T2", "http://x"), Some(1));
+        assert_eq!(
+            match_tab(&e, &HashSet::new(), "a", "T2", "http://x"),
+            Some(1)
+        );
     }
 
     #[test]
     fn match_falls_back_to_exact_url() {
         let e = vec![tab("a", Some("OLD"), "http://x")];
-        assert_eq!(match_tab(&e, &HashSet::new(), "a", "NEW", "http://x"), Some(0));
-        assert_eq!(match_tab(&e, &HashSet::new(), "a", "NEW", "http://x/"), None);
+        assert_eq!(
+            match_tab(&e, &HashSet::new(), "a", "NEW", "http://x"),
+            Some(0)
+        );
+        assert_eq!(
+            match_tab(&e, &HashSet::new(), "a", "NEW", "http://x/"),
+            None
+        );
     }
 
     #[test]
@@ -251,7 +279,10 @@ mod tests {
     #[test]
     fn match_tabs_target_id_beats_url_guess() {
         // Entry 0 is for T2 by id, though its URL equals T1's. T1 must not steal it.
-        let e = vec![tab("a", Some("T2"), "http://x"), tab("a", Some("GONE"), "http://x")];
+        let e = vec![
+            tab("a", Some("T2"), "http://x"),
+            tab("a", Some("GONE"), "http://x"),
+        ];
         let l = vec![live("a", "T1", "http://x"), live("a", "T2", "http://x")];
         assert_eq!(match_tabs(&e, &l), vec![Some(1), Some(0)]);
     }
@@ -270,12 +301,28 @@ mod tests {
     fn sample() -> State {
         State {
             groups: vec![
-                GroupEntry { id: "g1".into(), name: "Work".into(), color: Some("#ff0000".into()), collapsed: true },
-                GroupEntry { id: "g2".into(), name: "Misc".into(), color: None, collapsed: false },
+                GroupEntry {
+                    id: "g1".into(),
+                    name: "Work".into(),
+                    color: Some("#ff0000".into()),
+                    collapsed: true,
+                },
+                GroupEntry {
+                    id: "g2".into(),
+                    name: "Misc".into(),
+                    color: None,
+                    collapsed: false,
+                },
             ],
             tabs: vec![
-                TabEntry { pinned: true, ..tab("a", Some("T1"), "http://pin") },
-                TabEntry { group: Some("g1".into()), ..tab("b", None, "http://grouped") },
+                TabEntry {
+                    pinned: true,
+                    ..tab("a", Some("T1"), "http://pin")
+                },
+                TabEntry {
+                    group: Some("g1".into()),
+                    ..tab("b", None, "http://grouped")
+                },
                 tab("a", Some("T3"), "http://loose"),
             ],
         }
@@ -293,7 +340,10 @@ mod tests {
     #[test]
     fn missing_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(State::load(&dir.path().join("none.toml")).unwrap(), State::default());
+        assert_eq!(
+            State::load(&dir.path().join("none.toml")).unwrap(),
+            State::default()
+        );
     }
 
     #[test]
@@ -349,7 +399,13 @@ mod tests {
         assert_eq!(State::load(&p).unwrap(), s);
         let leftovers = std::fs::read_dir(dir.path())
             .unwrap()
-            .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp."))
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp.")
+            })
             .count();
         assert_eq!(leftovers, 0);
     }

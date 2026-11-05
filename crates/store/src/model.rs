@@ -62,7 +62,10 @@ pub enum ModelError {
     /// Group names must not be blank.
     EmptyName,
     /// A target position is past the end.
-    PositionOutOfRange { position: usize, len: usize },
+    PositionOutOfRange {
+        position: usize,
+        len: usize,
+    },
 }
 
 impl fmt::Display for ModelError {
@@ -168,7 +171,11 @@ impl State {
 
     /// Append a Tab Group and return its new unique id. With `color: None`
     /// the next unused palette colour is assigned.
-    pub fn create_group(&mut self, name: &str, color: Option<GroupColor>) -> Result<String, ModelError> {
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        color: Option<GroupColor>,
+    ) -> Result<String, ModelError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(ModelError::EmptyName);
@@ -216,7 +223,11 @@ impl State {
     /// Delete a Tab Group. Its Tabs become ungrouped; they are not deleted.
     pub fn delete_group(&mut self, id: &str) -> Result<GroupEntry, ModelError> {
         let i = self.group_pos(id)?;
-        for t in self.tabs.iter_mut().filter(|t| t.group.as_deref() == Some(id)) {
+        for t in self
+            .tabs
+            .iter_mut()
+            .filter(|t| t.group.as_deref() == Some(id))
+        {
             t.group = None;
         }
         Ok(self.groups.remove(i))
@@ -226,7 +237,10 @@ impl State {
     pub fn move_group(&mut self, id: &str, to: usize) -> Result<(), ModelError> {
         let from = self.group_pos(id)?;
         if to >= self.groups.len() {
-            return Err(ModelError::PositionOutOfRange { position: to, len: self.groups.len() });
+            return Err(ModelError::PositionOutOfRange {
+                position: to,
+                len: self.groups.len(),
+            });
         }
         let g = self.groups.remove(from);
         self.groups.insert(to, g);
@@ -270,7 +284,10 @@ impl State {
             return Err(ModelError::NoSuchTab(index));
         }
         if to >= self.tabs.len() {
-            return Err(ModelError::PositionOutOfRange { position: to, len: self.tabs.len() });
+            return Err(ModelError::PositionOutOfRange {
+                position: to,
+                len: self.tabs.len(),
+            });
         }
         let t = self.tabs.remove(index);
         self.tabs.insert(to, t);
@@ -280,7 +297,13 @@ impl State {
     /// Record last-known Placeholder Tab data for a live Tab. Updates the
     /// entry matched by target id (then exact URL), else appends an ungrouped
     /// Tab. Returns the entry's index.
-    pub fn add_or_update_tab(&mut self, connection: &str, target_id: &str, title: &str, url: &str) -> usize {
+    pub fn add_or_update_tab(
+        &mut self,
+        connection: &str,
+        target_id: &str,
+        title: &str,
+        url: &str,
+    ) -> usize {
         match crate::state::match_tab(&self.tabs, &HashSet::new(), connection, target_id, url) {
             Some(i) => {
                 let t = &mut self.tabs[i];
@@ -377,7 +400,8 @@ impl State {
         for (i, t) in self.tabs.iter().enumerate().filter(|(_, t)| t.pinned) {
             out.push(SidebarItem::Tab(view(i, t)));
         }
-        let in_group = |t: &TabEntry, g: &GroupEntry| !t.pinned && t.group.as_deref() == Some(g.id.as_str());
+        let in_group =
+            |t: &TabEntry, g: &GroupEntry| !t.pinned && t.group.as_deref() == Some(g.id.as_str());
         for g in &self.groups {
             let members: Vec<SidebarTab> = self
                 .tabs
@@ -403,7 +427,10 @@ impl State {
             }));
         }
         for (i, t) in self.tabs.iter().enumerate() {
-            let grouped = t.group.as_deref().is_some_and(|id| self.group(id).is_some());
+            let grouped = t
+                .group
+                .as_deref()
+                .is_some_and(|id| self.group(id).is_some());
             if !t.pinned && !grouped {
                 out.push(SidebarItem::Tab(view(i, t)));
             }
@@ -427,7 +454,11 @@ mod tests {
     }
 
     fn target(id: &str, url: &str) -> TargetInfo {
-        TargetInfo { target_id: id.into(), title: format!("new {url}"), url: url.into() }
+        TargetInfo {
+            target_id: id.into(),
+            title: format!("new {url}"),
+            url: url.into(),
+        }
     }
 
     fn all_connected(_: &str) -> bool {
@@ -437,7 +468,11 @@ mod tests {
     fn state3() -> State {
         State {
             groups: vec![],
-            tabs: vec![tab("a", "T0", "http://0"), tab("b", "T1", "http://1"), tab("a", "T2", "http://2")],
+            tabs: vec![
+                tab("a", "T0", "http://0"),
+                tab("b", "T1", "http://1"),
+                tab("a", "T2", "http://2"),
+            ],
         }
     }
 
@@ -463,13 +498,21 @@ mod tests {
             assert_eq!(GroupColor::from_name(c.name()), Some(c));
         }
         assert_eq!(GroupColor::next_unused(&[]), GroupColor::Violet);
-        assert_eq!(GroupColor::next_unused(&[GroupColor::Violet]), GroupColor::Olive);
+        assert_eq!(
+            GroupColor::next_unused(&[GroupColor::Violet]),
+            GroupColor::Olive
+        );
         assert_eq!(
             GroupColor::next_unused(&[GroupColor::Violet, GroupColor::Stone]),
             GroupColor::Olive
         );
         // All used: least used wins.
-        let all = [GroupColor::Violet, GroupColor::Olive, GroupColor::Stone, GroupColor::Violet];
+        let all = [
+            GroupColor::Violet,
+            GroupColor::Olive,
+            GroupColor::Stone,
+            GroupColor::Violet,
+        ];
         assert_eq!(GroupColor::next_unused(&all), GroupColor::Olive);
     }
 
@@ -494,8 +537,16 @@ mod tests {
     #[test]
     fn group_id_skips_existing_and_ignores_odd_ids() {
         let mut s = State::default();
-        s.groups.push(GroupEntry { id: "g7".into(), name: "x".into(), ..Default::default() });
-        s.groups.push(GroupEntry { id: "custom".into(), name: "y".into(), ..Default::default() });
+        s.groups.push(GroupEntry {
+            id: "g7".into(),
+            name: "x".into(),
+            ..Default::default()
+        });
+        s.groups.push(GroupEntry {
+            id: "custom".into(),
+            name: "y".into(),
+            ..Default::default()
+        });
         assert_eq!(s.create_group("n", None).unwrap(), "g8");
     }
 
@@ -507,9 +558,15 @@ mod tests {
         s.set_group_color(&g, GroupColor::Stone).unwrap();
         s.set_group_collapsed(&g, true).unwrap();
         let e = s.group(&g).unwrap();
-        assert_eq!((e.name.as_str(), e.color.as_deref(), e.collapsed), ("Renamed", Some("stone"), true));
+        assert_eq!(
+            (e.name.as_str(), e.color.as_deref(), e.collapsed),
+            ("Renamed", Some("stone"), true)
+        );
         assert_eq!(s.rename_group(&g, " "), Err(ModelError::EmptyName));
-        assert_eq!(s.rename_group("nope", "x"), Err(ModelError::NoSuchGroup("nope".into())));
+        assert_eq!(
+            s.rename_group("nope", "x"),
+            Err(ModelError::NoSuchGroup("nope".into()))
+        );
         assert!(s.set_group_color("nope", GroupColor::Olive).is_err());
         assert!(s.set_group_collapsed("nope", true).is_err());
         assert!(s.delete_group("nope").is_err());
@@ -544,7 +601,13 @@ mod tests {
         assert_eq!(ids, vec![c.clone(), a.clone(), b.clone()]);
         s.move_group(&c, 2).unwrap();
         assert_eq!(s.groups.last().unwrap().id, c);
-        assert_eq!(s.move_group(&a, 3), Err(ModelError::PositionOutOfRange { position: 3, len: 3 }));
+        assert_eq!(
+            s.move_group(&a, 3),
+            Err(ModelError::PositionOutOfRange {
+                position: 3,
+                len: 3
+            })
+        );
     }
 
     #[test]
@@ -563,7 +626,10 @@ mod tests {
         assert_eq!(s.pin_tab(9), Err(ModelError::NoSuchTab(9)));
         assert_eq!(s.unpin_tab(9), Err(ModelError::NoSuchTab(9)));
         assert_eq!(s.move_tab_to_group(9, &g), Err(ModelError::NoSuchTab(9)));
-        assert_eq!(s.move_tab_to_group(0, "zzz"), Err(ModelError::NoSuchGroup("zzz".into())));
+        assert_eq!(
+            s.move_tab_to_group(0, "zzz"),
+            Err(ModelError::NoSuchGroup("zzz".into()))
+        );
         assert_eq!(s.tabs[0].group, None);
         assert_eq!(s.remove_tab_from_group(9), Err(ModelError::NoSuchTab(9)));
     }
@@ -577,7 +643,13 @@ mod tests {
         s.reorder_tab(0, 2).unwrap();
         assert_eq!(s.tabs[2].url, "http://2");
         assert_eq!(s.reorder_tab(5, 0), Err(ModelError::NoSuchTab(5)));
-        assert_eq!(s.reorder_tab(0, 3), Err(ModelError::PositionOutOfRange { position: 3, len: 3 }));
+        assert_eq!(
+            s.reorder_tab(0, 3),
+            Err(ModelError::PositionOutOfRange {
+                position: 3,
+                len: 3
+            })
+        );
         assert_eq!(s, {
             let mut x = state3();
             x.reorder_tab(2, 0).unwrap();
@@ -595,7 +667,10 @@ mod tests {
         // Same target id: update in place, pin kept.
         assert_eq!(s.add_or_update_tab("a", "T1", "One!", "http://1/next"), 0);
         assert_eq!(s.tabs.len(), 1);
-        assert_eq!((s.tabs[0].title.as_str(), s.tabs[0].url.as_str()), ("One!", "http://1/next"));
+        assert_eq!(
+            (s.tabs[0].title.as_str(), s.tabs[0].url.as_str()),
+            ("One!", "http://1/next")
+        );
         assert!(s.tabs[0].pinned);
         // Same URL, new target id (restart): still the same entry.
         assert_eq!(s.add_or_update_tab("a", "T9", "One!", "http://1/next"), 0);
@@ -615,7 +690,10 @@ mod tests {
         s.move_tab_to_group(1, &g).unwrap();
         s.pin_tab(2).unwrap();
         let l = s.sidebar_layout(&all_connected);
-        assert_eq!(urls(&l), vec!["http://2", "[G]", "http://1", "http://0", "http://3"]);
+        assert_eq!(
+            urls(&l),
+            vec!["http://2", "[G]", "http://1", "http://0", "http://3"]
+        );
         match &l[0] {
             SidebarItem::Tab(t) => assert!(t.pinned && t.index == 2),
             _ => panic!(),
@@ -637,7 +715,10 @@ mod tests {
     fn layout_dangling_group_ref_is_ungrouped() {
         let mut s = state3();
         s.tabs[1].group = Some("gone".into());
-        assert_eq!(urls(&s.sidebar_layout(&all_connected)), vec!["http://0", "http://1", "http://2"]);
+        assert_eq!(
+            urls(&s.sidebar_layout(&all_connected)),
+            vec!["http://0", "http://1", "http://2"]
+        );
     }
 
     #[test]
@@ -649,13 +730,17 @@ mod tests {
         }
         s.set_group_collapsed(&g, true).unwrap();
         let l = s.sidebar_layout(&all_connected);
-        let SidebarItem::Group(gr) = &l[0] else { panic!() };
+        let SidebarItem::Group(gr) = &l[0] else {
+            panic!()
+        };
         assert!(gr.tabs.is_empty());
         assert_eq!(gr.tab_count, 3);
         assert_eq!(gr.connections, vec!["a".to_string(), "b".to_string()]);
         s.set_group_collapsed(&g, false).unwrap();
         let l = s.sidebar_layout(&all_connected);
-        let SidebarItem::Group(gr) = &l[0] else { panic!() };
+        let SidebarItem::Group(gr) = &l[0] else {
+            panic!()
+        };
         assert_eq!(gr.tabs.len(), 3, "group spans two Connections");
         assert_eq!(gr.connections.len(), 2);
     }
@@ -665,7 +750,9 @@ mod tests {
         let mut s = State::default();
         s.create_group("Empty", None).unwrap();
         let l = s.sidebar_layout(&all_connected);
-        let SidebarItem::Group(g) = &l[0] else { panic!() };
+        let SidebarItem::Group(g) = &l[0] else {
+            panic!()
+        };
         assert_eq!((g.tab_count, g.connections.len()), (0, 0));
     }
 
@@ -684,7 +771,10 @@ mod tests {
             flags,
             vec![("a".into(), false), ("b".into(), true), ("a".into(), false)]
         );
-        assert!(s.sidebar_layout(&|_| false).iter().all(|i| matches!(i, SidebarItem::Tab(t) if t.placeholder)));
+        assert!(s
+            .sidebar_layout(&|_| false)
+            .iter()
+            .all(|i| matches!(i, SidebarItem::Tab(t) if t.placeholder)));
     }
 
     #[test]
@@ -696,7 +786,14 @@ mod tests {
         s.move_tab_to_group(0, &g).unwrap();
         s.pin_tab(1).unwrap();
         let r = s.reconcile("a", &[target("N2", "http://2"), target("N1", "http://1")]);
-        assert_eq!(r, ReconcileReport { matched: 2, new: 0, orphaned: 0 });
+        assert_eq!(
+            r,
+            ReconcileReport {
+                matched: 2,
+                new: 0,
+                orphaned: 0
+            }
+        );
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.tabs[0].target_id.as_deref(), Some("N1"));
         assert_eq!(s.tabs[0].group.as_deref(), Some(g.as_str()));
@@ -710,17 +807,47 @@ mod tests {
         let mut s = State::default();
         s.add_or_update_tab("a", "T1", "t", "http://old");
         let r = s.reconcile("a", &[target("T1", "http://new")]);
-        assert_eq!(r, ReconcileReport { matched: 1, new: 0, orphaned: 0 });
+        assert_eq!(
+            r,
+            ReconcileReport {
+                matched: 1,
+                new: 0,
+                orphaned: 0
+            }
+        );
         assert_eq!(s.tabs[0].url, "http://new");
     }
 
     #[test]
     fn reconcile_duplicate_urls() {
         let mut s = State::default();
-        s.tabs.push(TabEntry { connection: "a".into(), url: "http://x".into(), pinned: true, ..Default::default() });
-        s.tabs.push(TabEntry { connection: "a".into(), url: "http://x".into(), ..Default::default() });
-        let r = s.reconcile("a", &[target("N1", "http://x"), target("N2", "http://x"), target("N3", "http://x")]);
-        assert_eq!(r, ReconcileReport { matched: 2, new: 1, orphaned: 0 });
+        s.tabs.push(TabEntry {
+            connection: "a".into(),
+            url: "http://x".into(),
+            pinned: true,
+            ..Default::default()
+        });
+        s.tabs.push(TabEntry {
+            connection: "a".into(),
+            url: "http://x".into(),
+            ..Default::default()
+        });
+        let r = s.reconcile(
+            "a",
+            &[
+                target("N1", "http://x"),
+                target("N2", "http://x"),
+                target("N3", "http://x"),
+            ],
+        );
+        assert_eq!(
+            r,
+            ReconcileReport {
+                matched: 2,
+                new: 1,
+                orphaned: 0
+            }
+        );
         assert_eq!(s.tabs[0].target_id.as_deref(), Some("N1"));
         assert!(s.tabs[0].pinned);
         assert_eq!(s.tabs[1].target_id.as_deref(), Some("N2"));
@@ -736,7 +863,14 @@ mod tests {
         let g = s.create_group("G", None).unwrap();
         s.move_tab_to_group(1, &g).unwrap();
         let r = s.reconcile("a", &[target("T1", "http://keep")]);
-        assert_eq!(r, ReconcileReport { matched: 1, new: 0, orphaned: 1 });
+        assert_eq!(
+            r,
+            ReconcileReport {
+                matched: 1,
+                new: 0,
+                orphaned: 1
+            }
+        );
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.tabs[1].title, "Gone");
         assert_eq!(s.tabs[1].group.as_deref(), Some(g.as_str()));
@@ -748,14 +882,28 @@ mod tests {
         let mut s = State::default();
         s.add_or_update_tab("b", "T1", "B", "http://b");
         let r = s.reconcile("a", &[target("T1", "http://b")]);
-        assert_eq!(r, ReconcileReport { matched: 0, new: 1, orphaned: 0 });
+        assert_eq!(
+            r,
+            ReconcileReport {
+                matched: 0,
+                new: 1,
+                orphaned: 0
+            }
+        );
         assert_eq!(s.tabs.len(), 2);
         assert_eq!(s.tabs[0].connection, "b");
         assert_eq!(s.tabs[0].title, "B");
         assert_eq!(s.tabs[1].connection, "a");
         // Empty live list: everything of "a" is orphaned, nothing deleted.
         let r = s.reconcile("a", &[]);
-        assert_eq!(r, ReconcileReport { matched: 0, new: 0, orphaned: 1 });
+        assert_eq!(
+            r,
+            ReconcileReport {
+                matched: 0,
+                new: 0,
+                orphaned: 1
+            }
+        );
         assert_eq!(s.tabs.len(), 2);
     }
 
@@ -772,7 +920,10 @@ mod tests {
         s.save(&p).unwrap();
         let loaded = State::load(&p).unwrap();
         assert_eq!(loaded, s);
-        assert_eq!(loaded.sidebar_layout(&all_connected), s.sidebar_layout(&all_connected));
+        assert_eq!(
+            loaded.sidebar_layout(&all_connected),
+            s.sidebar_layout(&all_connected)
+        );
     }
 
     /// A `state.toml` as written before the model layer: free-form colour,
@@ -815,8 +966,14 @@ url = "http://loose"
         let mut s = State::load(&p).unwrap();
         assert_eq!(s.groups.len(), 2);
         assert_eq!(s.groups[0].color.as_deref(), Some("#ff0000"));
-        assert_eq!(GroupColor::from_name(s.groups[0].color.as_deref().unwrap()), None);
-        assert_eq!(urls(&s.sidebar_layout(&|c| c == "a")), vec!["http://pin", "[Work]", "[Misc]", "http://loose"]);
+        assert_eq!(
+            GroupColor::from_name(s.groups[0].color.as_deref().unwrap()),
+            None
+        );
+        assert_eq!(
+            urls(&s.sidebar_layout(&|c| c == "a")),
+            vec!["http://pin", "[Work]", "[Misc]", "http://loose"]
+        );
         // Operations work on old data; new Groups pick the first palette colour.
         let n = s.create_group("New", None).unwrap();
         assert_eq!(n, "g3");

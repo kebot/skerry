@@ -136,8 +136,8 @@ impl ProfileStatus {
 
 /// Parse a Manager base URL (`http`/`https`, optional path prefix).
 fn parse_base(base_url: &str) -> Result<Url> {
-    let url = Url::parse(base_url)
-        .map_err(|e| Error::Transport(format!("invalid manager url: {e}")))?;
+    let url =
+        Url::parse(base_url).map_err(|e| Error::Transport(format!("invalid manager url: {e}")))?;
     match url.scheme() {
         "http" | "https" if url.host_str().is_some() => Ok(url),
         other => Err(Error::Transport(format!(
@@ -169,7 +169,11 @@ fn profile_url(base: &Url, id: &str, action: &str) -> Url {
 pub fn cdp_ws_url(base_url: &str, profile_id: &str) -> Result<String> {
     let base = parse_base(base_url)?;
     let mut url = profile_url(&base, profile_id, "cdp");
-    let scheme = if base.scheme() == "https" { "wss" } else { "ws" };
+    let scheme = if base.scheme() == "https" {
+        "wss"
+    } else {
+        "ws"
+    };
     url.set_scheme(scheme)
         .map_err(|_| Error::Transport("cannot set websocket scheme".into()))?;
     Ok(url.into())
@@ -198,7 +202,11 @@ impl ManagerClient {
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(120)) // launch can be slow
             .build()?;
-        Ok(Self { base: parse_base(base_url)?, token, http })
+        Ok(Self {
+            base: parse_base(base_url)?,
+            token,
+            http,
+        })
     }
 
     /// CDP WebSocket URL for a Profile on this Manager.
@@ -272,10 +280,14 @@ impl ManagerClient {
             StatusCode::UNAUTHORIZED => Error::Unauthorized,
             StatusCode::NOT_FOUND => Error::NotFound { detail },
             StatusCode::CONFLICT if is_launch => Error::AlreadyRunning { detail },
-            StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN if is_launch => {
-                Error::License { status: status.as_u16(), detail }
-            }
-            _ => Error::UnexpectedResponse { status: status.as_u16(), detail },
+            StatusCode::PAYMENT_REQUIRED | StatusCode::FORBIDDEN if is_launch => Error::License {
+                status: status.as_u16(),
+                detail,
+            },
+            _ => Error::UnexpectedResponse {
+                status: status.as_u16(),
+                detail,
+            },
         })
     }
 }
@@ -407,18 +419,33 @@ mod tests {
         let c = client(&base);
         let e = c.launch("running").await.unwrap_err();
         assert!(e.is_already_running(), "{e:?}");
-        assert!(matches!(c.launch("seats").await, Err(Error::License { status: 402, .. })));
-        assert!(matches!(c.launch("badkey").await, Err(Error::License { status: 403, .. })));
-        assert!(matches!(c.launch("missing").await, Err(Error::NotFound { .. })));
+        assert!(matches!(
+            c.launch("seats").await,
+            Err(Error::License { status: 402, .. })
+        ));
+        assert!(matches!(
+            c.launch("badkey").await,
+            Err(Error::License { status: 403, .. })
+        ));
+        assert!(matches!(
+            c.launch("missing").await,
+            Err(Error::NotFound { .. })
+        ));
     }
 
     #[tokio::test]
     async fn unauthorized_without_or_with_wrong_token() {
         let base = spawn().await;
         let none = ManagerClient::new(&base, None).unwrap();
-        assert!(matches!(none.list_profiles().await, Err(Error::Unauthorized)));
+        assert!(matches!(
+            none.list_profiles().await,
+            Err(Error::Unauthorized)
+        ));
         let wrong = ManagerClient::new(&base, Some(Token::new("nope"))).unwrap();
-        assert!(matches!(wrong.list_profiles().await, Err(Error::Unauthorized)));
+        assert!(matches!(
+            wrong.list_profiles().await,
+            Err(Error::Unauthorized)
+        ));
         assert!(matches!(wrong.launch("p").await, Err(Error::Unauthorized)));
     }
 
@@ -467,6 +494,9 @@ mod tests {
     async fn bad_json_is_unexpected_response() {
         let base = serve(Router::new().route("/api/profiles", get(|| async { "not json" }))).await;
         let c = ManagerClient::new(&base, None).unwrap();
-        assert!(matches!(c.list_profiles().await, Err(Error::UnexpectedResponse { .. })));
+        assert!(matches!(
+            c.list_profiles().await,
+            Err(Error::UnexpectedResponse { .. })
+        ));
     }
 }

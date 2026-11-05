@@ -73,17 +73,27 @@ pub struct LoadedConfig {
 
 #[derive(Debug)]
 pub enum ConfigError {
-    Io { path: PathBuf, source: std::io::Error },
-    Parse { message: String },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        message: String,
+    },
     /// A problem in one `[[connection]]` entry (`name` is the entry's name, or
     /// `#N` when it has none).
-    Invalid { name: String, message: String },
+    Invalid {
+        name: String,
+        message: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::Io { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            ConfigError::Io { path, source } => {
+                write!(f, "cannot read {}: {source}", path.display())
+            }
             ConfigError::Parse { message } => write!(f, "invalid config.toml: {message}"),
             ConfigError::Invalid { name, message } => {
                 write!(f, "connection \"{name}\": {message}")
@@ -181,46 +191,45 @@ fn validate(raw: RawConnection, label: &str) -> Result<ConnectionConfig, ConfigE
             return Err(invalid(&name, "`color` must look like #rrggbb"));
         }
     }
-    let kind = match (raw.manager_url, raw.cdp_url) {
-        (Some(_), Some(_)) => {
-            return Err(invalid(
+    let kind =
+        match (raw.manager_url, raw.cdp_url) {
+            (Some(_), Some(_)) => return Err(invalid(
                 &name,
                 "set either `manager_url` (with `profile_id` and `token`) or `cdp_url`, not both",
-            ))
-        }
-        (None, None) => {
-            return Err(invalid(
-                &name,
-                "needs `manager_url` (with `profile_id` and `token`) or `cdp_url`",
-            ))
-        }
-        (Some(manager_url), None) => {
-            check_url(&name, "manager_url", &manager_url, &["http", "https"])?;
-            let profile_id = match raw.profile_id {
-                Some(p) if !p.trim().is_empty() => p,
-                _ => return Err(invalid(&name, "Manager connection needs `profile_id`")),
-            };
-            let token = match raw.token {
-                Some(t) => t,
-                None => return Err(invalid(&name, "Manager connection needs `token`")),
-            };
-            ConnectionKind::Manager {
-                manager_url,
-                profile_id,
-                token,
+            )),
+            (None, None) => {
+                return Err(invalid(
+                    &name,
+                    "needs `manager_url` (with `profile_id` and `token`) or `cdp_url`",
+                ))
             }
-        }
-        (None, Some(cdp_url)) => {
-            check_url(&name, "cdp_url", &cdp_url, &["ws", "wss", "http", "https"])?;
-            if raw.profile_id.is_some() {
-                return Err(invalid(&name, "`profile_id` only applies to `manager_url`"));
+            (Some(manager_url), None) => {
+                check_url(&name, "manager_url", &manager_url, &["http", "https"])?;
+                let profile_id = match raw.profile_id {
+                    Some(p) if !p.trim().is_empty() => p,
+                    _ => return Err(invalid(&name, "Manager connection needs `profile_id`")),
+                };
+                let token = match raw.token {
+                    Some(t) => t,
+                    None => return Err(invalid(&name, "Manager connection needs `token`")),
+                };
+                ConnectionKind::Manager {
+                    manager_url,
+                    profile_id,
+                    token,
+                }
             }
-            ConnectionKind::Cdp {
-                cdp_url,
-                token: raw.token,
+            (None, Some(cdp_url)) => {
+                check_url(&name, "cdp_url", &cdp_url, &["ws", "wss", "http", "https"])?;
+                if raw.profile_id.is_some() {
+                    return Err(invalid(&name, "`profile_id` only applies to `manager_url`"));
+                }
+                ConnectionKind::Cdp {
+                    cdp_url,
+                    token: raw.token,
+                }
             }
-        }
-    };
+        };
     Ok(ConnectionConfig {
         name,
         color: raw.color,
@@ -238,7 +247,10 @@ fn check_url(name: &str, field: &str, url: &str, schemes: &[&str]) -> Result<(),
     let bad = |why: &str| invalid(name, &format!("`{field}` is not a valid URL: {why}"));
     let (scheme, rest) = url.split_once("://").ok_or_else(|| bad("missing scheme"))?;
     if !schemes.contains(&scheme.to_ascii_lowercase().as_str()) {
-        return Err(bad(&format!("scheme must be one of {}", schemes.join(", "))));
+        return Err(bad(&format!(
+            "scheme must be one of {}",
+            schemes.join(", ")
+        )));
     }
     if url.chars().any(char::is_whitespace) {
         return Err(bad("contains whitespace"));
@@ -324,7 +336,9 @@ cdp_url = "ws://10.0.0.5:9222/devtools/browser/x"
         assert!(work.auto_connect);
         assert_eq!(work.color.as_deref(), Some("#3b82f6"));
         match &work.kind {
-            ConnectionKind::Manager { profile_id, token, .. } => {
+            ConnectionKind::Manager {
+                profile_id, token, ..
+            } => {
                 assert_eq!(profile_id, "abc");
                 assert_eq!(token.expose(), "s3cr3t-token");
             }
@@ -337,11 +351,12 @@ cdp_url = "ws://10.0.0.5:9222/devtools/browser/x"
 
     #[test]
     fn cdp_with_token() {
-        let c = load_config_str(
-            "[[connection]]\nname=\"a\"\ncdp_url=\"wss://h/x\"\ntoken=\"t\"\n",
-        )
-        .unwrap();
-        assert!(matches!(&c.connections[0].kind, ConnectionKind::Cdp { token: Some(_), .. }));
+        let c = load_config_str("[[connection]]\nname=\"a\"\ncdp_url=\"wss://h/x\"\ntoken=\"t\"\n")
+            .unwrap();
+        assert!(matches!(
+            &c.connections[0].kind,
+            ConnectionKind::Cdp { token: Some(_), .. }
+        ));
     }
 
     #[test]
@@ -379,7 +394,13 @@ cdp_url = "ws://10.0.0.5:9222/devtools/browser/x"
 
     #[test]
     fn rejects_bad_urls_and_colors() {
-        for url in ["localhost:9222", "ftp://h", "ws://", "ws:///path", "ws://a b"] {
+        for url in [
+            "localhost:9222",
+            "ftp://h",
+            "ws://",
+            "ws:///path",
+            "ws://a b",
+        ] {
             let e = err(&format!("[[connection]]\nname=\"u\"\ncdp_url=\"{url}\"\n"));
             assert!(e.contains("\"u\"") && e.contains("cdp_url"), "{url}: {e}");
         }
@@ -414,7 +435,10 @@ cdp_url = "ws://10.0.0.5:9222/devtools/browser/x"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sub").join("config.toml");
         write_private_file(&path, GOOD).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let loaded = load_config(&path).unwrap();
         assert!(loaded.warnings.is_empty());
         assert_eq!(loaded.config.connections.len(), 2);
@@ -444,7 +468,9 @@ cdp_url = "ws://10.0.0.5:9222/devtools/browser/x"
         assert_eq!(default_config_path(), Some(PathBuf::from("/tmp/x/rb.toml")));
         std::env::remove_var("RB_CONFIG");
         if std::env::var_os("HOME").is_some() {
-            assert!(default_config_path().unwrap().ends_with(".config/rb/config.toml"));
+            assert!(default_config_path()
+                .unwrap()
+                .ends_with(".config/rb/config.toml"));
         }
     }
 }
