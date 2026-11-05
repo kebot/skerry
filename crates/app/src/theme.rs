@@ -154,6 +154,15 @@ pub fn group_color(name: Option<&str>, dark: bool) -> Rgba32 {
     }
 }
 
+/// The Agent marker colour (mock `--agent`).
+pub fn agent_color(dark: bool) -> Rgba32 {
+    if dark {
+        0xc084fcff
+    } else {
+        0xa855f7ff
+    }
+}
+
 /// Black or white text for a filled badge of colour `c`.
 pub fn on_color(c: Rgba32) -> Rgba32 {
     let (r, g, b) = (
@@ -193,6 +202,12 @@ mod tests {
         assert_eq!(group_color(Some("#ff0000"), false), 0xff0000ff);
         assert_eq!(group_color(Some("blue"), true), 0x9d85ffff);
         assert_eq!(group_color(None, false), 0x7c5cf0ff);
+    }
+
+    #[test]
+    fn agent_colour_follows_mock() {
+        assert_eq!(agent_color(false), 0xa855f7ff);
+        assert_eq!(agent_color(true), 0xc084fcff);
     }
 
     #[test]

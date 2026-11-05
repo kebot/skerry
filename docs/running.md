@@ -70,6 +70,64 @@ Try it without browsers: cargo run -p rb-app --example multi_demo (three fake
 Connections; control file path is printed, e.g. `echo "kill alpha 15" >>
 <dir>/cmd`, `dialog beta B1 confirm Sure?`, `popup alpha A1 Popup`).
 
+## Agents
+
+An external Agent (Playwright, Puppeteer, Playwright MCP, browser-use) can
+drive the same Remote Browser through a local proxy that rb runs per
+Connection. It is **off by default**: nothing listens unless you enable it.
+
+```toml
+[[connection]]
+name = "work"
+# ...manager_url / profile_id / token, or cdp_url...
+agent_proxy = true               # default false
+agent_proxy_port = 9333          # optional; default 0 = a free port each run
+agent_proxy_secret = "my-secret-1234"  # optional; default: random each run
+```
+
+Secret: at least 8 characters of `A-Z a-z 0-9 - _`. If it is not set, rb
+generates a random one every run (never written to the config). Set a fixed
+port and secret if the Agent needs a stable endpoint.
+
+The proxy starts when the Connection is connected and stops on Disconnect
+and quit. After a reconnect it restarts on the same port and secret and the
+Agent markers are cleared (target ids can change when the browser
+restarts). A port that is already in use shows a warning in the status bar
+and the Connection keeps working without an Agent endpoint. You can also
+turn it on or off at runtime: hover the Connection chip and use "Enable
+Agent endpoint" / "Disable" (a runtime choice is not saved to the config).
+
+The chip popover shows the endpoint, `http://127.0.0.1:PORT/SECRET`, a
+"Copy endpoint" button and the two usual ways to use it:
+
+    # Playwright (Python): browser = p.chromium.connect_over_cdp("<endpoint>")
+    # Playwright MCP:      npx @playwright/mcp --cdp-endpoint <endpoint>
+
+Puppeteer: use `ws://127.0.0.1:PORT/SECRET/devtools/browser/rb` as
+`browserWSEndpoint`.
+
+Agent marker: a violet ✦ on the Connection chip while at least one Agent
+client is attached, and on every Tab (Sidebar row, pinned tile, rail) the
+Agent sent commands to. It pulses while the Agent acted within the last 2 s
+and stays static after that ("touched earlier"). When the Agent disconnects
+the chip marker goes, the Tab marks stay until the Connection reconnects or
+the proxy is disabled.
+
+Security notes: it listens on 127.0.0.1 only; requests with an `Origin`
+header (any web page in a browser) are refused with 403, and so are Host
+headers other than 127.0.0.1 / localhost / ::1; the random path secret keeps
+other local users and processes from guessing the endpoint (any local process
+that knows the URL can drive the browser, so treat it like a token). The
+Manager token is added by rb on its own upstream connection and is never
+sent to, or visible to, the Agent. There is **no arbitration in v1**: you and
+the Agent control the same Tabs at the same time, and an Agent that changes
+emulation (`Emulation.set*Override`) changes what you see.
+
+Without a browser, `cargo run -p rb-app --example multi_demo` runs `alpha`
+with `agent_proxy = true` on port 39333 and plays the Agent on command
+(`echo "agent attach" >> <dir>/cmd`, `agent nav A2 https://example.com/`,
+`agent detach`).
+
 ## Known limitations
 
 - One Connection per run (first, or the one you name). No Groups, pins,

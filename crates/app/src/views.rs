@@ -24,6 +24,7 @@ use gpui::{
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Point, Render,
     SharedString, Styled, Window,
 };
+use rb_cdp::agent_proxy::{random_path_secret, AgentProxy, AgentProxyConfig, AgentState};
 use rb_cdp::{
     ActiveTab, Connection, ConnectionEvent, ConnectionState, Dialog, ScreencastOptions, TargetInfo,
 };
@@ -32,6 +33,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::actions::{self, PageCmd};
+use crate::agent_model::{self, AgentLine, Marker};
 use crate::connect::{self, ManagerTarget, Prepared};
 use crate::dialog_model;
 use crate::mirror::{Mirror, MirrorBackend};
@@ -68,6 +70,17 @@ enum Msg {
     /// Answering the dialog of a Tab finished (`Err`: it did not go through).
     DialogAnswered(usize, u64, Result<(), String>),
     Notice(usize, String),
+    /// The Agent proxy of a Connection started (or could not), by agent generation.
+    AgentStarted(usize, u64, Result<AgentProxy, String>),
+    AgentState(usize, u64, AgentState),
+}
+
+/// A running Agent proxy and its latest snapshot.
+struct AgentRun {
+    /// Dropping it stops the listener and all Agent clients.
+    _proxy: AgentProxy,
+    endpoint: String,
+    state: AgentState,
 }
 
 enum Phase {
@@ -105,6 +118,24 @@ struct Conn {
     notice: Option<String>,
     /// Bumped whenever the Connection is (re)started or dropped.
     gen: u64,
+    // ---- Agent proxy (off unless enabled in config or from the popover) ----
+    /// Upstream URL and token for the proxy (same as the Connection's own).
+    upstream: Option<(String, Option<rb_cdp::Token>)>,
+    agent_on: bool,
+    /// Port to bind; the config value, then the one actually bound, so the
+    /// endpoint stays the same across reconnects and Disable/Enable.
+    agent_port: u16,
+    /// Path secret: from config, else random per run (never written out).
+    agent_secret: Option<String>,
+    agent: Option<AgentRun>,
+    agent_starting: bool,
+    /// Bumped whenever the proxy is started or stopped (drops late messages).
+    agent_gen: u64,
+    agent_error: Option<String>,
+    /// "Copy endpoint" was pressed (the button says "Copied").
+    agent_copied: bool,
+    /// The Connection was connected at least once since it was started.
+    was_connected: bool,
 }
 
 impl Conn {
@@ -123,7 +154,24 @@ impl Conn {
             starting: false,
             notice: None,
             gen: 0,
+            upstream: None,
+            agent_on: false,
+            agent_port: 0,
+            agent_secret: None,
+            agent: None,
+            agent_starting: false,
+            agent_gen: 0,
+            agent_error: None,
+            agent_copied: false,
+            was_connected: false,
         };
+        c.agent_on = c.cfg.agent_proxy;
+        c.agent_port = c.cfg.agent_proxy_port;
+        c.agent_secret = c
+            .cfg
+            .agent_proxy_secret
+            .as_ref()
+            .map(|s| s.expose().to_string());
         c.arm();
         c
     }
@@ -133,6 +181,7 @@ impl Conn {
         match connect::resolve(&self.cfg) {
             Ok(r) => {
                 self.manager = r.manager;
+                self.upstream = Some((r.cdp.url.clone(), r.cdp.token.clone()));
                 self.pending_cdp = Some(r.cdp);
             }
             Err(e) => {
@@ -257,6 +306,9 @@ impl Root {
         // Flush pending changes when the app quits.
         cx.on_app_quit(|this, _| {
             this.save_now();
+            for c in &mut this.conns {
+                c.agent = None; // stop listening
+            }
             async {}
         })
         .detach();
@@ -566,6 +618,7 @@ impl Root {
         }
         c.mirror = None;
         c.pending_cdp = None;
+        c.was_connected = false;
         c.pages.clear();
         c.dialogs.clear();
         c.gen += 1;
@@ -573,6 +626,7 @@ impl Root {
         c.phase = Phase::Idle;
         c.notice = None;
         c.arm();
+        self.stop_agent(i);
         if self.streaming == Some(i) {
             self.streaming = None;
         }
@@ -711,7 +765,17 @@ impl Root {
                     // No modals for a Connection that is not connected.
                     c.dialogs.clear();
                 }
+                let was_up = c.conn_state == ConnectionState::Connected;
+                let reconnected = s == ConnectionState::Connected && !was_up && c.was_connected;
                 c.conn_state = s.clone();
+                if s == ConnectionState::Connected {
+                    c.was_connected = true;
+                    if reconnected {
+                        // Target ids may have changed: drop the old marks.
+                        self.stop_agent(i);
+                    }
+                    self.start_agent(i);
+                }
                 if s == ConnectionState::Connected && self.new_tab_after_connect == Some(i) {
                     self.new_tab_after_connect = None;
                     self.expect_new_tab = Some(i);
@@ -741,6 +805,27 @@ impl Root {
                 }
                 self.conns[i].notice = Some(format!("Could not answer the dialog: {e}"));
             }
+            Msg::AgentStarted(i, gen, r) if self.conns[i].agent_gen == gen => {
+                let c = &mut self.conns[i];
+                c.agent_starting = false;
+                match r {
+                    Ok(proxy) => {
+                        c.agent_port = proxy.port();
+                        c.agent_error = None;
+                        c.agent = Some(AgentRun {
+                            endpoint: proxy.endpoint(),
+                            _proxy: proxy,
+                            state: AgentState::default(),
+                        });
+                    }
+                    Err(e) => c.agent_error = Some(format!("Agent endpoint: {e}")),
+                }
+            }
+            Msg::AgentState(i, gen, st) if self.conns[i].agent_gen == gen => {
+                if let Some(a) = &mut self.conns[i].agent {
+                    a.state = st;
+                }
+            }
             Msg::Notice(i, n) => {
                 if let Some(c) = self.conns.get_mut(i) {
                     c.notice = Some(n);
@@ -749,6 +834,119 @@ impl Root {
             _ => {} // stale generation, or an event nobody needs
         }
         cx.notify();
+    }
+
+    // ---- Agent proxy ------------------------------------------------------
+
+    /// Start the Agent proxy of Connection `i` if it is enabled, connected
+    /// and not already running. Binds 127.0.0.1 only, on the remembered port.
+    fn start_agent(&mut self, i: usize) {
+        let c = &mut self.conns[i];
+        if !c.agent_on
+            || c.agent.is_some()
+            || c.agent_starting
+            || c.conn_state != ConnectionState::Connected
+        {
+            return;
+        }
+        let Some((url, token)) = c.upstream.clone() else {
+            return;
+        };
+        let secret = c
+            .agent_secret
+            .get_or_insert_with(random_path_secret)
+            .clone();
+        c.agent_starting = true;
+        c.agent_error = None;
+        c.agent_gen += 1;
+        let (gen, port, tx) = (c.agent_gen, c.agent_port, self.ui_tx.clone());
+        self.rt.spawn(async move {
+            let mut cfg = AgentProxyConfig::new(url, token);
+            cfg.bind_port = port;
+            cfg.path_secret = Some(secret);
+            let mut res = AgentProxy::start(cfg.clone()).await;
+            // A just-stopped proxy may still hold its port for a moment.
+            for _ in 0..10 {
+                if res.is_ok() || port == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                res = AgentProxy::start(cfg.clone()).await;
+            }
+            match res {
+                Ok(proxy) => {
+                    let mut st = proxy.state();
+                    if tx.send(Msg::AgentStarted(i, gen, Ok(proxy))).is_err() {
+                        return;
+                    }
+                    while st.changed().await.is_ok() {
+                        let snap = st.borrow_and_update().clone();
+                        if tx.send(Msg::AgentState(i, gen, snap)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::AgentStarted(i, gen, Err(port_error(port, &e))));
+                }
+            }
+        });
+    }
+
+    /// Stop the Agent proxy (Agent clients are dropped, marks cleared).
+    fn stop_agent(&mut self, i: usize) {
+        let c = &mut self.conns[i];
+        c.agent = None;
+        c.agent_starting = false;
+        c.agent_gen += 1;
+        c.agent_copied = false;
+    }
+
+    fn set_agent_enabled(&mut self, i: usize, on: bool, cx: &mut Context<Self>) {
+        self.conns[i].agent_on = on;
+        if on {
+            self.start_agent(i);
+        } else {
+            self.stop_agent(i);
+            self.conns[i].agent_error = None;
+        }
+        cx.notify();
+    }
+
+    fn copy_endpoint(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(a) = &self.conns[i].agent {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(a.endpoint.clone()));
+            self.conns[i].agent_copied = true;
+            cx.notify();
+        }
+    }
+
+    /// The Agent marker of a Tab of Connection `conn`.
+    fn agent_marker(&self, conn: &str, target_id: Option<&str>) -> Marker {
+        let state = self
+            .idx_of(conn)
+            .and_then(|i| self.conns[i].agent.as_ref())
+            .map(|a| &a.state);
+        agent_model::marker(state, target_id, std::time::Instant::now())
+    }
+
+    /// An Agent client is attached to Connection `i`.
+    fn agent_attached(&self, i: usize) -> bool {
+        agent_model::chip_marked(self.conns[i].agent.as_ref().map(|a| &a.state))
+    }
+
+    /// What the chip popover shows about the Agent endpoint.
+    fn agent_line(&self, i: usize) -> AgentLine {
+        let c = &self.conns[i];
+        match (&c.agent, &c.agent_error) {
+            (Some(a), _) => AgentLine::On {
+                endpoint: a.endpoint.clone(),
+                clients: a.state.clients,
+            },
+            (None, Some(e)) => AgentLine::Error(e.clone()),
+            (None, None) if c.agent_on => AgentLine::Waiting,
+            _ => AgentLine::Off,
+        }
     }
 
     /// Whether a message of generation `gen` still belongs to Connection `i`.
@@ -1449,6 +1647,11 @@ impl Root {
     fn status_bar(&self, p: &Palette) -> Option<impl IntoElement> {
         let mut extra: Vec<String> = self.warnings.clone();
         extra.extend(self.notice.clone());
+        extra.extend(
+            self.conns
+                .iter()
+                .filter_map(|c| c.agent_error.as_ref().map(|e| format!("{}: {e}", c.name))),
+        );
         extra.extend(self.focus_conn().and_then(|i| {
             self.conns[i]
                 .notice
@@ -1626,5 +1829,15 @@ impl Root {
         if let Some(id) = id {
             self.activate_tab(&id, window, cx);
         }
+    }
+}
+
+/// A readable reason for a failed bind.
+fn port_error(port: u16, e: &rb_cdp::CdpError) -> String {
+    let text = e.to_string();
+    if text.contains("in use") {
+        format!("port {port} is already in use; pick another `agent_proxy_port` or use 0")
+    } else {
+        text
     }
 }

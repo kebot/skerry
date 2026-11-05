@@ -16,6 +16,14 @@
 //!   dialog <server> <target> <kind> <text>  kind: alert|confirm|prompt|beforeunload
 //!   popup <server> <opener> <title>         open a popup Tab (openerId)
 //!
+//! `alpha` has `agent_proxy = true` on a fixed port and secret, so the demo
+//! can play the Agent: it connects `rb_cdp::Client` to the proxy endpoint
+//! (printed at start). Commands (same command file):
+//!   agent attach                  connect an Agent client to alpha's proxy
+//!   agent nav <target> <url>      attach (once) to the target, Page.navigate
+//!   agent detach                  close the Agent client
+//! Env RB_DEMO_AGENT_PORT (default 39333).
+//!
 //! Run: `cargo run -p rb-app --example multi_demo`
 //! Env: RB_DEMO_FPS (default 8). RB_STATE is a temp file unless set.
 
@@ -197,6 +205,7 @@ struct Spec {
     colors: [[u8; 3]; 3],
     tabs: &'static [(&'static str, &'static str)],
     auto_connect: bool,
+    agent: bool,
 }
 
 const SPECS: [Spec; 3] = [
@@ -210,6 +219,7 @@ const SPECS: [Spec; 3] = [
             ("Hacker News", "https://news.ycombinator.com/"),
         ],
         auto_connect: true,
+        agent: true,
     },
     Spec {
         name: "beta",
@@ -220,6 +230,7 @@ const SPECS: [Spec; 3] = [
             ("Docs rs", "https://docs.rs/"),
         ],
         auto_connect: true,
+        agent: false,
     },
     Spec {
         name: "lab",
@@ -231,8 +242,68 @@ const SPECS: [Spec; 3] = [
             ("Lab Queue", "https://lab.example/queue"),
         ],
         auto_connect: false,
+        agent: false,
     },
 ];
+
+const AGENT_SECRET: &str = "demo-secret-12345";
+
+fn agent_port() -> u16 {
+    std::env::var("RB_DEMO_AGENT_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(39333)
+}
+
+/// The demo plays the Agent through the proxy.
+#[derive(Default)]
+struct Player {
+    client: Option<rb_cdp::Client>,
+    sessions: HashMap<String, rb_cdp::Session>,
+}
+
+impl Player {
+    async fn run(&mut self, w: &[&str]) {
+        let ws = format!(
+            "ws://127.0.0.1:{}/{AGENT_SECRET}/devtools/browser/rb",
+            agent_port()
+        );
+        match w {
+            ["attach"] => match rb_cdp::Client::connect(&ws, None).await {
+                Ok(c) => {
+                    self.client = Some(c);
+                    println!("[agent] connected to {ws}");
+                }
+                Err(e) => println!("[agent] connect failed: {e}"),
+            },
+            ["nav", target, url] => {
+                let Some(c) = &self.client else {
+                    return println!("[agent] not attached");
+                };
+                if !self.sessions.contains_key(*target) {
+                    match c.attach_to_target(target).await {
+                        Ok(s) => {
+                            self.sessions.insert(target.to_string(), s);
+                        }
+                        Err(e) => return println!("[agent] attach failed: {e}"),
+                    }
+                }
+                let r = self.sessions[*target]
+                    .send("Page.navigate", Some(json!({"url": url})))
+                    .await;
+                println!("[agent] navigate {target} {url}: {r:?}");
+            }
+            ["detach"] => {
+                self.sessions.clear();
+                if let Some(c) = self.client.take() {
+                    c.close().await;
+                }
+                println!("[agent] detached");
+            }
+            _ => println!("[agent] bad command"),
+        }
+    }
+}
 
 /// Control commands from the command file, per server.
 enum Ctl {
@@ -480,6 +551,12 @@ group = "g1"
 
 [[tab]]
 connection = "alpha"
+title = "Hacker News"
+url = "https://news.ycombinator.com/"
+pinned = true
+
+[[tab]]
+connection = "alpha"
 title = "Rust Language"
 url = "https://www.rust-lang.org/"
 group = "g1"
@@ -543,9 +620,20 @@ fn main() {
             url
         });
         config.push_str(&format!(
-            "[[connection]]\nname = \"{}\"\ncdp_url = \"{url}\"\nauto_connect = {}\n\n",
+            "[[connection]]\nname = \"{}\"\ncdp_url = \"{url}\"\nauto_connect = {}\n",
             spec.name, spec.auto_connect
         ));
+        if spec.agent {
+            config.push_str(&format!(
+                "agent_proxy = true\nagent_proxy_port = {}\nagent_proxy_secret = \"{AGENT_SECRET}\"\n",
+                agent_port()
+            ));
+            println!(
+                "[demo] Agent endpoint: http://127.0.0.1:{}/{AGENT_SECRET}",
+                agent_port()
+            );
+        }
+        config.push('\n');
     }
     let path = dir.join("config.toml");
     rb_store::write_private_file(&path, &config).unwrap();
@@ -566,6 +654,7 @@ fn main() {
     std::fs::write(&cmd_file, "").unwrap();
     println!("[demo] command file: {}", cmd_file.display());
     rt.spawn(async move {
+        let mut player = Player::default();
         let mut done = 0usize;
         loop {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -573,6 +662,10 @@ fn main() {
             let lines: Vec<&str> = text.lines().collect();
             for line in lines.iter().skip(done) {
                 let w: Vec<&str> = line.split_whitespace().collect();
+                if let ["agent", rest @ ..] = w.as_slice() {
+                    player.run(rest).await;
+                    continue;
+                }
                 let ctl = match w.as_slice() {
                     ["kill", s, rest @ ..] => Some((
                         *s,

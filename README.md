@@ -4,7 +4,7 @@ A native macOS browser, written in Rust with [GPUI](https://gpui.rs/), for manag
 
 - One window for all Connections, with an Arc/Zen-style vertical Sidebar: pinned Tabs, Tab Groups that can span Connections, and a colour and shape per Connection.
 - Mirrors the Active Tab over the Chrome DevTools Protocol (CDP screencast). No audio.
-- Local CDP proxy so an external Agent (Playwright, Puppeteer, Playwright MCP, browser-use) can drive the same browser without ever seeing the Manager token.
+- Local CDP proxy so an external Agent (Playwright, Puppeteer, Playwright MCP, browser-use) can drive the same browser without ever seeing the Manager token (off by default; Tabs the Agent touched get a violet ✦ marker).
 - JS dialogs are answered in a local modal, popups open as Tabs, permission prompts are denied by default.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the agreed design, [GLOSSARY.md](GLOSSARY.md) for the vocabulary, [docs/adr/](docs/adr/) for decisions, and [docs/running.md](docs/running.md) for setup.

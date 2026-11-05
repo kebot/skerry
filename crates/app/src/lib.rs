@@ -2,6 +2,7 @@
 //! can use the views.
 
 pub mod actions;
+pub mod agent_model;
 pub mod app;
 pub mod connect;
 pub mod dialog_model;

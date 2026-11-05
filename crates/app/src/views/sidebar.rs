@@ -11,6 +11,7 @@ use gpui::{
 use rb_store::{SidebarGroup, SidebarItem, SidebarTab};
 
 use super::{Menu, Root};
+use crate::agent_model::{self, AgentLine, Marker};
 use crate::model;
 use crate::multi;
 use crate::sidebar_model::{self as sm, ChipAction, ChipStatus, ConnStyle, DropTarget, MenuKind};
@@ -462,6 +463,7 @@ impl Root {
         let dim = t.placeholder || !live;
         let active = live && self.is_active(&t.connection, t.target_id.as_deref());
         let alert = self.has_dialog_badge(&t.connection, t.target_id.as_deref());
+        let agent = self.agent_marker(&t.connection, t.target_id.as_deref());
         let style = sm::style_of(&self.conn_styles, &t.connection);
         let ccol = style.map(|s| s.color(dark)).unwrap_or(p.idle);
         let id = t.id.clone();
@@ -497,6 +499,12 @@ impl Root {
             .text_color(hsla(p.ink2))
             .child(SharedString::from(sm::fav_text(&t.title, &t.url)))
             .children(alert.then(|| dialog_badge(p).absolute().left(px(5.)).top(px(4.))))
+            .children(agent.shown().then(|| {
+                agent_mark(agent, 12., p)
+                    .absolute()
+                    .left(px(4.))
+                    .top(px(2.))
+            }))
             .child(
                 div()
                     .absolute()
@@ -571,6 +579,7 @@ impl Root {
         let dim = t.placeholder || !live;
         let active = live && self.is_active(&t.connection, t.target_id.as_deref());
         let alert = self.has_dialog_badge(&t.connection, t.target_id.as_deref());
+        let agent = self.agent_marker(&t.connection, t.target_id.as_deref());
         let style = sm::style_of(&self.conn_styles, &t.connection);
         let ccol = style.map(|s| s.color(dark)).unwrap_or(p.idle);
         let id = t.id.clone();
@@ -654,6 +663,16 @@ impl Root {
                         })),
                 )
             })
+            .children(agent.shown().then(|| {
+                if rail {
+                    agent_mark(agent, 9., p)
+                        .absolute()
+                        .top(px(1.))
+                        .right(px(2.))
+                } else {
+                    agent_mark(agent, 12., p)
+                }
+            }))
             .children(alert.then(|| dialog_badge(p)))
             .children(style.map(|s| conn_dot(s.shape, hsla(ccol), 9.)))
             .when_some(hint, |d, after| d.child(drop_bar(after, hsla(p.accent))))
@@ -913,6 +932,14 @@ impl Root {
             let off = !matches!(status, ChipStatus::Connected | ChipStatus::Reconnecting);
             let primary = Self::chip_primary(status);
             let tooltip_active = self.active.as_ref().is_some_and(|a| a.0 == i);
+            let attached = self.agent_attached(i);
+            let acting = attached
+                && self.conns[i].agent.as_ref().is_some_and(|a| {
+                    let now = std::time::Instant::now();
+                    a.state.targets.keys().any(|t| {
+                        agent_model::marker(Some(&a.state), Some(t), now) == Marker::Acting
+                    })
+                });
             row =
                 row.child(
                     div()
@@ -930,6 +957,27 @@ impl Root {
                                 .child(badge(s, dark, 26.)),
                         )
                         .child(status_dot(status, p))
+                        .children(attached.then(|| {
+                            div()
+                                .absolute()
+                                .left(px(-3.))
+                                .top(px(-5.))
+                                .size(px(14.))
+                                .rounded_full()
+                                .bg(hsla(p.side))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(agent_mark(
+                                    if acting {
+                                        Marker::Acting
+                                    } else {
+                                        Marker::Touched
+                                    },
+                                    12.,
+                                    p,
+                                ))
+                        }))
                         .child(
                             div()
                                 .id(SharedString::from(format!("chip-plus-{i}")))
@@ -1221,13 +1269,105 @@ impl Root {
             );
         }
         let left = if self.rail { 66. } else { 10. };
+        let agent_line = self.agent_line(i);
+        let can_agent = !matches!(self.conns[i].phase, super::Phase::Problem(_));
+        let copied = self.conns[i].agent_copied;
+        let small_btn = |id: &'static str, label: &'static str, p: &Palette| {
+            div()
+                .id(id)
+                .px(px(10.))
+                .py(px(2.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(12.))
+                .bg(hsla(p.hover))
+                .text_color(hsla(p.ink))
+                .hover(|st| st.opacity(0.85))
+                .child(label)
+        };
+        let agent_section = match agent_line {
+            AgentLine::Off if !can_agent => None,
+            AgentLine::Off => Some(div().mt(px(8.)).child(
+                small_btn("agent-enable", "Enable Agent endpoint", p).on_click(
+                    cx.listener(move |this, _, _, cx| this.set_agent_enabled(i, true, cx)),
+                ),
+            )),
+            other => {
+                let mut sec = div()
+                    .mt(px(8.))
+                    .pt(px(8.))
+                    .border_t_1()
+                    .border_color(hsla(p.line))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.));
+                let violet = hsla(theme::agent_color(dark));
+                let head = |t: String| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .text_size(px(12.))
+                        .child(div().text_color(violet).child("✦"))
+                        .child(SharedString::from(t))
+                };
+                let mut btns = div().flex().gap(px(6.));
+                match other {
+                    AgentLine::On { endpoint, clients } => {
+                        sec = sec
+                            .child(head(format!(
+                                "Agent endpoint · {clients} client{} attached",
+                                if clients == 1 { "" } else { "s" }
+                            )))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_family("Menlo")
+                                    .text_color(hsla(p.ink))
+                                    .whitespace_nowrap()
+                                    .child(SharedString::from(endpoint.clone())),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(hsla(p.ink3))
+                                    .child(SharedString::from(agent_model::usage_hint(&endpoint))),
+                            );
+                        btns = btns.child(
+                            small_btn(
+                                "agent-copy",
+                                if copied { "Copied" } else { "Copy endpoint" },
+                                p,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| this.copy_endpoint(i, cx))),
+                        );
+                    }
+                    AgentLine::Error(e) => {
+                        sec = sec.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(hsla(p.warn))
+                                .child(SharedString::from(e)),
+                        );
+                    }
+                    _ => {
+                        sec = sec.child(head("Agent endpoint · starting when connected".into()));
+                    }
+                }
+                btns = btns.child(small_btn("agent-disable", "Disable", p).on_click(
+                    cx.listener(move |this, _, _, cx| this.set_agent_enabled(i, false, cx)),
+                ));
+                Some(sec.child(btns))
+            }
+        };
+        let wide = self.conns[i].agent.is_some();
         deferred(
             div()
                 .id("chip-popover")
                 .absolute()
                 .left(px(left))
                 .bottom(px(54.))
-                .w(px(248.))
+                .w(px(if wide { 340. } else { 248. }))
                 .p(px(10.))
                 .rounded(px(10.))
                 .bg(hsla(p.win))
@@ -1254,7 +1394,8 @@ impl Root {
                         .text_color(hsla(p.ink2))
                         .child(SharedString::from(pop.text)),
                 )
-                .child(buttons),
+                .child(buttons)
+                .children(agent_section),
         )
         .with_priority(1)
         .into_any_element()
@@ -1328,4 +1469,32 @@ fn dialog_badge(p: &Palette) -> gpui::Div {
         .font_weight(gpui::FontWeight::BOLD)
         .text_size(px(10.))
         .child("!")
+}
+
+/// The Agent marker: a violet ✦, pulsing while the Agent is acting now and
+/// static when it touched the Tab earlier (one marker, per the mock).
+fn agent_mark(m: Marker, size: f32, p: &Palette) -> gpui::Div {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let alpha = agent_model::opacity(m, std::time::Duration::from_millis(ms));
+    div()
+        .flex_none()
+        .text_size(px(size))
+        .line_height(px(size))
+        .text_color(hsla(theme::agent_color(p.dark)))
+        .opacity(alpha)
+        .child("✦")
+        // Keeps frames coming while it pulses (the same trick as the spinner).
+        .when(m == Marker::Acting, |d| {
+            d.child(
+                canvas(
+                    |_, _, _| (),
+                    |_, _, window, _| window.request_animation_frame(),
+                )
+                .absolute()
+                .size(px(1.)),
+            )
+        })
 }
