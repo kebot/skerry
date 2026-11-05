@@ -2,8 +2,10 @@
 //! Sidebar layout, and reconciliation with a Connection's live targets.
 //! No UI, no I/O.
 //!
-//! A Tab is addressed by its index in `State::tabs` (stored order). Indices
-//! are valid only until the next call that adds or removes Tabs.
+//! A Tab is addressed by its index in `State::tabs` (stored order) or, stably,
+//! by its id (`TabEntry::id`, `t<N>`, never reused). Indices are valid only
+//! until the next call that adds, removes or moves Tabs; the `*_id` variants
+//! survive that. Every Tab created through this module gets an id.
 //!
 //! Sidebar order: pinned Tabs first (stored order), then Tab Groups in
 //! `State::groups` order (members in stored order), then ungrouped Tabs in
@@ -59,6 +61,7 @@ impl GroupColor {
 pub enum ModelError {
     NoSuchGroup(String),
     NoSuchTab(usize),
+    NoSuchTabId(String),
     /// Group names must not be blank.
     EmptyName,
     /// A target position is past the end.
@@ -73,6 +76,7 @@ impl fmt::Display for ModelError {
         match self {
             ModelError::NoSuchGroup(id) => write!(f, "no Tab Group with id {id:?}"),
             ModelError::NoSuchTab(i) => write!(f, "no Tab at index {i}"),
+            ModelError::NoSuchTabId(id) => write!(f, "no Tab with id {id:?}"),
             ModelError::EmptyName => write!(f, "Tab Group name must not be empty"),
             ModelError::PositionOutOfRange { position, len } => {
                 write!(f, "position {position} is out of range (len {len})")
@@ -82,6 +86,14 @@ impl fmt::Display for ModelError {
 }
 
 impl std::error::Error for ModelError {}
+
+/// A Sidebar section a Tab can be placed in (see [`State::place_tab`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Section {
+    Pinned,
+    Group(String),
+    Loose,
+}
 
 /// One live target as reported by a Connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +118,8 @@ pub struct ReconcileReport {
 /// One Tab as the Sidebar renders it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarTab {
+    /// Stable Tab id (empty only for a Tab that never got one).
+    pub id: String,
     /// Index in `State::tabs`.
     pub index: usize,
     pub connection: String,
@@ -150,6 +164,127 @@ impl State {
 
     fn tab_mut(&mut self, index: usize) -> Result<&mut TabEntry, ModelError> {
         self.tabs.get_mut(index).ok_or(ModelError::NoSuchTab(index))
+    }
+
+    /// A fresh Tab id (`t<N>`): above every id in use and above the persisted
+    /// counter, so the id of a closed Tab is not reused.
+    pub fn alloc_tab_id(&mut self) -> String {
+        let max = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.id.as_deref()?.strip_prefix('t')?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        let n = self.next_tab_id.max(max + 1).max(1);
+        self.next_tab_id = n + 1;
+        format!("t{n}")
+    }
+
+    /// Give an id to every Tab without one (old files) and replace duplicate
+    /// ids, so ids are unique. Existing ids are kept.
+    pub fn ensure_tab_ids(&mut self) {
+        let mut seen = HashSet::new();
+        for i in 0..self.tabs.len() {
+            let keep = match &self.tabs[i].id {
+                Some(id) if !id.is_empty() => seen.insert(id.clone()),
+                _ => false,
+            };
+            if !keep {
+                self.tabs[i].id = None;
+            }
+        }
+        for i in 0..self.tabs.len() {
+            if self.tabs[i].id.is_none() {
+                let id = self.alloc_tab_id();
+                seen.insert(id.clone());
+                self.tabs[i].id = Some(id);
+            }
+        }
+        // The counter must stay above every id in use (a hand-edited file).
+        let max = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.id.as_deref()?.strip_prefix('t')?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        self.next_tab_id = self.next_tab_id.max(max + 1);
+    }
+
+    /// Index of the Tab with this id.
+    pub fn tab_index(&self, id: &str) -> Option<usize> {
+        self.tabs.iter().position(|t| t.id.as_deref() == Some(id))
+    }
+
+    fn idx(&self, id: &str) -> Result<usize, ModelError> {
+        self.tab_index(id)
+            .ok_or_else(|| ModelError::NoSuchTabId(id.to_string()))
+    }
+
+    pub fn pin_tab_id(&mut self, id: &str) -> Result<(), ModelError> {
+        let i = self.idx(id)?;
+        self.pin_tab(i)
+    }
+
+    pub fn unpin_tab_id(&mut self, id: &str) -> Result<(), ModelError> {
+        let i = self.idx(id)?;
+        self.unpin_tab(i)
+    }
+
+    pub fn move_tab_to_group_id(&mut self, id: &str, group: &str) -> Result<(), ModelError> {
+        let i = self.idx(id)?;
+        self.move_tab_to_group(i, group)
+    }
+
+    pub fn remove_tab_from_group_id(&mut self, id: &str) -> Result<(), ModelError> {
+        let i = self.idx(id)?;
+        self.remove_tab_from_group(i)
+    }
+
+    pub fn remove_tab_id(&mut self, id: &str) -> Result<TabEntry, ModelError> {
+        let i = self.idx(id)?;
+        self.remove_tab(i)
+    }
+
+    /// Put a Tab into a Sidebar section and at a position: before the Tab
+    /// `before`, or last in the section when `None`. This is what a drag and
+    /// drop does. `before` should belong to the target section; the stored
+    /// order is global, so the position is only meaningful inside it.
+    pub fn place_tab(
+        &mut self,
+        id: &str,
+        section: &Section,
+        before: Option<&str>,
+    ) -> Result<(), ModelError> {
+        let from = self.idx(id)?;
+        if let Section::Group(g) = section {
+            self.group_pos(g)?;
+        }
+        if let Some(b) = before {
+            self.idx(b)?;
+            if b == id {
+                return Ok(()); // dropped on itself: nothing moves
+            }
+        }
+        let mut t = self.tabs.remove(from);
+        match section {
+            Section::Pinned => {
+                t.pinned = true;
+                t.group = None;
+            }
+            Section::Group(g) => {
+                t.pinned = false;
+                t.group = Some(g.clone());
+            }
+            Section::Loose => {
+                t.pinned = false;
+                t.group = None;
+            }
+        }
+        let at = before
+            .and_then(|b| self.tab_index(b))
+            .unwrap_or(self.tabs.len());
+        self.tabs.insert(at, t);
+        Ok(())
     }
 
     fn new_group_id(&self) -> String {
@@ -313,7 +448,9 @@ impl State {
                 i
             }
             None => {
+                let id = self.alloc_tab_id();
                 self.tabs.push(TabEntry {
+                    id: Some(id),
                     connection: connection.to_string(),
                     target_id: Some(target_id.to_string()),
                     title: title.to_string(),
@@ -362,7 +499,9 @@ impl State {
                     report.matched += 1;
                 }
                 None => {
+                    let id = self.alloc_tab_id();
                     self.tabs.push(TabEntry {
+                        id: Some(id),
                         connection: connection.to_string(),
                         target_id: Some(t.target_id.clone()),
                         title: t.title.clone(),
@@ -388,6 +527,7 @@ impl State {
     /// Tabs. A Tab pointing at a missing Group is shown ungrouped.
     pub fn sidebar_layout(&self, is_connected: &dyn Fn(&str) -> bool) -> Vec<SidebarItem> {
         let view = |index: usize, t: &TabEntry| SidebarTab {
+            id: t.id.clone().unwrap_or_default(),
             index,
             connection: t.connection.clone(),
             target_id: t.target_id.clone(),
@@ -466,14 +606,17 @@ mod tests {
     }
 
     fn state3() -> State {
-        State {
+        let mut s = State {
             groups: vec![],
             tabs: vec![
                 tab("a", "T0", "http://0"),
                 tab("b", "T1", "http://1"),
                 tab("a", "T2", "http://2"),
             ],
-        }
+            ..Default::default()
+        };
+        s.ensure_tab_ids();
+        s
     }
 
     fn urls(items: &[SidebarItem]) -> Vec<String> {
@@ -924,6 +1067,105 @@ mod tests {
             loaded.sidebar_layout(&all_connected),
             s.sidebar_layout(&all_connected)
         );
+    }
+
+    #[test]
+    fn ids_are_assigned_unique_and_never_reused() {
+        let mut s = state3();
+        let ids: Vec<_> = s.tabs.iter().map(|t| t.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["t1", "t2", "t3"]);
+        s.remove_tab_id("t3").unwrap();
+        let i = s.add_or_update_tab("a", "NEW", "n", "http://new");
+        assert_eq!(s.tabs[i].id.as_deref(), Some("t4"));
+        let rep = s.reconcile("a", &[target("Z", "http://z")]);
+        assert_eq!(rep.new, 1);
+        assert_eq!(s.tabs.last().unwrap().id.as_deref(), Some("t5"));
+        // Duplicate and blank ids are repaired, valid ones kept.
+        s.tabs[0].id = Some("t5".into());
+        s.tabs[1].id = Some(String::new());
+        s.ensure_tab_ids();
+        let ids: Vec<_> = s.tabs.iter().map(|t| t.id.clone().unwrap()).collect();
+        let mut dedup = ids.clone();
+        dedup.sort();
+        dedup.dedup();
+        assert_eq!(dedup.len(), ids.len());
+        assert_eq!(ids[0], "t5");
+    }
+
+    #[test]
+    fn operations_by_id_survive_reordering() {
+        let mut s = state3();
+        let g = s.create_group("G", None).unwrap();
+        s.reorder_tab(0, 2).unwrap(); // t1 is now last
+        s.move_tab_to_group_id("t1", &g).unwrap();
+        assert_eq!(s.tabs[2].group.as_deref(), Some(g.as_str()));
+        s.pin_tab_id("t1").unwrap();
+        assert!(s.tabs[2].pinned && s.tabs[2].group.is_none());
+        s.unpin_tab_id("t1").unwrap();
+        s.remove_tab_from_group_id("t2").unwrap();
+        assert_eq!(s.remove_tab_id("t1").unwrap().url, "http://0");
+        assert_eq!(
+            s.pin_tab_id("t1"),
+            Err(ModelError::NoSuchTabId("t1".into()))
+        );
+        assert_eq!(s.tab_index("t3"), Some(1));
+    }
+
+    #[test]
+    fn place_tab_sets_section_and_position() {
+        let mut s = state3(); // t1 t2 t3
+        let g = s.create_group("G", None).unwrap();
+        s.place_tab("t3", &Section::Group(g.clone()), None).unwrap();
+        assert_eq!(s.tabs[2].group.as_deref(), Some(g.as_str()));
+        s.place_tab("t1", &Section::Group(g.clone()), Some("t3"))
+            .unwrap();
+        let order: Vec<_> = s.tabs.iter().map(|t| t.id.clone().unwrap()).collect();
+        assert_eq!(order, ["t2", "t1", "t3"]);
+        assert_eq!(s.tabs[1].group.as_deref(), Some(g.as_str()));
+        s.place_tab("t3", &Section::Pinned, Some("t2")).unwrap();
+        assert!(s.tabs[0].pinned && s.tabs[0].group.is_none());
+        assert_eq!(s.tabs[0].id.as_deref(), Some("t3"));
+        s.place_tab("t3", &Section::Loose, None).unwrap();
+        assert!(!s.tabs[2].pinned);
+        assert_eq!(s.tabs[2].id.as_deref(), Some("t3"));
+        // Dropping on itself moves nothing; bad ids and Groups are errors.
+        let before = s.clone();
+        s.place_tab("t1", &Section::Loose, Some("t1")).unwrap();
+        assert_eq!(s, before);
+        assert!(s.place_tab("zz", &Section::Loose, None).is_err());
+        assert!(s
+            .place_tab("t1", &Section::Group("nope".into()), None)
+            .is_err());
+        assert!(s.place_tab("t1", &Section::Loose, Some("zz")).is_err());
+        assert_eq!(s, before);
+    }
+
+    #[test]
+    fn layout_exposes_ids() {
+        let s = state3();
+        let ids: Vec<String> = s
+            .sidebar_layout(&all_connected)
+            .into_iter()
+            .filter_map(|i| match i {
+                SidebarItem::Tab(t) => Some(t.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, ["t1", "t2", "t3"]);
+    }
+
+    #[test]
+    fn old_file_without_ids_gets_ids_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("state.toml");
+        std::fs::write(&p, PREVIOUS_VERSION).unwrap();
+        let s = State::load(&p).unwrap();
+        let ids: Vec<_> = s.tabs.iter().map(|t| t.id.clone().unwrap()).collect();
+        assert_eq!(ids, ["t1", "t2", "t3"]);
+        // Saved and reloaded: the ids are stable.
+        s.save(&p).unwrap();
+        assert_eq!(State::load(&p).unwrap(), s);
+        assert_eq!(s.next_tab_id, 4);
     }
 
     /// A `state.toml` as written before the model layer: free-form colour,

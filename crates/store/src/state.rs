@@ -24,6 +24,10 @@ pub struct GroupEntry {
 /// (within the pinned section, a Group, or the loose list).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TabEntry {
+    /// Stable local id (`t<N>`, never reused). `None` only in files written
+    /// before ids existed; [`State::load`] and the creating operations fill it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Name of the Connection in `config.toml`.
     pub connection: String,
     /// Last-known remote target id (changes if the Remote Browser restarts).
@@ -45,6 +49,10 @@ pub struct TabEntry {
 /// Unknown fields are ignored on load for forward compatibility.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
+    /// Next number for a Tab id (`t<N>`). Persisted so ids of closed Tabs are
+    /// not handed out again.
+    #[serde(default)]
+    pub next_tab_id: u64,
     #[serde(default, rename = "group")]
     pub groups: Vec<GroupEntry>,
     #[serde(default, rename = "tab")]
@@ -85,8 +93,13 @@ impl std::error::Error for StateError {
     }
 }
 
-/// Default state path: `~/.config/rb/state.toml`.
+/// Default state path: `$RB_STATE` if set, else `~/.config/rb/state.toml`.
 pub fn default_state_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("RB_STATE") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
     crate::default_dir().map(|d| d.join("state.toml"))
 }
 
@@ -94,10 +107,15 @@ impl State {
     /// Load state. A missing file gives an empty state.
     pub fn load(path: &Path) -> Result<State, StateError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| StateError::Parse {
-                path: path.to_path_buf(),
-                message: e.to_string(),
-            }),
+            Ok(text) => toml::from_str::<State>(&text)
+                .map(|mut s| {
+                    s.ensure_tab_ids();
+                    s
+                })
+                .map_err(|e| StateError::Parse {
+                    path: path.to_path_buf(),
+                    message: e.to_string(),
+                }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
             Err(source) => Err(StateError::Io {
                 path: path.to_path_buf(),
@@ -299,7 +317,7 @@ mod tests {
     }
 
     fn sample() -> State {
-        State {
+        let mut s = State {
             groups: vec![
                 GroupEntry {
                     id: "g1".into(),
@@ -325,7 +343,10 @@ mod tests {
                 },
                 tab("a", Some("T3"), "http://loose"),
             ],
-        }
+            ..Default::default()
+        };
+        s.ensure_tab_ids();
+        s
     }
 
     #[test]

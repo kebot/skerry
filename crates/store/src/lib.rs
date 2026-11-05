@@ -11,7 +11,8 @@ pub use config::{
     Config, ConfigError, ConnectionConfig, ConnectionKind, LoadedConfig, PermissionWarning,
 };
 pub use model::{
-    GroupColor, ModelError, ReconcileReport, SidebarGroup, SidebarItem, SidebarTab, TargetInfo,
+    GroupColor, ModelError, ReconcileReport, Section, SidebarGroup, SidebarItem, SidebarTab,
+    TargetInfo,
 };
 pub use secret::Secret;
 pub use state::{
