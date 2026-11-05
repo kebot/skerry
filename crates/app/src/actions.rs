@@ -59,15 +59,11 @@ async fn step_history(session: &Session, delta: i64) -> Result<(), CdpError> {
         .map(|_| ())
 }
 
-/// `Target.createTarget` (a new blank Tab). It appears in the Sidebar through
-/// the Connection's target events.
-pub async fn new_tab(client: &Client) -> Result<(), String> {
+/// `Target.createTarget` (a new Tab, blank or reopening `url`). It appears in
+/// the Sidebar through the Connection's target events.
+pub async fn new_tab(client: &Client, url: &str) -> Result<(), String> {
     client
-        .send(
-            "Target.createTarget",
-            Some(json!({ "url": "about:blank" })),
-            None,
-        )
+        .send("Target.createTarget", Some(json!({ "url": url })), None)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())

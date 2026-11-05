@@ -23,6 +23,9 @@ pub enum Startup {
     /// A Connection to use.
     Ready {
         connection: ConnectionConfig,
+        /// Position of the Connection in the config (picks its shape and
+        /// automatic colour, so they stay the same whichever one is chosen).
+        index: usize,
         /// File permission warnings and similar, shown in the status bar.
         warnings: Vec<String>,
     },
@@ -115,6 +118,12 @@ pub fn load(path: Option<PathBuf>, selector: Option<&str>) -> Startup {
     match select_connection(&loaded.config, selector) {
         Ok(c) => Startup::Ready {
             connection: c.clone(),
+            index: loaded
+                .config
+                .connections
+                .iter()
+                .position(|x| x.name == c.name)
+                .unwrap_or(0),
             warnings: loaded.warnings.iter().map(|w| w.to_string()).collect(),
         },
         Err(msg) => Startup::Problem(Overlay::new("Cannot choose a Connection").detail(msg)),
@@ -203,6 +212,7 @@ token = "SECRET-TOKEN"
         let Startup::Ready {
             connection,
             warnings,
+            ..
         } = load(Some(path.clone()), None)
         else {
             panic!("expected ready");

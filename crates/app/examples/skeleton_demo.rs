@@ -327,6 +327,50 @@ async fn run_browser(server: FakeCdpServer, fps: f64, outage: Option<(f64, f64)>
     }
 }
 
+/// A state with a pinned Tab, an open and a collapsed Group, an ungrouped Tab
+/// and a Tab (in the collapsed Group) whose page does not exist any more.
+const SEED_STATE: &str = r#"
+[[group]]
+id = "g1"
+name = "Reading"
+color = "violet"
+
+[[group]]
+id = "g2"
+name = "Old research"
+color = "olive"
+collapsed = true
+
+[[tab]]
+connection = "demo"
+title = "Example Domain"
+url = "https://example.com/"
+pinned = true
+
+[[tab]]
+connection = "demo"
+title = "Rust Programming Language"
+url = "https://www.rust-lang.org/"
+group = "g1"
+
+[[tab]]
+connection = "demo"
+title = "GitHub rb"
+url = "https://github.com/kebot/rb"
+group = "g1"
+
+[[tab]]
+connection = "demo"
+title = "Hacker News"
+url = "https://news.ycombinator.com/"
+
+[[tab]]
+connection = "demo"
+title = "Closed long ago"
+url = "https://gone.example/"
+group = "g2"
+"#;
+
 fn main() {
     let fps: f64 = std::env::var("RB_DEMO_FPS")
         .ok()
@@ -375,6 +419,21 @@ fn main() {
     )
     .unwrap();
     println!("[demo] config: {}", path.display());
+
+    // Local state (Groups, pins, Placeholder Tabs): a temp file unless the
+    // caller sets RB_STATE. RB_DEMO_SEED=1 writes a sample state first.
+    if std::env::var_os("RB_STATE").is_none_or(|v| v.is_empty()) {
+        let state = dir.join("state.toml");
+        std::env::set_var("RB_STATE", &state);
+    }
+    if std::env::var("RB_DEMO_SEED").is_ok_and(|v| v == "1") {
+        let state = std::env::var("RB_STATE").unwrap();
+        std::fs::write(&state, SEED_STATE).unwrap();
+    }
+    println!(
+        "[demo] state: {}",
+        std::env::var("RB_STATE").unwrap_or_default()
+    );
 
     let startup = rb_app::startup::load(Some(path), None);
     rb_app::app::run(startup, rt.handle().clone());

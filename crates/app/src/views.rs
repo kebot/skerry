@@ -1,37 +1,48 @@
-//! Root view: top bar, Sidebar (Tab list), Mirror, status bar.
+//! Root view: top bar, Sidebar (Tabs, Groups, Connection chips), Mirror.
 //!
 //! All CDP and Manager I/O runs on the app's tokio runtime. It reports back
 //! to this view through one unbounded channel of [`Msg`]s that a GPUI task
 //! drains (the bridge described in docs/gpui-notes.md).
+//!
+//! Tab Groups, pins and Placeholder Tabs live in an `rb_store::State`, loaded
+//! from `state.toml` at startup, reconciled with the live pages on every
+//! change and saved (debounced) after mutations. The Sidebar renders from
+//! `State::sidebar_layout` (see `views/sidebar.rs`).
+
+use std::path::PathBuf;
+use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, rgb, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, SharedString,
-    Styled, Window,
+    div, prelude::*, px, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Point, Render,
+    SharedString, Styled, Window,
 };
 use rb_cdp::{
     ActiveTab, Connection, ConnectionEvent, ConnectionState, ScreencastOptions, TargetInfo,
 };
+use rb_store::{ConnectionConfig, SidebarItem, State};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::actions::{self, PageCmd};
 use crate::connect::{self, ManagerTarget, Prepared};
 use crate::mirror::{Mirror, MirrorBackend};
-use crate::model::{self, Overlay, OverlayAction, Tone};
+use crate::model::{self, Overlay, OverlayAction};
+use crate::sidebar_model::{
+    self as sm, ChipAction, ChipStatus, ConnStyle, DropTarget, LineEdit, LinkState, MenuAction,
+    MenuKind,
+};
 use crate::startup::Startup;
-use crate::state::ToggleSidebar;
+use crate::state::{
+    CloseTab, FocusAddress, GoBack, GoForward, NewTab, Select1, Select2, Select3, Select4, Select5,
+    Select6, Select7, Select8, Select9, ToggleSidebar,
+};
+use crate::theme::{self, hsla, Palette};
 
-const BG: u32 = 0x1e1e1e;
-const BG_BAR: u32 = 0x2b2b2d;
-const BG_SIDEBAR: u32 = 0x252526;
-const BG_HOVER: u32 = 0x37373d;
-const BG_ACTIVE: u32 = 0x094771;
-const FG: u32 = 0xdddddd;
-const FG_DIM: u32 = 0x9a9a9a;
-const GOOD: u32 = 0x4ec9b0;
-const WARN: u32 = 0xe5c07b;
-const BAD: u32 = 0xf48771;
+mod sidebar;
+
+/// Debounce before `state.toml` is written after a change.
+const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// Messages from the tokio side to the view.
 enum Msg {
@@ -46,8 +57,13 @@ enum Msg {
 enum Phase {
     /// Checking the Profile / connecting for the first time.
     Connecting,
-    /// Nothing runs: first-run, config problem, Profile stopped, Manager error.
+    /// Nothing can run (first run, config problem): the whole window shows this.
     Problem(Overlay),
+    /// The Connection cannot connect (Profile stopped, Manager error): the
+    /// Sidebar stays, the Mirror area shows this.
+    Blocked(Overlay),
+    /// Not connected on purpose (the user disconnected).
+    Idle,
     /// A Connection exists; its state decides about an overlay.
     Running,
 }
@@ -60,12 +76,32 @@ struct Address {
     select_all: bool,
 }
 
+/// An open context menu.
+struct Menu {
+    kind: MenuKind,
+    pos: Point<gpui::Pixels>,
+}
+
+/// A Tab Group name being edited in its header.
+struct Rename {
+    group: String,
+    edit: LineEdit,
+    focus: FocusHandle,
+    /// The field has had focus; losing it commits.
+    seen_focus: bool,
+}
+
 pub struct Root {
     focus: FocusHandle,
     rt: Handle,
     ui_tx: UnboundedSender<Msg>,
-    sidebar_visible: bool,
+    /// The Sidebar is the narrow icon rail.
+    rail: bool,
+    /// Styles of all known Connections, in config order (one for now).
+    conn_styles: Vec<ConnStyle>,
     connection_name: String,
+    /// Config of the Connection, to arm it again after a disconnect.
+    connection_cfg: Option<ConnectionConfig>,
     warnings: Vec<String>,
     phase: Phase,
     manager: Option<ManagerTarget>,
@@ -83,6 +119,26 @@ pub struct Root {
     address: Address,
     /// Focus the Mirror on the next render (needs a Window).
     focus_mirror: bool,
+    // ---- persisted local state ----
+    state: State,
+    state_path: Option<PathBuf>,
+    /// False when `state.toml` exists but could not be read: never overwrite it.
+    state_writable: bool,
+    save_gen: u64,
+    dirty: bool,
+    // ---- Sidebar interaction ----
+    menu: Option<Menu>,
+    rename: Option<Rename>,
+    /// Chip whose popover is open.
+    chip_open: Option<usize>,
+    chip_over: bool,
+    pop_over: bool,
+    hover_gen: u64,
+    drop_hint: Option<DropTarget>,
+    /// A Tab (by id) to activate as soon as its Connection is up.
+    pending_select: Option<String>,
+    /// The next new page becomes the Active Tab (after Cmd+T).
+    expect_new_tab: bool,
 }
 
 impl Root {
@@ -96,13 +152,21 @@ impl Root {
             }
         })
         .detach();
+        // Flush pending changes when the app quits.
+        cx.on_app_quit(|this, _| {
+            this.save_now();
+            async {}
+        })
+        .detach();
 
         let mut root = Root {
             focus: cx.focus_handle(),
             rt,
             ui_tx,
-            sidebar_visible: true,
+            rail: false,
+            conn_styles: Vec::new(),
             connection_name: String::new(),
+            connection_cfg: None,
             warnings: Vec::new(),
             phase: Phase::Connecting,
             manager: None,
@@ -120,21 +184,39 @@ impl Root {
                 select_all: false,
             },
             focus_mirror: false,
+            state: State::default(),
+            state_path: None,
+            state_writable: true,
+            save_gen: 0,
+            dirty: false,
+            menu: None,
+            rename: None,
+            chip_open: None,
+            chip_over: false,
+            pop_over: false,
+            hover_gen: 0,
+            drop_hint: None,
+            pending_select: None,
+            expect_new_tab: false,
         };
         match startup {
             Startup::Problem(o) => root.phase = Phase::Problem(o),
             Startup::Ready {
                 connection,
+                index,
                 warnings,
             } => {
                 root.connection_name = connection.name.clone();
+                root.conn_styles = vec![ConnStyle::new(
+                    &connection.name,
+                    connection.color.as_deref(),
+                    index,
+                )];
                 root.warnings = warnings;
-                match connect::resolve(&connection) {
-                    Ok(r) => {
-                        root.manager = r.manager;
-                        root.pending_cdp = Some(r.cdp);
-                        root.begin_prepare(cx);
-                    }
+                root.load_state();
+                root.connection_cfg = Some(connection);
+                match root.arm() {
+                    Ok(()) => root.begin_prepare(cx),
                     Err(e) => {
                         root.phase = Phase::Problem(
                             Overlay::new("Invalid Connection in config.toml").detail(e),
@@ -146,10 +228,131 @@ impl Root {
         root
     }
 
+    /// Load `state.toml` (`RB_STATE` or the default path).
+    fn load_state(&mut self) {
+        self.state_path = rb_store::default_state_path();
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        match State::load(&path) {
+            Ok(s) => self.state = s,
+            Err(e) => {
+                self.state_writable = false;
+                self.warnings
+                    .push(format!("{e}; Tab Groups are not saved this run"));
+            }
+        }
+    }
+
+    // ---- persistence --------------------------------------------------------
+
+    /// Schedule a debounced save.
+    fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
+        self.save_gen += 1;
+        let gen = self.save_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SAVE_DEBOUNCE).await;
+            let _ = this.update(cx, |r, _| {
+                if r.save_gen == gen {
+                    r.save_now();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Write `state.toml` now if there are unsaved changes.
+    fn save_now(&mut self) {
+        if !self.dirty || !self.state_writable {
+            return;
+        }
+        self.dirty = false;
+        if let Some(p) = &self.state_path {
+            if let Err(e) = self.state.save(p) {
+                self.notice = Some(format!("Could not save state: {e}"));
+            }
+        }
+    }
+
+    /// Change the state; marks it dirty only if something changed.
+    fn edit_state(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut State)) {
+        let before = self.state.clone();
+        f(&mut self.state);
+        if self.state != before {
+            self.mark_dirty(cx);
+        }
+        cx.notify();
+    }
+
+    // ---- derived data -------------------------------------------------------
+
+    fn dark(&self, window: &Window) -> bool {
+        theme::is_dark(window.appearance())
+    }
+
+    /// The Connection's link state, for chips and Placeholder Tabs.
+    fn link(&self) -> LinkState {
+        match &self.phase {
+            Phase::Running => LinkState::Live(self.conn_state.clone()),
+            Phase::Connecting => LinkState::Connecting,
+            Phase::Blocked(o) if o.action == Some(OverlayAction::StartProfile) => {
+                LinkState::ProfileStopped
+            }
+            Phase::Blocked(_) | Phase::Idle | Phase::Problem(_) => LinkState::Off,
+        }
+    }
+
+    fn chip_status(&self) -> ChipStatus {
+        sm::chip_status(&self.link(), self.manager.is_some())
+    }
+
+    fn layout(&self) -> Vec<SidebarItem> {
+        let live = sm::tabs_live(&self.link());
+        let name = self.connection_name.clone();
+        self.state.sidebar_layout(&move |c: &str| live && c == name)
+    }
+
+    fn is_live_target(&self, target_id: Option<&str>) -> bool {
+        sm::tabs_live(&self.link())
+            && target_id.is_some_and(|t| self.pages.iter().any(|p| p.target_id == t))
+    }
+
+    /// The Connection a new Tab opens in: the Active Tab's, else the first.
+    fn target_connection(&self) -> Option<&ConnStyle> {
+        let active = self
+            .active
+            .as_deref()
+            .and_then(|t| {
+                self.state
+                    .tabs
+                    .iter()
+                    .find(|e| e.target_id.as_deref() == Some(t))
+            })
+            .and_then(|e| sm::style_of(&self.conn_styles, &e.connection));
+        active.or_else(|| self.conn_styles.first())
+    }
+
     // ---- connecting -------------------------------------------------------
+
+    /// Build the CDP config (and Manager client) from the saved Connection.
+    fn arm(&mut self) -> Result<(), String> {
+        let cfg = self.connection_cfg.as_ref().ok_or("no Connection")?;
+        let r = connect::resolve(cfg)?;
+        self.manager = r.manager;
+        self.pending_cdp = Some(r.cdp);
+        Ok(())
+    }
 
     /// Manager pre-flight, then start the Connection.
     fn begin_prepare(&mut self, cx: &mut Context<Self>) {
+        if self.pending_cdp.is_none() {
+            if let Err(e) = self.arm() {
+                self.phase =
+                    Phase::Problem(Overlay::new("Invalid Connection in config.toml").detail(e));
+                return;
+            }
+        }
         self.phase = Phase::Connecting;
         if self.manager.is_none() {
             self.start_connection(cx);
@@ -160,6 +363,30 @@ impl Root {
         self.rt.spawn(async move {
             let _ = tx.send(Msg::Prepared(connect::prepare(manager.as_ref()).await));
         });
+        cx.notify();
+    }
+
+    /// Connect (or retry) the Connection. Never starts a stopped Profile.
+    fn connect(&mut self, cx: &mut Context<Self>) {
+        match (&self.conn, &self.phase) {
+            (Some(c), _) => c.retry(),
+            (None, Phase::Connecting) => {}
+            (None, _) => self.begin_prepare(cx),
+        }
+        cx.notify();
+    }
+
+    fn disconnect(&mut self, cx: &mut Context<Self>) {
+        if let Some(c) = self.conn.take() {
+            self.rt.spawn(async move { c.close().await });
+        }
+        self.mirror = None;
+        self.pending_cdp = None;
+        self.pages.clear();
+        self.active = None;
+        self.conn_state = ConnectionState::Closed;
+        self.phase = Phase::Idle;
+        self.notice = None;
         cx.notify();
     }
 
@@ -208,12 +435,12 @@ impl Root {
         match msg {
             Msg::Prepared(Prepared::Ready) => self.start_connection(cx),
             Msg::Prepared(Prepared::NeedsStart) => {
-                self.phase = Phase::Problem(
+                self.phase = Phase::Blocked(
                     model::overlay_for(&ConnectionState::NotRunning, true).expect("overlay"),
                 );
             }
             Msg::Prepared(Prepared::Failed { title, detail }) => {
-                self.phase = Phase::Problem(
+                self.phase = Phase::Blocked(
                     Overlay::new(title)
                         .detail(detail)
                         .action(OverlayAction::Retry),
@@ -226,7 +453,10 @@ impl Root {
                         self.notice = None;
                         match &self.conn {
                             Some(c) => c.retry(),
-                            None => self.begin_prepare(cx),
+                            None => {
+                                self.pending_cdp = None;
+                                self.begin_prepare(cx)
+                            }
                         }
                     }
                     Err(e) => self.notice = Some(format!("Could not start the Profile: {e}")),
@@ -237,15 +467,9 @@ impl Root {
                     self.notice = None;
                 }
                 self.conn_state = s;
+                self.resolve_pending();
             }
-            Msg::Pages(p) => {
-                self.pages = p;
-                let want = model::choose_active(&self.pages, self.active.as_deref());
-                if want != self.active {
-                    self.active = want;
-                    self.sync_active();
-                }
-            }
+            Msg::Pages(p) => self.apply_pages(p, cx),
             Msg::Event(ConnectionEvent::ScreencastFailed { error, .. }) => {
                 self.notice = Some(format!("Screencast failed: {error}"));
             }
@@ -253,6 +477,63 @@ impl Root {
             Msg::Notice(n) => self.notice = Some(n),
         }
         cx.notify();
+    }
+
+    /// A new list of live pages: prune closed Tabs, reconcile the stored
+    /// Tabs, keep the Active Tab valid.
+    fn apply_pages(&mut self, pages: Vec<TargetInfo>, cx: &mut Context<Self>) {
+        let old: Vec<String> = self.pages.iter().map(|p| p.target_id.clone()).collect();
+        let new: Vec<String> = pages.iter().map(|p| p.target_id.clone()).collect();
+        let connected = self.conn_state == ConnectionState::Connected;
+        self.pages = pages;
+        let live: Vec<rb_store::TargetInfo> = self
+            .pages
+            .iter()
+            .map(|p| rb_store::TargetInfo {
+                target_id: p.target_id.clone(),
+                title: p.title.clone(),
+                url: p.url.clone(),
+            })
+            .collect();
+        let name = self.connection_name.clone();
+        let gone = sm::closed_targets(&old, &new, connected);
+        self.edit_state(cx, |s| {
+            sm::prune_closed(s, &name, &gone);
+            s.reconcile(&name, &live);
+        });
+        if self.expect_new_tab {
+            if let Some(n) = new.iter().find(|id| !old.contains(id)) {
+                self.expect_new_tab = false;
+                self.active = Some(n.clone());
+                self.sync_active();
+                self.focus_mirror = true;
+            }
+        }
+        self.resolve_pending();
+        let want = model::choose_active(&self.pages, self.active.as_deref());
+        if want != self.active {
+            self.active = want;
+            self.sync_active();
+        }
+    }
+
+    /// Activate the Tab the user clicked while its Connection was down, once
+    /// it is live.
+    fn resolve_pending(&mut self) {
+        let Some(tab_id) = self.pending_select.clone() else {
+            return;
+        };
+        let Some(i) = self.state.tab_index(&tab_id) else {
+            self.pending_select = None;
+            return;
+        };
+        let target = self.state.tabs[i].target_id.clone();
+        if self.is_live_target(target.as_deref()) {
+            self.pending_select = None;
+            self.active = target;
+            self.sync_active();
+            self.focus_mirror = true;
+        }
     }
 
     // ---- actions ----------------------------------------------------------
@@ -274,6 +555,26 @@ impl Root {
         }
         self.focus_mirror_now(window, cx);
         cx.notify();
+    }
+
+    /// A click (or Cmd+n) on a Sidebar Tab. A live Tab becomes Active; a
+    /// Placeholder Tab connects its Connection first; a leftover entry on a
+    /// connected Connection reopens its URL.
+    fn activate_tab(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(i) = self.state.tab_index(tab_id) else {
+            return;
+        };
+        let entry = self.state.tabs[i].clone();
+        if self.is_live_target(entry.target_id.as_deref()) {
+            self.pending_select = None;
+            self.select_tab(&entry.target_id.unwrap_or_default(), window, cx);
+        } else if sm::tabs_live(&self.link()) {
+            self.pending_select = Some(tab_id.to_string());
+            self.open_url_tab(&entry.url);
+        } else {
+            self.pending_select = Some(tab_id.to_string());
+            self.connect(cx);
+        }
     }
 
     fn focus_mirror_now(&mut self, window: &mut Window, cx: &App) {
@@ -301,24 +602,82 @@ impl Root {
         self.report(actions::run_page(session, cmd));
     }
 
-    fn new_tab(&self) {
+    fn open_url_tab(&mut self, url: &str) {
         if let Some(client) = self.conn.as_ref().and_then(|c| c.client()) {
-            self.report(async move { actions::new_tab(&client).await });
+            let url = if url.is_empty() { "about:blank" } else { url };
+            let url = url.to_string();
+            self.report(async move { actions::new_tab(&client, &url).await });
         }
     }
 
-    fn close_tab(&self, target_id: String) {
-        if let Some(client) = self.conn.as_ref().and_then(|c| c.client()) {
-            self.report(async move { actions::close_tab(&client, &target_id).await });
+    /// Cmd+T, the "+ New Tab" row and a chip's "+": a blank Tab in the target
+    /// Connection (becomes the Active Tab). A disconnected Connection connects
+    /// instead; a stopped Profile is not started.
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        if sm::tabs_live(&self.link()) && self.conn.as_ref().is_some_and(|c| c.client().is_some()) {
+            self.expect_new_tab = true;
+            self.open_url_tab("about:blank");
+        } else {
+            self.connect(cx);
+        }
+    }
+
+    /// Close a Sidebar Tab. A live Tab is closed on the Remote Browser (a
+    /// pinned one stays in the Sidebar); an entry with no live page is just
+    /// forgotten.
+    fn close_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(i) = self.state.tab_index(tab_id) else {
+            return;
+        };
+        let target = self.state.tabs[i].target_id.clone();
+        if self.is_live_target(target.as_deref()) {
+            let target = target.unwrap_or_default();
+            if self.active.as_deref() == Some(target.as_str()) {
+                self.active = self.neighbour_of(tab_id).or(self.active.take());
+                self.sync_active();
+                self.focus_mirror = true;
+            }
+            if let Some(client) = self.conn.as_ref().and_then(|c| c.client()) {
+                self.report(async move { actions::close_tab(&client, &target).await });
+            }
+        } else {
+            self.edit_state(cx, |s| {
+                let _ = s.remove_tab_id(tab_id);
+            });
+        }
+    }
+
+    /// The live Tab next to `tab_id` in Sidebar order (next, else previous).
+    fn neighbour_of(&self, tab_id: &str) -> Option<String> {
+        let layout = self.layout();
+        let flat: Vec<_> = sm::flat_tabs(&layout)
+            .into_iter()
+            .filter(|t| self.is_live_target(t.target_id.as_deref()))
+            .collect();
+        let pos = flat.iter().position(|t| t.id == tab_id)?;
+        flat.get(pos + 1)
+            .or(pos.checked_sub(1).and_then(|p| flat.get(p)))
+            .and_then(|t| t.target_id.clone())
+    }
+
+    fn close_active(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.active.clone() else {
+            return;
+        };
+        let id = self
+            .state
+            .tabs
+            .iter()
+            .find(|e| e.target_id.as_deref() == Some(active.as_str()))
+            .and_then(|e| e.id.clone());
+        if let Some(id) = id {
+            self.close_tab(&id, cx);
         }
     }
 
     fn overlay_action(&mut self, action: OverlayAction, cx: &mut Context<Self>) {
         match action {
-            OverlayAction::Retry => match &self.conn {
-                Some(c) => c.retry(),
-                None => self.begin_prepare(cx),
-            },
+            OverlayAction::Retry | OverlayAction::Connect => self.connect(cx),
             OverlayAction::StartProfile => {
                 let Some(m) = self.manager.clone() else {
                     return;
@@ -334,12 +693,147 @@ impl Root {
         cx.notify();
     }
 
+    fn chip_action(&mut self, action: ChipAction, cx: &mut Context<Self>) {
+        match action {
+            ChipAction::NewTab => self.new_tab(cx),
+            ChipAction::Disconnect => self.disconnect(cx),
+            ChipAction::RetryNow | ChipAction::Connect => self.connect(cx),
+            ChipAction::Start => self.overlay_action(OverlayAction::StartProfile, cx),
+        }
+        self.chip_open = None;
+        cx.notify();
+    }
+
+    /// Apply a context menu choice.
+    fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        if let MenuAction::CloseTab(id) = &action {
+            self.close_tab(id, cx);
+            return;
+        }
+        let mut renamed = None;
+        self.edit_state(cx, |s| renamed = sm::apply_menu_action(s, &action));
+        if let Some(g) = renamed {
+            self.start_rename(&g, window, cx);
+        }
+    }
+
+    fn start_rename(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(g) = self.state.group(group) else {
+            return;
+        };
+        let focus = cx.focus_handle();
+        window.focus(&focus);
+        self.rename = Some(Rename {
+            group: group.to_string(),
+            edit: LineEdit::with_text(&g.name),
+            focus,
+            seen_focus: false,
+        });
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, commit: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(r) = self.rename.take() else { return };
+        if commit && !r.edit.buf.trim().is_empty() {
+            let name = r.edit.buf.clone();
+            self.edit_state(cx, |s| {
+                let _ = s.rename_group(&r.group, &name);
+            });
+        }
+        self.focus_mirror_now(window, cx);
+        cx.notify();
+    }
+
+    fn rename_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        if ks.modifiers.platform {
+            return; // app shortcuts pass through
+        }
+        let Some(r) = &mut self.rename else { return };
+        let out = r.edit.key(
+            ks.key.as_str(),
+            ks.key_char.as_deref(),
+            ks.modifiers.control || ks.modifiers.function,
+        );
+        match out {
+            sm::EditOutcome::Commit => self.finish_rename(true, window, cx),
+            sm::EditOutcome::Cancel => self.finish_rename(false, window, cx),
+            sm::EditOutcome::Changed => {}
+            sm::EditOutcome::Ignored => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Finish a drag: apply the drop hint to the state.
+    fn drop_tab(&mut self, dragged: &str, cx: &mut Context<Self>) {
+        let Some(target) = self.drop_hint.take() else {
+            return;
+        };
+        let layout = self.layout();
+        self.edit_state(cx, |s| {
+            sm::apply_drop(s, &layout, dragged, &target);
+        });
+    }
+
+    fn set_drop_hint(&mut self, hint: DropTarget, cx: &mut Context<Self>) {
+        if self.drop_hint.as_ref() != Some(&hint) {
+            self.drop_hint = Some(hint);
+            cx.notify();
+        }
+    }
+
+    fn chip_hover_changed(&mut self, i: usize, hovered: bool, cx: &mut Context<Self>) {
+        self.chip_over = hovered;
+        if hovered {
+            self.chip_open = Some(i);
+            self.hover_gen += 1;
+        } else {
+            self.schedule_popover_close(cx);
+        }
+        cx.notify();
+    }
+
+    fn popover_hover_changed(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        self.pop_over = hovered;
+        if !hovered {
+            self.schedule_popover_close(cx);
+        } else {
+            self.hover_gen += 1;
+        }
+    }
+
+    fn schedule_popover_close(&mut self, cx: &mut Context<Self>) {
+        self.hover_gen += 1;
+        let gen = self.hover_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(220))
+                .await;
+            let _ = this.update(cx, |r, cx| {
+                if r.hover_gen == gen && !r.chip_over && !r.pop_over {
+                    r.chip_open = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn current_url(&self) -> String {
         self.active
             .as_deref()
             .and_then(|id| self.pages.iter().find(|p| p.target_id == id))
             .map(|p| p.url.clone())
             .unwrap_or_default()
+    }
+
+    fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.address.buf = self.current_url();
+        self.address.select_all = true;
+        window.focus(&self.address.focus);
+        cx.notify();
     }
 
     fn address_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -367,35 +861,28 @@ impl Root {
             cx.notify();
             return;
         }
-        match ks.key.as_str() {
-            "enter" => {
+        let mut edit = LineEdit {
+            buf: std::mem::take(&mut self.address.buf),
+            select_all: self.address.select_all,
+        };
+        let out = edit.key(
+            ks.key.as_str(),
+            ks.key_char.as_deref(),
+            ks.modifiers.control || ks.modifiers.function,
+        );
+        self.address.buf = edit.buf;
+        self.address.select_all = edit.select_all;
+        match out {
+            sm::EditOutcome::Commit => {
                 if let Some(url) = model::normalize_url(&self.address.buf) {
                     self.page_cmd(PageCmd::Navigate(url));
                 }
                 self.address.select_all = false;
                 self.focus_mirror_now(window, cx);
             }
-            "escape" => self.focus_mirror_now(window, cx),
-            "backspace" => {
-                if self.address.select_all {
-                    self.address.buf.clear();
-                    self.address.select_all = false;
-                } else {
-                    self.address.buf.pop();
-                }
-            }
-            _ => {
-                let typed = ks
-                    .key_char
-                    .as_deref()
-                    .filter(|c| !c.is_empty() && !ks.modifiers.control && !ks.modifiers.function);
-                let Some(c) = typed else { return };
-                if self.address.select_all {
-                    self.address.buf.clear();
-                    self.address.select_all = false;
-                }
-                self.address.buf.push_str(c);
-            }
+            sm::EditOutcome::Cancel => self.focus_mirror_now(window, cx),
+            sm::EditOutcome::Changed => {}
+            sm::EditOutcome::Ignored => return,
         }
         cx.stop_propagation();
         cx.notify();
@@ -403,7 +890,7 @@ impl Root {
 
     // ---- rendering --------------------------------------------------------
 
-    fn overlay_view(&self, o: &Overlay, cx: &mut Context<Self>) -> impl IntoElement {
+    fn overlay_view(&self, o: &Overlay, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let starting = self.starting;
         let mut detail = o.detail.clone().unwrap_or_default();
         if let Some(n) = &self.notice {
@@ -415,7 +902,7 @@ impl Root {
         let button = match (o.action, starting) {
             (Some(_), true) => Some(
                 div()
-                    .text_color(rgb(FG_DIM))
+                    .text_color(hsla(p.ink2))
                     .child("Starting the Profile...")
                     .into_any_element(),
             ),
@@ -423,16 +910,18 @@ impl Root {
                 let label = match a {
                     OverlayAction::StartProfile => "Start Profile",
                     OverlayAction::Retry => "Retry",
+                    OverlayAction::Connect => "Connect",
                 };
                 Some(
                     div()
                         .id("overlay-action")
                         .px_4()
-                        .py_2()
+                        .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .bg(rgb(BG_ACTIVE))
-                        .hover(|s| s.bg(rgb(0x0e639c)))
+                        .bg(hsla(p.accent))
+                        .text_color(gpui::white())
+                        .hover(|s| s.opacity(0.88))
                         .child(label)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.overlay_action(a, cx)
@@ -450,32 +939,33 @@ impl Root {
             .justify_center()
             .gap_3()
             .p_6()
-            .bg(rgb(BG))
-            .text_color(rgb(FG))
+            .bg(hsla(p.win))
+            .text_color(hsla(p.ink))
             .child(div().text_xl().child(o.title.clone()))
             .children((!detail.is_empty()).then(|| {
                 div()
                     .max_w(px(720.))
                     .font_family("Menlo")
                     .text_sm()
-                    .text_color(rgb(FG_DIM))
+                    .text_color(hsla(p.ink2))
                     .child(detail)
             }))
             .children(button)
     }
 
-    fn top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn top_bar(&self, window: &Window, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let button = |id: &'static str, label: &'static str| {
             div()
                 .id(id)
-                .w(px(28.))
+                .w(px(30.))
                 .h(px(26.))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded_md()
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(BG_HOVER)))
+                .text_color(hsla(p.ink2))
+                .hover(|s| s.bg(hsla(p.hover)))
                 .child(label)
         };
         let editing = self.address.focus.is_focused(window);
@@ -484,232 +974,175 @@ impl Root {
         } else {
             self.current_url()
         };
-        let field = div()
-            .id("address")
-            .track_focus(&self.address.focus)
-            .on_key_down(
-                cx.listener(|this, ev: &KeyDownEvent, window, cx| this.address_key(ev, window, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    if !this.address.focus.is_focused(window) {
-                        this.address.buf = this.current_url();
-                        this.address.select_all = true;
-                        window.focus(&this.address.focus);
-                        cx.notify();
-                    }
-                }),
-            )
-            .flex_1()
-            .h(px(26.))
-            .px_2()
-            .flex()
-            .items_center()
-            .rounded_md()
-            .bg(rgb(0x1a1a1a))
-            .border_1()
-            .border_color(rgb(if editing { 0x3794ff } else { 0x3c3c3c }))
-            .overflow_hidden()
-            .child(
-                div()
-                    .when(editing && self.address.select_all, |d| d.bg(rgb(0x264f78)))
-                    .whitespace_nowrap()
-                    .child(SharedString::from(if editing {
-                        format!("{text}|")
-                    } else {
-                        text
-                    })),
-            );
+        let dark = theme::is_dark(window.appearance());
+        let style = self.target_connection().cloned();
+        let field =
+            div()
+                .id("address")
+                .track_focus(&self.address.focus)
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    this.address_key(ev, window, cx)
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        if !this.address.focus.is_focused(window) {
+                            this.focus_address(window, cx);
+                        }
+                    }),
+                )
+                .flex_1()
+                .min_w_0()
+                .h(px(26.))
+                .mx_2()
+                .px_2()
+                .gap_2()
+                .flex()
+                .items_center()
+                .rounded_md()
+                .bg(hsla(p.field))
+                .border_1()
+                .border_color(if editing {
+                    hsla(p.accent)
+                } else {
+                    hsla(p.line)
+                })
+                .overflow_hidden()
+                .text_color(hsla(p.ink))
+                .children(style.as_ref().map(|s| {
+                    sidebar::conn_dot(s.shape, hsla(s.color(dark)), 9.).into_any_element()
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .when(editing && self.address.select_all, |d| {
+                            d.bg(hsla(p.accent & 0xffffff55))
+                        })
+                        .whitespace_nowrap()
+                        .child(SharedString::from(if editing {
+                            format!("{text}|")
+                        } else {
+                            text
+                        })),
+                )
+                .children(style.map(|s| {
+                    div()
+                        .flex_none()
+                        .px_1()
+                        .rounded(px(4.))
+                        .bg(hsla(p.hover))
+                        .text_xs()
+                        .text_color(hsla(p.ink3))
+                        .child(SharedString::from(s.name))
+                }));
         div()
             .flex_none()
-            .h(px(40.))
-            .px_2()
+            .h(px(46.))
+            .px_3()
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
-            .bg(rgb(BG_BAR))
+            .border_b_1()
+            .border_color(hsla(p.line))
+            .bg(hsla(p.win))
             .child(
-                button("back", "◀").on_click(
+                button("back", "←").on_click(
                     cx.listener(|this, _: &ClickEvent, _, _| this.page_cmd(PageCmd::Back)),
                 ),
             )
-            .child(button("forward", "▶").on_click(
+            .child(button("forward", "→").on_click(
                 cx.listener(|this, _: &ClickEvent, _, _| this.page_cmd(PageCmd::Forward)),
             ))
             .child(
-                button("reload", "⟳").on_click(
+                button("reload", "↻").on_click(
                     cx.listener(|this, _: &ClickEvent, _, _| this.page_cmd(PageCmd::Reload)),
                 ),
             )
             .child(field)
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows = model::tab_rows(&self.pages, self.active.as_deref());
-        let mut list = div().flex().flex_col().gap_px().overflow_hidden();
-        for row in rows {
-            let id = row.target_id.clone();
-            let close_id = row.target_id.clone();
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("tab-{}", row.target_id)))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .when(row.active, |d| d.bg(rgb(BG_ACTIVE)))
-                    .when(!row.active, |d| d.hover(|s| s.bg(rgb(BG_HOVER))))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                        this.select_tab(&id, window, cx)
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .child(model::truncate(&row.title, 28)),
-                            )
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(FG_DIM))
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .child(row.url.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("close-{}", row.target_id)))
-                            .w(px(20.))
-                            .h(px(20.))
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .text_color(rgb(FG_DIM))
-                            .hover(|s| s.bg(rgb(0x555555)).text_color(rgb(FG)))
-                            .child("×")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.close_tab(close_id.clone());
-                            })),
-                    ),
-            );
-        }
-        div()
-            .w(px(260.))
-            .h_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .bg(rgb(BG_SIDEBAR))
-            .child(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .text_xs()
-                    .text_color(rgb(FG_DIM))
-                    .child(SharedString::from(format!("TABS ({})", self.pages.len()))),
-            )
-            .child(list)
-            .child(
-                div()
-                    .id("new-tab")
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(rgb(FG_DIM))
-                    .hover(|s| s.bg(rgb(BG_HOVER)).text_color(rgb(FG)))
-                    .child("+ New Tab")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, _| this.new_tab())),
-            )
-    }
-
-    fn status_bar(&self) -> impl IntoElement {
-        let (text, tone) = if matches!(self.phase, Phase::Problem(_)) {
-            ("Not connected".to_string(), Tone::Bad)
-        } else {
-            model::status_line(&self.connection_name, &self.conn_state)
-        };
-        let color = match tone {
-            Tone::Good => GOOD,
-            Tone::Warn => WARN,
-            Tone::Bad => BAD,
-        };
+    /// Warnings and the last error, one slim line (hidden when empty).
+    fn status_bar(&self, p: &Palette) -> Option<impl IntoElement> {
         let mut extra: Vec<String> = self.warnings.clone();
         extra.extend(self.notice.clone());
-        div()
-            .flex_none()
-            .h(px(22.))
-            .px_2()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .text_xs()
-            .bg(rgb(BG_BAR))
-            .child(div().text_color(rgb(color)).child(format!("● {text}")))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_color(rgb(WARN))
-                    .child(extra.join("  |  ")),
-            )
+        if extra.is_empty() {
+            return None;
+        }
+        Some(
+            div()
+                .flex_none()
+                .h(px(22.))
+                .px_2()
+                .flex()
+                .items_center()
+                .text_xs()
+                .border_t_1()
+                .border_color(hsla(p.line))
+                .bg(hsla(p.win))
+                .text_color(hsla(p.warn))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(extra.join("  |  ")),
+        )
     }
 
-    fn running_body(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let overlay = model::overlay_for(&self.conn_state, self.manager.is_some())
-            .filter(|_| self.mirror.is_some());
+    /// The overlay for the Mirror area, if any.
+    fn main_overlay(&self) -> Option<Overlay> {
+        match &self.phase {
+            Phase::Running => model::overlay_for(&self.conn_state, self.manager.is_some())
+                .filter(|_| self.mirror.is_some()),
+            Phase::Connecting => Some(Overlay::new("Connecting...")),
+            Phase::Blocked(o) | Phase::Problem(o) => Some(o.clone()),
+            Phase::Idle => Some(
+                Overlay::new("Not connected")
+                    .detail("Disconnected. Connect to see this Connection's Tabs.")
+                    .action(OverlayAction::Connect),
+            ),
+        }
+    }
+
+    fn running_body(
+        &mut self,
+        window: &mut Window,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let overlay = self.main_overlay();
         let main = div()
             .relative()
             .flex_1()
             .min_w_0()
             .h_full()
+            .bg(hsla(p.page))
             .children(self.mirror.clone())
             .children(overlay.map(|o| {
+                let covering = self.mirror.is_some();
                 div()
                     .absolute()
                     .top_0()
                     .left_0()
                     .size_full()
                     .occlude()
-                    .bg(gpui::rgba(0x1e1e1ed9))
-                    .child(self.overlay_view(&o, cx))
+                    .when(covering, |d| d.bg(theme::hsla(p.win & 0xffffffe6)))
+                    .child(self.overlay_view(&o, p, cx))
             }));
+        let sidebar = self.sidebar_view(window, p, cx);
         div()
             .flex_1()
             .min_h_0()
             .flex()
-            .flex_col()
-            .child(self.top_bar(window, cx))
+            .flex_row()
+            .child(sidebar)
             .child(
                 div()
                     .flex_1()
-                    .min_h_0()
+                    .min_w_0()
                     .flex()
-                    .flex_row()
-                    .children(self.sidebar_visible.then(|| self.sidebar(cx)))
-                    .child(main),
+                    .flex_col()
+                    .child(self.top_bar(window, p, cx))
+                    .child(div().flex_1().min_h_0().child(main)),
             )
             .into_any_element()
     }
@@ -723,33 +1156,73 @@ impl Focusable for Root {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.focus_mirror && self.mirror.is_some() {
+        let p = theme::palette(self.dark(window));
+        if self.focus_mirror && self.mirror.is_some() && self.rename.is_none() {
             self.focus_mirror = false;
             self.focus_mirror_now(window, cx);
         }
-        let body = match &self.phase {
-            Phase::Running => self.running_body(window, cx),
-            Phase::Problem(o) => {
-                let o = o.clone();
-                self.overlay_view(&o, cx).into_any_element()
+        // A Group rename ends when its field loses focus.
+        if let Some(r) = &mut self.rename {
+            if r.focus.is_focused(window) {
+                r.seen_focus = true;
+            } else if r.seen_focus {
+                self.finish_rename(true, window, cx);
+            } else {
+                window.focus(&r.focus);
             }
-            Phase::Connecting => self
-                .overlay_view(&Overlay::new("Connecting..."), cx)
-                .into_any_element(),
+        }
+        let body = match &self.phase {
+            Phase::Problem(o) if self.connection_cfg.is_none() => {
+                let o = o.clone();
+                self.overlay_view(&o, &p, cx).into_any_element()
+            }
+            _ => self.running_body(window, &p, cx),
         };
+        let overlays = self.sidebar_overlays(window, &p, cx);
+        let status = self.status_bar(&p);
         div()
             .key_context("Root")
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.sidebar_visible = !this.sidebar_visible;
+                this.rail = !this.rail;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab(cx)))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active(cx)))
+            .on_action(
+                cx.listener(|this, _: &FocusAddress, window, cx| this.focus_address(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &GoBack, _, _| this.page_cmd(PageCmd::Back)))
+            .on_action(cx.listener(|this, _: &GoForward, _, _| this.page_cmd(PageCmd::Forward)))
+            .on_action(cx.listener(|this, _: &Select1, w, cx| this.select_nth(1, w, cx)))
+            .on_action(cx.listener(|this, _: &Select2, w, cx| this.select_nth(2, w, cx)))
+            .on_action(cx.listener(|this, _: &Select3, w, cx| this.select_nth(3, w, cx)))
+            .on_action(cx.listener(|this, _: &Select4, w, cx| this.select_nth(4, w, cx)))
+            .on_action(cx.listener(|this, _: &Select5, w, cx| this.select_nth(5, w, cx)))
+            .on_action(cx.listener(|this, _: &Select6, w, cx| this.select_nth(6, w, cx)))
+            .on_action(cx.listener(|this, _: &Select7, w, cx| this.select_nth(7, w, cx)))
+            .on_action(cx.listener(|this, _: &Select8, w, cx| this.select_nth(8, w, cx)))
+            .on_action(cx.listener(|this, _: &Select9, w, cx| this.select_nth(9, w, cx)))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
-            .text_color(rgb(FG))
+            .text_size(px(13.))
+            .bg(hsla(p.win))
+            .text_color(hsla(p.ink))
             .child(body)
-            .child(self.status_bar())
+            .children(status)
+            .children(overlays)
+    }
+}
+
+impl Root {
+    /// Cmd+`n`: the nth visible Tab.
+    fn select_nth(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let layout = self.layout();
+        let id = sm::tab_for_shortcut(&layout, n).map(|t| t.id.clone());
+        if let Some(id) = id {
+            self.activate_tab(&id, window, cx);
+        }
     }
 }

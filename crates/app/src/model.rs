@@ -9,6 +9,8 @@ pub enum OverlayAction {
     StartProfile,
     /// Try to connect again now.
     Retry,
+    /// Connect (nothing runs yet, or the user disconnected).
+    Connect,
 }
 
 /// A message that covers the Mirror (or the whole window before a Connection

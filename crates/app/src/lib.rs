@@ -6,6 +6,8 @@ pub mod app;
 pub mod connect;
 pub mod mirror;
 pub mod model;
+pub mod sidebar_model;
 pub mod startup;
 pub mod state;
+pub mod theme;
 pub mod views;
