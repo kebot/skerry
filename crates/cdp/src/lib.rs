@@ -20,6 +20,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod agent_proxy;
 mod client;
 mod connection;
 mod error;
@@ -39,3 +40,8 @@ pub use input::{KeyEvent, KeyEventKind, Modifiers, MouseButton, MouseEvent, Mous
 pub use screencast::{Frame, FrameMetadata, Screencast, ScreencastOptions};
 pub use target::{TargetEvent, TargetInfo, TargetList, TargetTracker};
 pub use viewport::{FrameFit, Point, Rect};
+
+pub use agent_proxy::{
+    random_path_secret, AgentEvent, AgentProxy, AgentProxyConfig, AgentState, TargetActivity,
+    ACTING_WINDOW,
+};
