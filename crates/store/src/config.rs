@@ -32,6 +32,14 @@ pub struct ConnectionConfig {
     pub color: Option<String>,
     /// Connect at startup (default false).
     pub auto_connect: bool,
+    /// Run the local Agent CDP proxy for this Connection (default false:
+    /// nothing listens unless enabled).
+    pub agent_proxy: bool,
+    /// Fixed 127.0.0.1 port for the Agent proxy; 0 picks an ephemeral port.
+    pub agent_proxy_port: u16,
+    /// Path secret for the Agent endpoint. `None`: the app generates a random
+    /// one each run (never written to the config).
+    pub agent_proxy_secret: Option<Secret>,
     pub kind: ConnectionKind,
 }
 
@@ -129,6 +137,10 @@ struct RawConnection {
     color: Option<String>,
     #[serde(default)]
     auto_connect: bool,
+    #[serde(default)]
+    agent_proxy: bool,
+    agent_proxy_port: Option<i64>,
+    agent_proxy_secret: Option<Secret>,
 }
 
 /// Default config path: `$RB_CONFIG` if set, else `~/.config/rb/config.toml`.
@@ -191,6 +203,25 @@ fn validate(raw: RawConnection, label: &str) -> Result<ConnectionConfig, ConfigE
             return Err(invalid(&name, "`color` must look like #rrggbb"));
         }
     }
+    let agent_proxy_port = match raw.agent_proxy_port {
+        None => 0,
+        Some(n) => {
+            u16::try_from(n).map_err(|_| invalid(&name, "`agent_proxy_port` must be 0..=65535"))?
+        }
+    };
+    if let Some(s) = &raw.agent_proxy_secret {
+        let v = s.expose();
+        if v.len() < 8
+            || !v
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(invalid(
+                &name,
+                "`agent_proxy_secret` must be at least 8 characters of A-Z a-z 0-9 - _",
+            ));
+        }
+    }
     let kind =
         match (raw.manager_url, raw.cdp_url) {
             (Some(_), Some(_)) => return Err(invalid(
@@ -234,6 +265,9 @@ fn validate(raw: RawConnection, label: &str) -> Result<ConnectionConfig, ConfigE
         name,
         color: raw.color,
         auto_connect: raw.auto_connect,
+        agent_proxy: raw.agent_proxy,
+        agent_proxy_port,
+        agent_proxy_secret: raw.agent_proxy_secret,
         kind,
     })
 }
@@ -323,6 +357,57 @@ auto_connect = true
 name = "raw"
 cdp_url = "ws://10.0.0.5:9222/devtools/browser/x"
 "##;
+
+    #[test]
+    fn agent_proxy_defaults_off() {
+        let c = load_config_str(GOOD).unwrap();
+        for conn in &c.connections {
+            assert!(!conn.agent_proxy);
+            assert_eq!(conn.agent_proxy_port, 0);
+            assert!(conn.agent_proxy_secret.is_none());
+        }
+    }
+
+    #[test]
+    fn agent_proxy_keys_parse_and_secret_is_redacted() {
+        let c = load_config_str(
+            r#"
+[[connection]]
+name = "a"
+cdp_url = "ws://h:1/x"
+agent_proxy = true
+agent_proxy_port = 9333
+agent_proxy_secret = "abcDEF-123_xyz"
+"#,
+        )
+        .unwrap();
+        let a = &c.connections[0];
+        assert!(a.agent_proxy);
+        assert_eq!(a.agent_proxy_port, 9333);
+        assert_eq!(
+            a.agent_proxy_secret.as_ref().unwrap().expose(),
+            "abcDEF-123_xyz"
+        );
+        assert!(!format!("{a:?}").contains("abcDEF"));
+    }
+
+    #[test]
+    fn agent_proxy_validation() {
+        let base = "[[connection]]\nname = \"a\"\ncdp_url = \"ws://h:1/x\"\n";
+        assert!(err(&format!("{base}agent_proxy_port = 70000\n")).contains("agent_proxy_port"));
+        assert!(err(&format!("{base}agent_proxy_port = -1\n")).contains("agent_proxy_port"));
+        assert!(
+            err(&format!("{base}agent_proxy_secret = \"short\"\n")).contains("agent_proxy_secret")
+        );
+        assert!(
+            err(&format!("{base}agent_proxy_secret = \"has/slash12\"\n"))
+                .contains("agent_proxy_secret")
+        );
+        // Typos are still rejected.
+        assert!(err(&format!("{base}agent_proxi = true\n")).contains("agent_proxi"));
+        // Wrong type.
+        assert!(load_config_str(&format!("{base}agent_proxy = \"yes\"\n")).is_err());
+    }
 
     fn err(text: &str) -> String {
         load_config_str(text).unwrap_err().to_string()
