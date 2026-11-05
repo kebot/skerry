@@ -42,6 +42,34 @@ app), Cmd+B toggles the Sidebar, Cmd+Q quits. A stopped Profile shows "Profile
 not running" with a Start button; a lost connection shows "Reconnecting..." over
 the Mirror and recovers by itself; a bad token shows an auth error.
 
+## Several Connections
+
+Add one [[connection]] block per Remote Browser (name, manager_url +
+profile_id + token, or cdp_url; optional color = "#rrggbb" and
+auto_connect = true). All Connections share one Sidebar: each Tab has a
+dot in its Connection's colour and shape. Connections connect lazily (click
+the chip, a Placeholder Tab, or "+ New Tab" for it) and stay connected in
+the background; auto_connect = true, --connection <name>, or a config with a
+single Connection connects at startup. Only the Active Tab (one across all
+Connections) streams. Chip row at the bottom of the Sidebar: round green =
+connected, spinning amber ring = reconnecting, red square = Profile
+stopped (Manager Connections; click or use the hover popover to Start),
+red ring = failed (bad token, Manager unreachable; Retry), hollow grey =
+not connected. More than 8 Connections overflow into a "+N" menu. Cmd+T opens
+a blank Tab in the Active Tab's Connection (connecting it first if it is
+down; a stopped Profile is never started automatically). Duplicate
+Connection colours or initials show a warning in the status bar.
+
+JS dialogs (alert, confirm, prompt, beforeunload) show a local modal over
+the Mirror for the Active Tab; Enter = OK / Leave, Escape = Cancel / Stay.
+Background Tabs with a dialog get an amber "!" in the Sidebar. A popup opens
+as a Tab next to its opener, and becomes Active only if its opener was the
+Active Tab.
+
+Try it without browsers: cargo run -p rb-app --example multi_demo (three fake
+Connections; control file path is printed, e.g. `echo "kill alpha 15" >>
+<dir>/cmd`, `dialog beta B1 confirm Sure?`, `popup alpha A1 Popup`).
+
 ## Known limitations
 
 - One Connection per run (first, or the one you name). No Groups, pins,

@@ -456,6 +456,8 @@ pub enum ChipStatus {
     Stopped,
     /// Hollow grey ring.
     NotConnected,
+    /// Red ring: authentication failed or the Manager cannot be reached.
+    Failed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -495,6 +497,9 @@ pub enum LinkState {
     ProfileStopped,
     /// Nothing runs (disconnected by the user, or a problem).
     Off,
+    /// Connecting failed for a reason the user must fix (token rejected,
+    /// Manager unreachable); a retry is offered.
+    Failed,
 }
 
 pub fn chip_status(link: &LinkState, can_start: bool) -> ChipStatus {
@@ -502,15 +507,15 @@ pub fn chip_status(link: &LinkState, can_start: bool) -> ChipStatus {
         LinkState::Connecting => ChipStatus::Reconnecting,
         LinkState::ProfileStopped => ChipStatus::Stopped,
         LinkState::Off => ChipStatus::NotConnected,
+        LinkState::Failed => ChipStatus::Failed,
         LinkState::Live(s) => match s {
             ConnectionState::Connected => ChipStatus::Connected,
             ConnectionState::Connecting | ConnectionState::Reconnecting { .. } => {
                 ChipStatus::Reconnecting
             }
             ConnectionState::NotRunning if can_start => ChipStatus::Stopped,
-            ConnectionState::NotRunning
-            | ConnectionState::Failed { .. }
-            | ConnectionState::Closed => ChipStatus::NotConnected,
+            ConnectionState::Failed { .. } => ChipStatus::Failed,
+            ConnectionState::NotRunning | ConnectionState::Closed => ChipStatus::NotConnected,
         },
     }
 }
@@ -555,6 +560,12 @@ pub fn popover(
         ChipStatus::Stopped => (
             "Profile stopped on the Manager. Start it to connect.".to_string(),
             vec![ChipAction::Start],
+        ),
+        ChipStatus::Failed => (
+            detail
+                .map(str::to_string)
+                .unwrap_or_else(|| "Could not connect.".to_string()),
+            vec![ChipAction::RetryNow],
         ),
         ChipStatus::NotConnected => (
             detail.map(str::to_string).unwrap_or_else(|| {
@@ -1127,6 +1138,28 @@ mod tests {
         );
         assert_eq!(p.text, "Authentication failed");
         assert!(ChipAction::Start.primary() && !ChipAction::Disconnect.primary());
+        let p = popover(
+            ChipStatus::Failed,
+            &LinkState::Failed,
+            0,
+            0,
+            Some("Authentication failed"),
+        );
+        assert_eq!(
+            (p.text.as_str(), p.actions),
+            ("Authentication failed", vec![ChipAction::RetryNow])
+        );
+        assert_eq!(chip_status(&LinkState::Failed, true), ChipStatus::Failed);
+        assert_eq!(
+            chip_status(
+                &LinkState::Live(ConnectionState::Failed {
+                    reason: rb_cdp::FailureReason::Unauthorized
+                }),
+                true
+            ),
+            ChipStatus::Failed
+        );
+        assert!(!tabs_live(&LinkState::Failed));
     }
 
     #[test]

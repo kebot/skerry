@@ -12,6 +12,7 @@ use rb_store::{SidebarGroup, SidebarItem, SidebarTab};
 
 use super::{Menu, Root};
 use crate::model;
+use crate::multi;
 use crate::sidebar_model::{self as sm, ChipAction, ChipStatus, ConnStyle, DropTarget, MenuKind};
 use crate::theme::{self, hsla, Palette, Shape};
 
@@ -160,6 +161,15 @@ fn status_dot(status: ChipStatus, p: &Palette) -> AnyElement {
                     .border_color(hsla(p.idle)),
             )
             .into_any_element(),
+        ChipStatus::Failed => ring
+            .child(
+                div()
+                    .size(px(8.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(hsla(p.bad)),
+            )
+            .into_any_element(),
     }
 }
 
@@ -190,14 +200,8 @@ impl Root {
         // Active Tab's Connection colour tints the whole Sidebar.
         let tint = self
             .active
-            .as_deref()
-            .and_then(|a| {
-                self.state
-                    .tabs
-                    .iter()
-                    .find(|e| e.target_id.as_deref() == Some(a))
-            })
-            .and_then(|e| sm::style_of(&self.conn_styles, &e.connection))
+            .as_ref()
+            .and_then(|(c, _)| self.conn_styles.get(*c))
             .map(|s| s.color(dark));
 
         let mut scroll = div()
@@ -454,9 +458,10 @@ impl Root {
         dark: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let live = self.is_live_target(t.target_id.as_deref());
+        let live = self.is_live_target(&t.connection, t.target_id.as_deref());
         let dim = t.placeholder || !live;
-        let active = live && self.active.as_deref() == t.target_id.as_deref();
+        let active = live && self.is_active(&t.connection, t.target_id.as_deref());
+        let alert = self.has_dialog_badge(&t.connection, t.target_id.as_deref());
         let style = sm::style_of(&self.conn_styles, &t.connection);
         let ccol = style.map(|s| s.color(dark)).unwrap_or(p.idle);
         let id = t.id.clone();
@@ -491,6 +496,7 @@ impl Root {
             .text_size(px(15.))
             .text_color(hsla(p.ink2))
             .child(SharedString::from(sm::fav_text(&t.title, &t.url)))
+            .children(alert.then(|| dialog_badge(p).absolute().left(px(5.)).top(px(4.))))
             .child(
                 div()
                     .absolute()
@@ -561,9 +567,10 @@ impl Root {
         dark: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let live = self.is_live_target(t.target_id.as_deref());
+        let live = self.is_live_target(&t.connection, t.target_id.as_deref());
         let dim = t.placeholder || !live;
-        let active = live && self.active.as_deref() == t.target_id.as_deref();
+        let active = live && self.is_active(&t.connection, t.target_id.as_deref());
+        let alert = self.has_dialog_badge(&t.connection, t.target_id.as_deref());
         let style = sm::style_of(&self.conn_styles, &t.connection);
         let ccol = style.map(|s| s.color(dark)).unwrap_or(p.idle);
         let id = t.id.clone();
@@ -647,6 +654,7 @@ impl Root {
                         })),
                 )
             })
+            .children(alert.then(|| dialog_badge(p)))
             .children(style.map(|s| conn_dot(s.shape, hsla(ccol), 9.)))
             .when_some(hint, |d, after| d.child(drop_bar(after, hsla(p.accent))))
             .on_click(
@@ -874,9 +882,22 @@ impl Root {
             .into_any_element()
     }
 
+    /// The action a click on a chip performs (none for a healthy Connection).
+    fn chip_primary(status: ChipStatus) -> Option<ChipAction> {
+        match status {
+            ChipStatus::Connected => None,
+            ChipStatus::Reconnecting | ChipStatus::Failed => Some(ChipAction::RetryNow),
+            ChipStatus::Stopped => Some(ChipAction::Start),
+            ChipStatus::NotConnected => Some(ChipAction::Connect),
+        }
+    }
+
+    /// One chip per Connection: badge, status dot, hover popover, click
+    /// connects (or starts, retries). Beyond [`multi::MAX_CHIPS`] the rest go
+    /// into an overflow menu behind a "..." chip.
     fn chips_row(&self, p: &Palette, dark: bool, cx: &mut Context<Self>) -> AnyElement {
         let rail = self.rail;
-        let status = self.chip_status();
+        let (shown, hidden) = multi::overflow_split(self.conn_styles.len());
         let mut row = div()
             .flex_none()
             .flex()
@@ -886,15 +907,12 @@ impl Root {
             .border_color(hsla(p.line))
             .when(rail, |d| d.flex_col().items_center().px(px(0.)))
             .when(!rail, |d| d.flex_row().flex_wrap().items_center());
-        for (i, s) in self.conn_styles.iter().enumerate() {
+        for (i, s) in self.conn_styles.iter().enumerate().take(shown) {
             let name = SharedString::from(format!("chip-{i}"));
+            let status = self.chip_status_of(i);
             let off = !matches!(status, ChipStatus::Connected | ChipStatus::Reconnecting);
-            let primary = match status {
-                ChipStatus::Connected => None,
-                ChipStatus::Reconnecting => Some(ChipAction::RetryNow),
-                ChipStatus::Stopped => Some(ChipAction::Start),
-                ChipStatus::NotConnected => Some(ChipAction::Connect),
-            };
+            let primary = Self::chip_primary(status);
+            let tooltip_active = self.active.as_ref().is_some_and(|a| a.0 == i);
             row =
                 row.child(
                     div()
@@ -905,6 +923,7 @@ impl Root {
                         .rounded(px(9.))
                         .cursor_pointer()
                         .hover(|st| st.bg(hsla(p.hover)))
+                        .when(tooltip_active, |d| d.bg(hsla(p.field)))
                         .child(
                             div()
                                 .when(off, |d| d.opacity(0.55))
@@ -927,9 +946,9 @@ impl Root {
                                 .opacity(0.)
                                 .group_hover(name.clone(), |st| st.opacity(1.))
                                 .child("+")
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.new_tab(cx)
+                                    this.new_tab_in(i, cx)
                                 })),
                         )
                         .on_hover(cx.listener(move |this, h: &bool, _, cx| {
@@ -937,12 +956,126 @@ impl Root {
                         }))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(a) = primary {
-                                this.chip_action(a, cx);
+                                this.chip_action(i, a, cx);
                             }
                         })),
                 );
         }
+        if hidden > 0 {
+            row = row.child(
+                div()
+                    .id("chip-overflow")
+                    .size(px(30.))
+                    .rounded(px(9.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .bg(hsla(p.field))
+                    .text_color(hsla(p.ink2))
+                    .hover(|st| st.bg(hsla(p.hover)))
+                    .child(SharedString::from(format!("+{hidden}")))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.overflow_open = !this.overflow_open;
+                        this.chip_open = None;
+                        cx.notify();
+                    })),
+            );
+        }
         row.into_any_element()
+    }
+
+    /// The overflow menu: one row per Connection past the chip row.
+    fn overflow_menu(&self, p: &Palette, dark: bool, cx: &mut Context<Self>) -> AnyElement {
+        let (shown, _) = multi::overflow_split(self.conn_styles.len());
+        let mut panel = div()
+            .id("chip-overflow-menu")
+            .absolute()
+            .left(px(if self.rail { 66. } else { 10. }))
+            .bottom(px(54.))
+            .w(px(248.))
+            .py(px(4.))
+            .rounded(px(10.))
+            .bg(hsla(p.win))
+            .border_1()
+            .border_color(hsla(p.line))
+            .shadow_lg()
+            .occlude()
+            .text_color(hsla(p.ink));
+        for (i, s) in self.conn_styles.iter().enumerate().skip(shown) {
+            let status = self.chip_status_of(i);
+            let live_tabs = self.live_tab_count(&s.name);
+            let pop = sm::popover(
+                status,
+                &self.link_of(i),
+                live_tabs,
+                self.tab_count(&s.name) - live_tabs,
+                self.detail_of(i).as_deref(),
+            );
+            let primary = Self::chip_primary(status);
+            panel = panel.child(
+                div()
+                    .id(SharedString::from(format!("overflow-{i}")))
+                    .mx(px(4.))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .hover(|st| st.bg(hsla(p.hover)))
+                    .child(
+                        div()
+                            .relative()
+                            .child(badge(s, dark, 20.))
+                            .child(status_dot(status, p)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(SharedString::from(s.name.clone()))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(hsla(p.ink3))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(SharedString::from(pop.text)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(hsla(p.accent))
+                            .child(primary.map(ChipAction::label).unwrap_or("Disconnect")),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.chip_action(i, primary.unwrap_or(ChipAction::Disconnect), cx)
+                    })),
+            );
+        }
+        deferred(panel).with_priority(1).into_any_element()
+    }
+
+    fn tab_count(&self, conn: &str) -> usize {
+        self.state
+            .tabs
+            .iter()
+            .filter(|t| t.connection == conn)
+            .count()
+    }
+
+    fn live_tab_count(&self, conn: &str) -> usize {
+        self.state
+            .tabs
+            .iter()
+            .filter(|t| t.connection == conn && self.is_live_target(conn, t.target_id.as_deref()))
+            .count()
     }
 
     /// Popover and context menu, drawn above everything else.
@@ -956,8 +1089,11 @@ impl Root {
         let dark = p.dark;
         if let Some(i) = self.chip_open {
             if let Some(s) = self.conn_styles.get(i).cloned() {
-                out.push(self.popover_view(&s, p, dark, cx));
+                out.push(self.popover_view(i, &s, p, dark, cx));
             }
+        }
+        if self.overflow_open {
+            out.push(self.overflow_menu(p, dark, cx));
         }
         if let Some(menu) = &self.menu {
             let items = sm::menu_items(&menu.kind, &self.state);
@@ -1051,35 +1187,17 @@ impl Root {
 
     fn popover_view(
         &self,
+        i: usize,
         s: &ConnStyle,
         p: &Palette,
         dark: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let status = self.chip_status();
-        let link = self.link();
-        let live_tabs = self
-            .state
-            .tabs
-            .iter()
-            .filter(|t| t.connection == s.name && self.is_live_target(t.target_id.as_deref()))
-            .count();
-        let placeholders = self
-            .state
-            .tabs
-            .iter()
-            .filter(|t| t.connection == s.name)
-            .count()
-            - live_tabs;
-        let detail = match &self.phase {
-            super::Phase::Blocked(o) if o.action != Some(model::OverlayAction::StartProfile) => {
-                Some(match &o.detail {
-                    Some(d) => format!("{}: {d}", o.title),
-                    None => o.title.clone(),
-                })
-            }
-            _ => None,
-        };
+        let status = self.chip_status_of(i);
+        let link = self.link_of(i);
+        let live_tabs = self.live_tab_count(&s.name);
+        let placeholders = self.tab_count(&s.name) - live_tabs;
+        let detail = self.detail_of(i);
         let pop = sm::popover(status, &link, live_tabs, placeholders, detail.as_deref());
         let mut buttons = div().flex().gap(px(6.));
         for (n, a) in pop.actions.iter().copied().enumerate() {
@@ -1099,7 +1217,7 @@ impl Root {
                     })
                     .hover(|st| st.opacity(0.85))
                     .child(a.label())
-                    .on_click(cx.listener(move |this, _, _, cx| this.chip_action(a, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.chip_action(i, a, cx))),
             );
         }
         let left = if self.rail { 66. } else { 10. };
@@ -1144,7 +1262,7 @@ impl Root {
 }
 
 /// A filled square badge with the Connection's initial (colour and letter).
-fn badge(s: &ConnStyle, dark: bool, size: f32) -> AnyElement {
+pub(super) fn badge(s: &ConnStyle, dark: bool, size: f32) -> AnyElement {
     let c = s.color(dark);
     div()
         .flex_none()
@@ -1195,3 +1313,19 @@ fn drop_bar_vertical(after: bool, color: Hsla) -> AnyElement {
 
 #[allow(dead_code)]
 fn _px(_: Pixels) {}
+
+/// A small amber "!" for a Tab that has a pending JS dialog.
+fn dialog_badge(p: &Palette) -> gpui::Div {
+    div()
+        .flex_none()
+        .size(px(14.))
+        .rounded_full()
+        .bg(hsla(p.warn))
+        .text_color(hsla(0x1a1200ff))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_size(px(10.))
+        .child("!")
+}

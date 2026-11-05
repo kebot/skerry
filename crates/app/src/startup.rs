@@ -20,12 +20,13 @@ token = "your-manager-token"
 /// What `main` hands to the app.
 #[derive(Debug)]
 pub enum Startup {
-    /// A Connection to use.
+    /// All Connections of the config.
     Ready {
-        connection: ConnectionConfig,
-        /// Position of the Connection in the config (picks its shape and
-        /// automatic colour, so they stay the same whichever one is chosen).
-        index: usize,
+        /// In config order (that order picks shapes and automatic colours).
+        connections: Vec<ConnectionConfig>,
+        /// The Connection named by `--connection` / `RB_CONNECTION`: it
+        /// connects first and is selected. `None`: no preference.
+        selected: Option<usize>,
         /// File permission warnings and similar, shown in the status bar.
         warnings: Vec<String>,
     },
@@ -91,7 +92,8 @@ fn error_text(e: &ConfigError) -> String {
     }
 }
 
-/// Load the config at `path` (`None`: no home directory) and choose a Connection.
+/// Load the config at `path` (`None`: no home directory). `selector` names
+/// the Connection to open first; it is optional.
 pub fn load(path: Option<PathBuf>, selector: Option<&str>) -> Startup {
     let Some(path) = path else {
         return Startup::Problem(
@@ -115,18 +117,23 @@ pub fn load(path: Option<PathBuf>, selector: Option<&str>) -> Startup {
     if loaded.config.connections.is_empty() {
         return Startup::Problem(first_run(&path));
     }
-    match select_connection(&loaded.config, selector) {
-        Ok(c) => Startup::Ready {
-            connection: c.clone(),
-            index: loaded
+    let selected = match selector {
+        None => None,
+        Some(_) => match select_connection(&loaded.config, selector) {
+            Ok(c) => loaded
                 .config
                 .connections
                 .iter()
-                .position(|x| x.name == c.name)
-                .unwrap_or(0),
-            warnings: loaded.warnings.iter().map(|w| w.to_string()).collect(),
+                .position(|x| x.name == c.name),
+            Err(msg) => {
+                return Startup::Problem(Overlay::new("Cannot choose a Connection").detail(msg))
+            }
         },
-        Err(msg) => Startup::Problem(Overlay::new("Cannot choose a Connection").detail(msg)),
+    };
+    Startup::Ready {
+        connections: loaded.config.connections.clone(),
+        selected,
+        warnings: loaded.warnings.iter().map(|w| w.to_string()).collect(),
     }
 }
 
@@ -189,6 +196,32 @@ token = "SECRET-TOKEN"
     }
 
     #[test]
+    fn selector_is_optional_and_picks_an_index() {
+        let dir = std::env::temp_dir().join(format!("rb-startup-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        rb_store::write_private_file(
+            &path,
+            "[[connection]]\nname=\"a\"\ncdp_url=\"ws://h/\"\n[[connection]]\nname=\"b\"\ncdp_url=\"ws://h2/\"\n",
+        )
+        .unwrap();
+        let Startup::Ready {
+            connections,
+            selected,
+            ..
+        } = load(Some(path.clone()), Some("b"))
+        else {
+            panic!("expected ready");
+        };
+        assert_eq!((connections.len(), selected), (2, Some(1)));
+        assert!(matches!(
+            load(Some(path.clone()), Some("zz")),
+            Startup::Problem(_)
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn missing_file_is_a_first_run_screen() {
         let p = std::env::temp_dir().join("rb-no-such-dir-xyz/config.toml");
         let Startup::Problem(o) = load(Some(p.clone()), None) else {
@@ -210,14 +243,16 @@ token = "SECRET-TOKEN"
         )
         .unwrap();
         let Startup::Ready {
-            connection,
+            connections,
+            selected,
             warnings,
-            ..
         } = load(Some(path.clone()), None)
         else {
             panic!("expected ready");
         };
+        let connection = &connections[0];
         assert_eq!(connection.name, "n");
+        assert_eq!(selected, None);
         assert!(warnings.is_empty());
         assert!(!format!("{connection:?}").contains("SECRET-TOKEN"));
 

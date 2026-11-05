@@ -1,15 +1,22 @@
 //! Root view: top bar, Sidebar (Tabs, Groups, Connection chips), Mirror.
 //!
+//! One window shows every Connection of `config.toml`. Each opened
+//! Connection is a [`Conn`] with its own `rb_cdp::Connection`, pages, dialogs
+//! and Mirror; only the Active Tab (one, app-wide) streams.
+//!
 //! All CDP and Manager I/O runs on the app's tokio runtime. It reports back
 //! to this view through one unbounded channel of [`Msg`]s that a GPUI task
-//! drains (the bridge described in docs/gpui-notes.md).
+//! drains (the bridge described in docs/gpui-notes.md). Every message names
+//! its Connection and a generation, so late messages of a Connection that was
+//! disconnected (or started again) are dropped.
 //!
 //! Tab Groups, pins and Placeholder Tabs live in an `rb_store::State`, loaded
-//! from `state.toml` at startup, reconciled with the live pages on every
-//! change and saved (debounced) after mutations. The Sidebar renders from
-//! `State::sidebar_layout` (see `views/sidebar.rs`).
+//! from `state.toml` at startup, reconciled with each Connection's live pages
+//! independently and saved (debounced) after mutations. The Sidebar renders
+//! from `State::sidebar_layout` (see `views/sidebar.rs`).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
@@ -18,7 +25,7 @@ use gpui::{
     SharedString, Styled, Window,
 };
 use rb_cdp::{
-    ActiveTab, Connection, ConnectionEvent, ConnectionState, ScreencastOptions, TargetInfo,
+    ActiveTab, Connection, ConnectionEvent, ConnectionState, Dialog, ScreencastOptions, TargetInfo,
 };
 use rb_store::{ConnectionConfig, SidebarItem, State};
 use tokio::runtime::Handle;
@@ -26,8 +33,10 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use crate::actions::{self, PageCmd};
 use crate::connect::{self, ManagerTarget, Prepared};
+use crate::dialog_model;
 use crate::mirror::{Mirror, MirrorBackend};
 use crate::model::{self, Overlay, OverlayAction};
+use crate::multi::{self, ProbeEffect};
 use crate::sidebar_model::{
     self as sm, ChipAction, ChipStatus, ConnStyle, DropTarget, LineEdit, LinkState, MenuAction,
     MenuKind,
@@ -39,33 +48,111 @@ use crate::state::{
 };
 use crate::theme::{self, hsla, Palette};
 
+mod dialog;
 mod sidebar;
 
 /// Debounce before `state.toml` is written after a change.
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
-/// Messages from the tokio side to the view.
+/// Messages from the tokio side to the view. `usize` is the Connection's
+/// index, `u64` its generation (see [`Conn::gen`]).
 enum Msg {
-    Prepared(Prepared),
-    Launched(Result<(), String>),
-    State(ConnectionState),
-    Pages(Vec<TargetInfo>),
-    Event(ConnectionEvent),
-    Notice(String),
+    Prepared(usize, u64, Prepared),
+    /// Profile status check of a Connection that is not running.
+    Probe(usize, u64, Prepared),
+    Launched(usize, Result<(), String>),
+    State(usize, u64, ConnectionState),
+    Pages(usize, u64, Vec<TargetInfo>),
+    Dialogs(usize, u64, Vec<Dialog>),
+    Event(usize, u64, ConnectionEvent),
+    /// Answering the dialog of a Tab finished (`Err`: it did not go through).
+    DialogAnswered(usize, u64, Result<(), String>),
+    Notice(usize, String),
 }
 
 enum Phase {
     /// Checking the Profile / connecting for the first time.
     Connecting,
-    /// Nothing can run (first run, config problem): the whole window shows this.
+    /// The Connection config is unusable: its Overlay says why.
     Problem(Overlay),
     /// The Connection cannot connect (Profile stopped, Manager error): the
-    /// Sidebar stays, the Mirror area shows this.
+    /// Sidebar stays, the Mirror area shows this when it is the focus.
     Blocked(Overlay),
-    /// Not connected on purpose (the user disconnected).
+    /// Not connected (lazy, or the user disconnected).
     Idle,
     /// A Connection exists; its state decides about an overlay.
     Running,
+}
+
+/// One configured Connection and everything it runs.
+struct Conn {
+    name: String,
+    cfg: ConnectionConfig,
+    phase: Phase,
+    /// Set for Manager Connections (status, launch).
+    manager: Option<ManagerTarget>,
+    /// Config for the CDP Connection, until it is started.
+    pending_cdp: Option<rb_cdp::ConnectionConfig>,
+    conn: Option<Arc<Connection>>,
+    mirror: Option<Entity<Mirror>>,
+    conn_state: ConnectionState,
+    pages: Vec<TargetInfo>,
+    /// JS dialogs blocking pages of this Connection.
+    dialogs: Vec<Dialog>,
+    /// The Manager Profile is being started.
+    starting: bool,
+    /// Last launch or command error, shown in the status bar and overlay.
+    notice: Option<String>,
+    /// Bumped whenever the Connection is (re)started or dropped.
+    gen: u64,
+}
+
+impl Conn {
+    fn new(cfg: ConnectionConfig) -> Conn {
+        let mut c = Conn {
+            name: cfg.name.clone(),
+            cfg,
+            phase: Phase::Idle,
+            manager: None,
+            pending_cdp: None,
+            conn: None,
+            mirror: None,
+            conn_state: ConnectionState::Closed,
+            pages: Vec::new(),
+            dialogs: Vec::new(),
+            starting: false,
+            notice: None,
+            gen: 0,
+        };
+        c.arm();
+        c
+    }
+
+    /// Build the CDP config (and Manager client) from the config entry.
+    fn arm(&mut self) {
+        match connect::resolve(&self.cfg) {
+            Ok(r) => {
+                self.manager = r.manager;
+                self.pending_cdp = Some(r.cdp);
+            }
+            Err(e) => {
+                self.phase =
+                    Phase::Problem(Overlay::new("Invalid Connection in config.toml").detail(e));
+            }
+        }
+    }
+
+    /// Reconnecting or first connect in progress.
+    fn connecting(&self) -> bool {
+        matches!(self.phase, Phase::Connecting)
+            || (matches!(self.phase, Phase::Running)
+                && self.conn_state == ConnectionState::Connecting)
+    }
+
+    /// Idle or showing a Blocked overlay: a Profile probe may change it.
+    fn probeable(&self) -> bool {
+        self.manager.is_some() && matches!(self.phase, Phase::Idle | Phase::Blocked(_))
+    }
 }
 
 /// The address field: a minimal single-line editor (append, backspace, paste).
@@ -91,30 +178,39 @@ struct Rename {
     seen_focus: bool,
 }
 
+/// The modal of the Active Tab's pending dialog: prompt text, focus.
+struct DialogInput {
+    /// Connection and Tab the modal belongs to.
+    key: (usize, String),
+    edit: LineEdit,
+    focus: FocusHandle,
+    /// An answer was sent; the modal stays until the dialog leaves
+    /// `pending_dialogs`.
+    busy: bool,
+}
+
 pub struct Root {
     focus: FocusHandle,
     rt: Handle,
     ui_tx: UnboundedSender<Msg>,
     /// The Sidebar is the narrow icon rail.
     rail: bool,
-    /// Styles of all known Connections, in config order (one for now).
+    /// Styles of all Connections, in config order (parallel to `conns`).
     conn_styles: Vec<ConnStyle>,
-    connection_name: String,
-    /// Config of the Connection, to arm it again after a disconnect.
-    connection_cfg: Option<ConnectionConfig>,
+    conns: Vec<Conn>,
     warnings: Vec<String>,
-    phase: Phase,
-    manager: Option<ManagerTarget>,
-    /// Config for the Connection, until it is started.
-    pending_cdp: Option<rb_cdp::ConnectionConfig>,
-    conn: Option<Connection>,
-    mirror: Option<Entity<Mirror>>,
-    conn_state: ConnectionState,
-    pages: Vec<TargetInfo>,
-    active: Option<String>,
-    /// The Manager Profile is being started.
-    starting: bool,
-    /// Last launch or command error, shown in the status bar and overlay.
+    /// Nothing can run (first run, config problem): the whole window shows this.
+    problem: Option<Overlay>,
+    /// The Connection named on the command line (opens first).
+    preferred: Option<usize>,
+    /// The Connection last connected, clicked or started: its state fills the
+    /// Mirror area while no Tab is Active.
+    last_conn: Option<usize>,
+    /// The one Active Tab: Connection index and target id.
+    active: Option<(usize, String)>,
+    /// The Connection whose screencast runs (at most one).
+    streaming: Option<usize>,
+    /// Last command error not tied to a Connection.
     notice: Option<String>,
     address: Address,
     /// Focus the Mirror on the next render (needs a Window).
@@ -131,14 +227,20 @@ pub struct Root {
     rename: Option<Rename>,
     /// Chip whose popover is open.
     chip_open: Option<usize>,
+    /// The chip overflow menu is open.
+    overflow_open: bool,
     chip_over: bool,
     pop_over: bool,
     hover_gen: u64,
     drop_hint: Option<DropTarget>,
     /// A Tab (by id) to activate as soon as its Connection is up.
     pending_select: Option<String>,
-    /// The next new page becomes the Active Tab (after Cmd+T).
-    expect_new_tab: bool,
+    /// The next new page of this Connection becomes the Active Tab (Cmd+T).
+    expect_new_tab: Option<usize>,
+    /// Open a blank Tab in this Connection as soon as it is connected.
+    new_tab_after_connect: Option<usize>,
+    // ---- JS dialog modal ----
+    dialog_input: Option<DialogInput>,
 }
 
 impl Root {
@@ -165,18 +267,13 @@ impl Root {
             ui_tx,
             rail: false,
             conn_styles: Vec::new(),
-            connection_name: String::new(),
-            connection_cfg: None,
+            conns: Vec::new(),
             warnings: Vec::new(),
-            phase: Phase::Connecting,
-            manager: None,
-            pending_cdp: None,
-            conn: None,
-            mirror: None,
-            conn_state: ConnectionState::Connecting,
-            pages: Vec::new(),
+            problem: None,
+            preferred: None,
+            last_conn: None,
             active: None,
-            starting: false,
+            streaming: None,
             notice: None,
             address: Address {
                 focus: cx.focus_handle(),
@@ -192,35 +289,42 @@ impl Root {
             menu: None,
             rename: None,
             chip_open: None,
+            overflow_open: false,
             chip_over: false,
             pop_over: false,
             hover_gen: 0,
             drop_hint: None,
             pending_select: None,
-            expect_new_tab: false,
+            expect_new_tab: None,
+            new_tab_after_connect: None,
+            dialog_input: None,
         };
         match startup {
-            Startup::Problem(o) => root.phase = Phase::Problem(o),
+            Startup::Problem(o) => root.problem = Some(o),
             Startup::Ready {
-                connection,
-                index,
+                connections,
+                selected,
                 warnings,
             } => {
-                root.connection_name = connection.name.clone();
-                root.conn_styles = vec![ConnStyle::new(
-                    &connection.name,
-                    connection.color.as_deref(),
-                    index,
-                )];
+                root.conn_styles = connections
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| ConnStyle::new(&c.name, c.color.as_deref(), i))
+                    .collect();
                 root.warnings = warnings;
+                root.warnings
+                    .extend(multi::style_warnings(&root.conn_styles));
                 root.load_state();
-                root.connection_cfg = Some(connection);
-                match root.arm() {
-                    Ok(()) => root.begin_prepare(cx),
-                    Err(e) => {
-                        root.phase = Phase::Problem(
-                            Overlay::new("Invalid Connection in config.toml").detail(e),
-                        )
+                let auto: Vec<bool> = connections.iter().map(|c| c.auto_connect).collect();
+                root.conns = connections.into_iter().map(Conn::new).collect();
+                root.preferred = selected;
+                let start = multi::startup_connects(&auto, selected);
+                root.last_conn = selected.or(start.first().copied());
+                for i in 0..root.conns.len() {
+                    if start.contains(&i) {
+                        root.begin_prepare(i, cx);
+                    } else {
+                        root.probe(i);
                     }
                 }
             }
@@ -291,132 +395,237 @@ impl Root {
         theme::is_dark(window.appearance())
     }
 
-    /// The Connection's link state, for chips and Placeholder Tabs.
-    fn link(&self) -> LinkState {
-        match &self.phase {
-            Phase::Running => LinkState::Live(self.conn_state.clone()),
+    fn idx_of(&self, name: &str) -> Option<usize> {
+        self.conns.iter().position(|c| c.name == name)
+    }
+
+    /// A Connection's link state, for chips and Placeholder Tabs.
+    fn link_of(&self, i: usize) -> LinkState {
+        let c = &self.conns[i];
+        match &c.phase {
+            Phase::Running => LinkState::Live(c.conn_state.clone()),
             Phase::Connecting => LinkState::Connecting,
             Phase::Blocked(o) if o.action == Some(OverlayAction::StartProfile) => {
                 LinkState::ProfileStopped
             }
-            Phase::Blocked(_) | Phase::Idle | Phase::Problem(_) => LinkState::Off,
+            Phase::Blocked(_) | Phase::Problem(_) => LinkState::Failed,
+            Phase::Idle => LinkState::Off,
         }
     }
 
-    fn chip_status(&self) -> ChipStatus {
-        sm::chip_status(&self.link(), self.manager.is_some())
+    fn chip_status_of(&self, i: usize) -> ChipStatus {
+        sm::chip_status(&self.link_of(i), self.conns[i].manager.is_some())
+    }
+
+    /// Why a Connection is failing, for its chip popover.
+    fn detail_of(&self, i: usize) -> Option<String> {
+        let c = &self.conns[i];
+        let o = match &c.phase {
+            Phase::Blocked(o) | Phase::Problem(o)
+                if o.action != Some(OverlayAction::StartProfile) =>
+            {
+                o.clone()
+            }
+            Phase::Running => model::overlay_for(&c.conn_state, c.manager.is_some())
+                .filter(|_| matches!(c.conn_state, ConnectionState::Failed { .. }))?,
+            _ => return None,
+        };
+        Some(match &o.detail {
+            Some(d) => format!("{}: {d}", o.title),
+            None => o.title.clone(),
+        })
+    }
+
+    fn tabs_live_of(&self, i: usize) -> bool {
+        sm::tabs_live(&self.link_of(i))
     }
 
     fn layout(&self) -> Vec<SidebarItem> {
-        let live = sm::tabs_live(&self.link());
-        let name = self.connection_name.clone();
-        self.state.sidebar_layout(&move |c: &str| live && c == name)
+        self.state
+            .sidebar_layout(&|c: &str| self.idx_of(c).is_some_and(|i| self.tabs_live_of(i)))
     }
 
-    fn is_live_target(&self, target_id: Option<&str>) -> bool {
-        sm::tabs_live(&self.link())
-            && target_id.is_some_and(|t| self.pages.iter().any(|p| p.target_id == t))
+    fn is_live_target(&self, conn: &str, target_id: Option<&str>) -> bool {
+        let Some(i) = self.idx_of(conn) else {
+            return false;
+        };
+        self.tabs_live_of(i)
+            && target_id.is_some_and(|t| self.conns[i].pages.iter().any(|p| p.target_id == t))
     }
 
-    /// The Connection a new Tab opens in: the Active Tab's, else the first.
+    fn is_active(&self, conn: &str, target_id: Option<&str>) -> bool {
+        match (&self.active, target_id, self.idx_of(conn)) {
+            (Some((c, t)), Some(id), Some(i)) => *c == i && t == id,
+            _ => false,
+        }
+    }
+
+    /// The Connection a new Tab opens in: the Active Tab's, else the last
+    /// used one, else the first.
+    fn target_conn_idx(&self) -> Option<usize> {
+        self.active
+            .as_ref()
+            .map(|a| a.0)
+            .or(self.last_conn)
+            .or((!self.conns.is_empty()).then_some(0))
+    }
+
     fn target_connection(&self) -> Option<&ConnStyle> {
-        let active = self
-            .active
-            .as_deref()
-            .and_then(|t| {
-                self.state
-                    .tabs
-                    .iter()
-                    .find(|e| e.target_id.as_deref() == Some(t))
-            })
-            .and_then(|e| sm::style_of(&self.conn_styles, &e.connection));
-        active.or_else(|| self.conn_styles.first())
+        self.target_conn_idx().and_then(|i| self.conn_styles.get(i))
+    }
+
+    /// The Connection whose state fills the Mirror area: the Active Tab's,
+    /// else the last used one.
+    fn focus_conn(&self) -> Option<usize> {
+        self.active.as_ref().map(|a| a.0).or(self.last_conn)
+    }
+
+    /// A pending JS dialog of the Active Tab (with its Connection index), only
+    /// while that Connection is connected.
+    fn active_dialog(&self) -> Option<(usize, Dialog)> {
+        let (ci, t) = self.active.as_ref()?;
+        let c = &self.conns[*ci];
+        if c.conn_state != ConnectionState::Connected {
+            return None;
+        }
+        dialog_model::for_target(&c.dialogs, t).map(|d| (*ci, d.clone()))
+    }
+
+    /// A background Tab (not the Active Tab) with a pending dialog.
+    fn has_dialog_badge(&self, conn: &str, target_id: Option<&str>) -> bool {
+        let (Some(i), Some(t)) = (self.idx_of(conn), target_id) else {
+            return false;
+        };
+        !self.is_active(conn, Some(t))
+            && self.conns[i].conn_state == ConnectionState::Connected
+            && dialog_model::for_target(&self.conns[i].dialogs, t).is_some()
     }
 
     // ---- connecting -------------------------------------------------------
 
-    /// Build the CDP config (and Manager client) from the saved Connection.
-    fn arm(&mut self) -> Result<(), String> {
-        let cfg = self.connection_cfg.as_ref().ok_or("no Connection")?;
-        let r = connect::resolve(cfg)?;
-        self.manager = r.manager;
-        self.pending_cdp = Some(r.cdp);
-        Ok(())
+    /// Check the Profile status in the background (Manager Connections that
+    /// are not running), so a stopped Profile shows its Start button.
+    fn probe(&self, i: usize) {
+        let c = &self.conns[i];
+        if !c.probeable() {
+            return;
+        }
+        let manager = c.manager.clone();
+        let (tx, gen) = (self.ui_tx.clone(), c.gen);
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Probe(i, gen, connect::prepare(manager.as_ref()).await));
+        });
     }
 
     /// Manager pre-flight, then start the Connection.
-    fn begin_prepare(&mut self, cx: &mut Context<Self>) {
-        if self.pending_cdp.is_none() {
-            if let Err(e) = self.arm() {
-                self.phase =
-                    Phase::Problem(Overlay::new("Invalid Connection in config.toml").detail(e));
+    fn begin_prepare(&mut self, i: usize, cx: &mut Context<Self>) {
+        let c = &mut self.conns[i];
+        if matches!(c.phase, Phase::Problem(_)) {
+            return;
+        }
+        if c.pending_cdp.is_none() {
+            c.arm();
+            if matches!(c.phase, Phase::Problem(_)) {
                 return;
             }
         }
-        self.phase = Phase::Connecting;
-        if self.manager.is_none() {
-            self.start_connection(cx);
+        c.phase = Phase::Connecting;
+        c.gen += 1;
+        if c.manager.is_none() {
+            self.start_connection(i, cx);
             return;
         }
-        let manager = self.manager.clone();
-        let tx = self.ui_tx.clone();
+        let manager = c.manager.clone();
+        let (tx, gen) = (self.ui_tx.clone(), c.gen);
         self.rt.spawn(async move {
-            let _ = tx.send(Msg::Prepared(connect::prepare(manager.as_ref()).await));
+            let _ = tx.send(Msg::Prepared(
+                i,
+                gen,
+                connect::prepare(manager.as_ref()).await,
+            ));
         });
         cx.notify();
     }
 
-    /// Connect (or retry) the Connection. Never starts a stopped Profile.
-    fn connect(&mut self, cx: &mut Context<Self>) {
-        match (&self.conn, &self.phase) {
-            (Some(c), _) => c.retry(),
+    /// Connect (or retry) a Connection. Never starts a stopped Profile.
+    fn connect_conn(&mut self, i: usize, cx: &mut Context<Self>) {
+        self.last_conn = Some(i);
+        let c = &self.conns[i];
+        match (&c.conn, &c.phase) {
+            (Some(conn), _) => conn.retry(),
             (None, Phase::Connecting) => {}
-            (None, _) => self.begin_prepare(cx),
+            (None, _) => self.begin_prepare(i, cx),
         }
         cx.notify();
     }
 
-    fn disconnect(&mut self, cx: &mut Context<Self>) {
-        if let Some(c) = self.conn.take() {
-            self.rt.spawn(async move { c.close().await });
+    fn disconnect(&mut self, i: usize, cx: &mut Context<Self>) {
+        let c = &mut self.conns[i];
+        if let Some(conn) = c.conn.take() {
+            self.rt.spawn(async move { conn.close().await });
         }
-        self.mirror = None;
-        self.pending_cdp = None;
-        self.pages.clear();
-        self.active = None;
-        self.conn_state = ConnectionState::Closed;
-        self.phase = Phase::Idle;
-        self.notice = None;
+        c.mirror = None;
+        c.pending_cdp = None;
+        c.pages.clear();
+        c.dialogs.clear();
+        c.gen += 1;
+        c.conn_state = ConnectionState::Closed;
+        c.phase = Phase::Idle;
+        c.notice = None;
+        c.arm();
+        if self.streaming == Some(i) {
+            self.streaming = None;
+        }
+        if self.new_tab_after_connect == Some(i) {
+            self.new_tab_after_connect = None;
+        }
+        if self.active.as_ref().is_some_and(|a| a.0 == i) {
+            self.active = self.any_live_tab();
+            self.sync_active();
+            self.focus_mirror = true;
+        }
+        self.probe(i);
         cx.notify();
     }
 
-    fn start_connection(&mut self, cx: &mut Context<Self>) {
-        let Some(cfg) = self.pending_cdp.take() else {
+    /// The first live page of any Connection.
+    fn any_live_tab(&self) -> Option<(usize, String)> {
+        self.conns.iter().enumerate().find_map(|(i, c)| {
+            (self.tabs_live_of(i))
+                .then(|| c.pages.first().map(|p| (i, p.target_id.clone())))
+                .flatten()
+        })
+    }
+
+    fn start_connection(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(cfg) = self.conns[i].pending_cdp.take() else {
             return;
         };
         let conn = {
             let _enter = self.rt.enter(); // Connection::start spawns on tokio
-            Connection::start(cfg)
+            Arc::new(Connection::start(cfg))
         };
         let backend =
             MirrorBackend::from_connection(&conn, self.rt.clone()).expect("fresh Connection");
-        self.mirror = Some(cx.new(|cx| Mirror::new(backend, cx)));
-        self.focus_mirror = true;
+        let mirror = cx.new(|cx| Mirror::new(backend, cx));
 
-        // One pump forwards state, Tab list and events to the UI.
+        // One pump forwards state, Tab list, dialogs and events to the UI.
+        let gen = self.conns[i].gen;
         let mut state = conn.state();
         let mut pages = conn.pages();
+        let mut dialogs = conn.pending_dialogs();
         let mut events = conn.events();
         let tx = self.ui_tx.clone();
         self.rt.spawn(async move {
-            let _ = tx.send(Msg::State(state.borrow().clone()));
-            let _ = tx.send(Msg::Pages(pages.borrow().clone()));
+            let _ = tx.send(Msg::State(i, gen, state.borrow().clone()));
+            let _ = tx.send(Msg::Pages(i, gen, pages.borrow().clone()));
             loop {
                 let sent = tokio::select! {
-                    r = state.changed() => r.is_ok() && tx.send(Msg::State(state.borrow_and_update().clone())).is_ok(),
-                    r = pages.changed() => r.is_ok() && tx.send(Msg::Pages(pages.borrow_and_update().clone())).is_ok(),
+                    r = state.changed() => r.is_ok() && tx.send(Msg::State(i, gen, state.borrow_and_update().clone())).is_ok(),
+                    r = pages.changed() => r.is_ok() && tx.send(Msg::Pages(i, gen, pages.borrow_and_update().clone())).is_ok(),
+                    r = dialogs.changed() => r.is_ok() && tx.send(Msg::Dialogs(i, gen, dialogs.borrow_and_update().clone())).is_ok(),
                     ev = events.recv() => match ev {
-                        Ok(e) => tx.send(Msg::Event(e)).is_ok(),
+                        Ok(e) => tx.send(Msg::Event(i, gen, e)).is_ok(),
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => true,
                         Err(_) => false,
                     },
@@ -426,67 +635,138 @@ impl Root {
                 }
             }
         });
-        self.conn = Some(conn);
-        self.phase = Phase::Running;
+        let c = &mut self.conns[i];
+        c.conn = Some(conn);
+        c.mirror = Some(mirror);
+        c.conn_state = ConnectionState::Connecting;
+        c.phase = Phase::Running;
+        if self.active.as_ref().is_some_and(|a| a.0 == i) || self.active.is_none() {
+            self.focus_mirror = true;
+        }
         cx.notify();
     }
 
     fn apply(&mut self, msg: Msg, cx: &mut Context<Self>) {
         match msg {
-            Msg::Prepared(Prepared::Ready) => self.start_connection(cx),
-            Msg::Prepared(Prepared::NeedsStart) => {
-                self.phase = Phase::Blocked(
-                    model::overlay_for(&ConnectionState::NotRunning, true).expect("overlay"),
-                );
+            Msg::Prepared(i, gen, p) if self.fresh(i, gen) => match p {
+                Prepared::Ready => self.start_connection(i, cx),
+                Prepared::NeedsStart => {
+                    self.conns[i].phase = Phase::Blocked(
+                        model::overlay_for(&ConnectionState::NotRunning, true).expect("overlay"),
+                    );
+                }
+                Prepared::Failed { title, detail } => {
+                    self.conns[i].phase = Phase::Blocked(
+                        Overlay::new(title)
+                            .detail(detail)
+                            .action(OverlayAction::Retry),
+                    );
+                }
+            },
+            Msg::Probe(i, gen, p) if self.fresh(i, gen) => {
+                let c = &mut self.conns[i];
+                match multi::probe_effect(&p, c.probeable()) {
+                    ProbeEffect::Stopped => {
+                        c.phase = Phase::Blocked(
+                            model::overlay_for(&ConnectionState::NotRunning, true)
+                                .expect("overlay"),
+                        )
+                    }
+                    ProbeEffect::Idle => c.phase = Phase::Idle,
+                    ProbeEffect::Failed => {
+                        if let Prepared::Failed { title, detail } = p {
+                            c.phase = Phase::Blocked(
+                                Overlay::new(title)
+                                    .detail(detail)
+                                    .action(OverlayAction::Retry),
+                            );
+                        }
+                    }
+                    ProbeEffect::Ignore => {}
+                }
             }
-            Msg::Prepared(Prepared::Failed { title, detail }) => {
-                self.phase = Phase::Blocked(
-                    Overlay::new(title)
-                        .detail(detail)
-                        .action(OverlayAction::Retry),
-                );
-            }
-            Msg::Launched(r) => {
-                self.starting = false;
+            Msg::Launched(i, r) => {
+                let c = &mut self.conns[i];
+                c.starting = false;
                 match r {
                     Ok(()) => {
-                        self.notice = None;
-                        match &self.conn {
-                            Some(c) => c.retry(),
+                        c.notice = None;
+                        match &c.conn {
+                            Some(conn) => conn.retry(),
                             None => {
-                                self.pending_cdp = None;
-                                self.begin_prepare(cx)
+                                c.pending_cdp = None;
+                                self.begin_prepare(i, cx)
                             }
                         }
                     }
-                    Err(e) => self.notice = Some(format!("Could not start the Profile: {e}")),
+                    Err(e) => c.notice = Some(format!("Could not start the Profile: {e}")),
                 }
             }
-            Msg::State(s) => {
+            Msg::State(i, gen, s) if self.fresh(i, gen) => {
+                let c = &mut self.conns[i];
                 if s == ConnectionState::Connected {
-                    self.notice = None;
+                    c.notice = None;
                 }
-                self.conn_state = s;
+                if s != ConnectionState::Connected {
+                    // No modals for a Connection that is not connected.
+                    c.dialogs.clear();
+                }
+                c.conn_state = s.clone();
+                if s == ConnectionState::Connected && self.new_tab_after_connect == Some(i) {
+                    self.new_tab_after_connect = None;
+                    self.expect_new_tab = Some(i);
+                    self.open_url_tab(i, "about:blank");
+                }
                 self.resolve_pending();
             }
-            Msg::Pages(p) => self.apply_pages(p, cx),
-            Msg::Event(ConnectionEvent::ScreencastFailed { error, .. }) => {
-                self.notice = Some(format!("Screencast failed: {error}"));
+            Msg::Pages(i, gen, p) if self.fresh(i, gen) => self.apply_pages(i, p, cx),
+            Msg::Dialogs(i, gen, d) if self.fresh(i, gen) => {
+                let c = &mut self.conns[i];
+                c.dialogs = if c.conn_state == ConnectionState::Connected {
+                    d
+                } else {
+                    Vec::new()
+                };
             }
-            Msg::Event(_) => {}
-            Msg::Notice(n) => self.notice = Some(n),
+            Msg::Event(i, gen, ConnectionEvent::ScreencastFailed { error, .. })
+                if self.fresh(i, gen) =>
+            {
+                self.conns[i].notice = Some(format!("Screencast failed: {error}"));
+            }
+            // Success needs nothing: the modal goes when the dialog leaves the
+            // pending list. Failure: let the user try again.
+            Msg::DialogAnswered(i, gen, Err(e)) if self.fresh(i, gen) => {
+                if let Some(d) = &mut self.dialog_input {
+                    d.busy = false;
+                }
+                self.conns[i].notice = Some(format!("Could not answer the dialog: {e}"));
+            }
+            Msg::Notice(i, n) => {
+                if let Some(c) = self.conns.get_mut(i) {
+                    c.notice = Some(n);
+                }
+            }
+            _ => {} // stale generation, or an event nobody needs
         }
         cx.notify();
     }
 
-    /// A new list of live pages: prune closed Tabs, reconcile the stored
-    /// Tabs, keep the Active Tab valid.
-    fn apply_pages(&mut self, pages: Vec<TargetInfo>, cx: &mut Context<Self>) {
-        let old: Vec<String> = self.pages.iter().map(|p| p.target_id.clone()).collect();
+    /// Whether a message of generation `gen` still belongs to Connection `i`.
+    fn fresh(&self, i: usize, gen: u64) -> bool {
+        self.conns.get(i).is_some_and(|c| c.gen == gen)
+    }
+
+    /// A new list of live pages of Connection `ci`: prune its closed Tabs,
+    /// reconcile its stored Tabs (other Connections' entries are untouched),
+    /// place popups, keep the Active Tab valid.
+    fn apply_pages(&mut self, ci: usize, pages: Vec<TargetInfo>, cx: &mut Context<Self>) {
+        let c = &mut self.conns[ci];
+        let old: Vec<String> = c.pages.iter().map(|p| p.target_id.clone()).collect();
         let new: Vec<String> = pages.iter().map(|p| p.target_id.clone()).collect();
-        let connected = self.conn_state == ConnectionState::Connected;
-        self.pages = pages;
-        let live: Vec<rb_store::TargetInfo> = self
+        let connected = c.conn_state == ConnectionState::Connected;
+        let popups = multi::new_popups(&c.pages, &pages);
+        c.pages = pages;
+        let live: Vec<rb_store::TargetInfo> = c
             .pages
             .iter()
             .map(|p| rb_store::TargetInfo {
@@ -495,25 +775,50 @@ impl Root {
                 url: p.url.clone(),
             })
             .collect();
-        let name = self.connection_name.clone();
+        let name = c.name.clone();
         let gone = sm::closed_targets(&old, &new, connected);
         self.edit_state(cx, |s| {
             sm::prune_closed(s, &name, &gone);
             s.reconcile(&name, &live);
         });
-        if self.expect_new_tab {
+        // Popups: next to their opener; active when the opener was.
+        for (popup, opener) in &popups {
+            let activate = multi::popup_activates(
+                self.active.as_ref().map(|(c, t)| (*c, t.as_str())),
+                ci,
+                opener,
+            );
+            self.edit_state(cx, |s| {
+                multi::place_popup(s, &name, popup, opener);
+            });
+            if activate {
+                self.active = Some((ci, popup.clone()));
+                self.sync_active();
+                self.focus_mirror = true;
+            }
+        }
+        if self.expect_new_tab == Some(ci) {
             if let Some(n) = new.iter().find(|id| !old.contains(id)) {
-                self.expect_new_tab = false;
-                self.active = Some(n.clone());
+                self.expect_new_tab = None;
+                self.active = Some((ci, n.clone()));
                 self.sync_active();
                 self.focus_mirror = true;
             }
         }
         self.resolve_pending();
-        let want = model::choose_active(&self.pages, self.active.as_deref());
+        let hold = self
+            .preferred
+            .is_some_and(|p| p != ci && self.conns[p].connecting());
+        let want = multi::choose_active(
+            self.active.as_ref().map(|(c, t)| (*c, t.as_str())),
+            ci,
+            &self.conns[ci].pages,
+            hold,
+        );
         if want != self.active {
             self.active = want;
             self.sync_active();
+            self.focus_mirror = true;
         }
     }
 
@@ -527,30 +832,51 @@ impl Root {
             self.pending_select = None;
             return;
         };
-        let target = self.state.tabs[i].target_id.clone();
-        if self.is_live_target(target.as_deref()) {
+        let e = self.state.tabs[i].clone();
+        if self.is_live_target(&e.connection, e.target_id.as_deref()) {
             self.pending_select = None;
-            self.active = target;
-            self.sync_active();
-            self.focus_mirror = true;
+            if let (Some(ci), Some(t)) = (self.idx_of(&e.connection), e.target_id) {
+                self.active = Some((ci, t));
+                self.sync_active();
+                self.focus_mirror = true;
+            }
         }
     }
 
     // ---- actions ----------------------------------------------------------
 
-    /// Tell the Connection which Tab is the Active Tab (starts its screencast).
-    fn sync_active(&self) {
-        if let Some(conn) = &self.conn {
-            conn.set_active_tab(self.active.clone().map(|target_id| ActiveTab {
-                target_id,
-                screencast: ScreencastOptions::default(),
-            }));
+    /// Tell the Connections which Tab is the Active Tab: the owner starts its
+    /// screencast, the Connection that streamed before stops. Exactly one
+    /// Connection streams.
+    fn sync_active(&mut self) {
+        let new_conn = self.active.as_ref().map(|a| a.0);
+        if let Some(old) = multi::stop_streaming(self.streaming, new_conn) {
+            if let Some(conn) = self.conns.get(old).and_then(|c| c.conn.as_ref()) {
+                conn.set_active_tab(None);
+            }
         }
+        if let Some((ci, target_id)) = self.active.clone() {
+            if let Some(conn) = &self.conns[ci].conn {
+                conn.set_active_tab(Some(ActiveTab {
+                    target_id,
+                    screencast: ScreencastOptions::default(),
+                }));
+            }
+        }
+        self.streaming = new_conn;
     }
 
-    fn select_tab(&mut self, target_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.as_deref() != Some(target_id) {
-            self.active = Some(target_id.to_string());
+    fn select_tab(
+        &mut self,
+        ci: usize,
+        target_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_select = None;
+        if self.active.as_ref().map(|(c, t)| (*c, t.as_str())) != Some((ci, target_id)) {
+            self.active = Some((ci, target_id.to_string()));
+            self.last_conn = Some(ci);
             self.sync_active();
         }
         self.focus_mirror_now(window, cx);
@@ -558,67 +884,92 @@ impl Root {
     }
 
     /// A click (or Cmd+n) on a Sidebar Tab. A live Tab becomes Active; a
-    /// Placeholder Tab connects its Connection first; a leftover entry on a
-    /// connected Connection reopens its URL.
+    /// Placeholder Tab connects its Connection first and is activated when its
+    /// pages arrive (matched by target id, then URL, by the state
+    /// reconcile); a leftover entry on a connected Connection reopens its URL.
     fn activate_tab(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(i) = self.state.tab_index(tab_id) else {
             return;
         };
         let entry = self.state.tabs[i].clone();
-        if self.is_live_target(entry.target_id.as_deref()) {
-            self.pending_select = None;
-            self.select_tab(&entry.target_id.unwrap_or_default(), window, cx);
-        } else if sm::tabs_live(&self.link()) {
+        let Some(ci) = self.idx_of(&entry.connection) else {
+            return; // a Tab of a Connection that is no longer configured
+        };
+        if self.is_live_target(&entry.connection, entry.target_id.as_deref()) {
+            self.select_tab(ci, &entry.target_id.unwrap_or_default(), window, cx);
+        } else if self.tabs_live_of(ci) {
             self.pending_select = Some(tab_id.to_string());
-            self.open_url_tab(&entry.url);
+            self.open_url_tab(ci, &entry.url);
         } else {
             self.pending_select = Some(tab_id.to_string());
-            self.connect(cx);
+            self.connect_conn(ci, cx);
         }
     }
 
     fn focus_mirror_now(&mut self, window: &mut Window, cx: &App) {
-        if let Some(m) = &self.mirror {
+        if let Some(m) = self.active_mirror() {
             window.focus(&m.read(cx).focus_handle(cx));
         }
     }
 
-    fn report<F>(&self, fut: F)
+    /// The Mirror of the Active Tab's Connection.
+    fn active_mirror(&self) -> Option<Entity<Mirror>> {
+        let (ci, _) = self.active.as_ref()?;
+        self.conns[*ci].mirror.clone()
+    }
+
+    fn report<F>(&self, ci: usize, fut: F)
     where
         F: std::future::Future<Output = Result<(), String>> + Send + 'static,
     {
         let tx = self.ui_tx.clone();
         self.rt.spawn(async move {
             if let Err(e) = fut.await {
-                let _ = tx.send(Msg::Notice(e));
+                let _ = tx.send(Msg::Notice(ci, e));
             }
         });
     }
 
     fn page_cmd(&self, cmd: PageCmd) {
-        let Some(conn) = &self.conn else { return };
+        let Some((ci, _)) = &self.active else { return };
+        let Some(conn) = &self.conns[*ci].conn else {
+            return;
+        };
         let session = conn.active_session().borrow().clone();
         let Some(session) = session else { return };
-        self.report(actions::run_page(session, cmd));
+        self.report(*ci, actions::run_page(session, cmd));
     }
 
-    fn open_url_tab(&mut self, url: &str) {
-        if let Some(client) = self.conn.as_ref().and_then(|c| c.client()) {
+    fn open_url_tab(&mut self, ci: usize, url: &str) {
+        if let Some(client) = self.conns[ci].conn.as_ref().and_then(|c| c.client()) {
             let url = if url.is_empty() { "about:blank" } else { url };
             let url = url.to_string();
-            self.report(async move { actions::new_tab(&client, &url).await });
+            self.report(ci, async move { actions::new_tab(&client, &url).await });
         }
     }
 
-    /// Cmd+T, the "+ New Tab" row and a chip's "+": a blank Tab in the target
-    /// Connection (becomes the Active Tab). A disconnected Connection connects
-    /// instead; a stopped Profile is not started.
+    /// Cmd+T and the "+ New Tab" row: a blank Tab in the target Connection.
     fn new_tab(&mut self, cx: &mut Context<Self>) {
-        if sm::tabs_live(&self.link()) && self.conn.as_ref().is_some_and(|c| c.client().is_some()) {
-            self.expect_new_tab = true;
-            self.open_url_tab("about:blank");
+        if let Some(i) = self.target_conn_idx() {
+            self.new_tab_in(i, cx);
+        }
+    }
+
+    /// A blank Tab in Connection `i` (becomes the Active Tab). A disconnected
+    /// Connection connects first and then opens it; a stopped Profile is not
+    /// started.
+    fn new_tab_in(&mut self, i: usize, cx: &mut Context<Self>) {
+        if self.tabs_live_of(i)
+            && self.conns[i]
+                .conn
+                .as_ref()
+                .is_some_and(|c| c.client().is_some())
+        {
+            self.expect_new_tab = Some(i);
+            self.open_url_tab(i, "about:blank");
         } else {
-            self.connect(cx);
+            self.new_tab_after_connect = Some(i);
+            self.connect_conn(i, cx);
         }
     }
 
@@ -629,16 +980,21 @@ impl Root {
         let Some(i) = self.state.tab_index(tab_id) else {
             return;
         };
-        let target = self.state.tabs[i].target_id.clone();
-        if self.is_live_target(target.as_deref()) {
-            let target = target.unwrap_or_default();
-            if self.active.as_deref() == Some(target.as_str()) {
+        let entry = self.state.tabs[i].clone();
+        if self.is_live_target(&entry.connection, entry.target_id.as_deref()) {
+            let (Some(ci), Some(target)) = (self.idx_of(&entry.connection), entry.target_id) else {
+                return;
+            };
+            if self.is_active(&entry.connection, Some(&target)) {
                 self.active = self.neighbour_of(tab_id).or(self.active.take());
                 self.sync_active();
                 self.focus_mirror = true;
             }
-            if let Some(client) = self.conn.as_ref().and_then(|c| c.client()) {
-                self.report(async move { actions::close_tab(&client, &target).await });
+            if let Some(client) = self.conns[ci].conn.as_ref().and_then(|c| c.client()) {
+                self.report(
+                    ci,
+                    async move { actions::close_tab(&client, &target).await },
+                );
             }
         } else {
             self.edit_state(cx, |s| {
@@ -648,59 +1004,66 @@ impl Root {
     }
 
     /// The live Tab next to `tab_id` in Sidebar order (next, else previous).
-    fn neighbour_of(&self, tab_id: &str) -> Option<String> {
+    fn neighbour_of(&self, tab_id: &str) -> Option<(usize, String)> {
         let layout = self.layout();
         let flat: Vec<_> = sm::flat_tabs(&layout)
             .into_iter()
-            .filter(|t| self.is_live_target(t.target_id.as_deref()))
+            .filter(|t| self.is_live_target(&t.connection, t.target_id.as_deref()))
             .collect();
         let pos = flat.iter().position(|t| t.id == tab_id)?;
-        flat.get(pos + 1)
-            .or(pos.checked_sub(1).and_then(|p| flat.get(p)))
-            .and_then(|t| t.target_id.clone())
+        let t = flat
+            .get(pos + 1)
+            .or(pos.checked_sub(1).and_then(|p| flat.get(p)))?;
+        Some((self.idx_of(&t.connection)?, t.target_id.clone()?))
     }
 
     fn close_active(&mut self, cx: &mut Context<Self>) {
-        let Some(active) = self.active.clone() else {
+        let Some((ci, active)) = self.active.clone() else {
             return;
         };
+        let name = self.conns[ci].name.clone();
         let id = self
             .state
             .tabs
             .iter()
-            .find(|e| e.target_id.as_deref() == Some(active.as_str()))
+            .find(|e| e.connection == name && e.target_id.as_deref() == Some(active.as_str()))
             .and_then(|e| e.id.clone());
         if let Some(id) = id {
             self.close_tab(&id, cx);
         }
     }
 
-    fn overlay_action(&mut self, action: OverlayAction, cx: &mut Context<Self>) {
+    fn start_profile(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(m) = self.conns[i].manager.clone() else {
+            return;
+        };
+        self.last_conn = Some(i);
+        self.conns[i].starting = true;
+        self.conns[i].notice = None;
+        let tx = self.ui_tx.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Launched(i, connect::launch(&m).await));
+        });
+        cx.notify();
+    }
+
+    fn overlay_action(&mut self, i: usize, action: OverlayAction, cx: &mut Context<Self>) {
         match action {
-            OverlayAction::Retry | OverlayAction::Connect => self.connect(cx),
-            OverlayAction::StartProfile => {
-                let Some(m) = self.manager.clone() else {
-                    return;
-                };
-                self.starting = true;
-                self.notice = None;
-                let tx = self.ui_tx.clone();
-                self.rt.spawn(async move {
-                    let _ = tx.send(Msg::Launched(connect::launch(&m).await));
-                });
-            }
+            OverlayAction::Retry | OverlayAction::Connect => self.connect_conn(i, cx),
+            OverlayAction::StartProfile => self.start_profile(i, cx),
         }
         cx.notify();
     }
 
-    fn chip_action(&mut self, action: ChipAction, cx: &mut Context<Self>) {
+    fn chip_action(&mut self, i: usize, action: ChipAction, cx: &mut Context<Self>) {
         match action {
-            ChipAction::NewTab => self.new_tab(cx),
-            ChipAction::Disconnect => self.disconnect(cx),
-            ChipAction::RetryNow | ChipAction::Connect => self.connect(cx),
-            ChipAction::Start => self.overlay_action(OverlayAction::StartProfile, cx),
+            ChipAction::NewTab => self.new_tab_in(i, cx),
+            ChipAction::Disconnect => self.disconnect(i, cx),
+            ChipAction::RetryNow | ChipAction::Connect => self.connect_conn(i, cx),
+            ChipAction::Start => self.start_profile(i, cx),
         }
         self.chip_open = None;
+        self.overflow_open = false;
         cx.notify();
     }
 
@@ -822,9 +1185,13 @@ impl Root {
     }
 
     fn current_url(&self) -> String {
-        self.active
-            .as_deref()
-            .and_then(|id| self.pages.iter().find(|p| p.target_id == id))
+        let Some((ci, t)) = &self.active else {
+            return String::new();
+        };
+        self.conns[*ci]
+            .pages
+            .iter()
+            .find(|p| &p.target_id == t)
             .map(|p| p.url.clone())
             .unwrap_or_default()
     }
@@ -890,23 +1257,31 @@ impl Root {
 
     // ---- rendering --------------------------------------------------------
 
-    fn overlay_view(&self, o: &Overlay, p: &Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let starting = self.starting;
+    /// A message over the Mirror area (or the whole window): what is wrong and
+    /// what the user can do. `conn` is the Connection it is about.
+    fn overlay_view(
+        &self,
+        conn: Option<usize>,
+        o: &Overlay,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let starting = conn.is_some_and(|i| self.conns[i].starting);
         let mut detail = o.detail.clone().unwrap_or_default();
-        if let Some(n) = &self.notice {
+        if let Some(n) = conn.and_then(|i| self.conns[i].notice.as_ref()) {
             if !detail.is_empty() {
                 detail.push_str("\n\n");
             }
             detail.push_str(n);
         }
-        let button = match (o.action, starting) {
-            (Some(_), true) => Some(
+        let button = match (o.action, starting, conn) {
+            (Some(_), true, _) => Some(
                 div()
                     .text_color(hsla(p.ink2))
                     .child("Starting the Profile...")
                     .into_any_element(),
             ),
-            (Some(a), false) => {
+            (Some(a), false, Some(i)) => {
                 let label = match a {
                     OverlayAction::StartProfile => "Start Profile",
                     OverlayAction::Retry => "Retry",
@@ -924,13 +1299,14 @@ impl Root {
                         .hover(|s| s.opacity(0.88))
                         .child(label)
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.overlay_action(a, cx)
+                            this.overlay_action(i, a, cx)
                         }))
                         .into_any_element(),
                 )
             }
-            (None, _) => None,
+            _ => None,
         };
+        let name = conn.map(|i| self.conns[i].name.clone());
         div()
             .size_full()
             .flex()
@@ -942,6 +1318,12 @@ impl Root {
             .bg(hsla(p.win))
             .text_color(hsla(p.ink))
             .child(div().text_xl().child(o.title.clone()))
+            .children(name.map(|n| {
+                div()
+                    .text_sm()
+                    .text_color(hsla(p.ink3))
+                    .child(SharedString::from(n))
+            }))
             .children((!detail.is_empty()).then(|| {
                 div()
                     .max_w(px(720.))
@@ -1067,6 +1449,12 @@ impl Root {
     fn status_bar(&self, p: &Palette) -> Option<impl IntoElement> {
         let mut extra: Vec<String> = self.warnings.clone();
         extra.extend(self.notice.clone());
+        extra.extend(self.focus_conn().and_then(|i| {
+            self.conns[i]
+                .notice
+                .as_ref()
+                .map(|n| format!("{}: {n}", self.conns[i].name))
+        }));
         if extra.is_empty() {
             return None;
         }
@@ -1088,19 +1476,30 @@ impl Root {
         )
     }
 
-    /// The overlay for the Mirror area, if any.
-    fn main_overlay(&self) -> Option<Overlay> {
-        match &self.phase {
-            Phase::Running => model::overlay_for(&self.conn_state, self.manager.is_some())
-                .filter(|_| self.mirror.is_some()),
+    /// The overlay for the Mirror area, if any, and the Connection it is about.
+    fn main_overlay(&self) -> Option<(Option<usize>, Overlay)> {
+        let Some(i) = self.focus_conn() else {
+            return (!self.conns.is_empty()).then(|| {
+                (
+                    None,
+                    Overlay::new("No Tab selected")
+                        .detail("Click a Tab in the Sidebar, or a Connection chip to connect."),
+                )
+            });
+        };
+        let c = &self.conns[i];
+        let o = match &c.phase {
+            Phase::Running => model::overlay_for(&c.conn_state, c.manager.is_some())
+                .filter(|_| c.mirror.is_some()),
             Phase::Connecting => Some(Overlay::new("Connecting...")),
             Phase::Blocked(o) | Phase::Problem(o) => Some(o.clone()),
             Phase::Idle => Some(
                 Overlay::new("Not connected")
-                    .detail("Disconnected. Connect to see this Connection's Tabs.")
+                    .detail("Not connected. Connect to see this Connection's Tabs.")
                     .action(OverlayAction::Connect),
             ),
-        }
+        };
+        o.map(|o| (Some(i), o))
     }
 
     fn running_body(
@@ -1110,15 +1509,17 @@ impl Root {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let overlay = self.main_overlay();
+        let mirror = self.active_mirror();
+        let covering = mirror.is_some();
+        let dialog = self.dialog_overlay(p, cx);
         let main = div()
             .relative()
             .flex_1()
             .min_w_0()
             .h_full()
             .bg(hsla(p.page))
-            .children(self.mirror.clone())
-            .children(overlay.map(|o| {
-                let covering = self.mirror.is_some();
+            .children(mirror)
+            .children(overlay.map(|(ci, o)| {
                 div()
                     .absolute()
                     .top_0()
@@ -1126,8 +1527,9 @@ impl Root {
                     .size_full()
                     .occlude()
                     .when(covering, |d| d.bg(theme::hsla(p.win & 0xffffffe6)))
-                    .child(self.overlay_view(&o, p, cx))
-            }));
+                    .child(self.overlay_view(ci, &o, p, cx))
+            }))
+            .children(dialog);
         let sidebar = self.sidebar_view(window, p, cx);
         div()
             .flex_1()
@@ -1157,9 +1559,12 @@ impl Focusable for Root {
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = theme::palette(self.dark(window));
-        if self.focus_mirror && self.mirror.is_some() && self.rename.is_none() {
+        self.sync_dialog_input(window, cx);
+        if self.focus_mirror && self.active_mirror().is_some() && self.rename.is_none() {
             self.focus_mirror = false;
-            self.focus_mirror_now(window, cx);
+            if self.dialog_input.is_none() {
+                self.focus_mirror_now(window, cx);
+            }
         }
         // A Group rename ends when its field loses focus.
         if let Some(r) = &mut self.rename {
@@ -1171,12 +1576,9 @@ impl Render for Root {
                 window.focus(&r.focus);
             }
         }
-        let body = match &self.phase {
-            Phase::Problem(o) if self.connection_cfg.is_none() => {
-                let o = o.clone();
-                self.overlay_view(&o, &p, cx).into_any_element()
-            }
-            _ => self.running_body(window, &p, cx),
+        let body = match self.problem.clone() {
+            Some(o) => self.overlay_view(None, &o, &p, cx).into_any_element(),
+            None => self.running_body(window, &p, cx),
         };
         let overlays = self.sidebar_overlays(window, &p, cx);
         let status = self.status_bar(&p);

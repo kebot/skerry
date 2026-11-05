@@ -4,8 +4,10 @@
 pub mod actions;
 pub mod app;
 pub mod connect;
+pub mod dialog_model;
 pub mod mirror;
 pub mod model;
+pub mod multi;
 pub mod sidebar_model;
 pub mod startup;
 pub mod state;
