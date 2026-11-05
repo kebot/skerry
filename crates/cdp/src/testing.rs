@@ -58,7 +58,12 @@ enum Handler {
     Error(i64, String),
     /// Never answer (to test pending commands).
     Silent,
+    /// Compute the answer from the command (`Err` is a protocol error).
+    Dynamic(DynamicHandler),
 }
+
+/// See [`FakeCdpServer::reply_with`].
+type DynamicHandler = Arc<dyn Fn(&RecordedCommand) -> Result<Value, (i64, String)> + Send + Sync>;
 
 #[derive(Clone)]
 struct Emit {
@@ -147,6 +152,19 @@ impl FakeCdpServer {
         self.st()
             .handlers
             .insert(method.into(), Handler::Error(code, message.into()));
+    }
+
+    /// Answer `method` by calling `f` for every command (e.g. a different
+    /// `sessionId` per `targetId`, or an error only for one session).
+    /// `Err((code, message))` becomes a protocol error.
+    pub fn reply_with(
+        &self,
+        method: &str,
+        f: impl Fn(&RecordedCommand) -> Result<Value, (i64, String)> + Send + Sync + 'static,
+    ) {
+        self.st()
+            .handlers
+            .insert(method.into(), Handler::Dynamic(Arc::new(f)));
     }
 
     /// Record `method` but never answer it.
@@ -384,6 +402,10 @@ async fn serve(stream: tokio::net::TcpStream, shared: Arc<Shared>) {
                     match handler {
                         Some(Handler::Silent) => continue,
                         Some(Handler::Result(r)) => resp["result"] = r,
+                        Some(Handler::Dynamic(f)) => match f(&cmd) {
+                            Ok(r) => resp["result"] = r,
+                            Err((c, m)) => resp["error"] = json!({"code": c, "message": m}),
+                        },
                         Some(Handler::Error(c, m)) => resp["error"] = json!({"code": c, "message": m}),
                         None => resp["error"] = json!({"code": -32601, "message": "method not found"}),
                     }

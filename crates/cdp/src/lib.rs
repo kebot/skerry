@@ -23,6 +23,7 @@
 pub mod agent_proxy;
 mod client;
 mod connection;
+mod dialog;
 mod error;
 mod input;
 mod screencast;
@@ -34,6 +35,9 @@ pub use client::{Client, Event, Events, Session, Token};
 pub use connection::{
     ActiveTab, BackoffConfig, Connection, ConnectionConfig, ConnectionEvent, ConnectionState,
     FailureReason,
+};
+pub use dialog::{
+    Dialog, DialogEvent, DialogKind, DialogResponse, PermissionPolicy, POLICY_PERMISSIONS,
 };
 pub use error::CdpError;
 pub use input::{KeyEvent, KeyEventKind, Modifiers, MouseButton, MouseEvent, MouseEventKind};

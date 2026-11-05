@@ -15,6 +15,28 @@
 //!   a browser restart: if the Active Tab's target id no longer exists,
 //!   [`ConnectionEvent::ActiveTabGone`] is emitted and nothing is guessed.
 //!
+//! * **Dialogs** (see [`ConnectionConfig::observe_dialogs`]): every page
+//!   target, not only the Active Tab, gets its own flat *observer* session
+//!   with `Page.enable`, so a background Tab blocked on `alert`/`confirm`/
+//!   `prompt`/`beforeunload` is noticed. Observer sessions are created from
+//!   the `Target.getTargets` result after (re)connect and from
+//!   `targetCreated`/`targetInfoChanged` events afterwards (this includes
+//!   popups opened with `window.open`, which are ordinary page targets with
+//!   `opener_id` set), and are forgotten on `targetDestroyed`. They are
+//!   separate from the Active Tab's screencast Session: no screencast runs on
+//!   them, and the screencast Session is unchanged. Chosen over
+//!   `Target.setAutoAttach` because it reuses the existing target tracking,
+//!   attaches only to `page` targets (no iframes/workers) and is deterministic
+//!   to test; the cost is one extra Page-enabled session per Tab. Open
+//!   dialogs are in [`Connection::pending_dialogs`] and announced by
+//!   [`ConnectionEvent::DialogOpened`] / [`ConnectionEvent::DialogClosed`];
+//!   answer with [`Connection::handle_dialog`]. Pending dialogs are dropped
+//!   on disconnect and rediscovered best effort (Chromium re-reports a
+//!   showing dialog on `Page.enable`) after reconnect.
+//! * **Permissions** ([`ConnectionConfig::permissions`]): the policy is applied
+//!   with `Browser.setPermission` the first time an http(s) origin shows up on
+//!   a page target (default browser context only).
+//!
 //! # Handles and pending commands
 //!
 //! A [`Client`] or [`Session`] belongs to one WebSocket. When it drops,
@@ -32,14 +54,18 @@
 //! call [`Connection::retry`] once the cause is fixed (e.g. after the
 //! Manager started the Profile).
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::client::ConnectFailure;
+use crate::dialog::{origin_of, DialogEvent, POLICY_PERMISSIONS};
 use crate::{
-    CdpError, Client, Frame, ScreencastOptions, Session, TargetEvent, TargetInfo, TargetList, Token,
+    CdpError, Client, Dialog, DialogResponse, Frame, PermissionPolicy, ScreencastOptions, Session,
+    TargetEvent, TargetInfo, TargetList, Token,
 };
 
 /// Timeout for each connect attempt and each rebuild command.
@@ -90,6 +116,12 @@ pub struct ConnectionConfig {
     pub url: String,
     pub token: Option<Token>,
     pub backoff: BackoffConfig,
+    /// Observe JS dialogs on all page targets (default `true`). Costs one
+    /// extra attached session per Tab; see the module docs.
+    pub observe_dialogs: bool,
+    /// What to do about permission prompts (default
+    /// [`PermissionPolicy::Deny`]).
+    pub permissions: PermissionPolicy,
 }
 
 impl ConnectionConfig {
@@ -98,6 +130,8 @@ impl ConnectionConfig {
             url: url.into(),
             token,
             backoff: BackoffConfig::default(),
+            observe_dialogs: true,
+            permissions: PermissionPolicy::default(),
         }
     }
 }
@@ -141,7 +175,8 @@ pub struct ActiveTab {
     pub screencast: ScreencastOptions,
 }
 
-/// Notable things that happen on a Connection.
+/// Notable things that happen on a Connection. New variants may be added;
+/// match with a wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionEvent {
     /// A (re)connect succeeded and state was rebuilt.
@@ -154,6 +189,72 @@ pub enum ConnectionEvent {
     ActiveTabGone { target_id: String },
     /// Attaching or starting the screencast for the Active Tab failed.
     ScreencastFailed { target_id: String, error: String },
+    /// A JS dialog opened on a page target (any Tab). Also in
+    /// [`Connection::pending_dialogs`].
+    DialogOpened(Dialog),
+    /// The dialog of `target_id` is gone: answered (by rb, the Agent or the
+    /// page), the page navigated or the target was destroyed. `accepted` and
+    /// `user_input` are as reported by the browser (`false`/empty when it
+    /// closed without a report).
+    DialogClosed {
+        target_id: String,
+        accepted: bool,
+        user_input: String,
+    },
+}
+
+/// Dialog state shared between the supervisor and [`Connection`].
+struct DialogShared {
+    pending: watch::Sender<Vec<Dialog>>,
+    /// Observer session per page target id.
+    sessions: Mutex<HashMap<String, Session>>,
+    events: broadcast::Sender<ConnectionEvent>,
+}
+
+impl DialogShared {
+    fn open(&self, d: Dialog) {
+        self.pending.send_modify(|v| {
+            v.retain(|x| x.target_id != d.target_id);
+            v.push(d.clone());
+        });
+        let _ = self.events.send(ConnectionEvent::DialogOpened(d));
+    }
+
+    /// Remove the dialog of `target_id`; emits only if there was one.
+    fn close(&self, target_id: &str, accepted: bool, user_input: String) {
+        let mut was = false;
+        self.pending.send_if_modified(|v| {
+            let n = v.len();
+            v.retain(|x| x.target_id != target_id);
+            was = v.len() != n;
+            was
+        });
+        if was {
+            let _ = self.events.send(ConnectionEvent::DialogClosed {
+                target_id: target_id.to_string(),
+                accepted,
+                user_input,
+            });
+        }
+    }
+
+    fn target_of(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, s)| s.id() == session_id)
+            .map(|(t, _)| t.clone())
+    }
+
+    fn clear(&self) {
+        self.sessions.lock().unwrap().clear();
+        self.pending.send_if_modified(|v| {
+            let had = !v.is_empty();
+            v.clear();
+            had
+        });
+    }
 }
 
 enum Cmd {
@@ -171,6 +272,7 @@ pub struct Connection {
     session: watch::Receiver<Option<Session>>,
     client: watch::Receiver<Option<Client>>,
     events: broadcast::Sender<ConnectionEvent>,
+    dialogs: Arc<DialogShared>,
     frames: std::sync::Mutex<Option<mpsc::Receiver<Frame>>>,
     task: JoinHandle<()>,
 }
@@ -186,7 +288,14 @@ impl Connection {
         let (client_tx, client) = watch::channel(None);
         let (events, _) = broadcast::channel(64);
         let (frames_tx, frames_rx) = mpsc::channel(2);
+        let (pending_tx, _) = watch::channel(Vec::new());
+        let dialogs = Arc::new(DialogShared {
+            pending: pending_tx,
+            sessions: Mutex::new(HashMap::new()),
+            events: events.clone(),
+        });
         let ctx = Ctx {
+            dialogs: dialogs.clone(),
             config,
             state_tx,
             pages_tx,
@@ -205,6 +314,7 @@ impl Connection {
             session,
             client,
             events,
+            dialogs,
             frames: std::sync::Mutex::new(Some(frames_rx)),
             task,
         }
@@ -237,6 +347,60 @@ impl Connection {
     /// replayed).
     pub fn events(&self) -> broadcast::Receiver<ConnectionEvent> {
         self.events.subscribe()
+    }
+
+    /// JS dialogs currently blocking a page target (at most one per Tab), in
+    /// the order they opened. Empty while down.
+    pub fn pending_dialogs(&self) -> watch::Receiver<Vec<Dialog>> {
+        self.dialogs.pending.subscribe()
+    }
+
+    /// Answer the open dialog of `target_id` with `Page.handleJavaScriptDialog`
+    /// on the session that observed it. The dialog leaves
+    /// [`Connection::pending_dialogs`] when the browser reports it closed.
+    ///
+    /// Races are not errors: if the dialog is already gone (the Agent or the
+    /// page closed it, `-32000 No dialog is showing`) or no dialog is pending
+    /// for the target, this returns `Ok(())` and the dialog is dropped from
+    /// the pending list. Only transport failures (e.g. [`CdpError::Closed`]
+    /// while reconnecting) are returned as `Err`.
+    pub async fn handle_dialog(
+        &self,
+        target_id: &str,
+        response: DialogResponse,
+    ) -> Result<(), CdpError> {
+        let session = self
+            .dialogs
+            .sessions
+            .lock()
+            .unwrap()
+            .get(target_id)
+            .cloned();
+        let pending = self
+            .dialogs
+            .pending
+            .borrow()
+            .iter()
+            .any(|d| d.target_id == target_id);
+        let (true, Some(session)) = (pending, session) else {
+            self.dialogs.close(target_id, false, String::new());
+            return Ok(());
+        };
+        let mut params = serde_json::json!({"accept": response.accept});
+        if let Some(t) = &response.prompt_text {
+            params["promptText"] = serde_json::json!(t);
+        }
+        match session
+            .send("Page.handleJavaScriptDialog", Some(params))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(CdpError::Protocol { .. }) => {
+                self.dialogs.close(target_id, false, String::new());
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The single Frame stream of the Active Tab; it continues across
@@ -275,6 +439,7 @@ impl Drop for Connection {
 }
 
 struct Ctx {
+    dialogs: Arc<DialogShared>,
     config: ConnectionConfig,
     state_tx: watch::Sender<ConnectionState>,
     pages_tx: watch::Sender<Vec<TargetInfo>>,
@@ -369,6 +534,7 @@ async fn run(mut ctx: Ctx, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
                 let end = serve(&mut ctx, &mut cmd_rx, &client).await;
                 ctx.client_tx.send_replace(None);
                 ctx.session_tx.send_replace(None);
+                ctx.dialogs.clear();
                 if let End::Close = end {
                     ctx.set_state(ConnectionState::Closed);
                     return;
@@ -472,16 +638,39 @@ async fn serve(ctx: &mut Ctx, cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>, client:
     ctx.emit(ConnectionEvent::Connected);
 
     let mut active: Option<ActiveRun> = None;
+    let mut seen_origins: HashSet<String> = HashSet::new();
+    for p in list.pages().to_vec() {
+        on_page(ctx, client, &p, &mut seen_origins).await;
+    }
     start_active(ctx, client, &list, &mut active).await;
 
     let end = loop {
         tokio::select! {
             ev = events.recv() => {
                 let Some(ev) = ev else { break End::Dropped };
-                if ev.session_id.is_some() { continue; }
+                if ev.session_id.is_some() {
+                    on_dialog_event(ctx, &ev);
+                    continue;
+                }
                 if let Some(te) = TargetEvent::from_event(&ev) {
                     if list.apply(&te) {
                         ctx.pages_tx.send_replace(list.pages().to_vec());
+                    }
+                    match &te {
+                        TargetEvent::Created(i) | TargetEvent::InfoChanged(i) if i.is_page() => {
+                            on_page(ctx, client, i, &mut seen_origins).await;
+                        }
+                        TargetEvent::Destroyed { target_id } => {
+                            ctx.dialogs.sessions.lock().unwrap().remove(target_id);
+                            ctx.dialogs.close(target_id, false, String::new());
+                        }
+                        TargetEvent::Detached { session_id, .. } => {
+                            if let Some(t) = ctx.dialogs.target_of(session_id) {
+                                ctx.dialogs.sessions.lock().unwrap().remove(&t);
+                                ctx.dialogs.close(&t, false, String::new());
+                            }
+                        }
+                        _ => {}
                     }
                     if let TargetEvent::Destroyed { target_id } = &te {
                         if active.as_ref().is_some_and(|a| &a.target_id == target_id) {
@@ -506,6 +695,89 @@ async fn serve(ctx: &mut Ctx, cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>, client:
     stop_active(ctx, &mut active, matches!(end, End::Close)).await;
     client.close().await;
     end
+}
+
+fn on_dialog_event(ctx: &Ctx, ev: &crate::Event) {
+    match DialogEvent::from_event(ev) {
+        Some(DialogEvent::Opening {
+            session_id,
+            kind,
+            message,
+            url,
+            default_prompt,
+        }) => {
+            if let Some(target_id) = ctx.dialogs.target_of(&session_id) {
+                ctx.dialogs.open(Dialog {
+                    target_id,
+                    session_id,
+                    kind,
+                    message,
+                    url,
+                    default_prompt,
+                });
+            }
+        }
+        Some(DialogEvent::Closed {
+            session_id,
+            result,
+            user_input,
+        }) => {
+            if let Some(target_id) = ctx.dialogs.target_of(&session_id) {
+                ctx.dialogs.close(&target_id, result, user_input);
+            }
+        }
+        None => {}
+    }
+}
+
+/// A page target appeared or changed: make sure its dialogs are observed
+/// and the permission policy covers its origin.
+async fn on_page(ctx: &Ctx, client: &Client, page: &TargetInfo, seen: &mut HashSet<String>) {
+    if ctx.config.observe_dialogs {
+        observe_dialogs(ctx, client, &page.target_id).await;
+    }
+    if let (Some(setting), Some(origin)) = (ctx.config.permissions.setting(), origin_of(&page.url))
+    {
+        if seen.insert(origin.clone()) {
+            let client = client.clone();
+            tokio::spawn(async move {
+                for name in POLICY_PERMISSIONS {
+                    let _ = client
+                        .send(
+                            "Browser.setPermission",
+                            Some(serde_json::json!({
+                                "permission": {"name": name},
+                                "setting": setting,
+                                "origin": origin,
+                            })),
+                            None,
+                        )
+                        .await;
+                }
+            });
+        }
+    }
+}
+
+/// Attach an observer session to `target_id` (once) and enable `Page`
+/// events. Failure (target already gone) is ignored; the next
+/// `targetInfoChanged` retries.
+async fn observe_dialogs(ctx: &Ctx, client: &Client, target_id: &str) {
+    if ctx.dialogs.sessions.lock().unwrap().contains_key(target_id) {
+        return;
+    }
+    let setup = async {
+        let session = client.attach_to_target(target_id).await?;
+        session.send("Page.enable", None).await?;
+        Ok::<_, CdpError>(session)
+    };
+    if let Ok(Ok(session)) = tokio::time::timeout(STEP_TIMEOUT, setup).await {
+        ctx.dialogs
+            .sessions
+            .lock()
+            .unwrap()
+            .insert(target_id.to_string(), session);
+    }
 }
 
 async fn stop_active(ctx: &Ctx, active: &mut Option<ActiveRun>, tell_browser: bool) {

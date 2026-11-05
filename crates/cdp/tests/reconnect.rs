@@ -30,6 +30,8 @@ async fn server() -> FakeCdpServer {
 
 fn config(s: &FakeCdpServer) -> ConnectionConfig {
     let mut c = ConnectionConfig::new(s.url(), Some(Token::new("tok")));
+    c.observe_dialogs = false; // these tests count attaches
+    c.permissions = rb_cdp::PermissionPolicy::Ask; // and commands
     c.backoff = BackoffConfig {
         initial: INITIAL,
         max: Duration::from_millis(80),
