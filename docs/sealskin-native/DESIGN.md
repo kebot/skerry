@@ -20,13 +20,17 @@ All SealSkin Native code lives in `crates/sealskin-native/src/`:
 
 - **`transport.rs` — Selkies WebSocket transport**
   - `socket_request` performs an unredirected `GET` on the session URL (which must carry `access_token` and end with `/`), expects `303 See Other` with a same-origin `Location` and `Set-Cookie`, and opens `wss://.../api/websockets` with the session `Cookie` and `Origin`.
-  - Negotiates JPEG video via `SETTINGS`: `encoder: "jpeg"`, `encoderFallback: true`, `initialClientWidth: 1280`, `initialClientHeight: 720`, `framerate: 30`, `jpeg_quality: 75`, `audioRedundancy: false`.
+  - Negotiates JPEG video via `SETTINGS` and requests an initial 1280×720 display with Opus redundancy disabled. It uses the server’s frame-rate and quality defaults when announced, with the previous 30 fps and quality 75 requests available as a compatibility fallback.
   - Incoming binary frames:
     - Type `3`: JPEG stripe at vertical offset `y`, decoded off-UI on the Tokio task and composited into a BGRA `RgbaImage` canvas (bounded to `4096×2160`).
     - Type `4`: non-JPEG video fallback; triggers an error after the 15 s video deadline if no JPEG arrives.
     - Type `1`: Opus audio packet forwarded to `audio::Playback`.
-  - Incoming text messages: checks `MODE websockets` (errors if the server requires WebRTC), handles `stream_resolution`, starts audio on `server_settings`, and emits `SessionEvent::Audio` on `AUDIO_STARTED`/`AUDIO_STOPPED`.
+  - Incoming text messages handle stream resolution, server policy, and encoder information. Pause/resume and mute labels follow server playback messages. Audio startup respects the server policy and the local mute choice.
+  - A one-second sample reports published-frame rate, received binary payload rate, JPEG stripe processing time, rejected stripes, and WebSocket ping RTT. Encoder information comes separately from the server.
   - Outgoing ticks: 33 ms presentation tick publishes changed `Frame` snapshots over a `watch` channel, sends `CLIENT_FRAME_ACK <id> 0`, and flushes coalesced pointer motion; 1 s heartbeat sends `kh,<keys>` while keys are held.
+
+- **`settings.rs` — JPEG controls and preferences**
+  - Reads numeric ranges and locks, filters unsupported controls, and reconciles live updates with the session’s initial defaults. Stores per-server preferences in Application Support.
 
 - **`audio.rs` — Opus playback**
   - `Playback` opens the default `cpal` output device at 48 kHz stereo `f32` and decodes incoming Opus packets with `opus-decoder` into a bounded ring queue (`48000 * 2 / 8` samples) to cap latency.
@@ -43,7 +47,7 @@ All SealSkin Native code lives in `crates/sealskin-native/src/`:
   - Screens:
     1. **Connect:** **Paste Application Key** button (and status/busy feedback).
     2. **Library:** sidebar with server address and **Remove Connection**; main pane with **Applications** (**Launch**), **Running Sessions** (**Resume**), and **Refresh**.
-    3. **Active session:** toolbar with app name, **Mute**/**Unmute** (when audio is active), **Full Screen**, **Reconnect**, and **Disconnect** (returns to the launcher and refreshes, leaving the remote session running).
+    3. **Active session:** toolbar with playback controls, a Video panel with JPEG settings, stream diagnostics and sizing modes, plus Full Screen, Reconnect, and Disconnect.
 
 ## Scope and non-goals (current version)
 
