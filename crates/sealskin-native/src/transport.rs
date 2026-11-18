@@ -1,4 +1,5 @@
 use crate::audio::Playback;
+use crate::settings::{Key, Settings};
 use futures_util::{SinkExt, StreamExt};
 use gpui::RenderImage;
 use image::{ImageDecoder, ImageFormat, ImageReader};
@@ -6,7 +7,7 @@ use reqwest::Url;
 use serde_json::{json, Value};
 use smallvec::smallvec;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{collections::BTreeSet, io::Cursor};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{
@@ -84,14 +85,57 @@ impl Canvas {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct StreamSample {
+    pub width: u16,
+    pub height: u16,
+    pub fps: f64,
+    pub wire_mbps: f64,
+    pub decode_ms: f64,
+    pub dropped: u64,
+    pub server_encoder: Option<String>,
+    pub rtt_ms: Option<f64>,
+}
+
+#[derive(Default)]
+struct Diagnostics {
+    bytes: usize,
+    frames: u64,
+    stripes: u64,
+    dropped: u64,
+    decode: Duration,
+    server_encoder: Option<String>,
+    rtt_ms: Option<f64>,
+}
+
+impl Diagnostics {
+    fn sample(&mut self, elapsed: Duration, width: u16, height: u16) -> StreamSample {
+        let seconds = elapsed.as_secs_f64();
+        StreamSample {
+            width,
+            height,
+            fps: std::mem::take(&mut self.frames) as f64 / seconds,
+            wire_mbps: std::mem::take(&mut self.bytes) as f64 * 8.0 / 1_000_000.0 / seconds,
+            decode_ms: std::mem::take(&mut self.decode).as_secs_f64() * 1000.0
+                / std::mem::take(&mut self.stripes).max(1) as f64,
+            dropped: self.dropped,
+            server_encoder: self.server_encoder.clone(),
+            rtt_ms: self.rtt_ms,
+        }
+    }
+}
+
 pub enum SessionEvent {
     Audio(bool),
+    Settings(Settings),
+    Stats(StreamSample),
     Error(String),
 }
 
 pub enum Input {
     Command(String),
     Audio(bool),
+    Settings(Vec<(Key, u16)>),
 }
 
 pub async fn run(
@@ -99,6 +143,7 @@ pub async fn run(
     frames: watch::Sender<Frame>,
     mut input: mpsc::UnboundedReceiver<Input>,
     pointer: watch::Receiver<Option<String>>,
+    preferences: Vec<(Key, u16)>,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<(), &'static str> {
     let request = socket_request(url).await?;
@@ -114,7 +159,7 @@ pub async fn run(
         "encoder": "jpeg", "encoderFallback": true,
         "displayId": "primary", "displayScale": 1, "initialClientWidth": 1280,
         "initialClientHeight": 720, "manual_resolution": false,
-        "framerate": 30, "jpeg_quality": 75, "audioRedundancy": false
+        "audioRedundancy": false
     });
     let disconnected = "The Selkies stream disconnected. Choose Reconnect to resume.";
     socket
@@ -129,6 +174,15 @@ pub async fn run(
     let mut unsupported_video = false;
     let mut audio = None;
     let mut ready = false;
+    let mut diagnostics = Diagnostics::default();
+    let mut sample_start = Instant::now();
+    let mut ping = None;
+    let mut sample_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut capabilities = Settings::default();
     let video_deadline = tokio::time::sleep(WAIT_FOR_VIDEO);
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
@@ -140,14 +194,21 @@ pub async fn run(
     loop {
         tokio::select! {
             incoming = socket.next() => match incoming {
-                Some(Ok(Message::Binary(data))) => match data.first().copied() {
+                Some(Ok(Message::Binary(data))) => {
+                    diagnostics.bytes += data.len();
+                    match data.first().copied() {
                     Some(3) if data.len() > 6 => {
                         let id = u16::from_be_bytes([data[2], data[3]]);
                         let y = u16::from_be_bytes([data[4], data[5]]);
                         last_frame = Some(id);
+                        let started = Instant::now();
                         if frame.stripe(y, &data[6..]).is_some() {
+                            diagnostics.stripes += 1;
+                            diagnostics.decode += started.elapsed();
                             changed = true;
                             seen_video = true;
+                        } else {
+                            diagnostics.dropped += 1;
                         }
                     }
                     Some(4) if data.len() > 12 => {
@@ -156,6 +217,7 @@ pub async fn run(
                     }
                     Some(1) => { if let Some(audio) = &mut audio { Playback::packet(audio, &data); } }
                     _ => {}
+                    }
                 },
                 Some(Ok(Message::Text(text))) => {
                     if text.starts_with("MODE ") && text != "MODE websockets" {
@@ -163,18 +225,40 @@ pub async fn run(
                     }
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
                         match data["type"].as_str() {
+                            Some("stream_info") => {
+                                diagnostics.server_encoder = data["info"]["encoder"].as_str().map(str::to_owned);
+                            }
                             Some("stream_resolution") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
                                 let width = dimension(&data["width"])?;
                                 let height = dimension(&data["height"])?;
                                 frame.resize(width, height)?;
                                 changed = true;
                             }
-                            Some("server_settings") if !ready => {
-                                ready = true;
-                                if data["settings"]["audio_enabled"]["value"].as_bool().unwrap_or(true) {
-                                    audio = Playback::new();
-                                    if audio.is_some() {
-                                        socket.send("START_AUDIO".into()).await.map_err(|_| disconnected)?;
+                            Some("server_settings") | Some("display_settings") if primary_display(&data) => {
+                                if data["type"] == "display_settings" {
+                                    capabilities.live(&data["settings"]);
+                                } else {
+                                    capabilities.announce(&data["settings"]);
+                                    if !capabilities.jpeg_available {
+                                        return Err("This server does not offer JPEG video for the session.");
+                                    }
+                                }
+                                let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                                if data["type"] == "server_settings" && !ready {
+                                    ready = true;
+                                    if let Some(legacy) = legacy_settings(&capabilities) {
+                                        socket.send(legacy.into()).await.map_err(|_| disconnected)?;
+                                    }
+                                    if let Some((command, applied)) = settings_command(&capabilities, preferences.iter().copied()) {
+                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        capabilities.live(&applied);
+                                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                                    }
+                                    if data["settings"]["audio_enabled"]["value"].as_bool().unwrap_or(true) {
+                                        audio = Playback::new();
+                                        if audio.is_some() {
+                                            socket.send("START_AUDIO".into()).await.map_err(|_| disconnected)?;
+                                        }
                                     }
                                 }
                             }
@@ -184,6 +268,11 @@ pub async fn run(
                         let _ = events.send(SessionEvent::Audio(true));
                     } else if text == "AUDIO_STOPPED" && audio.is_some() {
                         let _ = events.send(SessionEvent::Audio(false));
+                    }
+                }
+                Some(Ok(Message::Pong(data))) if data.as_ref() == b"sealskin-rtt" => {
+                    if let Some(sent) = ping.take() {
+                        diagnostics.rtt_ms = Some(Instant::now().duration_since(sent).as_secs_f64() * 1000.0);
                     }
                 }
                 Some(Ok(Message::Ping(_))) => { socket.flush().await.map_err(|_| disconnected)?; }
@@ -196,6 +285,14 @@ pub async fn run(
                     Some(Input::Audio(enabled)) => {
                         if let Some(audio) = &mut audio { audio.clear(); }
                         if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
+                    }
+                    Some(Input::Settings(changes)) => {
+                        let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
+                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        // Some Selkies versions only echo changes to other controllers.
+                        capabilities.live(&applied);
+                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
                     }
                     None => { let _ = socket.close(None).await; return Ok(()); }
                 };
@@ -210,8 +307,19 @@ pub async fn run(
                 let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
                 socket.send(format!("kh,{keys}").into()).await.map_err(|_| disconnected)?;
             }
+            _ = sample_tick.tick() => {
+                let now = Instant::now();
+                let sample = diagnostics.sample(now.duration_since(sample_start), frame.width, frame.height);
+                let _ = events.send(SessionEvent::Stats(sample));
+                sample_start = now;
+                if ping.is_none() {
+                    socket.send(Message::Ping(b"sealskin-rtt".as_slice().into())).await.map_err(|_| disconnected)?;
+                    ping = Some(now);
+                }
+            }
             _ = present.tick() => {
                 if changed {
+                    diagnostics.frames += 1;
                     frames.send_replace(frame.snapshot());
                     changed = false;
                 }
@@ -234,6 +342,42 @@ pub async fn run(
             }
         }
     }
+}
+
+fn primary_display(data: &Value) -> bool {
+    data["displayId"].as_str().unwrap_or("primary") == "primary"
+}
+
+fn legacy_settings(settings: &Settings) -> Option<String> {
+    let missing: serde_json::Map<String, Value> = [(Key::Fps, 30), (Key::Jpeg, 75)]
+        .into_iter()
+        .filter(|(key, _)| settings.get(*key).is_none())
+        .map(|(key, value)| (key.wire().into(), key.encode(value)))
+        .collect();
+    (!missing.is_empty()).then(|| format!("SETTINGS,{}", Value::Object(missing)))
+}
+
+fn settings_command(
+    settings: &Settings,
+    changes: impl IntoIterator<Item = (Key, u16)>,
+) -> Option<(String, Value)> {
+    let values: serde_json::Map<String, Value> = changes
+        .into_iter()
+        .filter_map(|(key, value)| {
+            settings
+                .request(key, value)
+                .map(|value| (key.wire().into(), key.encode(value)))
+        })
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let mut command = values.clone();
+    command.insert("picked".into(), json!(values.keys().collect::<Vec<_>>()));
+    Some((
+        format!("SETTINGS,{}", Value::Object(command)),
+        Value::Object(values),
+    ))
 }
 
 fn dimension(value: &Value) -> Result<u16, &'static str> {
@@ -318,6 +462,24 @@ mod tests {
             )
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn reports_wire_bytes_and_frames_within_the_sample_period() {
+        let mut stats = Diagnostics {
+            bytes: 500_000,
+            frames: 15,
+            decode: Duration::from_millis(30),
+            stripes: 30,
+            dropped: 2,
+            ..Default::default()
+        };
+        let sample = stats.sample(Duration::from_millis(500), 1280, 720);
+        assert_eq!(sample.wire_mbps, 8.0);
+        assert_eq!(sample.fps, 30.0);
+        assert_eq!(sample.decode_ms, 1.0);
+        assert_eq!(sample.dropped, 2);
+        assert_eq!(stats.sample(Duration::from_secs(1), 1280, 720).fps, 0.0);
     }
 
     #[test]

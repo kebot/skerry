@@ -1,3 +1,4 @@
+use crate::settings::Key;
 use crate::transport::{self, Frame, Input, SessionEvent};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
@@ -27,6 +28,7 @@ impl NativeSession {
         window: &mut Window,
         cx: &mut App,
         runtime: &Handle,
+        preferences: Vec<(Key, u16)>,
         events: mpsc::UnboundedSender<SessionEvent>,
     ) -> Self {
         let (frame_tx, frames) = watch::channel(Frame::default());
@@ -35,7 +37,8 @@ impl NativeSession {
         let view = cx.new(|cx| Desktop::new(input.clone(), pointer, frames, window, cx));
         window.focus(&view.read(cx).focus);
         let task = runtime.spawn(async move {
-            if let Err(message) = transport::run(address, frame_tx, commands, motion, &events).await
+            if let Err(message) =
+                transport::run(address, frame_tx, commands, motion, preferences, &events).await
             {
                 let _ = events.send(SessionEvent::Error(message.into()));
             }
@@ -45,6 +48,10 @@ impl NativeSession {
 
     pub fn view(&self) -> AnyView {
         self.view.clone().into()
+    }
+
+    pub fn set_settings(&self, changes: Vec<(Key, u16)>) {
+        let _ = self.input.send(Input::Settings(changes));
     }
 
     pub fn set_audio(&self, enabled: bool) {

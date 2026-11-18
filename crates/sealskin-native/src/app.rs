@@ -1,11 +1,13 @@
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
-use crate::transport::SessionEvent;
+use crate::settings::{self, Key, Preferences, Settings};
+use crate::transport::{SessionEvent, StreamSample};
 use crate::view::NativeSession;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Div, KeyBinding,
     Menu, MenuItem, SharedString, Stateful, TitlebarOptions, Window, WindowAppearance,
     WindowBounds, WindowOptions,
 };
+use std::time::Duration;
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
@@ -57,6 +59,12 @@ struct Launcher {
     current: Option<(RemoteSession, NativeSession)>,
     stream_events: Option<gpui::Task<()>>,
     audio: Option<bool>,
+    settings: Option<Settings>,
+    settings_open: bool,
+    stats: Option<StreamSample>,
+    preferences: Preferences,
+    pending_settings: Preferences,
+    settings_task: Option<gpui::Task<()>>,
     busy: Option<String>,
     status: Option<String>,
 }
@@ -70,6 +78,12 @@ impl Launcher {
             current: None,
             stream_events: None,
             audio: None,
+            settings: None,
+            settings_open: false,
+            stats: None,
+            preferences: Preferences::new(),
+            pending_settings: Preferences::new(),
+            settings_task: None,
             busy: None,
             status: None,
         };
@@ -191,10 +205,16 @@ impl Launcher {
         let Some(api) = &self.api else {
             return;
         };
+        self.preferences = settings::load(api.server());
+        let preferences = self
+            .preferences
+            .iter()
+            .map(|(&key, &value)| (key, value))
+            .collect();
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
         let stream = api
             .session_url(&session.session_url)
-            .map(|url| NativeSession::open(url, window, cx, &self.rt, events));
+            .map(|url| NativeSession::open(url, window, cx, &self.rt, preferences, events));
         match stream {
             Ok(stream) => {
                 self.audio = None;
@@ -207,7 +227,12 @@ impl Launcher {
                             .update(cx, |this, cx| {
                                 match event {
                                     SessionEvent::Audio(enabled) => this.audio = Some(enabled),
+                                    SessionEvent::Settings(settings) => {
+                                        this.settings = Some(settings)
+                                    }
+                                    SessionEvent::Stats(sample) => this.stats = Some(sample),
                                     SessionEvent::Error(error) => {
+                                        this.settings = None;
                                         this.audio = None;
                                         this.status = Some(error);
                                     }
@@ -234,7 +259,166 @@ impl Launcher {
         }
     }
 
+    fn change_setting(&mut self, key: Key, value: u16, cx: &mut Context<Self>) {
+        let Some(value) = self
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.request(key, value))
+        else {
+            return;
+        };
+        self.preferences.insert(key, value);
+        self.pending_settings.insert(key, value);
+        let timer = cx.background_executor().timer(Duration::from_millis(180));
+        self.settings_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, cx| {
+                this.apply_settings();
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    fn apply_settings(&mut self) {
+        if let Some((_, stream)) = &self.current {
+            stream.set_settings(
+                std::mem::take(&mut self.pending_settings)
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        if let Some(api) = &self.api {
+            if settings::save(api.server(), &self.preferences).is_err() {
+                self.status = Some("Couldn’t save video preferences.".into());
+            }
+        }
+    }
+
+    fn reset_settings(&mut self, cx: &mut Context<Self>) {
+        let Some(settings) = &self.settings else {
+            return;
+        };
+        self.settings_task = None;
+        self.preferences.clear();
+        self.pending_settings = Key::ALL
+            .into_iter()
+            .filter_map(|key| {
+                let control = settings.get(key)?;
+                settings
+                    .request(key, control.initial)
+                    .map(|value| (key, value))
+            })
+            .collect();
+        self.apply_settings();
+        cx.notify();
+    }
+
+    fn video_settings(&self, colors: Colors, cx: &mut Context<Self>) -> Div {
+        let mut panel = div().p_3().bg(rgb(colors.panel)).flex().flex_col().gap_2();
+        if let Some(stats) = &self.stats {
+            let rtt = stats
+                .rtt_ms
+                .map_or_else(|| "RTT unavailable".into(), |ms| format!("{ms:.0} ms RTT"));
+            let encoder = stats.server_encoder.as_deref().unwrap_or("unreported");
+            let summary = format!("JPEG over WebSocket · {}×{} · {:.0} FPS · {:.2} Mb/s received · {:.1} ms per stripe · {} rejected stripes · {rtt} · Server encoder {encoder}",
+                stats.width, stats.height, stats.fps, stats.wire_mbps, stats.decode_ms, stats.dropped);
+            panel = panel.child(div().text_sm().text_color(rgb(colors.muted)).child(summary));
+        }
+        let Some(settings) = &self.settings else {
+            return panel.child("Video settings are unavailable for this connection.");
+        };
+        panel
+            .child(
+                div().flex().flex_wrap().gap_2().children(
+                    [
+                        (Key::Fps, "Frame rate", "fps", 5),
+                        (Key::Jpeg, "JPEG quality", "%", 5),
+                        (Key::PaintOver, "Paint over still areas", "", 1),
+                        (Key::PaintQuality, "Still JPEG quality", "%", 5),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, label, unit, step)| {
+                        let control = settings.get(key)?;
+                        let value = self
+                            .pending_settings
+                            .get(&key)
+                            .copied()
+                            .unwrap_or(control.current);
+                        let caption = if key == Key::PaintOver {
+                            format!("{label} · {}", if value == 0 { "Off" } else { "On" })
+                        } else {
+                            format!("{label} · {value} {unit}")
+                        };
+                        let group = div()
+                            .flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().child(caption));
+                        if control.locked || control.min == control.max {
+                            return Some(
+                                group.child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(colors.muted))
+                                        .child("Server controlled"),
+                                ),
+                            );
+                        }
+                        if key == Key::PaintOver {
+                            return Some(
+                                group.child(
+                                    colors
+                                        .button(
+                                            "paint-over",
+                                            if value == 0 { "Turn On" } else { "Turn Off" },
+                                            false,
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.change_setting(key, 1 - value, cx)
+                                        })),
+                                ),
+                            );
+                        }
+                        Some(
+                            group.children(
+                                [
+                                    (value.saturating_sub(step).max(control.min), "−"),
+                                    (value.saturating_add(step).min(control.max), "+"),
+                                ]
+                                .into_iter()
+                                .filter(|(next, _)| *next != value)
+                                .map(|(next, sign)| {
+                                    colors
+                                        .button(
+                                            SharedString::from(format!("{}{sign}", key.wire())),
+                                            sign,
+                                            false,
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.change_setting(key, next, cx)
+                                        }))
+                                }),
+                            ),
+                        )
+                    }),
+                ),
+            )
+            .child(
+                colors
+                    .button("reset-video-settings", "Reset Video Settings", false)
+                    .on_click(cx.listener(|this, _, _, cx| this.reset_settings(cx))),
+            )
+    }
+
     fn close_stream(&mut self, window: &mut Window, cx: &mut App) {
+        self.settings_task = None;
+        if !self.pending_settings.is_empty() {
+            self.apply_settings();
+        }
+        self.settings = None;
+        self.stats = None;
+        self.settings_open = false;
         self.stream_events = None;
         if let Some((_, stream)) = self.current.take() {
             stream.release_focus(window, cx);
@@ -347,6 +531,12 @@ impl Render for Launcher {
                 .flex_col()
                 .child(
                     toolbar
+                        .child(colors.button("video-settings", "Video", false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.settings_open = !this.settings_open;
+                                cx.notify();
+                            }),
+                        ))
                         .child(
                             colors
                                 .button("fullscreen", "Full Screen", false)
@@ -366,6 +556,9 @@ impl Render for Launcher {
                 )
                 .when_some(self.status.clone(), |root, status| {
                     root.child(div().p_3().bg(rgb(colors.panel)).child(status))
+                })
+                .when(self.settings_open, |root| {
+                    root.child(self.video_settings(colors, cx))
                 })
                 .child(div().flex_1().min_h_0().child(view));
         }

@@ -5086,6 +5086,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "tempfile",
  "tokio",
  "tokio-tungstenite",
 ]
