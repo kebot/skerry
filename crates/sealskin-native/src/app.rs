@@ -1,6 +1,6 @@
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
 use crate::settings::{self, Key, Preferences, Settings};
-use crate::transport::{SessionEvent, StreamSample};
+use crate::transport::{Resolution, SessionEvent, StreamSample};
 use crate::view::NativeSession;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Div, KeyBinding,
@@ -52,6 +52,13 @@ pub fn run() {
 
 actions!(sealskin, [Quit]);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayMode {
+    Fit,
+    MatchWindow,
+    Fixed(Resolution),
+}
+
 struct Launcher {
     rt: Handle,
     api: Option<Api>,
@@ -62,6 +69,9 @@ struct Launcher {
     settings: Option<Settings>,
     settings_open: bool,
     stats: Option<StreamSample>,
+    display_mode: DisplayMode,
+    resize_allowed: bool,
+    resize_task: Option<gpui::Task<()>>,
     preferences: Preferences,
     pending_settings: Preferences,
     settings_task: Option<gpui::Task<()>>,
@@ -81,12 +91,21 @@ impl Launcher {
             settings: None,
             settings_open: false,
             stats: None,
+            display_mode: DisplayMode::Fit,
+            resize_allowed: false,
+            resize_task: None,
             preferences: Preferences::new(),
             pending_settings: Preferences::new(),
             settings_task: None,
             busy: None,
             status: None,
         };
+        cx.observe_window_bounds(window, |this, window, cx| {
+            if this.display_mode == DisplayMode::MatchWindow {
+                this.resize_display(window, cx);
+            }
+        })
+        .detach();
         cx.observe_window_appearance(window, |_, _, cx| cx.notify())
             .detach();
         match Credential::startup() {
@@ -221,17 +240,25 @@ impl Launcher {
                 self.status = None;
                 window.set_window_title(&format!("{} — {APP_NAME}", session.app_name));
                 self.current = Some((session, stream));
-                self.stream_events = Some(cx.spawn(async move |this, cx| {
+                self.stream_events = Some(cx.spawn_in(window, async move |this, cx| {
                     while let Some(event) = incoming.recv().await {
                         if this
-                            .update(cx, |this, cx| {
+                            .update_in(cx, |this, window, cx| {
                                 match event {
                                     SessionEvent::Audio(enabled) => this.audio = Some(enabled),
                                     SessionEvent::Settings(settings) => {
                                         this.settings = Some(settings)
                                     }
                                     SessionEvent::Stats(sample) => this.stats = Some(sample),
+                                    SessionEvent::ResizeAllowed(allowed) => {
+                                        if allowed && !this.resize_allowed {
+                                            this.resize_allowed = true;
+                                            this.resize_display(window, cx);
+                                        }
+                                        this.resize_allowed = allowed;
+                                    }
                                     SessionEvent::Error(error) => {
+                                        this.resize_allowed = false;
                                         this.settings = None;
                                         this.audio = None;
                                         this.status = Some(error);
@@ -314,6 +341,68 @@ impl Launcher {
         cx.notify();
     }
 
+    fn resize_display(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !self.resize_allowed {
+            return;
+        }
+        let viewport = window.viewport_size();
+        let resolution = match self.display_mode {
+            DisplayMode::Fit => return,
+            DisplayMode::MatchWindow => Resolution::from_window(
+                f32::from(viewport.width) as u16,
+                (f32::from(viewport.height) - TOOLBAR_HEIGHT) as u16,
+            ),
+            DisplayMode::Fixed(resolution) => resolution,
+        };
+        let fixed = matches!(self.display_mode, DisplayMode::Fixed(_));
+        let timer = cx.background_executor().timer(Duration::from_millis(250));
+        self.resize_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, _| {
+                if let Some((_, stream)) = &this.current {
+                    stream.set_resolution(resolution, fixed);
+                }
+            });
+        }));
+    }
+
+    fn display_settings(&self, colors: Colors, cx: &mut Context<Self>) -> Div {
+        let row = div()
+            .flex()
+            .gap_2()
+            .flex_wrap()
+            .items_center()
+            .child("Display");
+        if !self.resize_allowed {
+            return row.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(colors.muted))
+                    .child("Remote size controlled by server"),
+            );
+        }
+        row.children(
+            [
+                (DisplayMode::Fit, "Fit"),
+                (DisplayMode::MatchWindow, "Match Window"),
+                (DisplayMode::Fixed(Resolution(1280, 720)), "1280×720"),
+                (DisplayMode::Fixed(Resolution(1920, 1080)), "1920×1080"),
+                (DisplayMode::Fixed(Resolution(3840, 2160)), "3840×2160"),
+            ]
+            .into_iter()
+            .map(|(mode, label)| {
+                colors
+                    .button(label, label, self.display_mode == mode)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.resize_task = None;
+                        this.display_mode = mode;
+                        this.resize_display(window, cx);
+                        cx.notify();
+                    }))
+            }),
+        )
+    }
+
     fn video_settings(&self, colors: Colors, cx: &mut Context<Self>) -> Div {
         let mut panel = div().p_3().bg(rgb(colors.panel)).flex().flex_col().gap_2();
         if let Some(stats) = &self.stats {
@@ -329,6 +418,7 @@ impl Launcher {
             return panel.child("Video settings are unavailable for this connection.");
         };
         panel
+            .child(self.display_settings(colors, cx))
             .child(
                 div().flex().flex_wrap().gap_2().children(
                     [
@@ -418,6 +508,8 @@ impl Launcher {
         }
         self.settings = None;
         self.stats = None;
+        self.resize_allowed = false;
+        self.resize_task = None;
         self.settings_open = false;
         self.stream_events = None;
         if let Some((_, stream)) = self.current.take() {
@@ -550,6 +642,7 @@ impl Render for Launcher {
                         .child(colors.button("disconnect", "Disconnect", false).on_click(
                             cx.listener(|this, _, window, cx| {
                                 this.close_stream(window, cx);
+                                this.display_mode = DisplayMode::Fit;
                                 this.refresh(cx);
                             }),
                         )),

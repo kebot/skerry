@@ -1,5 +1,5 @@
 use crate::settings::Key;
-use crate::transport::{self, Frame, Input, SessionEvent};
+use crate::transport::{self, Frame, Input, Resolution, SessionEvent};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
     DispatchPhase, Entity, FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -52,6 +52,10 @@ impl NativeSession {
 
     pub fn set_settings(&self, changes: Vec<(Key, u16)>) {
         let _ = self.input.send(Input::Settings(changes));
+    }
+
+    pub fn set_resolution(&self, size: Resolution, fixed: bool) {
+        let _ = self.input.send(Input::Resolution(size, fixed));
     }
 
     pub fn set_audio(&self, enabled: bool) {

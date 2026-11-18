@@ -18,6 +18,19 @@ const MAX_WIDTH: u16 = 4096;
 const MAX_HEIGHT: u16 = 2160;
 const WAIT_FOR_VIDEO: Duration = Duration::from_secs(15);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolution(pub u16, pub u16);
+
+impl Resolution {
+    pub fn from_window(width: u16, height: u16) -> Self {
+        let scale = (f64::from(MAX_WIDTH) / f64::from(width.max(1)))
+            .min(f64::from(MAX_HEIGHT) / f64::from(height.max(1)))
+            .min(1.0);
+        let even = |size| ((f64::from(size) * scale) as u16 & !1).max(2);
+        Self(even(width), even(height))
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Frame {
     pub width: u16,
@@ -129,6 +142,7 @@ pub enum SessionEvent {
     Audio(bool),
     Settings(Settings),
     Stats(StreamSample),
+    ResizeAllowed(bool),
     Error(String),
 }
 
@@ -136,6 +150,7 @@ pub enum Input {
     Command(String),
     Audio(bool),
     Settings(Vec<(Key, u16)>),
+    Resolution(Resolution, bool),
 }
 
 pub async fn run(
@@ -183,6 +198,7 @@ pub async fn run(
     );
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capabilities = Settings::default();
+    let mut resize_allowed = false;
     let video_deadline = tokio::time::sleep(WAIT_FOR_VIDEO);
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
@@ -239,6 +255,8 @@ pub async fn run(
                                     capabilities.live(&data["settings"]);
                                 } else {
                                     capabilities.announce(&data["settings"]);
+                                    resize_allowed = allows_resize(&data["settings"]);
+                                    let _ = events.send(SessionEvent::ResizeAllowed(resize_allowed));
                                     if !capabilities.jpeg_available {
                                         return Err("This server does not offer JPEG video for the session.");
                                     }
@@ -294,6 +312,18 @@ pub async fn run(
                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                         continue;
                     }
+                    Some(Input::Resolution(Resolution(width, height), fixed)) => {
+                        if resize_allowed {
+                            let settings = if fixed {
+                                json!({"manual_resolution": true, "manual_width": width, "manual_height": height})
+                            } else {
+                                json!({"manual_resolution": false})
+                            };
+                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
+                            socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
                     None => { let _ = socket.close(None).await; return Ok(()); }
                 };
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
@@ -342,6 +372,11 @@ pub async fn run(
             }
         }
     }
+}
+
+fn allows_resize(settings: &Value) -> bool {
+    settings["enable_resize"]["value"].as_bool().unwrap_or(true)
+        && settings["manual_resolution"]["locked"].as_bool() != Some(true)
 }
 
 fn primary_display(data: &Value) -> bool {
@@ -462,6 +497,13 @@ mod tests {
             )
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn resolution_fits_within_native_limits_and_uses_even_sizes() {
+        assert_eq!(Resolution::from_window(1281, 721), Resolution(1280, 720));
+        assert_eq!(Resolution::from_window(5120, 2880), Resolution(3840, 2160));
+        assert_eq!(Resolution::from_window(1, 1), Resolution(2, 2));
     }
 
     #[test]
