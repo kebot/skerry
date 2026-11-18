@@ -1,5 +1,5 @@
 use crate::settings::Key;
-use crate::transport::{self, Frame, Input, Resolution, SessionEvent};
+use crate::transport::{self, Frame, Input, Resolution, SessionEvent, SessionOptions};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
     DispatchPhase, Entity, FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -28,7 +28,7 @@ impl NativeSession {
         window: &mut Window,
         cx: &mut App,
         runtime: &Handle,
-        preferences: Vec<(Key, u16)>,
+        options: SessionOptions,
         events: mpsc::UnboundedSender<SessionEvent>,
     ) -> Self {
         let (frame_tx, frames) = watch::channel(Frame::default());
@@ -38,7 +38,7 @@ impl NativeSession {
         window.focus(&view.read(cx).focus);
         let task = runtime.spawn(async move {
             if let Err(message) =
-                transport::run(address, frame_tx, commands, motion, preferences, &events).await
+                transport::run(address, frame_tx, commands, motion, options, &events).await
             {
                 let _ = events.send(SessionEvent::Error(message.into()));
             }
@@ -54,8 +54,16 @@ impl NativeSession {
         let _ = self.input.send(Input::Settings(changes));
     }
 
-    pub fn set_resolution(&self, size: Resolution, fixed: bool) {
-        let _ = self.input.send(Input::Resolution(size, fixed));
+    pub fn set_resolution(&self, size: Resolution, scale: Option<f32>) {
+        let _ = self.input.send(Input::Resolution(size, scale));
+    }
+
+    pub fn set_appearance(&self, dark: bool) {
+        let _ = self.input.send(Input::Appearance(dark));
+    }
+
+    pub fn set_video(&self, enabled: bool) {
+        let _ = self.input.send(Input::Video(enabled));
     }
 
     pub fn set_audio(&self, enabled: bool) {

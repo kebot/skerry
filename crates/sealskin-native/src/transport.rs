@@ -140,6 +140,8 @@ impl Diagnostics {
 
 pub enum SessionEvent {
     Audio(bool),
+    AudioUnavailable(&'static str),
+    Video(bool),
     Settings(Settings),
     Stats(StreamSample),
     ResizeAllowed(bool),
@@ -149,8 +151,16 @@ pub enum SessionEvent {
 pub enum Input {
     Command(String),
     Audio(bool),
+    Video(bool),
     Settings(Vec<(Key, u16)>),
-    Resolution(Resolution, bool),
+    Resolution(Resolution, Option<f32>),
+    Appearance(bool),
+}
+
+pub struct SessionOptions {
+    pub preferences: Vec<(Key, u16)>,
+    pub dark: bool,
+    pub muted: bool,
 }
 
 pub async fn run(
@@ -158,7 +168,7 @@ pub async fn run(
     frames: watch::Sender<Frame>,
     mut input: mpsc::UnboundedReceiver<Input>,
     pointer: watch::Receiver<Option<String>>,
-    preferences: Vec<(Key, u16)>,
+    options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<(), &'static str> {
     let request = socket_request(url).await?;
@@ -199,6 +209,10 @@ pub async fn run(
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capabilities = Settings::default();
     let mut resize_allowed = false;
+    let mut dark = options.dark;
+    let mut video_playing = None;
+    let mut appearance = Value::Null;
+    let mut sent_scheme = None;
     let video_deadline = tokio::time::sleep(WAIT_FOR_VIDEO);
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
@@ -222,6 +236,10 @@ pub async fn run(
                             diagnostics.stripes += 1;
                             diagnostics.decode += started.elapsed();
                             changed = true;
+                            if video_playing.is_none() {
+                                video_playing = Some(true);
+                                let _ = events.send(SessionEvent::Video(true));
+                            }
                             seen_video = true;
                         } else {
                             diagnostics.dropped += 1;
@@ -256,32 +274,47 @@ pub async fn run(
                                 } else {
                                     capabilities.announce(&data["settings"]);
                                     resize_allowed = allows_resize(&data["settings"]);
+                                    appearance = data["settings"]["color_scheme"].clone();
                                     let _ = events.send(SessionEvent::ResizeAllowed(resize_allowed));
                                     if !capabilities.jpeg_available {
                                         return Err("This server does not offer JPEG video for the session.");
                                     }
                                 }
                                 let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                                if data["type"] == "server_settings" {
+                                    if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
+                                        socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
+                                        sent_scheme = Some(scheme);
+                                    }
+                                }
                                 if data["type"] == "server_settings" && !ready {
                                     ready = true;
                                     if let Some(legacy) = legacy_settings(&capabilities) {
                                         socket.send(legacy.into()).await.map_err(|_| disconnected)?;
                                     }
-                                    if let Some((command, applied)) = settings_command(&capabilities, preferences.iter().copied()) {
+                                    if let Some((command, applied)) = settings_command(&capabilities, options.preferences.iter().copied()) {
                                         socket.send(command.into()).await.map_err(|_| disconnected)?;
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
-                                    if data["settings"]["audio_enabled"]["value"].as_bool().unwrap_or(true) {
+                                    if data["settings"]["audio_enabled"]["value"].as_bool() == Some(false) {
+                                        let _ = events.send(SessionEvent::AudioUnavailable("Audio is disabled by the server."));
+                                    } else {
                                         audio = Playback::new();
-                                        if audio.is_some() {
-                                            socket.send("START_AUDIO".into()).await.map_err(|_| disconnected)?;
+                                        match audio_start(&data["settings"], audio.is_some(), options.muted) {
+                                            AudioStart::Play => socket.send("START_AUDIO".into()).await.map_err(|_| disconnected)?,
+                                            AudioStart::Muted => { let _ = events.send(SessionEvent::Audio(false)); }
+                                            AudioStart::Unavailable => { let _ = events.send(SessionEvent::AudioUnavailable("No compatible 48 kHz stereo audio output is available.")); }
                                         }
                                     }
                                 }
                             }
                             _ => {}
                         }
+                    } else if text == "VIDEO_STARTED" || text == "VIDEO_STOPPED" {
+                        let playing = text == "VIDEO_STARTED";
+                        video_playing = Some(playing);
+                        let _ = events.send(SessionEvent::Video(playing));
                     } else if text == "AUDIO_STARTED" && audio.is_some() {
                         let _ = events.send(SessionEvent::Audio(true));
                     } else if text == "AUDIO_STOPPED" && audio.is_some() {
@@ -300,6 +333,9 @@ pub async fn run(
             command = input.recv() => {
                 let text = match command {
                     Some(Input::Command(text)) => text,
+                    Some(Input::Video(enabled)) => {
+                        if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
+                    }
                     Some(Input::Audio(enabled)) => {
                         if let Some(audio) = &mut audio { audio.clear(); }
                         if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
@@ -312,15 +348,22 @@ pub async fn run(
                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                         continue;
                     }
-                    Some(Input::Resolution(Resolution(width, height), fixed)) => {
+                    Some(Input::Resolution(Resolution(width, height), scale)) => {
                         if resize_allowed {
-                            let settings = if fixed {
-                                json!({"manual_resolution": true, "manual_width": width, "manual_height": height})
-                            } else {
-                                json!({"manual_resolution": false})
+                            let settings = match scale {
+                                None => json!({"manual_resolution": true, "manual_width": width, "manual_height": height, "displayScale": 1}),
+                                Some(scale) => json!({"manual_resolution": false, "displayScale": scale}),
                             };
                             socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
                             socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Appearance(next)) => {
+                        dark = next;
+                        if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
+                            socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
+                            sent_scheme = Some(scheme);
                         }
                         continue;
                     }
@@ -363,7 +406,7 @@ pub async fn run(
                     }
                 }
             }
-            _ = &mut video_deadline, if !seen_video => {
+            _ = &mut video_deadline, if !seen_video && video_playing != Some(false) => {
                 return Err(if unsupported_video {
                     "The server did not switch to JPEG. Enable JPEG for this session and reconnect."
                 } else {
@@ -372,6 +415,38 @@ pub async fn run(
             }
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AudioStart {
+    Play,
+    Muted,
+    Unavailable,
+}
+
+fn audio_start(settings: &Value, output: bool, muted: bool) -> AudioStart {
+    if !output {
+        return AudioStart::Unavailable;
+    }
+    if muted || settings["audio_on_start"]["value"].as_bool() == Some(false) {
+        AudioStart::Muted
+    } else {
+        AudioStart::Play
+    }
+}
+
+fn requested_scheme(policy: &Value, dark: bool) -> Option<&'static str> {
+    let scheme = if dark { "dark" } else { "light" };
+    (policy["locked"].as_bool() != Some(true)
+        && policy["allowed"]
+            .as_array()?
+            .iter()
+            .any(|option| option == scheme))
+    .then_some(scheme)
+}
+
+fn color_command(scheme: &str) -> String {
+    format!("SETTINGS,{}", json!({"color_scheme": scheme}))
 }
 
 fn allows_resize(settings: &Value) -> bool {
@@ -497,6 +572,32 @@ mod tests {
             )
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn playback_and_display_follow_server_policy() {
+        assert_eq!(
+            audio_start(&json!({"audio_on_start": {"value": false}}), true, false),
+            AudioStart::Muted
+        );
+        assert_eq!(audio_start(&json!({}), true, true), AudioStart::Muted);
+        assert_eq!(
+            audio_start(&json!({}), false, false),
+            AudioStart::Unavailable
+        );
+        assert_eq!(audio_start(&json!({}), true, false), AudioStart::Play);
+        assert_eq!(
+            requested_scheme(&json!({"allowed": ["light", "dark"]}), true),
+            Some("dark")
+        );
+        assert_eq!(
+            requested_scheme(&json!({"allowed": ["light", "dark"], "locked": true}), true),
+            None
+        );
+        assert!(!allows_resize(&json!({"enable_resize": {"value": false}})));
+        assert!(!allows_resize(
+            &json!({"manual_resolution": {"locked": true}})
+        ));
     }
 
     #[test]

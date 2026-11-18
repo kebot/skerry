@@ -1,6 +1,6 @@
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
 use crate::settings::{self, Key, Preferences, Settings};
-use crate::transport::{Resolution, SessionEvent, StreamSample};
+use crate::transport::{Resolution, SessionEvent, SessionOptions, StreamSample};
 use crate::view::NativeSession;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Div, KeyBinding,
@@ -56,6 +56,7 @@ actions!(sealskin, [Quit]);
 enum DisplayMode {
     Fit,
     MatchWindow,
+    Retina,
     Fixed(Resolution),
 }
 
@@ -66,6 +67,9 @@ struct Launcher {
     current: Option<(RemoteSession, NativeSession)>,
     stream_events: Option<gpui::Task<()>>,
     audio: Option<bool>,
+    audio_unavailable: Option<&'static str>,
+    muted: bool,
+    video: Option<bool>,
     settings: Option<Settings>,
     settings_open: bool,
     stats: Option<StreamSample>,
@@ -88,6 +92,9 @@ impl Launcher {
             current: None,
             stream_events: None,
             audio: None,
+            audio_unavailable: None,
+            muted: false,
+            video: None,
             settings: None,
             settings_open: false,
             stats: None,
@@ -101,13 +108,21 @@ impl Launcher {
             status: None,
         };
         cx.observe_window_bounds(window, |this, window, cx| {
-            if this.display_mode == DisplayMode::MatchWindow {
+            if matches!(
+                this.display_mode,
+                DisplayMode::MatchWindow | DisplayMode::Retina
+            ) {
                 this.resize_display(window, cx);
             }
         })
         .detach();
-        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
-            .detach();
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if let Some((_, stream)) = &this.current {
+                stream.set_appearance(dark_appearance(window));
+            }
+            cx.notify();
+        })
+        .detach();
         match Credential::startup() {
             Ok(Some(credential)) => launcher.connect(credential, false, cx),
             Ok(None) => {}
@@ -231,9 +246,20 @@ impl Launcher {
             .map(|(&key, &value)| (key, value))
             .collect();
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-        let stream = api
-            .session_url(&session.session_url)
-            .map(|url| NativeSession::open(url, window, cx, &self.rt, preferences, events));
+        let stream = api.session_url(&session.session_url).map(|url| {
+            NativeSession::open(
+                url,
+                window,
+                cx,
+                &self.rt,
+                SessionOptions {
+                    preferences,
+                    dark: dark_appearance(window),
+                    muted: self.muted,
+                },
+                events,
+            )
+        });
         match stream {
             Ok(stream) => {
                 self.audio = None;
@@ -246,6 +272,10 @@ impl Launcher {
                             .update_in(cx, |this, window, cx| {
                                 match event {
                                     SessionEvent::Audio(enabled) => this.audio = Some(enabled),
+                                    SessionEvent::AudioUnavailable(reason) => {
+                                        this.audio_unavailable = Some(reason)
+                                    }
+                                    SessionEvent::Video(enabled) => this.video = Some(enabled),
                                     SessionEvent::Settings(settings) => {
                                         this.settings = Some(settings)
                                     }
@@ -261,6 +291,7 @@ impl Launcher {
                                         this.resize_allowed = false;
                                         this.settings = None;
                                         this.audio = None;
+                                        this.video = None;
                                         this.status = Some(error);
                                     }
                                 }
@@ -346,21 +377,28 @@ impl Launcher {
             return;
         }
         let viewport = window.viewport_size();
-        let resolution = match self.display_mode {
-            DisplayMode::Fit => return,
-            DisplayMode::MatchWindow => Resolution::from_window(
-                f32::from(viewport.width) as u16,
-                (f32::from(viewport.height) - TOOLBAR_HEIGHT) as u16,
-            ),
-            DisplayMode::Fixed(resolution) => resolution,
+        let scale = if self.display_mode == DisplayMode::Retina {
+            window.scale_factor()
+        } else {
+            1.0
         };
-        let fixed = matches!(self.display_mode, DisplayMode::Fixed(_));
+        let (resolution, scale) = match self.display_mode {
+            DisplayMode::Fit => return,
+            DisplayMode::MatchWindow | DisplayMode::Retina => (
+                Resolution::from_window(
+                    (f32::from(viewport.width) * scale) as u16,
+                    ((f32::from(viewport.height) - TOOLBAR_HEIGHT) * scale) as u16,
+                ),
+                Some(scale),
+            ),
+            DisplayMode::Fixed(resolution) => (resolution, None),
+        };
         let timer = cx.background_executor().timer(Duration::from_millis(250));
         self.resize_task = Some(cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |this, _| {
                 if let Some((_, stream)) = &this.current {
-                    stream.set_resolution(resolution, fixed);
+                    stream.set_resolution(resolution, scale);
                 }
             });
         }));
@@ -385,6 +423,7 @@ impl Launcher {
             [
                 (DisplayMode::Fit, "Fit"),
                 (DisplayMode::MatchWindow, "Match Window"),
+                (DisplayMode::Retina, "Match Retina"),
                 (DisplayMode::Fixed(Resolution(1280, 720)), "1280×720"),
                 (DisplayMode::Fixed(Resolution(1920, 1080)), "1920×1080"),
                 (DisplayMode::Fixed(Resolution(3840, 2160)), "3840×2160"),
@@ -516,8 +555,17 @@ impl Launcher {
             stream.release_focus(window, cx);
         }
         self.audio = None;
+        self.audio_unavailable = None;
+        self.video = None;
         window.set_window_title(APP_NAME);
     }
+}
+
+fn dark_appearance(window: &Window) -> bool {
+    matches!(
+        window.appearance(),
+        WindowAppearance::Dark | WindowAppearance::VibrantDark
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -612,7 +660,23 @@ impl Render for Launcher {
                         .button("audio", if enabled { "Mute" } else { "Unmute" }, false)
                         .on_click(cx.listener(move |this, _, _, _| {
                             if let Some((_, stream)) = &this.current {
+                                this.muted = enabled;
                                 stream.set_audio(!enabled);
+                            }
+                        })),
+                );
+            }
+            if let Some(enabled) = self.video {
+                toolbar = toolbar.child(
+                    colors
+                        .button(
+                            "video-playback",
+                            if enabled { "Pause" } else { "Resume Video" },
+                            false,
+                        )
+                        .on_click(cx.listener(move |this, _, _, _| {
+                            if let Some((_, stream)) = &this.current {
+                                stream.set_video(!enabled);
                             }
                         })),
                 );
@@ -643,12 +707,16 @@ impl Render for Launcher {
                             cx.listener(|this, _, window, cx| {
                                 this.close_stream(window, cx);
                                 this.display_mode = DisplayMode::Fit;
+                                this.muted = false;
                                 this.refresh(cx);
                             }),
                         )),
                 )
                 .when_some(self.status.clone(), |root, status| {
                     root.child(div().p_3().bg(rgb(colors.panel)).child(status))
+                })
+                .when_some(self.audio_unavailable, |root, reason| {
+                    root.child(div().p_2().text_sm().bg(rgb(colors.panel)).child(reason))
                 })
                 .when(self.settings_open, |root| {
                     root.child(self.video_settings(colors, cx))
