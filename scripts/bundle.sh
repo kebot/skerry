@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
-# Build a release binary and wrap it in dist/rb.app (macOS).
+# Build a release binary and wrap it as a macOS app in dist/.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print([p for p in json.load(sys.stdin)["packages"] if p["name"]=="rb-app"][0]["version"])')"
-cargo build --release -p rb-app
+case "${1:-rb}" in
+  rb) package=rb-app; name=rb; identifier=dev.kebot.rb ;;
+  sealskin-native) package=sealskin-native-app; name='SealSkin Native'; identifier=dev.kebot.sealskin.native ;;
+  *) echo "usage: $0 [rb|sealskin-native]" >&2; exit 2 ;;
+esac
 
-APP="dist/rb.app"
+VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]))' "$package")"
+cargo build --release -p "$package"
+
+APP="dist/$name.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp target/release/rb-app "$APP/Contents/MacOS/rb"
+cp "target/release/$package" "$APP/Contents/MacOS/$name"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>rb</string>
-  <key>CFBundleDisplayName</key><string>rb</string>
-  <key>CFBundleIdentifier</key><string>dev.kebot.rb</string>
-  <key>CFBundleExecutable</key><string>rb</string>
+  <key>CFBundleName</key><string>${name}</string>
+  <key>CFBundleDisplayName</key><string>${name}</string>
+  <key>CFBundleIdentifier</key><string>${identifier}</string>
+  <key>CFBundleExecutable</key><string>${name}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key><string>${VERSION}</string>
