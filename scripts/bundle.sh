@@ -3,10 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-case "${1:-rb}" in
-  rb) package=rb-app; name=rb; identifier=dev.kebot.rb ;;
+case "${1:-sealskin-native}" in
   sealskin-native) package=sealskin-native-app; name='SealSkin Native'; identifier=dev.kebot.sealskin.native ;;
-  *) echo "usage: $0 [rb|sealskin-native]" >&2; exit 2 ;;
+  *) echo "usage: $0 [sealskin-native]" >&2; exit 2 ;;
 esac
 
 VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == sys.argv[1]))' "$package")"

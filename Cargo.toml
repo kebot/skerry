@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cdp", "crates/manager", "crates/store", "crates/app", "crates/sealskin-native"]
+members = ["crates/sealskin-native"]
 
 [workspace.package]
 edition = "2021"
