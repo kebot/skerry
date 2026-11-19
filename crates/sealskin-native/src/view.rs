@@ -1,6 +1,8 @@
 use crate::app::ToggleSessionControls;
 use crate::settings::{Key, ScreenChange};
-use crate::transport::{self, Frame, Input, Pointer, Resolution, SessionEvent, SessionOptions};
+use crate::transport::{
+    self, Frame, Input, Picture, Pointer, Resolution, SessionEvent, SessionOptions,
+};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
     DispatchPhase, Entity, FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -275,7 +277,7 @@ impl Render for Desktop {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let desktop = cx.entity();
         let frame = self.frame.clone();
-        let empty = frame.image.is_none();
+        let empty = frame.picture.is_none();
         let bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
         let native_scale = (!self.scale_locally).then_some(window.scale_factor());
         let picture = picture_bounds(bounds, frame.width, frame.height, native_scale);
@@ -284,7 +286,7 @@ impl Render for Desktop {
         let surface = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |bounds, hitbox, window, cx| {
-                let display = frame.image.as_ref().and_then(|_| {
+                let display = frame.picture.as_ref().and_then(|_| {
                     picture_bounds(bounds, frame.width, frame.height, native_scale).map(|bounds| {
                         PaintedDisplay {
                             bounds,
@@ -344,21 +346,26 @@ impl Render for Desktop {
                         });
                     }
                 });
-                if let (Some(display), Some(image)) = (display, &frame.image) {
-                    let _ = window.paint_image(
-                        display.bounds,
-                        Corners::default(),
-                        image.clone(),
-                        0,
-                        false,
-                    );
+                let mut jpeg = None;
+                if let (Some(display), Some(picture)) = (display, &frame.picture) {
+                    match picture {
+                        Picture::Jpeg(image) => {
+                            let _ = window.paint_image(
+                                display.bounds,
+                                Corners::default(),
+                                image.clone(),
+                                0,
+                                false,
+                            );
+                            jpeg = Some(image.clone());
+                        }
+                        Picture::H264(surface) => {
+                            window.paint_surface(display.bounds, surface.pixel_buffer())
+                        }
+                    }
                 }
-                if let Some(old) = painted.replace(frame.image.clone()) {
-                    if !frame
-                        .image
-                        .as_ref()
-                        .is_some_and(|new| Arc::ptr_eq(new, &old))
-                    {
+                if let Some(old) = painted.replace(jpeg.clone()) {
+                    if !jpeg.as_ref().is_some_and(|new| Arc::ptr_eq(new, &old)) {
                         let _ = window.drop_image(old);
                     }
                 }

@@ -1,5 +1,6 @@
 use crate::audio::Playback;
-use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
+use crate::h264::{self, Decoder};
+use crate::settings::{encoder_allowed, Key, ScreenChange, ScreenPolicy, Settings};
 use futures_util::{SinkExt, StreamExt};
 use gpui::RenderImage;
 use image::{ImageDecoder, ImageFormat, ImageReader};
@@ -41,7 +42,13 @@ impl Resolution {
 pub struct Frame {
     pub width: u16,
     pub height: u16,
-    pub image: Option<Arc<RenderImage>>,
+    pub picture: Option<Picture>,
+}
+
+#[derive(Clone)]
+pub enum Picture {
+    Jpeg(Arc<RenderImage>),
+    H264(h264::Surface),
 }
 
 #[derive(Default)]
@@ -54,7 +61,7 @@ struct Canvas {
 
 impl Canvas {
     fn resize(&mut self, width: u16, height: u16) -> Result<(), &'static str> {
-        if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
+        if !valid_resolution(width, height) {
             return Err("The remote display resolution is outside the supported range.");
         }
         if (self.width, self.height) != (width, height) {
@@ -95,10 +102,10 @@ impl Canvas {
         Frame {
             width: self.width,
             height: self.height,
-            image: self.received_image.then(|| {
-                Arc::new(RenderImage::new(smallvec![image::Frame::new(
+            picture: self.received_image.then(|| {
+                Picture::Jpeg(Arc::new(RenderImage::new(smallvec![image::Frame::new(
                     self.pixels.clone()
-                )]))
+                )])))
             }),
         }
     }
@@ -112,6 +119,7 @@ pub struct StreamSample {
     pub wire_mbps: f64,
     pub decode_ms: f64,
     pub dropped: u64,
+    pub client_decoder: &'static str,
     pub server_encoder: Option<String>,
     pub rtt_ms: Option<f64>,
 }
@@ -120,7 +128,8 @@ pub struct StreamSample {
 struct Diagnostics {
     bytes: usize,
     frames: u64,
-    stripes: u64,
+    packets: u64,
+    hardware_video: bool,
     dropped: u64,
     decode: Duration,
     server_encoder: Option<String>,
@@ -136,7 +145,12 @@ impl Diagnostics {
             fps: std::mem::take(&mut self.frames) as f64 / seconds,
             wire_mbps: std::mem::take(&mut self.bytes) as f64 * 8.0 / 1_000_000.0 / seconds,
             decode_ms: std::mem::take(&mut self.decode).as_secs_f64() * 1000.0
-                / std::mem::take(&mut self.stripes).max(1) as f64,
+                / std::mem::take(&mut self.packets).max(1) as f64,
+            client_decoder: if self.hardware_video {
+                "H.264 · VideoToolbox"
+            } else {
+                "JPEG"
+            },
             dropped: self.dropped,
             server_encoder: self.server_encoder.clone(),
             rtt_ms: self.rtt_ms,
@@ -186,6 +200,54 @@ pub struct SessionOptions {
     pub preferences: Vec<(Key, u16)>,
     pub dark: bool,
     pub muted: bool,
+    pub prefer_h264: bool,
+}
+
+struct HardwareVideo {
+    decoder: Decoder,
+    decoded: bool,
+    deadline: Option<Instant>,
+    next_keyframe_request: Instant,
+}
+
+impl HardwareVideo {
+    fn new(now: Instant) -> Self {
+        Self {
+            decoder: Decoder::default(),
+            decoded: false,
+            deadline: Some(now + WAIT_FOR_VIDEO),
+            next_keyframe_request: now,
+        }
+    }
+
+    fn decode(&mut self, data: &[u8]) -> Option<Frame> {
+        let packet = h264::Packet::parse(data)?;
+        let (width, height) = packet.size;
+        if !valid_resolution(width, height) {
+            return None;
+        }
+        let surface = self.decoder.decode(&packet).ok()??;
+        self.decoded = true;
+        self.deadline = None;
+        Some(Frame {
+            width,
+            height,
+            picture: Some(Picture::H264(surface)),
+        })
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn recover(&mut self, now: Instant) -> bool {
+        self.deadline.get_or_insert(now + WAIT_FOR_VIDEO);
+        if now < self.next_keyframe_request {
+            return false;
+        }
+        self.next_keyframe_request = now + Duration::from_secs(1);
+        true
+    }
 }
 
 pub async fn run(
@@ -205,8 +267,10 @@ pub async fn run(
     .await
     .map_err(|_| "The Selkies WebSocket did not respond.")?
     .map_err(|_| "Couldn’t connect to the Selkies WebSocket.")?;
+    let mut hardware =
+        (options.prefer_h264 && h264::supported()).then(|| HardwareVideo::new(Instant::now()));
     let settings = json!({
-        "encoder": "jpeg", "encoderFallback": true,
+        "encoder": if hardware.is_some() { "h264enc" } else { "jpeg" }, "encoderFallback": true,
         "displayId": "primary", "displayScale": 1, "initialClientWidth": 1280,
         "initialClientHeight": 720, "manual_resolution": false,
         "audioRedundancy": false
@@ -217,7 +281,9 @@ pub async fn run(
         .await
         .map_err(|_| disconnected)?;
     let mut frame = Canvas::default();
-    frame.resize(1280, 720)?;
+    let mut jpeg_size = Resolution(1280, 720);
+    let mut active_size = jpeg_size;
+    let mut decoded = None;
     let mut changed = false;
     let mut last_frame = None;
     let mut seen_video = false;
@@ -253,19 +319,18 @@ pub async fn run(
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
                     match data.first().copied() {
-                    Some(3) if data.len() > 6 => {
+                    Some(3) if data.len() > 6 && hardware.as_ref().is_none_or(|video| !video.decoded) => {
+                        frame.resize(jpeg_size.0, jpeg_size.1)?;
+                        active_size = jpeg_size;
                         let id = u16::from_be_bytes([data[2], data[3]]);
                         let y = u16::from_be_bytes([data[4], data[5]]);
                         last_frame = Some(id);
                         let started = Instant::now();
                         if frame.stripe(y, &data[6..]).is_some() {
-                            diagnostics.stripes += 1;
+                            diagnostics.packets += 1;
+                            diagnostics.hardware_video = false;
                             diagnostics.decode += started.elapsed();
                             changed = true;
-                            if video_playing.is_none() {
-                                video_playing = Some(true);
-                                let _ = events.send(SessionEvent::Video(true));
-                            }
                             seen_video = true;
                         } else {
                             diagnostics.dropped += 1;
@@ -273,10 +338,33 @@ pub async fn run(
                     }
                     Some(4) if data.len() > 12 => {
                         last_frame = Some(u16::from_be_bytes([data[2], data[3]]));
-                        unsupported_video = true;
+                        if let Some(video) = &mut hardware {
+                            let started = Instant::now();
+                            if let Some(picture) = video.decode(&data) {
+                                frame = Canvas::default();
+                                active_size = Resolution(picture.width, picture.height);
+                                decoded = Some(picture);
+                                changed = false;
+                                diagnostics.hardware_video = true;
+                                diagnostics.packets += 1;
+                                diagnostics.decode += started.elapsed();
+                                seen_video = true;
+                            } else {
+                                diagnostics.dropped += 1;
+                                if video.recover(Instant::now()) {
+                                    socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
+                                }
+                            }
+                        } else {
+                            unsupported_video = true;
+                        }
                     }
                     Some(1) => { if let Some(audio) = &mut audio { Playback::packet(audio, &data); } }
                     _ => {}
+                    }
+                    if seen_video && video_playing.is_none() {
+                        video_playing = Some(true);
+                        let _ = events.send(SessionEvent::Video(true));
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
@@ -291,8 +379,15 @@ pub async fn run(
                             Some("stream_resolution") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
                                 let width = dimension(&data["width"])?;
                                 let height = dimension(&data["height"])?;
-                                frame.resize(width, height)?;
-                                changed = true;
+                                if !valid_resolution(width, height) {
+                                    return Err("The remote display resolution is outside the supported range.");
+                                }
+                                jpeg_size = Resolution(width, height);
+                                active_size = jpeg_size;
+                                if hardware.as_ref().is_none_or(|video| !video.decoded) {
+                                    frame.resize(width, height)?;
+                                    changed = true;
+                                }
                             }
                             Some("server_settings") | Some("display_settings") if primary_display(&data) => {
                                 if data["type"] == "display_settings" {
@@ -304,7 +399,12 @@ pub async fn run(
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
                                     appearance = data["settings"]["color_scheme"].clone();
                                     let _ = events.send(SessionEvent::ResizeAllowed(resize_allowed));
-                                    if !capabilities.jpeg_available {
+                                    if !encoder_allowed(&data["settings"]["encoder"], "h264enc") {
+                                        if let Some(video) = &mut hardware {
+                                            video.deadline = Some(Instant::now());
+                                        }
+                                    }
+                                    if hardware.is_none() && !capabilities.jpeg_available {
                                         return Err("This server does not offer JPEG video for the session.");
                                     }
                                 }
@@ -362,10 +462,14 @@ pub async fn run(
                 let text = match command {
                     Some(Input::Command(text)) => text,
                     Some(Input::Pointer(position)) => {
-                        let Some(text) = position.command_for(Resolution(frame.width, frame.height)) else { continue; };
+                        let Some(text) = position.command_for(active_size) else { continue; };
                         text
                     }
                     Some(Input::Video(enabled)) => {
+                        if let Some(video) = &mut hardware {
+                            video.decoder = Decoder::default();
+                            video.deadline = enabled.then(|| Instant::now() + WAIT_FOR_VIDEO);
+                        }
                         if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
                     }
                     Some(Input::Audio(enabled)) => {
@@ -421,7 +525,7 @@ pub async fn run(
             }
             _ = sample_tick.tick() => {
                 let now = Instant::now();
-                let sample = diagnostics.sample(now.duration_since(sample_start), frame.width, frame.height);
+                let sample = diagnostics.sample(now.duration_since(sample_start), active_size.0, active_size.1);
                 let _ = events.send(SessionEvent::Stats(sample));
                 sample_start = now;
                 if ping.is_none() {
@@ -430,9 +534,21 @@ pub async fn run(
                 }
             }
             _ = present.tick() => {
-                if changed {
-                    diagnostics.frames += 1;
-                    frames.send_replace(frame.snapshot());
+                if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
+                    if !capabilities.jpeg_available {
+                        return Err("Hardware H.264 failed and the server does not allow JPEG fallback.");
+                    }
+                    hardware = None;
+                    decoded = None;
+                    seen_video = false;
+                    unsupported_video = false;
+                    video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
+                    socket.send("SETTINGS,{\"encoder\":\"jpeg\",\"encoderFallback\":true}".into()).await.map_err(|_| disconnected)?;
+                    socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
+                }
+                if let Some(picture) = decoded.take().or_else(|| changed.then(|| frame.snapshot())) {
+                    if picture.picture.is_some() { diagnostics.frames += 1; }
+                    frames.send_replace(picture);
                     changed = false;
                 }
                 if let Some(id) = last_frame.take() {
@@ -440,12 +556,12 @@ pub async fn run(
                 }
                 if pointer.has_changed().unwrap_or(false) {
                     let position = *pointer.borrow_and_update();
-                    if let Some(command) = position.and_then(|p| p.command_for(Resolution(frame.width, frame.height))) {
+                    if let Some(command) = position.and_then(|p| p.command_for(active_size)) {
                         socket.send(command.into()).await.map_err(|_| disconnected)?;
                     }
                 }
             }
-            _ = &mut video_deadline, if !seen_video && video_playing != Some(false) => {
+            _ = &mut video_deadline, if hardware.is_none() && !seen_video && video_playing != Some(false) => {
                 return Err(if unsupported_video {
                     "The server did not switch to JPEG. Enable JPEG for this session and reconnect."
                 } else {
@@ -527,6 +643,10 @@ fn settings_command(
         format!("SETTINGS,{}", Value::Object(command)),
         Value::Object(values),
     ))
+}
+
+fn valid_resolution(width: u16, height: u16) -> bool {
+    width > 0 && width <= MAX_WIDTH && height > 0 && height <= MAX_HEIGHT
 }
 
 fn dimension(value: &Value) -> Result<u16, &'static str> {
@@ -654,6 +774,17 @@ mod tests {
     }
 
     #[test]
+    fn hardware_recovery_throttles_requests_without_postponing_fallback() {
+        let start = Instant::now();
+        let mut video = HardwareVideo::new(start);
+        assert!(video.recover(start));
+        assert!(!video.recover(start + Duration::from_millis(500)));
+        assert!(video.recover(start + Duration::from_secs(1)));
+        assert!(!video.expired(start + Duration::from_secs(14)));
+        assert!(video.expired(start + WAIT_FOR_VIDEO));
+    }
+
+    #[test]
     fn manual_resolution_rejects_dimensions_outside_client_limits() {
         assert_eq!(
             Resolution::manual("1367", "769"),
@@ -677,7 +808,7 @@ mod tests {
             bytes: 500_000,
             frames: 15,
             decode: Duration::from_millis(30),
-            stripes: 30,
+            packets: 30,
             dropped: 2,
             ..Default::default()
         };
@@ -702,8 +833,8 @@ mod tests {
         assert!(unchanged.0[2] > 240); // BGRA red
         assert!(canvas.pixels.get_pixel(0, 1).0[0] > 240); // BGRA blue
         assert!(canvas.stripe(2, &red).is_none());
-        assert!(canvas.snapshot().image.is_some());
+        assert!(canvas.snapshot().picture.is_some());
         canvas.resize(3, 2).unwrap();
-        assert!(canvas.snapshot().image.is_none());
+        assert!(canvas.snapshot().picture.is_none());
     }
 }

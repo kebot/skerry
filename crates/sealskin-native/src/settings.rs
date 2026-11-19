@@ -69,11 +69,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn announce(&mut self, payload: &Value) {
-        let encoder = &payload["encoder"];
-        self.jpeg_available = encoder["allowed"].as_array().map_or_else(
-            || encoder["locked"].as_bool() != Some(true) || encoder["value"] == "jpeg",
-            |allowed| allowed.iter().any(|value| value == "jpeg"),
-        );
+        self.jpeg_available = encoder_allowed(&payload["encoder"], "jpeg");
         for key in Key::ALL {
             if let Some(control) = parse(key, &payload[key.wire()], self.get(key)) {
                 self.controls.insert(key, control);
@@ -100,6 +96,15 @@ impl Settings {
             .filter(|control| !control.locked && control.min != control.max)
             .map(|control| value.clamp(control.min, control.max))
     }
+}
+
+pub fn encoder_allowed(encoder: &Value, name: &str) -> bool {
+    if encoder["locked"] == true {
+        return encoder["value"] == name;
+    }
+    encoder["allowed"]
+        .as_array()
+        .is_none_or(|allowed| allowed.iter().any(|value| value == name))
 }
 
 fn parse(key: Key, entry: &Value, previous: Option<Control>) -> Option<Control> {

@@ -294,6 +294,7 @@ impl Launcher {
                     preferences,
                     dark: dark_appearance(window),
                     muted: self.muted,
+                    prefer_h264: std::env::var("SEALSKIN_VIDEO_CODEC").as_deref() == Ok("h264"),
                 },
                 events,
             )

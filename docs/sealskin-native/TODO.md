@@ -14,8 +14,8 @@
 - [x] [Support Retina displays and remote light and dark appearance](tickets/hidpi-and-appearance.md)
 - [x] [Add video pause and clearer audio controls](tickets/playback.md)
 
-### DOING
-- [ ] [Test hardware-decoded H.264 over the existing connection](tickets/h264-video.md)
+### REVIEW
+- [x] [Prototype hardware-decoded H.264 over the existing connection](tickets/h264-video.md)
 
 ### TODO
 - [ ] [Evaluate AV1, H.265, VP8, and VP9 after H.264](tickets/more-codecs.md)

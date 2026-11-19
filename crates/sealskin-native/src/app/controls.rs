@@ -724,16 +724,17 @@ impl Render for ControlPanel {
                         ("Received bitrate", format!("{:.2} Mb/s", stats.wire_mbps)),
                         (
                             "Decode time",
-                            format!("{:.1} ms per stripe", stats.decode_ms),
+                            format!("{:.1} ms per packet", stats.decode_ms),
                         ),
-                        ("Rejected stripes", stats.dropped.to_string()),
+                        ("Rejected packets", stats.dropped.to_string()),
                         (
                             "Round trip",
                             stats
                                 .rtt_ms
                                 .map_or("Unavailable".into(), |ms| format!("{ms:.0} ms")),
                         ),
-                        ("Transport", "JPEG over WebSocket".into()),
+                        ("Transport", "WebSocket".into()),
+                        ("Client decoder", stats.client_decoder.into()),
                         (
                             "Server encoder",
                             stats.server_encoder.clone().unwrap_or("Unreported".into()),
