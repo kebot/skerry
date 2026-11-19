@@ -1,4 +1,4 @@
-use gpui::{App, DisplayId, Pixels, Size, Window};
+use gpui_kit::{App, DisplayId, Pixels, Size, Window};
 use objc2_core_foundation::{CFArray, CFRetained};
 use objc2_core_graphics::{CGDisplayCopyAllDisplayModes, CGDisplayMode};
 
@@ -33,7 +33,7 @@ impl UiScale {
                 return panel.scale.unwrap_or(backing);
             }
         }
-        let scale = native_ui_scale(id.into(), logical);
+        let scale = native_ui_scale(u64::from(id) as u32, logical);
         self.panel = Some(Panel {
             display: id,
             logical,

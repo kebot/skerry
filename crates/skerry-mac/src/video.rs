@@ -1,5 +1,3 @@
-use core_foundation::base::TCFType;
-use core_video::pixel_buffer::CVPixelBuffer;
 use objc2_core_foundation::{
     CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
 };
@@ -13,8 +11,9 @@ use objc2_core_media::{
 };
 use objc2_core_video::{
     kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
-    kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-    CVImageBuffer, CVPixelBufferGetIOSurface,
+    kCVPixelBufferPixelFormatTypeKey, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, CVBuffer,
+    CVImageBuffer, CVPixelBufferGetHeight, CVPixelBufferGetIOSurface,
+    CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
 };
 use objc2_video_toolbox::{
     kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder, VTDecodeFrameFlags,
@@ -168,7 +167,7 @@ impl<'a> AccessUnit<'a> {
 }
 
 #[derive(Clone)]
-pub struct Surface(CVPixelBuffer);
+pub struct Surface(CFRetained<CVBuffer>);
 
 // VideoToolbox has finished writing before publication. The retained buffer is
 // only shared for Metal reads, and Core Foundation reference counting is atomic.
@@ -176,7 +175,7 @@ unsafe impl Send for Surface {}
 unsafe impl Sync for Surface {}
 
 impl Surface {
-    pub fn pixel_buffer(&self) -> CVPixelBuffer {
+    pub fn pixel_buffer(&self) -> CFRetained<CVBuffer> {
         self.0.clone()
     }
 }
@@ -345,10 +344,8 @@ unsafe extern "C-unwind" fn decoded_frame(
     if CVPixelBufferGetIOSurface(Some(image)).is_none() {
         return;
     }
-    // Retain a reference through the Core Video bindings that GPUI uses.
-    let buffer =
-        unsafe { CVPixelBuffer::wrap_under_get_rule(NonNull::from(image).as_ptr().cast()) };
-    if buffer.get_pixel_format() == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+    if CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+        let buffer = CFRetained::from(image);
         unsafe {
             *output.cast::<Option<Surface>>() = Some(Surface(buffer));
         }
@@ -538,7 +535,10 @@ impl Decoder {
             .as_ref()
             .ok_or("The video decoder needs a keyframe.")?;
         let surface = session.decode(sample)?;
-        if (surface.0.get_width(), surface.0.get_height())
+        if (
+            CVPixelBufferGetWidth(&surface.0),
+            CVPixelBufferGetHeight(&surface.0),
+        )
             != (usize::from(packet.size.0), usize::from(packet.size.1))
         {
             return Err("The decoded picture size doesn’t match the packet.");
@@ -632,15 +632,21 @@ mod tests {
             payload: &key,
         };
         let surface = decoder.decode(&packet).unwrap().unwrap().pixel_buffer();
-        let flags = core_video::pixel_buffer::kCVPixelBufferLock_ReadOnly;
-        assert_eq!(surface.lock_base_address(flags), 0);
-        let stride = surface.get_bytes_per_row_of_plane(0);
+        let flags = objc2_core_video::CVPixelBufferLockFlags::ReadOnly;
+        assert_eq!(
+            unsafe { objc2_core_video::CVPixelBufferLockBaseAddress(&surface, flags) },
+            0
+        );
+        let stride = objc2_core_video::CVPixelBufferGetBytesPerRowOfPlane(&surface, 0);
         // Core Video provides a read-only luma plane for the lifetime of the lock.
         let (black, white) = unsafe {
-            let plane = surface.get_base_address_of_plane(0).cast::<u8>();
+            let plane = objc2_core_video::CVPixelBufferGetBaseAddressOfPlane(&surface, 0).cast::<u8>();
             (*plane.add(48 * stride + 16), *plane.add(144 * stride + 16))
         };
-        assert_eq!(surface.unlock_base_address(flags), 0);
+        assert_eq!(
+            unsafe { objc2_core_video::CVPixelBufferUnlockBaseAddress(&surface, flags) },
+            0
+        );
         assert!(black <= 4 && white >= 251, "luma range {black}–{white}");
 
         let mut predicted = Packet {

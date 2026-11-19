@@ -3,7 +3,7 @@ use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
-use gpui::RenderImage;
+use gpui_kit::RenderImage;
 use image::{ImageDecoder, ImageFormat, ImageReader};
 use reqwest::Url;
 use serde_json::{json, Value};

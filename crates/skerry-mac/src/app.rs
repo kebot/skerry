@@ -10,10 +10,15 @@ use crate::transport::{DisplayRequest, Resolution, SessionEvent, SessionOptions,
 use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
-use gpui::{
-    actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Div, KeyBinding,
-    Menu, MenuItem, SharedString, Stateful, TitlebarOptions, Window, WindowAppearance,
-    WindowBounds, WindowHandle, WindowOptions,
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    scroll::ScrollableElement as _,
+    ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
+};
+use gpui_kit::{
+    actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, Context, Div,
+    FontWeight, KeyBinding, Menu, MenuItem, Pixels, SharedString, Size, Task, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
@@ -38,7 +43,10 @@ pub fn run() {
         .build()
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
-    Application::new().run(move |cx: &mut App| {
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx: &mut App| {
+        gpui_kit::init(cx);
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
@@ -51,6 +59,7 @@ pub fn run() {
             Menu {
                 name: APP_NAME.into(),
                 items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
+                disabled: false,
             },
             Menu {
                 name: "View".into(),
@@ -58,16 +67,17 @@ pub fn run() {
                     MenuItem::action("Session Controls", ToggleSessionControls),
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
                 ],
+                disabled: false,
             },
         ]);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
         let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
-        cx.open_window(
+        gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(640.), px(420.))),
@@ -77,6 +87,7 @@ pub fn run() {
                 }),
                 ..Default::default()
             },
+            cx,
             move |window, cx| cx.new(|cx| Launcher::new(handle.clone(), window, cx)),
         )
         .expect("open SealSkin window");
@@ -106,7 +117,7 @@ enum DisplayMode {
 impl DisplayMode {
     fn request(
         self,
-        viewport: gpui::Size<gpui::Pixels>,
+        viewport: Size<Pixels>,
         backing_scale: f32,
     ) -> Option<DisplayRequest> {
         let scale = match self {
@@ -135,13 +146,13 @@ struct Launcher {
     api: Option<Api>,
     library: Option<Library>,
     current: Option<(RemoteSession, NativeSession)>,
-    stream_events: Option<gpui::Task<()>>,
+    stream_events: Option<Task<()>>,
     audio: Option<bool>,
     audio_unavailable: Option<&'static str>,
     muted: bool,
     video: Option<bool>,
     settings: Option<Settings>,
-    controls: Option<WindowHandle<ControlPanel>>,
+    controls: Option<AnyWindowHandle>,
     stats: Option<StreamSample>,
     display_mode: DisplayMode,
     retina: bool,
@@ -152,10 +163,10 @@ struct Launcher {
     applied_resolution: Option<DisplayRequest>,
     applied_dpi: Option<u16>,
     resize_allowed: bool,
-    resize_task: Option<gpui::Task<()>>,
+    resize_task: Option<Task<()>>,
     preferences: Preferences,
     pending_settings: VideoSettings,
-    settings_task: Option<gpui::Task<()>>,
+    settings_task: Option<Task<()>>,
     busy: Option<String>,
     status: Option<String>,
 }
@@ -198,7 +209,9 @@ impl Launcher {
         });
         cx.observe_window_bounds(window, |this, window, cx| this.resize_display(window, cx))
             .detach();
+        Theme::sync_system_appearance(Some(window), cx);
         cx.observe_window_appearance(window, |this, window, cx| {
+            Theme::sync_system_appearance(Some(window), cx);
             if let Some((_, stream)) = &this.current {
                 stream.set_appearance(dark_appearance(window));
             }
@@ -672,71 +685,13 @@ fn dark_appearance(window: &Window) -> bool {
     )
 }
 
-#[derive(Clone, Copy)]
-struct Colors {
-    background: u32,
-    sidebar: u32,
-    panel: u32,
-    ink: u32,
-    muted: u32,
-    edge: u32,
-    accent: u32,
-}
-
-impl Colors {
-    fn for_window(window: &Window) -> Self {
-        match window.appearance() {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self {
-                background: 0x191c22,
-                sidebar: 0x14171d,
-                panel: 0x22262f,
-                ink: 0xf1f3f6,
-                muted: 0xa3acbb,
-                edge: 0x343b48,
-                accent: 0x346ce0,
-            },
-            _ => Self {
-                background: 0xf5f6f9,
-                sidebar: 0xedeff4,
-                panel: 0xffffff,
-                ink: 0x182238,
-                muted: 0x56647a,
-                edge: 0xdde2ec,
-                accent: 0x2658cb,
-            },
-        }
-    }
-
-    fn button(
-        self,
-        id: impl Into<gpui::ElementId>,
-        label: impl Into<SharedString>,
-        primary: bool,
-    ) -> Stateful<Div> {
-        div()
-            .id(id)
-            .flex_none()
-            .px_3()
-            .py_1p5()
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(if primary { self.accent } else { self.edge }))
-            .bg(rgb(if primary { self.accent } else { self.panel }))
-            .text_color(rgb(if primary { 0xffffff } else { self.ink }))
-            .text_sm()
-            .cursor_pointer()
-            .hover(move |style| style.border_color(rgb(self.muted)))
-            .child(label.into())
-    }
-}
-
 impl Render for Launcher {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_window(window);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let root = div()
             .size_full()
-            .bg(rgb(colors.background))
-            .text_color(rgb(colors.ink));
+            .bg(theme.background)
+            .text_color(theme.foreground);
         if let Some((_, stream)) = &self.current {
             return root
                 .relative()
@@ -758,50 +713,77 @@ impl Render for Launcher {
                             .right_3()
                             .p_3()
                             .rounded_md()
-                            .bg(rgb(colors.panel))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.popover)
                             .child(status),
                     )
                 });
         }
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
             return root.flex().items_center().justify_center().child(
-                div().w(px(416.)).p_6().rounded_xl().border_1().border_color(rgb(colors.edge)).bg(rgb(colors.panel)).flex().flex_col().gap_4()
-                    .child(div().text_2xl().font_weight(gpui::FontWeight::SEMIBOLD).child("Connect to SealSkin"))
-                    .child(div().text_sm().text_color(rgb(colors.muted)).child("Copy an application key from Settings → Application Keys on your SealSkin server. SealSkin stores it in macOS Keychain after connecting."))
+                div()
+                    .w(px(416.))
+                    .p_6()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .v_flex()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Connect to SealSkin"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child("Copy an application key from Settings → Application Keys on your SealSkin server. SealSkin stores it in macOS Keychain after connecting."),
+                    )
                     .when_some(self.status.clone(), |view, status| view.child(status))
                     .when_some(self.busy.clone(), |view, busy| view.child(busy))
-                    .when(self.busy.is_none(), |view| view.child(colors.button("paste", "Paste Application Key", true)
-                        .on_click(cx.listener(|this, _, _, cx| this.paste(cx))))));
+                    .when(self.busy.is_none(), |view| {
+                        view.child(
+                            Button::new("paste")
+                                .primary()
+                                .label("Paste Application Key")
+                                .on_click(cx.listener(|this, _, _, cx| this.paste(cx))),
+                        )
+                    }),
+            );
         };
         let sidebar = div()
             .w(px(222.))
             .flex_none()
             .h_full()
             .p_5()
-            .flex()
-            .flex_col()
+            .v_flex()
             .gap_3()
-            .bg(rgb(colors.sidebar))
+            .bg(theme.sidebar)
             .border_r_1()
-            .border_color(rgb(colors.edge))
+            .border_color(theme.border)
             .child(
                 div()
                     .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child(APP_NAME),
             )
             .child(
                 div()
                     .text_sm()
-                    .text_color(rgb(colors.muted))
+                    .text_color(theme.muted_foreground)
                     .truncate()
                     .child(api.server().to_string()),
             )
             .child(div().flex_1())
             .when(self.busy.is_none(), |view| {
                 view.child(
-                    colors
-                        .button("forget", "Remove Connection", false)
+                    Button::new("forget")
+                        .outline()
+                        .label("Remove Connection")
                         .on_click(cx.listener(|this, _, _, cx| this.forget(cx))),
                 )
             });
@@ -811,33 +793,34 @@ impl Render for Launcher {
             .flex_1()
             .min_w_0()
             .h_full()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .p_6()
-            .flex()
-            .flex_col()
+            .v_flex()
             .gap_3()
             .child(
                 div()
-                    .flex()
+                    .h_flex()
                     .items_center()
                     .justify_between()
                     .gap_2()
                     .child(
                         div()
                             .text_2xl()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child("Applications"),
                     )
                     .when(enabled, |view| {
                         view.child(
-                            colors
-                                .button("refresh", "Refresh", false)
+                            Button::new("refresh")
+                                .outline()
+                                .small()
+                                .label("Refresh")
                                 .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
                         )
                     }),
             )
             .when_some(self.busy.clone(), |view, busy| {
-                view.child(div().text_sm().text_color(rgb(colors.muted)).child(busy))
+                view.child(div().text_sm().text_color(theme.muted_foreground).child(busy))
             })
             .when_some(self.status.clone(), |view, status| {
                 view.child(div().text_sm().child(status))
@@ -846,20 +829,18 @@ impl Render for Launcher {
                 view.child(
                     div()
                         .text_sm()
-                        .text_color(rgb(colors.muted))
+                        .text_color(theme.muted_foreground)
                         .child("No applications are available for this account."),
                 )
             })
             .children(library.apps.iter().map(|app| {
                 let app = app.clone();
-                row(colors, app.name.clone()).when(enabled, |view| {
+                row(&theme, app.name.clone()).when(enabled, |view| {
                     view.child(
-                        colors
-                            .button(
-                                SharedString::from(format!("launch-{}", app.id)),
-                                "Launch",
-                                true,
-                            )
+                        Button::new(SharedString::from(format!("launch-{}", app.id)))
+                            .primary()
+                            .small()
+                            .label("Launch")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.launch(app.clone(), window, cx)
                             })),
@@ -870,27 +851,25 @@ impl Render for Launcher {
                 div()
                     .mt_4()
                     .text_lg()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child("Running Sessions"),
             )
             .when(library.sessions.is_empty(), |view| {
                 view.child(
                     div()
                         .text_sm()
-                        .text_color(rgb(colors.muted))
+                        .text_color(theme.muted_foreground)
                         .child("No running sessions."),
                 )
             })
             .children(library.sessions.iter().map(|session| {
                 let session = session.clone();
-                row(colors, session.app_name.clone()).when(enabled, |view| {
+                row(&theme, session.app_name.clone()).when(enabled, |view| {
                     view.child(
-                        colors
-                            .button(
-                                SharedString::from(format!("resume-{}", session.session_id)),
-                                "Resume",
-                                false,
-                            )
+                        Button::new(SharedString::from(format!("resume-{}", session.session_id)))
+                            .outline()
+                            .small()
+                            .label("Resume")
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_session(session.clone(), window, cx)
                             })),
@@ -901,9 +880,9 @@ impl Render for Launcher {
     }
 }
 
-fn row(colors: Colors, name: String) -> Div {
+fn row(theme: &Theme, name: String) -> Div {
     div()
-        .flex()
+        .h_flex()
         .items_center()
         .justify_between()
         .gap_3()
@@ -912,8 +891,8 @@ fn row(colors: Colors, name: String) -> Div {
         .min_h(px(48.))
         .rounded_lg()
         .border_1()
-        .border_color(rgb(colors.edge))
-        .bg(rgb(colors.panel))
+        .border_color(theme.border)
+        .bg(theme.popover)
         .child(div().min_w_0().truncate().child(name))
 }
 

@@ -8,11 +8,10 @@ publish.workspace = true
 base64 = "0.22"
 block2 = "0.6"
 core-foundation = "0.10"
-core-video = "0.4.3"
 cpal = "0.17.3"
 dotenvy = "0.15"
 futures-util = { version = "0.3", features = ["sink"] }
-gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSEvent", "NSGraphics", "NSView", "NSWindow", "block2"] }

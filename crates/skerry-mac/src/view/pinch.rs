@@ -1,7 +1,7 @@
 use super::PaintedDisplay;
 use crate::transport::{Input, Pointer};
 use block2::RcBlock;
-use gpui::{point, px, Pixels, Point};
+use gpui_kit::{point, px, Pixels, Point};
 use objc2::{rc::Retained, runtime::AnyObject, MainThreadMarker};
 use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase, NSView, NSWindow};
 use objc2_foundation::NSPoint;

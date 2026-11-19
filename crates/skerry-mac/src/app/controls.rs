@@ -1,5 +1,5 @@
 use super::{
-    native_window, CloseSessionControls, Colors, DisplayMode, Launcher, ToggleFullScreen,
+    native_window, CloseSessionControls, DisplayMode, Launcher, ToggleFullScreen,
     ToggleSessionControls,
 };
 use crate::input::{InputFeature, InputSettings, RemoteChord};
@@ -8,9 +8,19 @@ use crate::{
     settings::{Key, ScreenChange},
     transport::Resolution,
 };
-use gpui::{
-    div, point, prelude::*, px, rgb, size, App, Bounds, Context, Div, FocusHandle, FontWeight,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    collapsible::Collapsible,
+    input::{Input, InputEvent, InputState},
+    label::Label,
+    scroll::ScrollableElement as _,
+    switch::Switch,
+    ActiveTheme as _, IconName, Sizable as _, StyledExt as _, Theme,
+};
+use gpui_kit::{
+    div, point, prelude::*, px, size, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent,
+    Context, Div, Entity, FocusHandle, FontWeight, SharedString, TitlebarOptions, Window,
+    WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 
@@ -23,8 +33,8 @@ pub(super) struct ControlPanel {
     video: bool,
     stats: bool,
     picker: Option<Picker>,
-    width: Dimension,
-    height: Dimension,
+    width: Entity<InputState>,
+    height: Entity<InputState>,
     size_error: bool,
 }
 
@@ -32,22 +42,6 @@ pub(super) struct ControlPanel {
 enum Picker {
     Preset,
     Dpi,
-}
-
-struct Dimension {
-    focus: FocusHandle,
-    value: String,
-    replace: bool,
-}
-
-impl Dimension {
-    fn new(cx: &mut Context<ControlPanel>) -> Self {
-        Self {
-            focus: cx.focus_handle(),
-            value: String::new(),
-            replace: false,
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -75,7 +69,7 @@ impl ControlPanel {
     pub(super) fn open(
         window: &Window,
         cx: &mut Context<Launcher>,
-    ) -> gpui::Result<WindowHandle<Self>> {
+    ) -> gpui_kit::Result<AnyWindowHandle> {
         let owner = window
             .window_handle()
             .downcast::<Launcher>()
@@ -103,7 +97,7 @@ impl ControlPanel {
                 Bounds::new(point(x, y), panel_size)
             },
         );
-        cx.open_window(
+        let (handle, _) = gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(330.), px(300.))),
@@ -118,6 +112,7 @@ impl ControlPanel {
                 is_minimizable: false,
                 ..Default::default()
             },
+            cx,
             move |window, cx| {
                 if let Some(panel) = native_window(window) {
                     panel.setCollectionBehavior(
@@ -133,14 +128,47 @@ impl ControlPanel {
                 }
                 let panel = cx.new(|cx: &mut Context<Self>| {
                     cx.observe(&launcher, |_, _, cx| cx.notify()).detach();
-                    let mut width = Dimension::new(cx);
-                    let mut height = Dimension::new(cx);
-                    if let Ok(launcher) = owner.read(cx) {
+                    let initial = owner.read(cx).ok().and_then(|launcher| {
                         if let DisplayMode::Fixed(size) = launcher.display_mode {
-                            width.value = size.0.to_string();
-                            height.value = size.1.to_string();
+                            Some(size)
+                        } else {
+                            None
                         }
-                    }
+                    });
+                    let digit_filter =
+                        |s: &str, _: &mut App| s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit());
+                    let width = cx.new(|cx| {
+                        let state = InputState::new(window, cx)
+                            .placeholder("e.g. 1920")
+                            .validate(digit_filter);
+                        if let Some(size) = initial {
+                            state.default_value(size.0.to_string())
+                        } else {
+                            state
+                        }
+                    });
+                    let height = cx.new(|cx| {
+                        let state = InputState::new(window, cx)
+                            .placeholder("e.g. 1080")
+                            .validate(digit_filter);
+                        if let Some(size) = initial {
+                            state.default_value(size.1.to_string())
+                        } else {
+                            state
+                        }
+                    });
+                    cx.subscribe_in(&width, window, |this, _, event: &InputEvent, window, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.apply_size(window, cx);
+                        }
+                    })
+                    .detach();
+                    cx.subscribe_in(&height, window, |this, _, event: &InputEvent, window, cx| {
+                        if matches!(event, InputEvent::PressEnter { .. }) {
+                            this.apply_size(window, cx);
+                        }
+                    })
+                    .detach();
                     Self {
                         owner,
                         focus: cx.focus_handle(),
@@ -159,11 +187,13 @@ impl ControlPanel {
                     Self::send(owner, Command::Close, cx);
                     false
                 });
-                window.focus(&panel.read(cx).focus);
+                let focus = panel.read(cx).focus.clone();
+                window.focus(&focus, cx);
                 window.activate_window();
                 panel
             },
-        )
+        )?;
+        Ok(handle)
     }
 
     fn send(owner: WindowHandle<Launcher>, command: Command, cx: &mut App) {
@@ -250,176 +280,73 @@ impl ControlPanel {
         });
     }
 
-    fn action(&self, colors: Colors, label: &'static str, command: Command) -> gpui::Stateful<Div> {
+    fn action(&self, label: &'static str, command: Command) -> Button {
         let owner = self.owner;
-        colors
-            .button(label, label, false)
+        Button::new(label)
+            .outline()
+            .small()
+            .label(label)
             .on_click(move |_, _, cx| Self::send(owner, command, cx))
     }
 
-    fn picker_button(
-        &self,
-        picker: Picker,
-        label: String,
-        colors: Colors,
-        cx: &Context<Self>,
-    ) -> gpui::Stateful<Div> {
+    fn picker_button(&self, picker: Picker, label: String, cx: &Context<Self>) -> Button {
         let id = match picker {
             Picker::Preset => "preset-picker",
             Picker::Dpi => "dpi-picker",
         };
-        colors
-            .button(id, label, self.picker == Some(picker))
+        let button = Button::new(id)
+            .small()
             .w_full()
-            .flex()
-            .justify_between()
-            .child("⌄")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.picker = (this.picker != Some(picker)).then_some(picker);
-                cx.notify();
-            }))
+            .label(label)
+            .dropdown_caret(true);
+        let button = if self.picker == Some(picker) {
+            button.primary()
+        } else {
+            button.outline()
+        };
+        button.on_click(cx.listener(move |this, _, _, cx| {
+            this.picker = (this.picker != Some(picker)).then_some(picker);
+            cx.notify();
+        }))
     }
 
-    fn input_field(
-        &self,
-        horizontal: bool,
-        colors: Colors,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> Div {
-        let (field, label, example) = if horizontal {
-            (&self.width, "Width", "e.g. 1920")
+    fn input_field(&self, horizontal: bool) -> Div {
+        let (field, label) = if horizontal {
+            (&self.width, "Width")
         } else {
-            (&self.height, "Height", "e.g. 1080")
-        };
-        let focus = field.focus.clone();
-        let focused = focus.is_focused(window);
-        let text = if field.value.is_empty() {
-            example.to_string()
-        } else {
-            field.value.clone()
+            (&self.height, "Height")
         };
         div()
             .flex_1()
             .min_w_0()
-            .flex()
-            .flex_col()
+            .v_flex()
             .gap_1()
-            .child(label)
-            .child(
-                div()
-                    .id(label)
-                    .track_focus(&focus)
-                    .border_1()
-                    .rounded_md()
-                    .py_2()
-                    .px_3()
-                    .cursor_text()
-                    .border_color(rgb(if focused { colors.accent } else { colors.edge }))
-                    .bg(rgb(colors.background))
-                    .text_color(rgb(if field.value.is_empty() {
-                        colors.muted
-                    } else {
-                        colors.ink
-                    }))
-                    .child(text)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let field = if horizontal {
-                            &mut this.width
-                        } else {
-                            &mut this.height
-                        };
-                        window.focus(&field.focus);
-                        field.replace = true;
-                        cx.notify();
-                    }))
-                    .on_key_down(cx.listener(
-                        move |this, event: &gpui::KeyDownEvent, window, cx| {
-                            let field = if horizontal {
-                                &mut this.width
-                            } else {
-                                &mut this.height
-                            };
-                            let key = &event.keystroke;
-                            match (key.modifiers.platform, key.key.as_str()) {
-                                (true, "a") => field.replace = true,
-                                (true, "v") => {
-                                    if let Some(paste) =
-                                        cx.read_from_clipboard().and_then(|item| item.text())
-                                    {
-                                        let paste = paste.trim();
-                                        if paste.len() <= 4
-                                            && paste.bytes().all(|byte| byte.is_ascii_digit())
-                                        {
-                                            field.value = paste.into();
-                                            field.replace = false;
-                                        }
-                                    }
-                                }
-                                (false, "backspace" | "delete") => {
-                                    if field.replace {
-                                        field.value.clear();
-                                    } else {
-                                        field.value.pop();
-                                    }
-                                    field.replace = false;
-                                }
-                                (false, "enter") => this.apply_size(cx),
-                                (false, "tab") => {
-                                    let next = if horizontal {
-                                        &mut this.height
-                                    } else {
-                                        &mut this.width
-                                    };
-                                    next.replace = true;
-                                    window.focus(&next.focus);
-                                }
-                                (false, _)
-                                    if key.key.len() == 1
-                                        && key.key.as_bytes()[0].is_ascii_digit() =>
-                                {
-                                    if field.replace {
-                                        field.value.clear();
-                                    }
-                                    field.replace = false;
-                                    if field.value.len() < 4 {
-                                        field.value.push_str(&key.key);
-                                    }
-                                }
-                                _ => return,
-                            }
-                            cx.stop_propagation();
-                            cx.notify();
-                        },
-                    )),
-            )
+            .child(Label::new(label))
+            .child(Input::new(field).small())
     }
 
-    fn apply_size(&mut self, cx: &mut Context<Self>) {
-        let resolution = Resolution::manual(&self.width.value, &self.height.value);
+    fn apply_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let width_val = self.width.read(cx).value();
+        let height_val = self.height.read(cx).value();
+        let resolution = Resolution::manual(&width_val, &height_val);
         self.size_error = resolution.is_none();
         if let Some(size) = resolution {
             self.picker = None;
-            self.width.value = size.0.to_string();
-            self.height.value = size.1.to_string();
+            self.width
+                .update(cx, |s, cx| s.set_value(size.0.to_string(), window, cx));
+            self.height
+                .update(cx, |s, cx| s.set_value(size.1.to_string(), window, cx));
             Self::send(self.owner, Command::Display(DisplayMode::Fixed(size)), cx);
         }
         cx.notify();
     }
 
-    fn display_settings(
-        &self,
-        launcher: &Launcher,
-        colors: Colors,
-        window: &Window,
-        cx: &Context<Self>,
-    ) -> Div {
+    fn display_settings(&self, launcher: &Launcher, theme: &Theme, cx: &Context<Self>) -> Div {
         let owner = self.owner;
         let matching_retina = launcher.display_mode == DisplayMode::Retina;
-        let mut panel = div().flex().flex_col().gap_3();
+        let mut panel = div().v_flex().gap_3();
         if launcher.resize_allowed {
             panel = panel.child(switch_row(
-                colors,
                 "HiDPI (Pixel Perfect)",
                 matching_retina,
                 Command::Retina(!matching_retina),
@@ -428,14 +355,14 @@ impl ControlPanel {
         } else {
             panel = panel.child(
                 div()
-                    .text_color(rgb(colors.muted))
+                    .text_color(theme.muted_foreground)
                     .child("Remote size controlled by server"),
             );
         }
         if let Some((aligned, locked)) = launcher.screen_policy.alignment {
             panel = panel.child(if locked {
                 div()
-                    .flex()
+                    .h_flex()
                     .justify_between()
                     .child("Force Aligned Resolution")
                     .child(if aligned {
@@ -446,7 +373,6 @@ impl ControlPanel {
                     .into_any_element()
             } else {
                 switch_row(
-                    colors,
                     "Force Aligned Resolution",
                     aligned,
                     Command::Screen(ScreenChange::Alignment(!aligned)),
@@ -456,14 +382,14 @@ impl ControlPanel {
         }
         if let Some(dpi) = launcher.screen_policy.dpi {
             let mut label = dpi_label(dpi);
-            let row = div().flex().flex_col().gap_1().child("UI Scaling");
+            let row = div().v_flex().gap_1().child(Label::new("UI Scaling"));
             if launcher.screen_policy.dpi_choices.len() > 1 {
                 let automatic = launcher.dpi_override.is_none();
                 if automatic {
                     label.push_str(" · Match Mac Display");
                 }
                 panel = panel.child(
-                    row.child(self.picker_button(Picker::Dpi, label, colors, cx))
+                    row.child(self.picker_button(Picker::Dpi, label, cx))
                         .when(self.picker == Some(Picker::Dpi), |row| {
                             row.children(
                                 std::iter::once(None)
@@ -478,17 +404,19 @@ impl ControlPanel {
                                     .map(|dpi| {
                                         let label = dpi
                                             .map_or_else(|| "Match Mac Display".into(), dpi_label);
-                                        colors
-                                            .button(
-                                                SharedString::from(label.clone()),
-                                                label,
-                                                launcher.dpi_override == dpi,
-                                            )
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.picker = None;
-                                                Self::send(owner, Command::UiScaling(dpi), cx);
-                                                cx.notify();
-                                            }))
+                                        let button = Button::new(SharedString::from(label.clone()))
+                                            .small()
+                                            .label(label);
+                                        let button = if launcher.dpi_override == dpi {
+                                            button.primary()
+                                        } else {
+                                            button.outline()
+                                        };
+                                        button.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.picker = None;
+                                            Self::send(owner, Command::UiScaling(dpi), cx);
+                                            cx.notify();
+                                        }))
                                     }),
                             )
                         }),
@@ -506,20 +434,23 @@ impl ControlPanel {
             panel = panel
                 .child(
                     div()
-                        .flex()
-                        .flex_col()
+                        .v_flex()
                         .gap_1()
-                        .child("Preset")
-                        .child(self.picker_button(Picker::Preset, preset, colors, cx))
+                        .child(Label::new("Preset"))
+                        .child(self.picker_button(Picker::Preset, preset, cx))
                         .when(self.picker == Some(Picker::Preset), |row| {
-                            row.child(colors.button("fit", "Keep Remote Size", false).on_click(
-                                cx.listener(move |this, _, _, cx| {
-                                    this.picker = None;
-                                    this.size_error = false;
-                                    Self::send(owner, Command::Display(DisplayMode::Fit), cx);
-                                    cx.notify();
-                                }),
-                            ))
+                            row.child(
+                                Button::new("fit")
+                                    .outline()
+                                    .small()
+                                    .label("Keep Remote Size")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.picker = None;
+                                        this.size_error = false;
+                                        Self::send(owner, Command::Display(DisplayMode::Fit), cx);
+                                        cx.notify();
+                                    })),
+                            )
                             .children(
                                 [
                                     Resolution(1280, 720),
@@ -530,13 +461,19 @@ impl ControlPanel {
                                 .into_iter()
                                 .map(|size| {
                                     let label = format!("{} × {}", size.0, size.1);
-                                    colors
-                                        .button(SharedString::from(label.clone()), label, false)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    Button::new(SharedString::from(label.clone()))
+                                        .outline()
+                                        .small()
+                                        .label(label)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
                                             this.picker = None;
-                                            this.width.value = size.0.to_string();
-                                            this.height.value = size.1.to_string();
-                                            this.apply_size(cx);
+                                            this.width.update(cx, |s, cx| {
+                                                s.set_value(size.0.to_string(), window, cx)
+                                            });
+                                            this.height.update(cx, |s, cx| {
+                                                s.set_value(size.1.to_string(), window, cx)
+                                            });
+                                            this.apply_size(window, cx);
                                         }))
                                 }),
                             )
@@ -544,28 +481,34 @@ impl ControlPanel {
                 )
                 .child(
                     div()
-                        .flex()
+                        .h_flex()
                         .gap_2()
-                        .child(self.input_field(true, colors, window, cx))
-                        .child(self.input_field(false, colors, window, cx)),
+                        .child(self.input_field(true))
+                        .child(self.input_field(false)),
                 )
                 .child(
                     div()
-                        .flex()
+                        .h_flex()
                         .flex_wrap()
                         .gap_2()
                         .child(
-                            colors
-                                .button("apply-manual", "Set Manual Resolution", true)
-                                .on_click(cx.listener(|this, _, _, cx| this.apply_size(cx))),
+                            Button::new("apply-manual")
+                                .primary()
+                                .small()
+                                .label("Set Manual Resolution")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_size(window, cx)
+                                })),
                         )
                         .child(
-                            colors
-                                .button("reset-to-window", "Reset to Window", false)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            Button::new("reset-to-window")
+                                .outline()
+                                .small()
+                                .label("Reset to Window")
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     this.picker = None;
-                                    this.width.value.clear();
-                                    this.height.value.clear();
+                                    this.width.update(cx, |s, cx| s.set_value("", window, cx));
+                                    this.height.update(cx, |s, cx| s.set_value("", window, cx));
                                     this.size_error = false;
                                     Self::send(owner, Command::ResetToWindow, cx);
                                     cx.notify();
@@ -573,12 +516,15 @@ impl ControlPanel {
                         ),
                 )
                 .when(self.size_error, |panel| {
-                    panel.child("Enter a width of 2–4096 and a height of 2–2160.")
+                    panel.child(
+                        div()
+                            .text_color(theme.danger)
+                            .child("Enter a width of 2–4096 and a height of 2–2160."),
+                    )
                 });
         }
         panel.child(
             self.action(
-                colors,
                 if launcher.scale_locally {
                     "Scale Locally: On"
                 } else {
@@ -590,40 +536,27 @@ impl ControlPanel {
         )
     }
 
-    fn input_settings(&self, input: InputSettings, colors: Colors) -> Div {
+    fn input_settings(&self, input: InputSettings) -> Div {
         let owner = self.owner;
         div()
-            .flex()
-            .flex_col()
+            .v_flex()
             .gap_3()
             .children(InputFeature::ALL.into_iter().map(|(feature, label)| {
                 let enabled = feature.enabled(input);
-                switch_row(
-                    colors,
-                    label,
-                    enabled,
-                    Command::Input(feature, !enabled),
-                    owner,
-                )
+                switch_row(label, enabled, Command::Input(feature, !enabled), owner)
             }))
             .child(
                 div()
-                    .flex()
-                    .flex_col()
+                    .v_flex()
                     .gap_2()
-                    .child("Send Key Combination")
+                    .child(Label::new("Send Key Combination"))
                     .child(
                         div()
-                            .flex()
+                            .h_flex()
                             .flex_wrap()
                             .gap_2()
+                            .child(self.action("Alt+Tab", Command::Chord(RemoteChord::SwitchApp)))
                             .child(self.action(
-                                colors,
-                                "Alt+Tab",
-                                Command::Chord(RemoteChord::SwitchApp),
-                            ))
-                            .child(self.action(
-                                colors,
                                 "Ctrl+Alt+Delete",
                                 Command::Chord(RemoteChord::ControlAltDelete),
                             )),
@@ -631,8 +564,8 @@ impl ControlPanel {
             )
     }
 
-    fn video_settings(&self, launcher: &Launcher, colors: Colors) -> Div {
-        let panel = div().flex().flex_col().gap_2();
+    fn video_settings(&self, launcher: &Launcher, theme: &Theme) -> Div {
+        let panel = div().v_flex().gap_2();
         let Some(settings) = &launcher.settings else {
             return panel.child("Video settings are unavailable for this connection.");
         };
@@ -659,24 +592,28 @@ impl ControlPanel {
                     .map(|setting| setting.current)
             });
         panel
-            .child("Codec")
+            .child(Label::new("Codec"))
             .child(
                 div()
-                    .flex()
+                    .h_flex()
                     .flex_wrap()
                     .gap_2()
                     .children(settings.codecs.iter().map(|&choice| {
-                        colors
-                            .button(choice.wire(), choice.label(), choice == codec)
-                            .on_click(move |_, _, cx| {
-                                if choice != codec || choice != preferred {
-                                    Self::send(owner, Command::Codec(choice), cx);
-                                }
-                            })
+                        let button = Button::new(choice.wire()).small().label(choice.label());
+                        let button = if choice == codec {
+                            button.primary()
+                        } else {
+                            button.outline()
+                        };
+                        button.on_click(move |_, _, cx| {
+                            if choice != codec || choice != preferred {
+                                Self::send(owner, Command::Codec(choice), cx);
+                            }
+                        })
                     })),
             )
             .when(launcher.preferences.codec != codec, |panel| {
-                panel.child(div().text_color(rgb(colors.muted)).child(format!(
+                panel.child(div().text_color(theme.muted_foreground).child(format!(
                     "Preferred codec · {}",
                     launcher.preferences.codec.label()
                 )))
@@ -710,40 +647,45 @@ impl ControlPanel {
                         .copied()
                         .unwrap_or(control.current);
                     let group = div()
-                        .flex()
+                        .h_flex()
                         .items_center()
                         .justify_between()
                         .gap_2()
                         .child(label);
                     let mut values = div()
-                        .flex()
+                        .h_flex()
                         .items_center()
                         .gap_2()
-                        .text_color(rgb(colors.muted));
+                        .text_color(theme.muted_foreground);
                     if key == Key::PaintOver {
                         let text = if value == 0 { "Off" } else { "On" };
                         values = values.child(text);
                         if settings.request(key, 1 - value).is_some() {
                             let label = if value == 0 { "Turn On" } else { "Turn Off" };
-                            values =
-                                values.child(colors.button("paint-over", label, false).on_click(
-                                    move |_, _, cx| {
+                            values = values.child(
+                                Button::new("paint-over")
+                                    .outline()
+                                    .small()
+                                    .label(label)
+                                    .on_click(move |_, _, cx| {
                                         Self::send(owner, Command::Setting(key, 1 - value), cx);
-                                    },
-                                ));
+                                    }),
+                            );
                         }
                     } else if key == Key::RateControl {
                         for (mode, label) in [(0, "CBR"), (1, "CRF")] {
                             if value == mode || settings.request(key, mode).is_some() {
-                                values = values.child(
-                                    colors.button(label, label, value == mode).on_click(
-                                        move |_, _, cx| {
-                                            if value != mode {
-                                                Self::send(owner, Command::Setting(key, mode), cx);
-                                            }
-                                        },
-                                    ),
-                                );
+                                let button = Button::new(label).small().label(label);
+                                let button = if value == mode {
+                                    button.primary()
+                                } else {
+                                    button.outline()
+                                };
+                                values = values.child(button.on_click(move |_, _, cx| {
+                                    if value != mode {
+                                        Self::send(owner, Command::Setting(key, mode), cx);
+                                    }
+                                }));
                             }
                         }
                     } else {
@@ -754,35 +696,39 @@ impl ControlPanel {
                         ] {
                             if next != value && settings.request(key, next).is_some() {
                                 let id = SharedString::from(format!("{}{sign}", key.wire()));
-                                values = values.child(colors.button(id, sign, false).on_click(
-                                    move |_, _, cx| {
-                                        Self::send(owner, Command::Setting(key, next), cx);
-                                    },
-                                ));
+                                values = values.child(
+                                    Button::new(id)
+                                        .outline()
+                                        .small()
+                                        .label(sign)
+                                        .on_click(move |_, _, cx| {
+                                            Self::send(owner, Command::Setting(key, next), cx);
+                                        }),
+                                );
                             }
                         }
                     }
                     Some(group.child(values))
                 }),
             )
-            .child(div().pt_1().child(self.action(
-                colors,
-                "Reset Video Settings",
-                Command::ResetVideo,
-            )))
+            .child(
+                div()
+                    .pt_1()
+                    .child(self.action("Reset Video Settings", Command::ResetVideo)),
+            )
     }
 }
 
 impl Render for ControlPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let colors = Colors::for_window(window);
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
         let owner = self.owner;
         let root = div()
             .id("session-controls")
             .size_full()
-            .overflow_y_scroll()
-            .bg(rgb(colors.background))
-            .text_color(rgb(colors.ink))
+            .overflow_y_scrollbar()
+            .bg(theme.background)
+            .text_color(theme.foreground)
             .text_sm()
             .track_focus(&self.focus)
             .key_context("SessionControls")
@@ -800,19 +746,17 @@ impl Render for ControlPanel {
             return root;
         };
         let actions = div()
-            .flex()
+            .h_flex()
             .flex_wrap()
             .gap_2()
             .when_some(launcher.audio, |row, enabled| {
                 row.child(self.action(
-                    colors,
                     if enabled { "Mute" } else { "Unmute" },
                     Command::Audio(!enabled),
                 ))
             })
             .when_some(launcher.video, |row, enabled| {
                 row.child(self.action(
-                    colors,
                     if enabled {
                         "Pause Video"
                     } else {
@@ -822,7 +766,6 @@ impl Render for ControlPanel {
                 ))
             })
             .child(self.action(
-                colors,
                 if self.fullscreen {
                     "Exit Full Screen"
                 } else {
@@ -830,13 +773,12 @@ impl Render for ControlPanel {
                 },
                 Command::FullScreen,
             ))
-            .child(self.action(colors, "Reconnect", Command::Reconnect))
-            .child(self.action(colors, "Disconnect", Command::Disconnect));
+            .child(self.action("Reconnect", Command::Reconnect))
+            .child(self.action("Disconnect", Command::Disconnect));
         root.child(
             div()
                 .p_4()
-                .flex()
-                .flex_col()
+                .v_flex()
                 .gap_3()
                 .child(
                     div()
@@ -846,45 +788,45 @@ impl Render for ControlPanel {
                 )
                 .child(actions)
                 .when_some(launcher.audio_unavailable, |view, reason| {
-                    view.child(div().text_color(rgb(colors.muted)).child(reason))
+                    view.child(div().text_color(theme.muted_foreground).child(reason))
                 }),
         )
         .child(section(
-            colors,
+            &theme,
             "Input",
             self.input,
-            || self.input_settings(launcher.preferences.input, colors),
+            || self.input_settings(launcher.preferences.input),
             cx.listener(|this, _, _, cx| {
                 this.input = !this.input;
                 cx.notify();
             }),
         ))
         .child(section(
-            colors,
+            &theme,
             "Screen Settings",
             self.screen,
-            || self.display_settings(launcher, colors, window, cx),
+            || self.display_settings(launcher, &theme, cx),
             cx.listener(|this, _, _, cx| {
                 this.screen = !this.screen;
                 cx.notify();
             }),
         ))
         .child(section(
-            colors,
+            &theme,
             "Video",
             self.video,
-            || self.video_settings(launcher, colors),
+            || self.video_settings(launcher, &theme),
             cx.listener(|this, _, _, cx| {
                 this.video = !this.video;
                 cx.notify();
             }),
         ))
         .child(section(
-            colors,
+            &theme,
             "Stream Diagnostics",
             self.stats,
             || {
-                let mut rows = div().flex().flex_col().gap_2();
+                let mut rows = div().v_flex().gap_2();
                 if let Some(stats) = &launcher.stats {
                     let fields = [
                         ("Resolution", format!("{}×{}", stats.width, stats.height)),
@@ -916,10 +858,10 @@ impl Render for ControlPanel {
                     ];
                     rows = rows.children(fields.into_iter().map(|(label, value)| {
                         div()
-                            .flex()
+                            .h_flex()
                             .justify_between()
                             .child(label)
-                            .child(div().text_color(rgb(colors.muted)).child(value))
+                            .child(div().text_color(theme.muted_foreground).child(value))
                     }));
                 } else {
                     rows = rows.child("Waiting for stream diagnostics…");
@@ -935,30 +877,40 @@ impl Render for ControlPanel {
 }
 
 fn section(
-    colors: Colors,
+    theme: &Theme,
     title: &'static str,
     open: bool,
     body: impl FnOnce() -> Div,
-    toggle: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     div()
         .border_t_1()
-        .border_color(rgb(colors.edge))
+        .border_color(theme.border)
         .child(
             div()
                 .id(title)
                 .px_4()
                 .py_3()
-                .bg(rgb(colors.panel))
+                .bg(theme.secondary)
                 .cursor_pointer()
-                .flex()
+                .h_flex()
+                .items_center()
                 .justify_between()
                 .font_weight(FontWeight::SEMIBOLD)
                 .child(title)
-                .child(if open { "▾" } else { "▸" })
+                .child(if open {
+                    IconName::ChevronDown
+                } else {
+                    IconName::ChevronRight
+                })
                 .on_click(toggle),
         )
-        .when(open, |view| view.child(div().p_4().child(body())))
+        .child(
+            Collapsible::new()
+                .open(open)
+                .motion_id(SharedString::from(format!("section-{title}")))
+                .content(div().p_4().child(body())),
+        )
 }
 
 fn dpi_label(dpi: u16) -> String {
@@ -966,43 +918,21 @@ fn dpi_label(dpi: u16) -> String {
 }
 
 fn switch_row(
-    colors: Colors,
     label: &'static str,
     enabled: bool,
     command: Command,
     owner: WindowHandle<Launcher>,
-) -> gpui::AnyElement {
+) -> AnyElement {
     div()
-        .id(label)
-        .flex()
+        .h_flex()
         .items_center()
         .justify_between()
         .gap_2()
-        .cursor_pointer()
-        .child(label)
+        .child(Label::new(label))
         .child(
-            div()
-                .flex()
-                .items_center()
-                .flex_none()
-                .w(px(36.))
-                .h(px(20.))
-                .px(px(2.))
-                .rounded_full()
-                .border_1()
-                .border_color(rgb(if enabled { colors.accent } else { colors.muted }))
-                .bg(rgb(if enabled {
-                    colors.accent
-                } else {
-                    colors.background
-                }))
-                .when(enabled, |track| track.justify_end())
-                .child(div().size(px(14.)).rounded_full().bg(rgb(if enabled {
-                    0xffffff
-                } else {
-                    colors.muted
-                }))),
+            Switch::new(label)
+                .checked(enabled)
+                .on_click(move |_, _, cx| ControlPanel::send(owner, command, cx)),
         )
-        .on_click(move |_, _, cx| ControlPanel::send(owner, command, cx))
         .into_any_element()
 }

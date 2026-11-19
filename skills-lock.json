@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "skills": {
+    "open-prose": {
+      "source": "openprose/prose",
+      "commit": "0ab7237ced4ac29ca002c94878e69c5cbf6b1ea6",
+      "sourceType": "github",
+      "skillPath": "skills/open-prose/SKILL.md",
+      "computedHash": "aa1ada43ee48f874d247d2d39e645aa29e139a3c3f988dc8e0da57ead94513d3"
+    }
+  }
+}

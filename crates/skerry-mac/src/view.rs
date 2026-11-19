@@ -7,12 +7,16 @@ use crate::transport::{
     self, DisplayRequest, Frame, Input, Picture, Pointer, RemoteCursor, Resolution, SessionEvent,
     SessionOptions,
 };
-use gpui::{
+use gpui_kit::component::{
+    button::{Button, ButtonVariants as _},
+    IconName, Sizable as _,
+};
+use gpui_kit::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, ContentMask, Context,
-    Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler,
-    FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, UTF16Selection,
-    Window,
+    Corners, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta,
+    ScrollEvent, Task, UTF16Selection, Window,
 };
 use reqwest::Url;
 use std::cell::RefCell;
@@ -53,7 +57,8 @@ impl NativeSession {
             let desktop = view.read(cx);
             pinch::Monitor::install(native, desktop.pinch_target.clone(), input.clone())
         });
-        window.focus(&view.read(cx).focus);
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
         let task = runtime.spawn(async move {
             if let Err(message) =
                 transport::run(address, frame_tx, commands, motion, options, &events).await
@@ -73,8 +78,9 @@ impl NativeSession {
         self.view.clone().into()
     }
 
-    pub fn focus(&self, window: &mut Window, cx: &App) {
-        window.focus(&self.view.read(cx).focus);
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        let focus = self.view.read(cx).focus.clone();
+        window.focus(&focus, cx);
     }
 
     pub fn set_settings(&self, changes: Vec<(Key, u32)>) {
@@ -177,7 +183,7 @@ struct Desktop {
     focus: FocusHandle,
     scale_locally: bool,
     frame: Frame,
-    painted: Rc<RefCell<Option<Arc<gpui::RenderImage>>>>,
+    painted: Rc<RefCell<Option<Arc<RenderImage>>>>,
     painted_display: Option<PaintedDisplay>,
     pinch_target: pinch::Target,
     input: mpsc::UnboundedSender<Input>,
@@ -188,7 +194,7 @@ struct Desktop {
     modifiers: Modifiers,
     scroll: (f32, f32),
     finger_scroll_allowed: bool,
-    finger_scroll_task: Option<gpui::Task<()>>,
+    finger_scroll_task: Option<Task<()>>,
     settings: InputSettings,
     cursor: Option<RemoteCursor>,
     marked: String,
@@ -312,7 +318,7 @@ impl Desktop {
         self.send_pointer();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+    fn scroll(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
         if let ScrollDelta::Pixels(delta) = event.delta {
             if self.settings.trackpad_scroll && self.finger_scroll_allowed {
                 if let Some(display) = self.painted_display {
@@ -570,9 +576,9 @@ impl Render for Desktop {
                 let hb = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
-                        v.update(cx, |desktop, _| {
+                        v.update(cx, |desktop, cx| {
                             if desktop.mouse_position(event.position, false) {
-                                window.focus(&desktop.focus);
+                                window.focus(&desktop.focus, cx);
                                 desktop.ime_click = Some(event.position);
                                 desktop.modifiers(event.modifiers);
                                 desktop.mouse_button(event.button, true);
@@ -611,7 +617,7 @@ impl Render for Desktop {
                 });
                 let v = desktop.clone();
                 let hb = hitbox.clone();
-                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
                         v.update(cx, |desktop, cx| {
                             if desktop.mouse_position(event.position, false) {
@@ -627,6 +633,7 @@ impl Render for Desktop {
                     match picture {
                         Picture::Jpeg(image) => {
                             let _ = window.paint_image(
+                                display.bounds,
                                 display.bounds,
                                 Corners::default(),
                                 image.clone(),
@@ -647,7 +654,12 @@ impl Render for Desktop {
                         && hitbox.is_hovered(window)
                         && display.bounds.contains(&mouse)
                     {
-                        window.set_cursor_style(CursorStyle::None, &hitbox);
+                        unsafe {
+                            let _: () = objc2::msg_send![
+                                objc2::class!(NSCursor),
+                                setHiddenUntilMouseMoves: true
+                            ];
+                        }
                         if let RemoteCursor::Image {
                             image,
                             hotspot,
@@ -673,6 +685,7 @@ impl Render for Desktop {
                                 }),
                                 |window| {
                                     let _ = window.paint_image(
+                                        image_bounds,
                                         image_bounds,
                                         Corners::default(),
                                         image.clone(),
@@ -729,7 +742,7 @@ impl Render for Desktop {
                 }
             }))
             .on_modifiers_changed(cx.listener(
-                |desktop, event: &gpui::ModifiersChangedEvent, _, _| {
+                |desktop, event: &ModifiersChangedEvent, _, _| {
                     desktop.modifiers(event.modifiers);
                 },
             ))
@@ -749,23 +762,21 @@ impl Render for Desktop {
             .when_some(menu, |view, position| {
                 view.child(
                     div()
-                        .id("session-controls-trigger")
                         .absolute()
                         .top(position.y)
                         .left(position.x)
                         .size(MENU_SIZE)
-                        .rounded_md()
-                        .bg(rgb(0x22262f))
-                        .text_color(rgb(0xf1f3f6))
-                        .hover(|button| button.bg(rgb(0x354258)))
-                        .cursor_pointer()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child("•••")
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(ToggleSessionControls), cx)
-                        }),
+                        .child(
+                            Button::new("session-controls-trigger")
+                                .secondary()
+                                .small()
+                                .size(MENU_SIZE)
+                                .icon(IconName::Ellipsis)
+                                .tooltip("Session Controls")
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(Box::new(ToggleSessionControls), cx)
+                                }),
+                        ),
                 )
             })
             .when(empty, |view| {
