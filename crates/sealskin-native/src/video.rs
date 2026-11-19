@@ -29,8 +29,8 @@ use std::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Codec {
-    #[default]
     Jpeg,
+    #[default]
     H264,
     Hevc,
     Av1,

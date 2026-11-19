@@ -58,6 +58,8 @@ enum Command {
     Playback(bool),
     Display(DisplayMode),
     Retina(bool),
+    ResetToWindow,
+    UiScaling(Option<u16>),
     ScaleLocally(bool),
     Screen(ScreenChange),
     Setting(Key, u32),
@@ -172,7 +174,6 @@ impl ControlPanel {
                     Command::Reconnect => launcher.reconnect(window, cx),
                     Command::Disconnect => {
                         launcher.close_stream(window, cx);
-                        launcher.display_mode = DisplayMode::Fit;
                         launcher.muted = false;
                         launcher.refresh(cx);
                     }
@@ -200,6 +201,19 @@ impl ControlPanel {
                         } else {
                             DisplayMode::MatchWindow
                         };
+                        launcher.resize_display(window, cx);
+                    }
+                    Command::ResetToWindow => {
+                        launcher.dpi_override = None;
+                        launcher.display_mode = if launcher.retina {
+                            DisplayMode::Retina
+                        } else {
+                            DisplayMode::MatchWindow
+                        };
+                        launcher.resize_display(window, cx);
+                    }
+                    Command::UiScaling(dpi) => {
+                        launcher.dpi_override = dpi;
                         launcher.resize_display(window, cx);
                     }
                     Command::ScaleLocally(enabled) => {
@@ -387,7 +401,6 @@ impl ControlPanel {
         cx: &Context<Self>,
     ) -> Div {
         let owner = self.owner;
-        let retina = launcher.retina;
         let matching_retina = launcher.display_mode == DisplayMode::Retina;
         let mut panel = div().flex().flex_col().gap_3();
         if launcher.resize_allowed {
@@ -428,26 +441,42 @@ impl ControlPanel {
             });
         }
         if let Some(dpi) = launcher.screen_policy.dpi {
-            let label = dpi_label(dpi);
+            let mut label = dpi_label(dpi);
             let row = div().flex().flex_col().gap_1().child("UI Scaling");
             if launcher.screen_policy.dpi_choices.len() > 1 {
+                let automatic = launcher.dpi_override.is_none();
+                if automatic {
+                    label.push_str(" · Match Mac Display");
+                }
                 panel = panel.child(
                     row.child(self.picker_button(Picker::Dpi, label, colors, cx))
                         .when(self.picker == Some(Picker::Dpi), |row| {
-                            row.children(launcher.screen_policy.dpi_choices.iter().map(|&dpi| {
-                                let label = dpi_label(dpi);
-                                colors
-                                    .button(SharedString::from(label.clone()), label, false)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.picker = None;
-                                        Self::send(
-                                            owner,
-                                            Command::Screen(ScreenChange::Dpi(dpi)),
-                                            cx,
-                                        );
-                                        cx.notify();
-                                    }))
-                            }))
+                            row.children(
+                                std::iter::once(None)
+                                    .chain(
+                                        launcher
+                                            .screen_policy
+                                            .dpi_choices
+                                            .iter()
+                                            .copied()
+                                            .map(Some),
+                                    )
+                                    .map(|dpi| {
+                                        let label = dpi
+                                            .map_or_else(|| "Match Mac Display".into(), dpi_label);
+                                        colors
+                                            .button(
+                                                SharedString::from(label.clone()),
+                                                label,
+                                                launcher.dpi_override == dpi,
+                                            )
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.picker = None;
+                                                Self::send(owner, Command::UiScaling(dpi), cx);
+                                                cx.notify();
+                                            }))
+                                    }),
+                            )
                         }),
                 );
             } else {
@@ -457,7 +486,8 @@ impl ControlPanel {
         if launcher.resize_allowed {
             let preset = match launcher.display_mode {
                 DisplayMode::Fixed(size) => format!("{} × {}", size.0, size.1),
-                _ => "Select Preset".into(),
+                DisplayMode::Fit => "Keep Remote Size".into(),
+                DisplayMode::MatchWindow | DisplayMode::Retina => "Match Window".into(),
             };
             panel = panel
                 .child(
@@ -523,7 +553,7 @@ impl ControlPanel {
                                     this.width.value.clear();
                                     this.height.value.clear();
                                     this.size_error = false;
-                                    Self::send(owner, Command::Retina(retina), cx);
+                                    Self::send(owner, Command::ResetToWindow, cx);
                                     cx.notify();
                                 })),
                         ),

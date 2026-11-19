@@ -234,6 +234,14 @@ impl ScreenPolicy {
         }
     }
 
+    pub fn display_dpi(&self, scale: f32) -> Option<u16> {
+        let target = (96. * scale).round() as u16;
+        self.dpi_choices
+            .iter()
+            .copied()
+            .min_by_key(|&dpi| (dpi.abs_diff(target), dpi))
+    }
+
     pub fn apply(&mut self, change: ScreenChange) -> Option<Value> {
         match change {
             ScreenChange::Alignment(value) if self.alignment.is_some_and(|(_, locked)| !locked) => {
@@ -241,7 +249,7 @@ impl ScreenPolicy {
                 Some(json!({"force_aligned_resolution": value}))
             }
             ScreenChange::Dpi(value)
-                if self.dpi_choices.len() > 1 && self.dpi_choices.contains(&value) =>
+                if self.dpi != Some(value) && self.dpi_choices.contains(&value) =>
             {
                 self.dpi = Some(value);
                 Some(json!({"scaling_dpi": value}))
@@ -311,10 +319,22 @@ mod tests {
     }
 
     #[test]
+    fn automatic_dpi_matches_the_closest_server_scale() {
+        let settings = json!({"scaling_dpi": {"value": "96", "allowed": ["96", "144", "192"]}});
+        let policy = ScreenPolicy::from_server(&settings);
+        assert_eq!(policy.display_dpi(2.), Some(192));
+        assert_eq!(policy.display_dpi(1.), Some(96));
+        assert_eq!(policy.display_dpi(1.6), Some(144));
+        let mut locked = settings;
+        locked["scaling_dpi"]["overridden"] = json!(true);
+        assert_eq!(ScreenPolicy::from_server(&locked).display_dpi(2.), None);
+    }
+
+    #[test]
     fn legacy_video_preferences_load_and_codec_round_trips() {
         let mut prefs: Preferences =
             serde_json::from_value(json!({"jpeg": 45, "fps": 25})).unwrap();
-        assert_eq!(prefs.codec, Codec::Jpeg);
+        assert_eq!(prefs.codec, Codec::H264);
         assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
         prefs.codec = Codec::Hevc;
         prefs.video.insert(Key::Bitrate, 80_000);

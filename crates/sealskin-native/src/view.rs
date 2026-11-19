@@ -1,7 +1,7 @@
 use crate::app::ToggleSessionControls;
 use crate::settings::{Key, ScreenChange};
 use crate::transport::{
-    self, Frame, Input, Picture, Pointer, Resolution, SessionEvent, SessionOptions,
+    self, DisplayRequest, Frame, Input, Picture, Pointer, Resolution, SessionEvent, SessionOptions,
 };
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
@@ -77,8 +77,8 @@ impl NativeSession {
         });
     }
 
-    pub fn set_resolution(&self, size: Resolution, scale: Option<f32>) {
-        let _ = self.input.send(Input::Resolution(size, scale));
+    pub fn set_resolution(&self, request: DisplayRequest) {
+        let _ = self.input.send(Input::Resolution(request));
     }
 
     pub fn set_appearance(&self, dark: bool) {

@@ -37,7 +37,7 @@ scripts/bundle.sh sealskin-native   # produces dist/SealSkin Native.app
 
 The GPUI dependency uses `runtime_shaders`, so the Xcode Metal toolchain does not need to be installed to build (see [gpui-notes.md](../gpui-notes.md)).
 
-JPEG is the default. To switch codecs, open **Session Controls → Video → Codec** while connected. SealSkin reconnects to the same session and remembers the choice for this server. **Stream Diagnostics → Client decoder** shows the codec actually in use. If hardware decoding cannot recover, SealSkin requests JPEG where the server allows it. [Codec support and verification](tickets/more-codecs.md)
+H.264 is the preferred codec for servers without a saved codec choice. To switch codecs, open **Session Controls → Video → Codec** while connected. SealSkin reconnects to the same session and remembers the choice for this server. **Stream Diagnostics → Client decoder** shows the codec actually in use. SealSkin can use JPEG where the server allows it if H.264 is unavailable or hardware decoding cannot recover. [Codec support and verification](tickets/more-codecs.md)
 
 ## 4. Using the app
 
@@ -46,7 +46,7 @@ JPEG is the default. To switch codecs, open **Session Controls → Video → Cod
   - **Mute / Unmute:** controls remote audio when a compatible output is available. Reconnect preserves your mute choice.
   - **Pause / Resume Video:** stops or restarts video delivery while keeping the session open.
   - **Video** shows the codecs supported by both the Mac and the server. It offers JPEG quality and still-image settings for JPEG, and server-supported CBR target bitrate or CRF quality for hardware video. Frame rate cap applies to either. **Reset Video Settings** restores the server’s tuning defaults and keeps the codec preference.
-  - **Screen Settings** has resolution presets, manual width and height, window matching, and HiDPI. **Scale Locally** fits the picture to the window. UI scaling and forced alignment depend on what the server advertises. Diagnostics show the resolution Selkies delivers.
+  - **Screen Settings** opens each session in **Match Window** with **HiDPI** enabled and **UI Scaling** set to **Match Mac Display**. The requested remote resolution and UI scale follow the window when it is resized or moves between displays. The UI scale uses the server’s closest allowed value. Use **Reset to Window** after a manual resolution or UI scale change to resume following the window and Mac display. **Scale Locally** fits the picture to the window.
   - **Full Screen:** toggles macOS full-screen mode. You can also press **⌃⌘F**.
   - **Reconnect:** tears down and re-opens the Selkies stream for the current session.
   - **Disconnect:** closes the local stream and returns to the launcher, leaving the remote session running on the server.
@@ -55,6 +55,6 @@ JPEG is the default. To switch codecs, open **Session Controls → Video → Cod
 ## 5. Limitations
 
 - **Transport and codecs** are limited to Selkies WebSockets with JPEG or full-frame 8-bit H.264, H.265 (HEVC), and AV1 on Macs with compatible VideoToolbox hardware decoding.
-- **Initial size:** the client requests `1280×720`. The server can constrain later resize requests. The client scales and letterboxes the received picture to fit the available area.
+- **Remote resolution** follows the window up to the client’s 4096×2160 limit. The server may further constrain the resolution or lock UI scaling. Stream Diagnostics shows the resolution Selkies delivers.
 - **Individual sessions only:** collaboration rooms are not supported in this version.
 - **Audio:** requires a macOS output device supporting 48 kHz stereo `f32` audio; otherwise the session runs without audio.

@@ -38,6 +38,24 @@ impl Resolution {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayRequest {
+    pub resolution: Resolution,
+    pub scale: Option<f32>,
+}
+
+impl DisplayRequest {
+    fn settings(self) -> Value {
+        let Resolution(width, height) = self.resolution;
+        match self.scale {
+            None => {
+                json!({"manual_resolution": true, "manual_width": width, "manual_height": height, "displayScale": 1})
+            }
+            Some(scale) => json!({"manual_resolution": false, "displayScale": scale}),
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Frame {
     pub width: u16,
@@ -187,7 +205,7 @@ pub enum Input {
     Audio(bool),
     Video(bool),
     Settings(Vec<(Key, u32)>),
-    Resolution(Resolution, Option<f32>),
+    Resolution(DisplayRequest),
     Screen(ScreenChange),
     Appearance(bool),
 }
@@ -197,6 +215,7 @@ pub struct SessionOptions {
     pub dark: bool,
     pub muted: bool,
     pub codec: Codec,
+    pub display: Option<DisplayRequest>,
 }
 
 struct HardwareVideo {
@@ -270,12 +289,21 @@ pub async fn run(
         Codec::Jpeg
     };
     let mut hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
-    let settings = json!({
-        "encoder": codec.wire(), "encoderFallback": true, "video_10bit": false, "video_fullcolor": false,
-        "displayId": "primary", "displayScale": 1, "initialClientWidth": 1280,
-        "initialClientHeight": 720, "manual_resolution": false,
-        "audioRedundancy": false
-    });
+    let mut settings = options.display.map_or_else(
+        || json!({"manual_resolution": false, "displayScale": 1}),
+        DisplayRequest::settings,
+    );
+    if let Some(display) = options.display {
+        let Resolution(width, height) = display.resolution;
+        settings["initialClientWidth"] = json!(width);
+        settings["initialClientHeight"] = json!(height);
+    }
+    settings["encoder"] = json!(codec.wire());
+    settings["encoderFallback"] = json!(true);
+    settings["video_10bit"] = json!(false);
+    settings["video_fullcolor"] = json!(false);
+    settings["displayId"] = json!("primary");
+    settings["audioRedundancy"] = json!(false);
     let disconnected = "The Selkies stream disconnected. Choose Reconnect to resume.";
     socket
         .send(format!("SETTINGS,{settings}").into())
@@ -498,12 +526,10 @@ pub async fn run(
                         }
                         continue;
                     }
-                    Some(Input::Resolution(Resolution(width, height), scale)) => {
+                    Some(Input::Resolution(request)) => {
                         if resize_allowed {
-                            let settings = match scale {
-                                None => json!({"manual_resolution": true, "manual_width": width, "manual_height": height, "displayScale": 1}),
-                                Some(scale) => json!({"manual_resolution": false, "displayScale": scale}),
-                            };
+                            let Resolution(width, height) = request.resolution;
+                            let settings = request.settings();
                             socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
                             socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
                         }

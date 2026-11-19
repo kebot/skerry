@@ -6,7 +6,7 @@ Use VideoToolbox, verify codec negotiation and keyframe recovery after reconnect
 
 ## Prototype results
 
-SealSkin Native can request `h264enc` from **Session Controls → Video → Codec**. It converts full-frame Annex B access units to length-prefixed samples, requires hardware VideoToolbox decode, and gives retained full-range NV12 surfaces directly to GPUI. JPEG remains the default and is the fallback when permitted by the server. [Running the app](../running.md)
+SealSkin Native can request `h264enc` from **Session Controls → Video → Codec**. It converts full-frame Annex B access units to length-prefixed samples, requires hardware VideoToolbox decode, and gives retained full-range NV12 surfaces directly to GPUI. H.264 is preferred when no codec choice has been saved. JPEG is the fallback when permitted by the server. [Running the app](../running.md)
 
 A disposable Zen session on SealSkin 0.4.2 delivered 1280×720 x264 over the existing WebSocket. The client rendered it, recovered after pause and reconnect, and handled JPEG stripes queued before the codec switch. A QA build that rejected incoming H.264 packets requested keyframes and then switched back to JPEG after the 15-second recovery window. The hardware test checks black and white expansion from limited range and verifies that a missing reference invalidates deltas until a new keyframe arrives.
 

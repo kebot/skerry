@@ -1,8 +1,10 @@
 mod controls;
 
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
-use crate::settings::{self, Key, Preferences, ScreenPolicy, Settings, VideoSettings};
-use crate::transport::{Resolution, SessionEvent, SessionOptions, StreamSample};
+use crate::settings::{
+    self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
+};
+use crate::transport::{DisplayRequest, Resolution, SessionEvent, SessionOptions, StreamSample};
 use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
@@ -80,12 +82,40 @@ actions!(
     ]
 );
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum DisplayMode {
     Fit,
     MatchWindow,
+    #[default]
     Retina,
     Fixed(Resolution),
+}
+
+impl DisplayMode {
+    fn request(
+        self,
+        viewport: gpui::Size<gpui::Pixels>,
+        backing_scale: f32,
+    ) -> Option<DisplayRequest> {
+        let scale = match self {
+            Self::Fit => return None,
+            Self::Fixed(resolution) => {
+                return Some(DisplayRequest {
+                    resolution,
+                    scale: None,
+                })
+            }
+            Self::MatchWindow => 1.,
+            Self::Retina => backing_scale,
+        };
+        Some(DisplayRequest {
+            resolution: Resolution::from_window(
+                (f32::from(viewport.width) * scale) as u16,
+                (f32::from(viewport.height) * scale) as u16,
+            ),
+            scale: Some(scale),
+        })
+    }
 }
 
 struct Launcher {
@@ -105,6 +135,9 @@ struct Launcher {
     retina: bool,
     scale_locally: bool,
     screen_policy: ScreenPolicy,
+    dpi_override: Option<u16>,
+    applied_resolution: Option<DisplayRequest>,
+    applied_dpi: Option<u16>,
     resize_allowed: bool,
     resize_task: Option<gpui::Task<()>>,
     preferences: Preferences,
@@ -129,10 +162,13 @@ impl Launcher {
             settings: None,
             controls: None,
             stats: None,
-            display_mode: DisplayMode::Fit,
-            retina: false,
+            display_mode: DisplayMode::default(),
+            retina: true,
             scale_locally: true,
             screen_policy: ScreenPolicy::default(),
+            dpi_override: None,
+            applied_resolution: None,
+            applied_dpi: None,
             resize_allowed: false,
             resize_task: None,
             preferences: Preferences::default(),
@@ -146,15 +182,8 @@ impl Launcher {
             let _ = owner.update(cx, |launcher, cx| launcher.remove_controls(cx));
             true
         });
-        cx.observe_window_bounds(window, |this, window, cx| {
-            if matches!(
-                this.display_mode,
-                DisplayMode::MatchWindow | DisplayMode::Retina
-            ) {
-                this.resize_display(window, cx);
-            }
-        })
-        .detach();
+        cx.observe_window_bounds(window, |this, window, cx| this.resize_display(window, cx))
+            .detach();
         cx.observe_window_appearance(window, |this, window, cx| {
             if let Some((_, stream)) = &this.current {
                 stream.set_appearance(dark_appearance(window));
@@ -263,7 +292,7 @@ impl Launcher {
                         if let Some(library) = &mut this.library {
                             library.sessions.insert(0, session.clone());
                         }
-                        this.open(session, window, cx);
+                        this.open_session(session, window, cx);
                     }
                     Err(error) => this.status = Some(error),
                 }
@@ -272,6 +301,19 @@ impl Launcher {
         })
         .detach();
         cx.notify();
+    }
+
+    fn open_session(
+        &mut self,
+        session: RemoteSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_mode = DisplayMode::default();
+        self.retina = true;
+        self.scale_locally = true;
+        self.dpi_override = None;
+        self.open(session, window, cx);
     }
 
     fn open(&mut self, session: RemoteSession, window: &mut Window, cx: &mut Context<Self>) {
@@ -297,6 +339,9 @@ impl Launcher {
                     dark: dark_appearance(window),
                     muted: self.muted,
                     codec: self.preferences.codec,
+                    display: self
+                        .display_mode
+                        .request(window.viewport_size(), window.scale_factor()),
                 },
                 events,
             )
@@ -326,14 +371,15 @@ impl Launcher {
                                     }
                                     SessionEvent::Stats(sample) => this.stats = Some(sample),
                                     SessionEvent::ScreenPolicy(policy) => {
-                                        this.screen_policy = policy
+                                        this.screen_policy = policy;
+                                        this.resize_display(window, cx);
                                     }
                                     SessionEvent::ResizeAllowed(allowed) => {
-                                        if allowed && !this.resize_allowed {
-                                            this.resize_allowed = true;
+                                        if this.resize_allowed != allowed {
+                                            this.resize_allowed = allowed;
+                                            this.applied_resolution = None;
                                             this.resize_display(window, cx);
                                         }
-                                        this.resize_allowed = allowed;
                                     }
                                     SessionEvent::Error(error) => {
                                         this.resize_allowed = false;
@@ -441,32 +487,39 @@ impl Launcher {
     }
 
     fn resize_display(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if !self.resize_allowed {
+        if self.current.is_none() {
             return;
         }
-        let viewport = window.viewport_size();
-        let scale = if self.display_mode == DisplayMode::Retina {
-            window.scale_factor()
-        } else {
-            1.0
+        let scale = window.scale_factor();
+        let resolution = self
+            .resize_allowed
+            .then(|| self.display_mode.request(window.viewport_size(), scale))
+            .flatten();
+        let dpi = match self.dpi_override {
+            Some(dpi) => self.screen_policy.dpi_choices.contains(&dpi).then_some(dpi),
+            None => self.screen_policy.display_dpi(scale),
         };
-        let (resolution, scale) = match self.display_mode {
-            DisplayMode::Fit => return,
-            DisplayMode::MatchWindow | DisplayMode::Retina => (
-                Resolution::from_window(
-                    (f32::from(viewport.width) * scale) as u16,
-                    (f32::from(viewport.height) * scale) as u16,
-                ),
-                Some(scale),
-            ),
-            DisplayMode::Fixed(resolution) => (resolution, None),
-        };
+        if resolution == self.applied_resolution && dpi == self.applied_dpi {
+            self.resize_task = None;
+            return;
+        }
         let timer = cx.background_executor().timer(Duration::from_millis(250));
         self.resize_task = Some(cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |this, _| {
                 if let Some((_, stream)) = &this.current {
-                    stream.set_resolution(resolution, scale);
+                    if resolution != this.applied_resolution {
+                        if let Some(request) = resolution {
+                            stream.set_resolution(request);
+                        }
+                        this.applied_resolution = resolution;
+                    }
+                    if dpi != this.applied_dpi {
+                        if let Some(value) = dpi {
+                            stream.set_screen(ScreenChange::Dpi(value));
+                        }
+                        this.applied_dpi = dpi;
+                    }
                 }
             });
         }));
@@ -509,6 +562,8 @@ impl Launcher {
         }
         self.settings = None;
         self.screen_policy = ScreenPolicy::default();
+        self.applied_resolution = None;
+        self.applied_dpi = None;
         self.stats = None;
         self.resize_allowed = false;
         self.resize_task = None;
@@ -790,7 +845,7 @@ impl Render for Launcher {
                                 false,
                             )
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open(session.clone(), window, cx)
+                                this.open_session(session.clone(), window, cx)
                             })),
                     )
                 })
@@ -813,4 +868,32 @@ fn row(colors: Colors, name: String) -> Div {
         .border_color(rgb(colors.edge))
         .bg(rgb(colors.panel))
         .child(div().min_w_0().truncate().child(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_window_resolution_follows_the_display_backing_scale() {
+        let viewport = size(px(800.), px(600.));
+        let mode = DisplayMode::default();
+        assert_eq!(
+            mode.request(viewport, 2.).unwrap().resolution,
+            Resolution(1600, 1200)
+        );
+        assert_eq!(
+            mode.request(viewport, 1.).unwrap().resolution,
+            Resolution(800, 600)
+        );
+        assert_eq!(
+            DisplayMode::MatchWindow
+                .request(viewport, 2.)
+                .unwrap()
+                .resolution,
+            Resolution(800, 600)
+        );
+        let fixed = DisplayMode::Fixed(Resolution(1280, 720));
+        assert_eq!(fixed.request(viewport, 2.), fixed.request(viewport, 1.));
+    }
 }
