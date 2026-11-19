@@ -15,7 +15,7 @@ futures-util = { version = "0.3", features = ["sink"] }
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSEvent", "NSGestureRecognizer", "NSGraphics", "NSTouch", "NSView", "NSWindow", "block2"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSEvent", "NSGraphics", "NSResponder", "NSTouch", "NSView", "NSWindow", "block2"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }

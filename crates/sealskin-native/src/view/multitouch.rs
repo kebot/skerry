@@ -1,16 +1,15 @@
 use super::pinch;
 use crate::transport::{Contact, Input};
 use objc2::{
-    define_class, msg_send, rc::Retained, runtime::AnyObject, DefinedClass, MainThreadMarker,
-    MainThreadOnly,
+    define_class, msg_send,
+    rc::{Retained, Weak},
+    runtime::AnyObject,
+    DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSEvent, NSGestureRecognizer, NSTouchPhase, NSTouchType, NSTouchTypeMask, NSView, NSWindow,
+    NSEvent, NSResponder, NSTouchPhase, NSTouchType, NSTouchTypeMask, NSView, NSWindow,
 };
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::cell::{Cell, RefCell};
 use tokio::sync::mpsc;
 
 const MAX_CONTACTS: usize = 10;
@@ -99,14 +98,19 @@ pub(super) fn position(x: f64, y: f64) -> Option<(u16, u16)> {
     Some((quantize(x), quantize(1. - y)))
 }
 
-define_class!(
-    // The parent recognizer and all callbacks are restricted to the AppKit thread.
-    #[unsafe(super(NSGestureRecognizer))]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = Rc<State>]
-    struct SealSkinTrackpadRecognizer;
+struct ResponderState {
+    input: State,
+    view: Weak<NSView>,
+}
 
-    impl SealSkinTrackpadRecognizer {
+define_class!(
+    // AppKit delivers indirect touches through the view's responder chain.
+    #[unsafe(super(NSResponder))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = ResponderState]
+    struct SealSkinTrackpadResponder;
+
+    impl SealSkinTrackpadResponder {
         #[unsafe(method(touchesBeganWithEvent:))]
         fn began(&self, event: &NSEvent) { self.contacts(event); }
 
@@ -117,22 +121,28 @@ define_class!(
         fn ended(&self, event: &NSEvent) { self.contacts(event); }
 
         #[unsafe(method(touchesCancelledWithEvent:))]
-        fn cancelled(&self, _: &NSEvent) { self.ivars().clear(); }
+        fn cancelled(&self, _: &NSEvent) { self.ivars().input.clear(); }
     }
 );
 
-impl SealSkinTrackpadRecognizer {
+impl SealSkinTrackpadResponder {
     fn contacts(&self, event: &NSEvent) {
-        if let Some(view) = self.view() {
-            self.ivars().update(event, &view);
+        let state = self.ivars();
+        if let Some(view) = state.view.load() {
+            state.input.update(event, &view);
         }
     }
 }
 
+struct PreviousResponder {
+    next: Option<Retained<NSResponder>>,
+    touch_types: NSTouchTypeMask,
+}
+
 pub(super) struct Capture {
     view: Retained<NSView>,
-    recognizer: Retained<SealSkinTrackpadRecognizer>,
-    previous_touch_types: NSTouchTypeMask,
+    responder: Retained<SealSkinTrackpadResponder>,
+    previous: RefCell<Option<PreviousResponder>>,
 }
 
 impl Capture {
@@ -143,55 +153,72 @@ impl Capture {
     ) -> Option<Self> {
         let main = MainThreadMarker::new()?;
         let view = window.contentView()?;
-        let state = Rc::new(State {
-            enabled: Cell::new(false),
-            target,
-            input,
-            next_id: Cell::new(1),
-            active: RefCell::default(),
+        let allocated = SealSkinTrackpadResponder::alloc(main).set_ivars(ResponderState {
+            input: State {
+                enabled: Cell::new(false),
+                target,
+                input,
+                next_id: Cell::new(1),
+                active: RefCell::default(),
+            },
+            view: Weak::new(&*view),
         });
-        let allocated = SealSkinTrackpadRecognizer::alloc(main).set_ivars(state);
-        // The superclass initializer accepts nil target and action. The overrides read contacts without recognizing a gesture.
-        let recognizer: Retained<SealSkinTrackpadRecognizer> = unsafe {
-            msg_send![super(allocated), initWithTarget: Option::<&AnyObject>::None, action: Option::<objc2::runtime::Sel>::None]
-        };
-        recognizer.setAllowedTouchTypes(NSTouchTypeMask::Indirect);
-        recognizer.setEnabled(false);
-        let previous_touch_types = view.allowedTouchTypes();
-        view.addGestureRecognizer(&recognizer);
+        // NSResponder's init returns the allocated responder with its Rust fields intact.
+        let responder = unsafe { msg_send![super(allocated), init] };
         Some(Self {
             view,
-            recognizer,
-            previous_touch_types,
+            responder,
+            previous: RefCell::default(),
         })
     }
 
     pub(super) fn set_enabled(&self, enabled: bool) {
-        if !enabled {
+        let mut previous = self.previous.borrow_mut();
+        self.responder.ivars().input.enabled.set(enabled);
+        if enabled {
+            if previous.is_some() {
+                return;
+            }
+            // The original responder is alive in the view's chain. Capture retains
+            // both links until detach, and restores the view's original next responder.
+            unsafe {
+                let next = self.view.nextResponder();
+                let touch_types = self.view.allowedTouchTypes();
+                self.responder.setNextResponder(next.as_deref());
+                self.view.setNextResponder(Some(&self.responder));
+                self.view
+                    .setAllowedTouchTypes(touch_types | NSTouchTypeMask::Indirect);
+                *previous = Some(PreviousResponder { next, touch_types });
+            }
+        } else if let Some(previous) = previous.take() {
             self.clear();
+            // The view and both responders are still retained while restoring the chain.
+            unsafe {
+                if self
+                    .view
+                    .nextResponder()
+                    .is_some_and(|next| std::ptr::eq(&*next, &**self.responder))
+                {
+                    self.view.setNextResponder(previous.next.as_deref());
+                }
+                self.responder.setNextResponder(None);
+            }
+            self.view.setAllowedTouchTypes(previous.touch_types);
         }
-        self.recognizer.ivars().enabled.set(enabled);
-        self.view.setAllowedTouchTypes(if enabled {
-            self.previous_touch_types | NSTouchTypeMask::Indirect
-        } else {
-            self.previous_touch_types
-        });
-        self.recognizer.setEnabled(enabled);
     }
 
     pub(super) fn clear(&self) {
-        self.recognizer.ivars().clear();
+        self.responder.ivars().input.clear();
     }
 
     pub(super) fn has_contacts(&self) -> bool {
-        !self.recognizer.ivars().active.borrow().is_empty()
+        !self.responder.ivars().input.active.borrow().is_empty()
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
         self.set_enabled(false);
-        self.view.removeGestureRecognizer(&self.recognizer);
     }
 }
 
