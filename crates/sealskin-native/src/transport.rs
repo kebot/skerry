@@ -371,6 +371,18 @@ impl HardwareVideo {
     }
 }
 
+fn display_config(text: &str) -> Option<(bool, bool)> {
+    let payload = text.strip_prefix("DISPLAY_CONFIG_UPDATE,").unwrap_or(text);
+    let data: Value = serde_json::from_str(payload).ok()?;
+    if data["type"] != "display_config_update" {
+        return None;
+    }
+    Some((
+        data["finger_scroll"].as_bool().unwrap_or(false),
+        data["multitouch_trackpad"].as_bool().unwrap_or(false),
+    ))
+}
+
 pub async fn run(
     url: Url,
     frames: watch::Sender<Frame>,
@@ -516,14 +528,14 @@ pub async fn run(
                     if text.starts_with("MODE ") && text != "MODE websockets" {
                         return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.");
                     }
+                    if let Some((finger_scroll, supported)) = display_config(&text) {
+                        multitouch = supported;
+                        let _ = events.send(SessionEvent::FingerScroll(finger_scroll));
+                        let _ = events.send(SessionEvent::Multitouch(multitouch));
+                        continue;
+                    }
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
                         match data["type"].as_str() {
-                            Some("display_config_update") => {
-                                let enabled = data["finger_scroll"].as_bool().unwrap_or(false);
-                                let _ = events.send(SessionEvent::FingerScroll(enabled));
-                                multitouch = data["multitouch_trackpad"].as_bool().unwrap_or(false);
-                                let _ = events.send(SessionEvent::Multitouch(multitouch));
-                            }
                             Some("stream_info") => {
                                 diagnostics.server_encoder = data["info"]["encoder"].as_str().map(str::to_owned);
                             }
@@ -893,6 +905,21 @@ async fn socket_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_selkies_prefixed_display_capabilities() {
+        assert_eq!(
+            display_config(
+                r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","finger_scroll":true,"multitouch_trackpad":true}"#
+            ),
+            Some((true, true))
+        );
+        assert_eq!(
+            display_config(r#"{"type":"display_config_update"}"#),
+            Some((false, false))
+        );
+        assert_eq!(display_config(r#"{"type":"stream_info"}"#), None);
+    }
 
     fn jpeg(color: [u8; 3]) -> Vec<u8> {
         let mut bytes = Vec::new();
