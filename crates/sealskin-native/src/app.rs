@@ -14,6 +14,7 @@ use gpui::{
     WindowBounds, WindowHandle, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
+use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -21,6 +22,15 @@ use tokio::runtime::Handle;
 const APP_NAME: &str = "SealSkin Native";
 
 pub fn run() {
+    // GPUI 0.2.2 can reenter its window lock when AppKit restores key-window state.
+    // The launcher restores remote sessions itself, so skip local window restoration.
+    let key = NSString::from_str("ApplePersistenceIgnoreState");
+    let enabled = NSNumber::numberWithBool(true);
+    let defaults =
+        NSDictionary::<NSString, objc2::runtime::AnyObject>::from_slices(&[&*key], &[&enabled]);
+    // The registered value is a property-list boolean and lasts only for this run.
+    unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
