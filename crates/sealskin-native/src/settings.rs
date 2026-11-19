@@ -320,7 +320,8 @@ mod tests {
 
     #[test]
     fn automatic_dpi_matches_the_closest_server_scale() {
-        let settings = json!({"scaling_dpi": {"value": "96", "allowed": ["96", "144", "192"]}});
+        let settings =
+            json!({"scaling_dpi": {"value": "96", "allowed": ["96", "120", "144", "168", "192"]}});
         let policy = ScreenPolicy::from_server(&settings);
         assert_eq!(policy.display_dpi(2.), Some(192));
         assert_eq!(policy.display_dpi(1.), Some(96));

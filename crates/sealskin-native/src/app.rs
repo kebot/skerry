@@ -1,4 +1,5 @@
 mod controls;
+mod display;
 
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
 use crate::settings::{
@@ -146,6 +147,7 @@ struct Launcher {
     scale_locally: bool,
     screen_policy: ScreenPolicy,
     dpi_override: Option<u16>,
+    ui_scale: display::UiScale,
     applied_resolution: Option<DisplayRequest>,
     applied_dpi: Option<u16>,
     resize_allowed: bool,
@@ -177,6 +179,7 @@ impl Launcher {
             scale_locally: true,
             screen_policy: ScreenPolicy::default(),
             dpi_override: None,
+            ui_scale: display::UiScale::default(),
             applied_resolution: None,
             applied_dpi: None,
             resize_allowed: false,
@@ -507,7 +510,10 @@ impl Launcher {
             .flatten();
         let dpi = match self.dpi_override {
             Some(dpi) => self.screen_policy.dpi_choices.contains(&dpi).then_some(dpi),
-            None => self.screen_policy.display_dpi(scale),
+            None if !self.screen_policy.dpi_choices.is_empty() => self
+                .screen_policy
+                .display_dpi(self.ui_scale.for_window(window, cx)),
+            None => None,
         };
         if resolution == self.applied_resolution && dpi == self.applied_dpi {
             self.resize_task = None;

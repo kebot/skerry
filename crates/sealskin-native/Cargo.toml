@@ -15,6 +15,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSGraphics", "NSView", "NSWindow"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "objc2", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSDictionary", "NSString", "NSUserDefaults", "NSValue"] }
