@@ -1,6 +1,6 @@
 use crate::audio::Playback;
-use crate::h264::{self, Decoder};
-use crate::settings::{encoder_allowed, Key, ScreenChange, ScreenPolicy, Settings};
+use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
+use crate::video::{self, Codec, Decoder};
 use futures_util::{SinkExt, StreamExt};
 use gpui::RenderImage;
 use image::{ImageDecoder, ImageFormat, ImageReader};
@@ -48,7 +48,7 @@ pub struct Frame {
 #[derive(Clone)]
 pub enum Picture {
     Jpeg(Arc<RenderImage>),
-    H264(h264::Surface),
+    Video(video::Surface),
 }
 
 #[derive(Default)]
@@ -119,7 +119,7 @@ pub struct StreamSample {
     pub wire_mbps: f64,
     pub decode_ms: f64,
     pub dropped: u64,
-    pub client_decoder: &'static str,
+    pub client_codec: Option<Codec>,
     pub server_encoder: Option<String>,
     pub rtt_ms: Option<f64>,
 }
@@ -129,7 +129,7 @@ struct Diagnostics {
     bytes: usize,
     frames: u64,
     packets: u64,
-    hardware_video: bool,
+    codec: Option<Codec>,
     dropped: u64,
     decode: Duration,
     server_encoder: Option<String>,
@@ -146,11 +146,7 @@ impl Diagnostics {
             wire_mbps: std::mem::take(&mut self.bytes) as f64 * 8.0 / 1_000_000.0 / seconds,
             decode_ms: std::mem::take(&mut self.decode).as_secs_f64() * 1000.0
                 / std::mem::take(&mut self.packets).max(1) as f64,
-            client_decoder: if self.hardware_video {
-                "H.264 · VideoToolbox"
-            } else {
-                "JPEG"
-            },
+            client_codec: self.codec,
             dropped: self.dropped,
             server_encoder: self.server_encoder.clone(),
             rtt_ms: self.rtt_ms,
@@ -190,20 +186,21 @@ pub enum Input {
     Pointer(Pointer),
     Audio(bool),
     Video(bool),
-    Settings(Vec<(Key, u16)>),
+    Settings(Vec<(Key, u32)>),
     Resolution(Resolution, Option<f32>),
     Screen(ScreenChange),
     Appearance(bool),
 }
 
 pub struct SessionOptions {
-    pub preferences: Vec<(Key, u16)>,
+    pub preferences: Vec<(Key, u32)>,
     pub dark: bool,
     pub muted: bool,
-    pub prefer_h264: bool,
+    pub codec: Codec,
 }
 
 struct HardwareVideo {
+    codec: Codec,
     decoder: Decoder,
     decoded: bool,
     deadline: Option<Instant>,
@@ -211,8 +208,9 @@ struct HardwareVideo {
 }
 
 impl HardwareVideo {
-    fn new(now: Instant) -> Self {
+    fn new(codec: Codec, now: Instant) -> Self {
         Self {
+            codec,
             decoder: Decoder::default(),
             decoded: false,
             deadline: Some(now + WAIT_FOR_VIDEO),
@@ -220,19 +218,18 @@ impl HardwareVideo {
         }
     }
 
-    fn decode(&mut self, data: &[u8]) -> Option<Frame> {
-        let packet = h264::Packet::parse(data)?;
+    fn decode(&mut self, packet: &video::Packet<'_>) -> Option<Frame> {
         let (width, height) = packet.size;
         if !valid_resolution(width, height) {
             return None;
         }
-        let surface = self.decoder.decode(&packet).ok()??;
+        let surface = self.decoder.decode(packet).ok()??;
         self.decoded = true;
         self.deadline = None;
         Some(Frame {
             width,
             height,
-            picture: Some(Picture::H264(surface)),
+            picture: Some(Picture::Video(surface)),
         })
     }
 
@@ -267,10 +264,14 @@ pub async fn run(
     .await
     .map_err(|_| "The Selkies WebSocket did not respond.")?
     .map_err(|_| "Couldn’t connect to the Selkies WebSocket.")?;
-    let mut hardware =
-        (options.prefer_h264 && h264::supported()).then(|| HardwareVideo::new(Instant::now()));
+    let mut codec = if options.codec.supported() {
+        options.codec
+    } else {
+        Codec::Jpeg
+    };
+    let mut hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
     let settings = json!({
-        "encoder": if hardware.is_some() { "h264enc" } else { "jpeg" }, "encoderFallback": true,
+        "encoder": codec.wire(), "encoderFallback": true, "video_10bit": false, "video_fullcolor": false,
         "displayId": "primary", "displayScale": 1, "initialClientWidth": 1280,
         "initialClientHeight": 720, "manual_resolution": false,
         "audioRedundancy": false
@@ -328,7 +329,7 @@ pub async fn run(
                         let started = Instant::now();
                         if frame.stripe(y, &data[6..]).is_some() {
                             diagnostics.packets += 1;
-                            diagnostics.hardware_video = false;
+                            diagnostics.codec = Some(Codec::Jpeg);
                             diagnostics.decode += started.elapsed();
                             changed = true;
                             seen_video = true;
@@ -339,13 +340,17 @@ pub async fn run(
                     Some(4) if data.len() > 12 => {
                         last_frame = Some(u16::from_be_bytes([data[2], data[3]]));
                         if let Some(video) = &mut hardware {
+                            let packet = video::Packet::parse(&data);
+                            if packet.as_ref().is_some_and(|packet| packet.codec != video.codec) {
+                                continue;
+                            }
                             let started = Instant::now();
-                            if let Some(picture) = video.decode(&data) {
+                            if let Some(picture) = packet.as_ref().and_then(|packet| video.decode(packet)) {
                                 frame = Canvas::default();
                                 active_size = Resolution(picture.width, picture.height);
                                 decoded = Some(picture);
                                 changed = false;
-                                diagnostics.hardware_video = true;
+                                diagnostics.codec = Some(video.codec);
                                 diagnostics.packets += 1;
                                 diagnostics.decode += started.elapsed();
                                 seen_video = true;
@@ -399,13 +404,15 @@ pub async fn run(
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
                                     appearance = data["settings"]["color_scheme"].clone();
                                     let _ = events.send(SessionEvent::ResizeAllowed(resize_allowed));
-                                    if !encoder_allowed(&data["settings"]["encoder"], "h264enc") {
-                                        if let Some(video) = &mut hardware {
-                                            video.deadline = Some(Instant::now());
-                                        }
-                                    }
-                                    if hardware.is_none() && !capabilities.jpeg_available {
-                                        return Err("This server does not offer JPEG video for the session.");
+                                    if !capabilities.codecs.contains(&codec) {
+                                        codec = capabilities.codecs.first().copied().ok_or("This server offers no video codec this Mac can play.")?;
+                                        hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
+                                        decoded = None;
+                                        seen_video = false;
+                                        let command = codec_command(codec);
+                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
+                                        video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
                                     }
                                 }
                                 let _ = events.send(SessionEvent::Settings(capabilities.clone()));
@@ -535,15 +542,16 @@ pub async fn run(
             }
             _ = present.tick() => {
                 if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
-                    if !capabilities.jpeg_available {
-                        return Err("Hardware H.264 failed and the server does not allow JPEG fallback.");
+                    if !capabilities.codecs.contains(&Codec::Jpeg) {
+                        return Err("Hardware video decoding failed and the server does not allow JPEG fallback.");
                     }
+                    codec = Codec::Jpeg;
                     hardware = None;
                     decoded = None;
                     seen_video = false;
                     unsupported_video = false;
                     video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
-                    socket.send("SETTINGS,{\"encoder\":\"jpeg\",\"encoderFallback\":true}".into()).await.map_err(|_| disconnected)?;
+                    socket.send(codec_command(codec).into()).await.map_err(|_| disconnected)?;
                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                 }
                 if let Some(picture) = decoded.take().or_else(|| changed.then(|| frame.snapshot())) {
@@ -624,7 +632,7 @@ fn legacy_settings(settings: &Settings) -> Option<String> {
 
 fn settings_command(
     settings: &Settings,
-    changes: impl IntoIterator<Item = (Key, u16)>,
+    changes: impl IntoIterator<Item = (Key, u32)>,
 ) -> Option<(String, Value)> {
     let values: serde_json::Map<String, Value> = changes
         .into_iter()
@@ -643,6 +651,13 @@ fn settings_command(
         format!("SETTINGS,{}", Value::Object(command)),
         Value::Object(values),
     ))
+}
+
+fn codec_command(codec: Codec) -> String {
+    format!(
+        "SETTINGS,{}",
+        json!({"encoder": codec.wire(), "encoderFallback": true, "video_10bit": false, "video_fullcolor": false})
+    )
 }
 
 fn valid_resolution(width: u16, height: u16) -> bool {
@@ -776,7 +791,7 @@ mod tests {
     #[test]
     fn hardware_recovery_throttles_requests_without_postponing_fallback() {
         let start = Instant::now();
-        let mut video = HardwareVideo::new(start);
+        let mut video = HardwareVideo::new(Codec::H264, start);
         assert!(video.recover(start));
         assert!(!video.recover(start + Duration::from_millis(500)));
         assert!(video.recover(start + Duration::from_secs(1)));

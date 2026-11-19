@@ -1,10 +1,15 @@
 use core_foundation::base::TCFType;
 use core_video::pixel_buffer::CVPixelBuffer;
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{
+    CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
 use objc2_core_media::{
-    kCMBlockBufferAssureMemoryNowFlag, kCMVideoCodecType_H264, CMBlockBuffer, CMFormatDescription,
-    CMSampleBuffer, CMTime, CMVideoFormatDescriptionCreateFromH264ParameterSets,
-    CMVideoFormatDescriptionGetDimensions,
+    kCMBlockBufferAssureMemoryNowFlag,
+    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms, kCMVideoCodecType_AV1,
+    kCMVideoCodecType_H264, kCMVideoCodecType_HEVC, CMBlockBuffer, CMFormatDescription,
+    CMSampleBuffer, CMTime, CMVideoFormatDescriptionCreate,
+    CMVideoFormatDescriptionCreateFromH264ParameterSets,
+    CMVideoFormatDescriptionCreateFromHEVCParameterSets, CMVideoFormatDescriptionGetDimensions,
 };
 use objc2_core_video::{
     kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
@@ -21,7 +26,60 @@ use std::{
     ptr::{null, null_mut, NonNull},
 };
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Codec {
+    #[default]
+    Jpeg,
+    H264,
+    Hevc,
+    Av1,
+}
+
+impl Codec {
+    pub const ALL: [Self; 4] = [Self::Jpeg, Self::H264, Self::Hevc, Self::Av1];
+
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpeg",
+            Self::H264 => "h264enc",
+            Self::Hevc => "h265enc",
+            Self::Av1 => "av1enc",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Jpeg => "JPEG",
+            Self::H264 => "H.264",
+            Self::Hevc => "H.265 (HEVC)",
+            Self::Av1 => "AV1",
+        }
+    }
+
+    pub fn decoder_label(self) -> &'static str {
+        match self {
+            Self::Jpeg => "JPEG",
+            Self::H264 => "H.264 · VideoToolbox",
+            Self::Hevc => "H.265 · VideoToolbox",
+            Self::Av1 => "AV1 · VideoToolbox",
+        }
+    }
+
+    pub fn supported(self) -> bool {
+        let code = match self {
+            Self::Jpeg => return true,
+            Self::H264 => kCMVideoCodecType_H264,
+            Self::Hevc => kCMVideoCodecType_HEVC,
+            Self::Av1 => kCMVideoCodecType_AV1,
+        };
+        // The query takes a constant Core Media codec identifier.
+        unsafe { VTIsHardwareDecodeSupported(code) }
+    }
+}
+
 pub struct Packet<'a> {
+    pub codec: Codec,
     pub id: u16,
     pub reference: u16,
     pub size: (u16, u16),
@@ -36,10 +94,17 @@ impl<'a> Packet<'a> {
             return None;
         };
         // Legacy Selkies used a zero codec nibble for H.264.
-        if !matches!(kind >> 4, 0 | 1) || payload.is_empty() {
+        let codec = match kind >> 4 {
+            0 | 1 => Codec::H264,
+            4 => Codec::Av1,
+            5 => Codec::Hevc,
+            _ => return None,
+        };
+        if payload.is_empty() {
             return None;
         }
         Some(Self {
+            codec,
             id: u16::from_be_bytes([id_hi, id_lo]),
             reference: u16::from_be_bytes([ref_hi, ref_lo]),
             size: (
@@ -53,16 +118,14 @@ impl<'a> Packet<'a> {
 }
 
 struct AccessUnit<'a> {
-    sps: Option<&'a [u8]>,
-    pps: Option<&'a [u8]>,
+    parameters: [Option<&'a [u8]>; 3],
     avcc: Vec<u8>,
 }
 
 impl<'a> AccessUnit<'a> {
-    fn parse(bytes: &'a [u8]) -> Option<Self> {
+    fn parse(codec: Codec, bytes: &'a [u8]) -> Option<Self> {
         let mut unit = Self {
-            sps: None,
-            pps: None,
+            parameters: [None; 3],
             avcc: Vec::with_capacity(bytes.len()),
         };
         let start = |bytes: &[u8]| bytes.windows(3).position(|window| window == [0, 0, 1]);
@@ -77,14 +140,25 @@ impl<'a> AccessUnit<'a> {
             while let Some((0, rest)) = nalu.split_last() {
                 nalu = rest;
             }
-            match nalu.first()? & 0x1f {
-                7 => unit.sps = Some(nalu),
-                8 => unit.pps = Some(nalu),
-                _ => {
-                    unit.avcc
-                        .extend_from_slice(&u32::try_from(nalu.len()).ok()?.to_be_bytes());
-                    unit.avcc.extend_from_slice(nalu);
-                }
+            let header = *nalu.first()?;
+            let parameter = match codec {
+                Codec::H264 => match header & 0x1f {
+                    7 => Some(0),
+                    8 => Some(1),
+                    _ => None,
+                },
+                Codec::Hevc => match (header >> 1) & 0x3f {
+                    32..=34 => Some(usize::from(((header >> 1) & 0x3f) - 32)),
+                    _ => None,
+                },
+                _ => return None,
+            };
+            if let Some(index) = parameter {
+                unit.parameters[index] = Some(nalu);
+            } else {
+                unit.avcc
+                    .extend_from_slice(&u32::try_from(nalu.len()).ok()?.to_be_bytes());
+                unit.avcc.extend_from_slice(nalu);
             }
             let Some(next) = next else { break };
             remaining = &remaining[next + 3..];
@@ -107,16 +181,12 @@ impl Surface {
     }
 }
 
-pub fn supported() -> bool {
-    // The query takes a constant Core Media codec identifier.
-    unsafe { VTIsHardwareDecodeSupported(kCMVideoCodecType_H264) }
-}
-
 struct Session {
     session: CFRetained<VTDecompressionSession>,
     format: CFRetained<CMFormatDescription>,
-    sps: Vec<u8>,
-    pps: Vec<u8>,
+    codec: Codec,
+    size: (u16, u16),
+    config: Vec<Vec<u8>>,
 }
 
 // Each session is exclusively owned by one task. VideoToolbox sessions have no
@@ -124,27 +194,17 @@ struct Session {
 unsafe impl Send for Session {}
 
 impl Session {
-    fn new(sps: &[u8], pps: &[u8], size: (u16, u16)) -> Result<Self, &'static str> {
-        let parameters = [NonNull::from(&sps[0]), NonNull::from(&pps[0])];
-        let lengths = [sps.len(), pps.len()];
-        let mut format = null();
-        // The arrays describe two parameter sets that remain live for the call.
-        let status = unsafe {
-            CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                None,
-                2,
-                NonNull::from(&parameters[0]),
-                NonNull::from(&lengths[0]),
-                4,
-                NonNull::from(&mut format),
-            )
-        };
-        let format = unsafe { take_created(status, format.cast_mut()) }
-            .ok_or("Invalid H.264 parameter sets.")?;
+    fn new(codec: Codec, config: &[&[u8]], size: (u16, u16)) -> Result<Self, &'static str> {
+        let format = if codec == Codec::Av1 {
+            av1_format(config[0], size)
+        } else {
+            nal_format(codec, config)
+        }
+        .ok_or("Invalid video codec configuration.")?;
         // Verify the actual coded size before asking VideoToolbox to allocate surfaces.
         let coded = unsafe { CMVideoFormatDescriptionGetDimensions(&format) };
         if (coded.width, coded.height) != (i32::from(size.0), i32::from(size.1)) {
-            return Err("H.264 parameter sets disagree with the display size.");
+            return Err("Video configuration disagrees with the display size.");
         }
 
         let format_code = CFNumber::new_i32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange as i32);
@@ -180,12 +240,13 @@ impl Session {
             )
         };
         let session = unsafe { take_created(status, session) }
-            .ok_or("Couldn’t start the hardware H.264 decoder.")?;
+            .ok_or("Couldn’t start the hardware video decoder.")?;
         Ok(Self {
             session,
             format,
-            sps: sps.to_vec(),
-            pps: pps.to_vec(),
+            codec,
+            size,
+            config: config.iter().map(|part| part.to_vec()).collect(),
         })
     }
 
@@ -207,12 +268,12 @@ impl Session {
             )
         };
         let block =
-            unsafe { take_created(status, block) }.ok_or("Couldn’t allocate the H.264 sample.")?;
+            unsafe { take_created(status, block) }.ok_or("Couldn’t allocate the video sample.")?;
         if unsafe {
             CMBlockBuffer::replace_data_bytes(NonNull::from(&bytes[0]).cast(), &block, 0, len)
         } != 0
         {
-            return Err("Couldn’t fill the H.264 sample.");
+            return Err("Couldn’t fill the video sample.");
         }
         let mut sample = null_mut();
         let status = unsafe {
@@ -229,7 +290,7 @@ impl Session {
             )
         };
         let sample =
-            unsafe { take_created(status, sample) }.ok_or("Couldn’t create the H.264 sample.")?;
+            unsafe { take_created(status, sample) }.ok_or("Couldn’t create the video sample.")?;
         let mut output: Option<Surface> = None;
         // Without asynchronous or temporal flags, the callback completes before the call returns.
         let status = unsafe {
@@ -241,9 +302,9 @@ impl Session {
             )
         };
         if status != 0 {
-            return Err("Hardware H.264 decode failed.");
+            return Err("Hardware video decode failed.");
         }
-        output.ok_or("The H.264 decoder returned no renderable surface.")
+        output.ok_or("The video decoder returned no renderable surface.")
     }
 }
 
@@ -294,45 +355,195 @@ unsafe extern "C-unwind" fn decoded_frame(
     }
 }
 
+fn nal_format(codec: Codec, config: &[&[u8]]) -> Option<CFRetained<CMFormatDescription>> {
+    let pointers = config
+        .iter()
+        .map(|part| part.first().map(NonNull::from))
+        .collect::<Option<Vec<_>>>()?;
+    let lengths: Vec<_> = config.iter().map(|part| part.len()).collect();
+    let mut format = null();
+    // The arrays and each parameter set remain live for the call.
+    let status = unsafe {
+        let pointers = NonNull::from(pointers.first()?);
+        let lengths = NonNull::from(lengths.first()?);
+        let out = NonNull::from(&mut format);
+        if codec == Codec::H264 {
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                None,
+                config.len(),
+                pointers,
+                lengths,
+                4,
+                out,
+            )
+        } else {
+            CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                None,
+                config.len(),
+                pointers,
+                lengths,
+                4,
+                None,
+                out,
+            )
+        }
+    };
+    unsafe { take_created(status, format.cast_mut()) }
+}
+
+// Selkies sends low-overhead AV1 OBUs. The first sequence header in a keyframe
+// supplies the configuration OBU for the av1C atom consumed by VideoToolbox.
+fn av1_sequence(mut data: &[u8]) -> Option<(&[u8], &[u8])> {
+    while let Some(&header) = data.first() {
+        if header & 0x83 != 2 {
+            return None;
+        }
+        let size_start = 1 + usize::from(header & 4 != 0);
+        let size_bytes = data.get(size_start..)?;
+        let last = size_bytes.iter().take(4).position(|byte| *byte < 128)?;
+        let size = size_bytes[..=last]
+            .iter()
+            .enumerate()
+            .fold(0usize, |size, (index, byte)| {
+                size | (usize::from(byte & 127) << (index * 7))
+            });
+        let payload_start = size_start + last + 1;
+        let end = payload_start + size;
+        let obu = data.get(..end)?;
+        if (header >> 3) & 15 == 1 {
+            return Some((obu, &obu[payload_start..]));
+        }
+        data = &data[end..];
+    }
+    None
+}
+
+fn av1_format(obu: &[u8], size: (u16, u16)) -> Option<CFRetained<CMFormatDescription>> {
+    let (_, payload) = av1_sequence(obu)?;
+    let mut bits = payload
+        .iter()
+        .flat_map(|byte| (0..8).rev().map(move |shift| (byte >> shift) & 1));
+    fn read_bits(bits: &mut impl Iterator<Item = u8>, count: usize) -> Option<u8> {
+        (0..count).try_fold(0u8, |value, _| Some((value << 1) | bits.next()?))
+    }
+    // Support the normal Main 8-bit 4:2:0 streams negotiated below.
+    if read_bits(&mut bits, 3)? != 0 {
+        return None;
+    }
+    bits.next()?; // still_picture
+    let reduced = bits.next()? != 0;
+    if !reduced {
+        if bits.next()? != 0 {
+            bits.nth(63)?; // timing information
+            if bits.next()? != 0 {
+                let leading = (0..32).find(|_| bits.next() != Some(0))?;
+                for _ in 0..leading {
+                    bits.next()?;
+                }
+            }
+            if bits.next()? != 0 {
+                bits.nth(46)?;
+            } // decoder model info
+        }
+        bits.nth(17)?; // display delay flag, operating point count, first operating point ID
+    }
+    let level = read_bits(&mut bits, 5)?;
+    let tier = if !reduced && level > 7 {
+        bits.next()?
+    } else {
+        0
+    };
+    let mut av1c = vec![0x81, level, (tier << 7) | 0x0c, 0];
+    av1c.extend_from_slice(obu);
+    let atom = CFData::from_bytes(&av1c);
+    let atom_name = CFString::from_str("av1C");
+    let atoms = CFDictionary::from_slices(&[&*atom_name], &[&*atom]);
+    let mut format = null();
+    // Core Media retains the extension dictionary when creating the format description.
+    let status = unsafe {
+        let extensions = CFDictionary::from_slices(
+            &[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms],
+            &[&*atoms],
+        );
+        CMVideoFormatDescriptionCreate(
+            None,
+            kCMVideoCodecType_AV1,
+            size.0.into(),
+            size.1.into(),
+            Some(extensions.as_opaque()),
+            NonNull::from(&mut format),
+        )
+    };
+    unsafe { take_created(status, format.cast_mut()) }
+}
+
 #[derive(Default)]
 pub struct Decoder {
     session: Option<Session>,
-    last: Option<(u16, (u16, u16))>,
+    last: Option<u16>,
 }
 
 impl Decoder {
     pub fn decode(&mut self, packet: &Packet<'_>) -> Result<Option<Surface>, &'static str> {
-        if !packet.key && self.last != Some((packet.reference, packet.size)) {
+        let matches = self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.codec == packet.codec && session.size == packet.size);
+        if !packet.key && (!matches || self.last != Some(packet.reference)) {
             self.last = None;
             return Ok(None);
         }
         self.last = None;
-        let unit = AccessUnit::parse(packet.payload).ok_or("Invalid Annex B H.264 access unit.")?;
-        if packet.key {
-            let sps = unit.sps.ok_or("The H.264 keyframe contains no SPS.")?;
-            let pps = unit.pps.ok_or("The H.264 keyframe contains no PPS.")?;
-            if !self
-                .session
-                .as_ref()
-                .is_some_and(|session| session.sps == sps && session.pps == pps)
-            {
-                self.session = Some(Session::new(sps, pps, packet.size)?);
-            }
+        let framed;
+        let (sample, config) = if packet.codec == Codec::Av1 {
+            let config = if packet.key {
+                vec![
+                    av1_sequence(packet.payload)
+                        .ok_or("Missing AV1 sequence header.")?
+                        .0,
+                ]
+            } else {
+                Vec::new()
+            };
+            (packet.payload, config)
+        } else {
+            framed = AccessUnit::parse(packet.codec, packet.payload)
+                .ok_or("Invalid Annex B access unit.")?;
+            let config = if packet.key {
+                let count = if packet.codec == Codec::Hevc { 3 } else { 2 };
+                framed.parameters[..count]
+                    .iter()
+                    .copied()
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or("Missing video parameter sets.")?
+            } else {
+                Vec::new()
+            };
+            (framed.avcc.as_slice(), config)
+        };
+        if packet.key
+            && (!matches
+                || !self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.config == config))
+        {
+            self.session = Some(Session::new(packet.codec, &config, packet.size)?);
         }
-        if unit.avcc.is_empty() {
-            return Err("The H.264 packet contains no picture data.");
+        if sample.is_empty() {
+            return Err("The packet contains no picture data.");
         }
         let session = self
             .session
             .as_ref()
-            .ok_or("The H.264 decoder needs a keyframe.")?;
-        let surface = session.decode(&unit.avcc)?;
+            .ok_or("The video decoder needs a keyframe.")?;
+        let surface = session.decode(sample)?;
         if (surface.0.get_width(), surface.0.get_height())
             != (usize::from(packet.size.0), usize::from(packet.size.1))
         {
-            return Err("The H.264 picture size doesn’t match the packet.");
+            return Err("The decoded picture size doesn’t match the packet.");
         }
-        self.last = Some((packet.id, packet.size));
+        self.last = Some(packet.id);
         Ok(Some(surface))
     }
 }
@@ -340,6 +551,22 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_the_av1_sequence_obu_and_rejects_truncated_lengths() {
+        let bytes = [0x12, 0, 0x0a, 2, 0x08, 0, 0x32, 1, 0];
+        assert_eq!(av1_sequence(&bytes), Some((&bytes[2..6], &bytes[4..6])));
+        assert!(av1_sequence(&[0x0a, 0x80]).is_none());
+        assert!(av1_sequence(&[0x0a, 5, 0]).is_none());
+    }
+
+    #[test]
+    fn distinguishes_hevc_and_av1_wire_packets() {
+        let mut bytes = [4, 0x51, 0, 1, 0, 0, 5, 0, 2, 208, 0, 0, 1];
+        assert_eq!(Packet::parse(&bytes).unwrap().codec, Codec::Hevc);
+        bytes[1] = 0x41;
+        assert_eq!(Packet::parse(&bytes).unwrap().codec, Codec::Av1);
+    }
 
     #[test]
     fn reads_full_frame_h264_with_a_wrapped_reference_id() {
@@ -363,7 +590,7 @@ mod tests {
 
     #[test]
     fn hardware_decoder_expands_limited_range_and_recovers_at_a_keyframe() {
-        if !supported() {
+        if !Codec::H264.supported() {
             return;
         }
         // x264 Baseline Annex B, 318×190, limited range. Black above row 96, white below it.
@@ -397,6 +624,7 @@ mod tests {
         ];
         let mut decoder = Decoder::default();
         let mut packet = Packet {
+            codec: Codec::H264,
             id: u16::MAX,
             reference: 0,
             size: (318, 190),
@@ -416,6 +644,7 @@ mod tests {
         assert!(black <= 4 && white >= 251, "luma range {black}–{white}");
 
         let mut predicted = Packet {
+            codec: Codec::H264,
             id: 0,
             reference: u16::MAX,
             size: packet.size,
@@ -435,11 +664,11 @@ mod tests {
     #[test]
     fn extracts_parameter_sets_and_reframes_mixed_annex_b_start_codes() {
         let bytes = [0, 0, 0, 1, 0x67, 1, 0, 0, 1, 0x68, 2, 0, 0, 1, 0x65, 3];
-        let frame = AccessUnit::parse(&bytes).unwrap();
-        assert_eq!(frame.sps, Some(&[0x67, 1][..]));
-        assert_eq!(frame.pps, Some(&[0x68, 2][..]));
+        let frame = AccessUnit::parse(Codec::H264, &bytes).unwrap();
+        assert_eq!(frame.parameters[0], Some(&[0x67, 1][..]));
+        assert_eq!(frame.parameters[1], Some(&[0x68, 2][..]));
         assert_eq!(frame.avcc, [0, 0, 0, 2, 0x65, 3]);
-        assert!(AccessUnit::parse(&[0, 0, 1]).is_none());
-        assert!(AccessUnit::parse(&[0x65, 3]).is_none());
+        assert!(AccessUnit::parse(Codec::H264, &[0, 0, 1]).is_none());
+        assert!(AccessUnit::parse(Codec::H264, &[0x65, 3]).is_none());
     }
 }

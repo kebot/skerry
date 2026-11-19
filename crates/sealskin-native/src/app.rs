@@ -1,8 +1,9 @@
 mod controls;
 
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
-use crate::settings::{self, Key, Preferences, ScreenPolicy, Settings};
+use crate::settings::{self, Key, Preferences, ScreenPolicy, Settings, VideoSettings};
 use crate::transport::{Resolution, SessionEvent, SessionOptions, StreamSample};
+use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
 use gpui::{
@@ -107,7 +108,7 @@ struct Launcher {
     resize_allowed: bool,
     resize_task: Option<gpui::Task<()>>,
     preferences: Preferences,
-    pending_settings: Preferences,
+    pending_settings: VideoSettings,
     settings_task: Option<gpui::Task<()>>,
     busy: Option<String>,
     status: Option<String>,
@@ -134,8 +135,8 @@ impl Launcher {
             screen_policy: ScreenPolicy::default(),
             resize_allowed: false,
             resize_task: None,
-            preferences: Preferences::new(),
-            pending_settings: Preferences::new(),
+            preferences: Preferences::default(),
+            pending_settings: VideoSettings::new(),
             settings_task: None,
             busy: None,
             status: None,
@@ -280,6 +281,7 @@ impl Launcher {
         self.preferences = settings::load(api.server());
         let preferences = self
             .preferences
+            .video
             .iter()
             .map(|(&key, &value)| (key, value))
             .collect();
@@ -294,7 +296,7 @@ impl Launcher {
                     preferences,
                     dark: dark_appearance(window),
                     muted: self.muted,
-                    prefer_h264: std::env::var("SEALSKIN_VIDEO_CODEC").as_deref() == Ok("h264"),
+                    codec: self.preferences.codec,
                 },
                 events,
             )
@@ -363,7 +365,27 @@ impl Launcher {
         }
     }
 
-    fn change_setting(&mut self, key: Key, value: u16, cx: &mut Context<Self>) {
+    fn change_codec(&mut self, codec: Codec, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.codecs.contains(&codec))
+        {
+            return;
+        }
+        let Some(api) = &self.api else { return };
+        let previous = self.preferences.codec;
+        self.preferences.codec = codec;
+        if settings::save(api.server(), &self.preferences).is_err() {
+            self.preferences.codec = previous;
+            self.status = Some("Couldn’t save the codec preference.".into());
+            cx.notify();
+            return;
+        }
+        self.reconnect(window, cx);
+    }
+
+    fn change_setting(&mut self, key: Key, value: u32, cx: &mut Context<Self>) {
         let Some(value) = self
             .settings
             .as_ref()
@@ -371,7 +393,7 @@ impl Launcher {
         else {
             return;
         };
-        self.preferences.insert(key, value);
+        self.preferences.video.insert(key, value);
         self.pending_settings.insert(key, value);
         let timer = cx.background_executor().timer(Duration::from_millis(180));
         self.settings_task = Some(cx.spawn(async move |this, cx| {
@@ -404,7 +426,7 @@ impl Launcher {
             return;
         };
         self.settings_task = None;
-        self.preferences.clear();
+        self.preferences.video.clear();
         self.pending_settings = Key::ALL
             .into_iter()
             .filter_map(|key| {

@@ -2,6 +2,7 @@ use super::{
     native_window, CloseSessionControls, Colors, DisplayMode, Launcher, ToggleFullScreen,
     ToggleSessionControls,
 };
+use crate::video::Codec;
 use crate::{
     settings::{Key, ScreenChange},
     transport::Resolution,
@@ -59,7 +60,8 @@ enum Command {
     Retina(bool),
     ScaleLocally(bool),
     Screen(ScreenChange),
-    Setting(Key, u16),
+    Setting(Key, u32),
+    Codec(Codec),
     ResetVideo,
 }
 
@@ -211,6 +213,7 @@ impl ControlPanel {
                             stream.set_screen(change);
                         }
                     }
+                    Command::Codec(codec) => launcher.change_codec(codec, window, cx),
                     Command::Setting(key, value) => launcher.change_setting(key, value, cx),
                     Command::ResetVideo => launcher.reset_settings(cx),
                 }
@@ -549,16 +552,72 @@ impl ControlPanel {
             return panel.child("Video settings are unavailable for this connection.");
         };
         let owner = self.owner;
+        let preferred = launcher.preferences.codec;
+        let codec = launcher
+            .stats
+            .as_ref()
+            .and_then(|stats| stats.client_codec)
+            .unwrap_or_else(|| {
+                if settings.codecs.contains(&preferred) {
+                    preferred
+                } else {
+                    settings.codecs.first().copied().unwrap_or_default()
+                }
+            });
+        let rate = launcher
+            .pending_settings
+            .get(&Key::RateControl)
+            .copied()
+            .or_else(|| {
+                settings
+                    .get(Key::RateControl)
+                    .map(|setting| setting.current)
+            });
         panel
+            .child("Codec")
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(settings.codecs.iter().map(|&choice| {
+                        colors
+                            .button(choice.wire(), choice.label(), choice == codec)
+                            .on_click(move |_, _, cx| {
+                                if choice != codec || choice != preferred {
+                                    Self::send(owner, Command::Codec(choice), cx);
+                                }
+                            })
+                    })),
+            )
+            .when(launcher.preferences.codec != codec, |panel| {
+                panel.child(div().text_color(rgb(colors.muted)).child(format!(
+                    "Preferred codec · {}",
+                    launcher.preferences.codec.label()
+                )))
+            })
             .children(
                 [
                     (Key::Fps, "Frame rate cap", "fps", 5),
                     (Key::Jpeg, "JPEG quality", "%", 5),
                     (Key::PaintOver, "Improve still areas", "", 1),
                     (Key::PaintQuality, "Still image quality", "%", 5),
+                    (Key::RateControl, "Rate control", "", 1),
+                    (Key::Bitrate, "Target bitrate", "kbps", 500),
+                    (Key::Crf, "Constant quality (CRF)", "", 1),
                 ]
                 .into_iter()
                 .filter_map(|(key, label, unit, step)| {
+                    let visible = match key {
+                        Key::Fps => true,
+                        Key::Jpeg | Key::PaintOver | Key::PaintQuality => codec == Codec::Jpeg,
+                        Key::RateControl => codec != Codec::Jpeg,
+                        Key::Bitrate => codec != Codec::Jpeg && rate != Some(1),
+                        Key::Crf => codec != Codec::Jpeg && rate == Some(1),
+                    };
+                    if !visible {
+                        return None;
+                    }
                     let control = settings.get(key)?;
                     let value = launcher
                         .pending_settings
@@ -588,8 +647,22 @@ impl ControlPanel {
                                     },
                                 ));
                         }
+                    } else if key == Key::RateControl {
+                        for (mode, label) in [(0, "CBR"), (1, "CRF")] {
+                            if value == mode || settings.request(key, mode).is_some() {
+                                values = values.child(
+                                    colors.button(label, label, value == mode).on_click(
+                                        move |_, _, cx| {
+                                            if value != mode {
+                                                Self::send(owner, Command::Setting(key, mode), cx);
+                                            }
+                                        },
+                                    ),
+                                );
+                            }
+                        }
                     } else {
-                        values = values.child(format!("{value} {unit}"));
+                        values = values.child(format!("{value} {unit}").trim_end().to_owned());
                         for (next, sign) in [
                             (value.saturating_sub(step).max(control.min), "−"),
                             (value.saturating_add(step).min(control.max), "+"),
@@ -734,7 +807,13 @@ impl Render for ControlPanel {
                                 .map_or("Unavailable".into(), |ms| format!("{ms:.0} ms")),
                         ),
                         ("Transport", "WebSocket".into()),
-                        ("Client decoder", stats.client_decoder.into()),
+                        (
+                            "Client decoder",
+                            stats
+                                .client_codec
+                                .map_or("Waiting for video", Codec::decoder_label)
+                                .into(),
+                        ),
                         (
                             "Server encoder",
                             stats.server_encoder.clone().unwrap_or("Unreported".into()),

@@ -1,3 +1,4 @@
+use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::BTreeMap, io, path::PathBuf};
@@ -9,10 +10,21 @@ pub enum Key {
     Jpeg,
     PaintOver,
     PaintQuality,
+    RateControl,
+    Bitrate,
+    Crf,
 }
 
 impl Key {
-    pub const ALL: [Self; 4] = [Self::Fps, Self::Jpeg, Self::PaintOver, Self::PaintQuality];
+    pub const ALL: [Self; 7] = [
+        Self::Fps,
+        Self::Jpeg,
+        Self::PaintOver,
+        Self::PaintQuality,
+        Self::RateControl,
+        Self::Bitrate,
+        Self::Crf,
+    ];
 
     pub fn wire(self) -> &'static str {
         match self {
@@ -20,21 +32,34 @@ impl Key {
             Self::Jpeg => "jpeg_quality",
             Self::PaintOver => "use_paint_over_quality",
             Self::PaintQuality => "paint_over_jpeg_quality",
+            Self::RateControl => "rate_control_mode",
+            Self::Bitrate => "video_bitrate",
+            Self::Crf => "video_crf",
         }
     }
 
-    fn read(self, value: &Value) -> Option<u16> {
+    fn read(self, value: &Value) -> Option<u32> {
+        if self == Self::RateControl {
+            return match value.as_str()? {
+                "cbr" => Some(0),
+                "crf" => Some(1),
+                _ => None,
+            };
+        }
         if self == Self::PaintOver {
-            value.as_bool().map(u16::from)
+            value.as_bool().map(u32::from)
         } else {
             value
                 .as_f64()
-                .filter(|v| (0.0..=f64::from(u16::MAX)).contains(v))
-                .map(|v| v.round() as u16)
+                .filter(|v| (0.0..=f64::from(u32::MAX)).contains(v))
+                .map(|v| v.round() as u32)
         }
     }
 
-    pub fn encode(self, value: u16) -> Value {
+    pub fn encode(self, value: u32) -> Value {
+        if self == Self::RateControl {
+            return json!(if value == 0 { "cbr" } else { "crf" });
+        }
         if self == Self::PaintOver {
             json!(value != 0)
         } else {
@@ -45,32 +70,60 @@ impl Key {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Control {
-    pub current: u16,
-    pub initial: u16,
-    pub min: u16,
-    pub max: u16,
+    pub current: u32,
+    pub initial: u32,
+    pub min: u32,
+    pub max: u32,
     pub locked: bool,
 }
 
 #[derive(Clone)]
 pub struct Settings {
     controls: BTreeMap<Key, Control>,
-    pub jpeg_available: bool,
+    pub codecs: Vec<Codec>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             controls: BTreeMap::new(),
-            jpeg_available: true,
+            codecs: Codec::ALL
+                .into_iter()
+                .filter(|codec| codec.supported())
+                .collect(),
         }
     }
 }
 
 impl Settings {
     pub fn announce(&mut self, payload: &Value) {
-        self.jpeg_available = encoder_allowed(&payload["encoder"], "jpeg");
+        self.codecs = Codec::ALL
+            .into_iter()
+            .filter(|codec| codec.supported() && encoder_allowed(&payload["encoder"], codec.wire()))
+            .collect();
         for key in Key::ALL {
+            if key == Key::RateControl {
+                let mode = &payload[key.wire()];
+                let control = key.read(&mode["value"]).map(|current| {
+                    let locked = payload["enable_rate_control"]["value"] == false
+                        || mode["locked"] == true
+                        || !["cbr", "crf"]
+                            .iter()
+                            .all(|name| encoder_allowed(mode, name));
+                    Control {
+                        current,
+                        initial: self.get(key).map_or(current, |old| old.initial),
+                        min: 0,
+                        max: 1,
+                        locked,
+                    }
+                });
+                self.controls.remove(&key);
+                if let Some(control) = control {
+                    self.controls.insert(key, control);
+                }
+                continue;
+            }
             if let Some(control) = parse(key, &payload[key.wire()], self.get(key)) {
                 self.controls.insert(key, control);
             } else {
@@ -91,7 +144,7 @@ impl Settings {
         self.controls.get(&key).copied()
     }
 
-    pub fn request(&self, key: Key, value: u16) -> Option<u16> {
+    pub fn request(&self, key: Key, value: u32) -> Option<u32> {
         self.get(key)
             .filter(|control| !control.locked && control.min != control.max)
             .map(|control| value.clamp(control.min, control.max))
@@ -198,7 +251,15 @@ impl ScreenPolicy {
     }
 }
 
-pub type Preferences = BTreeMap<Key, u16>;
+pub type VideoSettings = BTreeMap<Key, u32>;
+
+#[derive(Default, Deserialize, Serialize)]
+pub struct Preferences {
+    #[serde(default)]
+    pub codec: Codec,
+    #[serde(flatten)]
+    pub video: VideoSettings,
+}
 
 fn path(server: &str) -> Option<PathBuf> {
     Some(
@@ -250,6 +311,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_video_preferences_load_and_codec_round_trips() {
+        let mut prefs: Preferences =
+            serde_json::from_value(json!({"jpeg": 45, "fps": 25})).unwrap();
+        assert_eq!(prefs.codec, Codec::Jpeg);
+        assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
+        prefs.codec = Codec::Hevc;
+        prefs.video.insert(Key::Bitrate, 80_000);
+        let restored: Preferences =
+            serde_json::from_value(serde_json::to_value(prefs).unwrap()).unwrap();
+        assert_eq!(restored.codec, Codec::Hevc);
+        assert_eq!(restored.video.get(&Key::Bitrate), Some(&80_000));
+    }
+
+    #[test]
+    fn rate_settings_respect_server_bounds_and_locks() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({
+            "encoder": {"value": "jpeg", "locked": true, "allowed": ["jpeg", "h265enc"]},
+            "rate_control_mode": {"value": "cbr", "allowed": ["cbr", "crf"]},
+            "video_bitrate": {"default": 8000, "min": 100, "max": 1_000_000},
+            "video_crf": {"default": 25, "min": 5, "max": 50, "locked": true}
+        }));
+        assert_eq!(settings.codecs, [Codec::Jpeg]);
+        assert_eq!(settings.request(Key::Bitrate, 80_000), Some(80_000));
+        assert_eq!(settings.request(Key::Crf, 40), None);
+        assert_eq!(
+            settings
+                .request(Key::RateControl, 1)
+                .map(|value| Key::RateControl.encode(value)),
+            Some(json!("crf"))
+        );
+        settings.announce(&json!({"rate_control_mode": {"value": "cbr"}, "enable_rate_control": {"value": false}}));
+        assert_eq!(settings.request(Key::RateControl, 1), None);
+    }
+
+    #[test]
     fn screen_policy_only_sends_editable_and_advertised_values() {
         let mut policy = ScreenPolicy::from_server(&json!({
             "force_aligned_resolution": {"value": false, "locked": true},
@@ -267,11 +364,11 @@ mod tests {
     #[test]
     fn jpeg_is_unavailable_only_when_the_server_excludes_it() {
         let mut settings = Settings::default();
-        assert!(settings.jpeg_available);
+        assert!(settings.codecs.contains(&Codec::Jpeg));
         settings
             .announce(&json!({"encoder": {"value": "h264enc", "allowed": ["h264enc", "jpeg"]}}));
-        assert!(settings.jpeg_available);
+        assert!(settings.codecs.contains(&Codec::Jpeg));
         settings.announce(&json!({"encoder": {"value": "h264enc", "allowed": ["h264enc"]}}));
-        assert!(!settings.jpeg_available);
+        assert!(!settings.codecs.contains(&Codec::Jpeg));
     }
 }

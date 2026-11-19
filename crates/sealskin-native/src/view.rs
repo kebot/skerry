@@ -60,7 +60,7 @@ impl NativeSession {
         window.focus(&self.view.read(cx).focus);
     }
 
-    pub fn set_settings(&self, changes: Vec<(Key, u16)>) {
+    pub fn set_settings(&self, changes: Vec<(Key, u32)>) {
         let _ = self.input.send(Input::Settings(changes));
     }
 
@@ -359,7 +359,7 @@ impl Render for Desktop {
                             );
                             jpeg = Some(image.clone());
                         }
-                        Picture::H264(surface) => {
+                        Picture::Video(surface) => {
                             window.paint_surface(display.bounds, surface.pixel_buffer())
                         }
                     }

@@ -16,9 +16,10 @@
 
 ### REVIEW
 - [x] [Prototype hardware-decoded H.264 over the existing connection](tickets/h264-video.md)
+- [x] [Choose JPEG, H.264, H.265, or AV1 and tune video in Session Controls](tickets/more-codecs.md)
 
 ### TODO
-- [ ] [Evaluate AV1, H.265, VP8, and VP9 after H.264](tickets/more-codecs.md)
+- [ ] [Evaluate VP8, VP9, and additional encoder options](tickets/more-codecs.md#remaining-work)
 
 ### BACKLOG
 - [ ] [Open a second remote display in its own window](tickets/second-display.md)

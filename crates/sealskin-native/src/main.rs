@@ -5,11 +5,11 @@ mod app;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
-mod h264;
-#[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
 mod transport;
+#[cfg(target_os = "macos")]
+mod video;
 #[cfg(target_os = "macos")]
 mod view;
 

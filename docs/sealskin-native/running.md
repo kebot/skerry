@@ -4,7 +4,7 @@
 
 - A [SealSkin server](https://docs.sealskin.app/latest/) with a trusted HTTPS certificate.
 - Your account must allow the **Other** client type for application keys.
-- Individual sessions must support the Selkies WebSocket transport with JPEG enabled, or H.264 enabled when running the hardware decoding prototype.
+- Individual sessions must support the Selkies WebSocket transport and allow a codec supported by the Mac.
 
 ## 2. Application key
 
@@ -37,13 +37,7 @@ scripts/bundle.sh sealskin-native   # produces dist/SealSkin Native.app
 
 The GPUI dependency uses `runtime_shaders`, so the Xcode Metal toolchain does not need to be installed to build (see [gpui-notes.md](../gpui-notes.md)).
 
-JPEG is the default. To try H.264 hardware decoding, start the app with this setting and open a session that allows `h264enc`.
-
-```sh
-SEALSKIN_VIDEO_CODEC=h264 'dist/SealSkin Native.app/Contents/MacOS/SealSkin Native'
-```
-
-Check **Client decoder** in **Stream Diagnostics** to see what the Mac is decoding. The client requests JPEG if H.264 is unavailable or cannot recover and the server allows JPEG. [Benchmark and verification](tickets/h264-video.md)
+JPEG is the default. To switch codecs, open **Session Controls → Video → Codec** while connected. SealSkin reconnects to the same session and remembers the choice for this server. **Stream Diagnostics → Client decoder** shows the codec actually in use. If hardware decoding cannot recover, SealSkin requests JPEG where the server allows it. [Codec support and verification](tickets/more-codecs.md)
 
 ## 4. Using the app
 
@@ -51,7 +45,7 @@ Check **Client decoder** in **Stream Diagnostics** to see what the Mac is decodi
 - **Session Controls:** press **⌘⇧M**, choose **View → Session Controls**, or click **•••** when it appears in the space beside the picture. The controls open in a separate, movable macOS panel with collapsible **Screen Settings**, **Video**, and **Stream Diagnostics** sections. Press **Esc** or **⌘W** to close the panel and return focus to the session.
   - **Mute / Unmute:** controls remote audio when a compatible output is available. Reconnect preserves your mute choice.
   - **Pause / Resume Video:** stops or restarts video delivery while keeping the session open.
-  - **Video:** shows stream diagnostics and server-supported JPEG controls. Changes are saved per server. **Reset Video Settings** restores the defaults announced when the session opened.
+  - **Video** shows the codecs supported by both the Mac and the server. It offers JPEG quality and still-image settings for JPEG, and server-supported CBR target bitrate or CRF quality for hardware video. Frame rate cap applies to either. **Reset Video Settings** restores the server’s tuning defaults and keeps the codec preference.
   - **Screen Settings** has resolution presets, manual width and height, window matching, and HiDPI. **Scale Locally** fits the picture to the window. UI scaling and forced alignment depend on what the server advertises. Diagnostics show the resolution Selkies delivers.
   - **Full Screen:** toggles macOS full-screen mode. You can also press **⌃⌘F**.
   - **Reconnect:** tears down and re-opens the Selkies stream for the current session.
@@ -60,7 +54,7 @@ Check **Client decoder** in **Stream Diagnostics** to see what the Mac is decodi
 
 ## 5. Limitations
 
-- **Transport and codecs** are limited to Selkies WebSockets with JPEG or opt-in, full-frame 8-bit H.264 on Macs with VideoToolbox hardware decode.
+- **Transport and codecs** are limited to Selkies WebSockets with JPEG or full-frame 8-bit H.264, H.265 (HEVC), and AV1 on Macs with compatible VideoToolbox hardware decoding.
 - **Initial size:** the client requests `1280×720`. The server can constrain later resize requests. The client scales and letterboxes the received picture to fit the available area.
 - **Individual sessions only:** collaboration rooms are not supported in this version.
 - **Audio:** requires a macOS output device supporting 48 kHz stereo `f32` audio; otherwise the session runs without audio.
