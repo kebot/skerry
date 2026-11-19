@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sealskin-native"]
+members = ["crates/skerry-mac"]
 
 [workspace.package]
 edition = "2021"

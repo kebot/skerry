@@ -26,13 +26,13 @@ Keys supplied via `SEALSKIN_APPLICATION_KEY` or `.env` are used for the current 
 Run from source:
 
 ```sh
-cargo run -p sealskin-native-app
+cargo run -p skerry-mac
 ```
 
 Build a macOS `.app` bundle (ad-hoc signed, not notarised):
 
 ```sh
-scripts/bundle.sh sealskin-native   # produces dist/SealSkin Native.app
+scripts/bundle.sh skerry-mac   # produces dist/SealSkin Native.app
 ```
 
 The GPUI dependency uses `runtime_shaders`, so the Xcode Metal toolchain does not need to be installed to build (see [gpui-notes.md](../gpui-notes.md)).

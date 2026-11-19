@@ -8,21 +8,21 @@ For development, the app also reads `SEALSKIN_APPLICATION_KEY` from the environm
 
 This version supports individual sessions with the Selkies WebSocket transport and JPEG enabled. It requests 1280×720 and scales the remote picture to the local window. WebRTC, other video codecs, and collaboration rooms are outside this version’s scope.
 
-See [docs/sealskin-native/DESIGN.md](docs/sealskin-native/DESIGN.md) for the architecture and [docs/sealskin-native/running.md](docs/sealskin-native/running.md) for setup, credentials, and usage. Shared GPUI notes are in [docs/gpui-notes.md](docs/gpui-notes.md).
+See [docs/skerry-mac/DESIGN.md](docs/skerry-mac/DESIGN.md) for the architecture and [docs/skerry-mac/running.md](docs/skerry-mac/running.md) for setup, credentials, and usage. Shared GPUI notes are in [docs/gpui-notes.md](docs/gpui-notes.md).
 
 The GPUI dependency uses the `runtime_shaders` feature, so the Xcode Metal toolchain is not needed to build.
 
 ```sh
-cargo run -p sealskin-native-app
-scripts/bundle.sh sealskin-native   # produces dist/SealSkin Native.app
+cargo run -p skerry-mac
+scripts/bundle.sh skerry-mac   # produces dist/SealSkin Native.app
 ```
 
 ## Layout
 
 | Path | Contents |
 |------|----------|
-| `crates/sealskin-native` | The SealSkin launcher and API client, Selkies transport, GPUI desktop view, and Core Audio playback |
-| `design/sealskin-native/` | Static HTML mock of the UI |
+| `crates/skerry-mac` | The SealSkin launcher and API client, Selkies transport, GPUI desktop view, and Core Audio playback |
+| `design/skerry-mac/` | Static HTML mock of the UI |
 | `docs/` | Design notes, tickets, and shared GPUI notes |
 
 ## Develop

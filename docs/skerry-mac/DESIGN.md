@@ -1,6 +1,6 @@
 # SealSkin Native: design and architecture
 
-SealSkin Native (`crates/sealskin-native`, package `sealskin-native-app`) is a native macOS GPUI client for launching and resuming applications on a [SealSkin server](https://docs.sealskin.app/latest/).
+SealSkin Native (`crates/skerry-mac`, package `skerry-mac`) is a native macOS GPUI client for launching and resuming applications on a [SealSkin server](https://docs.sealskin.app/latest/).
 
 ## Purpose
 
@@ -8,7 +8,7 @@ Connect directly to a SealSkin server with an application key, list available ap
 
 ## Architecture
 
-All SealSkin Native code lives in `crates/sealskin-native/src/`:
+All SealSkin Native code lives in `crates/skerry-mac/src/`:
 
 - **`api.rs` — credentials and companion REST API**
   - `Credential::parse` validates application keys of the form `ssk_<id>_<secret>@<host>[:port]`, requiring an `https` origin with no path, query, or credentials in the URL.
