@@ -75,7 +75,7 @@ pub fn select_connection<'a>(
 fn first_run(path: &Path) -> Overlay {
     Overlay::new("Welcome to rb")
         .detail(format!(
-            "No config file found. Create {} (mode 0600, it holds tokens) with a Connection, for example:\n\n{}\nSee docs/running.md.",
+            "No config file found. Create {} (mode 0600, it holds tokens) with a Connection, for example:\n\n{}\nSee docs/rb/running.md.",
             path.display(),
             EXAMPLE_CONFIG
         ))

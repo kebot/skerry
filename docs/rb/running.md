@@ -135,7 +135,7 @@ with `agent_proxy = true` on port 39333 and plays the Agent on command
   elsewhere), popups as Tabs, or Agent proxy yet.
 - The address field is minimal: type, backspace, Cmd+V, Cmd+A; no cursor
   movement or selection. Back/forward are not disabled at the ends of history.
-- Typed CJK composition does not work in the Mirror (see docs/gpui-notes.md).
+- Typed CJK composition does not work in the Mirror (see [gpui-notes.md](../gpui-notes.md)).
 - Frames are scaled, the remote viewport is not resized (ADR 0002).
 - Backoff can leave "Reconnecting..." showing for up to 30 s after the server
   is back; the Connection retries on its own schedule.

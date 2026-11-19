@@ -1,6 +1,6 @@
 # rb: agreed design
 
-Status: agreed in a design interview; no code written yet. Terms are defined in [GLOSSARY.md](../GLOSSARY.md).
+Status: agreed in a design interview; no code written yet. Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
 
 ## Purpose
 

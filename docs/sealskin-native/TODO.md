@@ -19,14 +19,15 @@
 - [x] [Choose JPEG, H.264, H.265, or AV1 and tune video in Session Controls](tickets/more-codecs.md)
 
 ### TODO
-- [ ] [Evaluate VP8, VP9, and additional encoder options](tickets/more-codecs.md#remaining-work)
 
 ### BACKLOG
 - [ ] [Open a second remote display in its own window](tickets/second-display.md)
 - [ ] [Evaluate WebRTC as a second transport](tickets/webrtc.md)
+- [ ] [Evaluate VP8, VP9, and additional encoder options](tickets/more-codecs.md#remaining-work)
 
 ## Launcher and sessions
 
+### TODO
 - [ ] [Choose launch options and see startup progress](tickets/launch-options.md)
 - [ ] [View previews, send files, and stop running sessions](tickets/session-management.md)
 - [ ] [Open links and files in remote apps](tickets/open-links-and-files.md)
