@@ -1,5 +1,6 @@
+use crate::app::ToggleSessionControls;
 use crate::settings::Key;
-use crate::transport::{self, Frame, Input, Resolution, SessionEvent, SessionOptions};
+use crate::transport::{self, Frame, Input, Pointer, Resolution, SessionEvent, SessionOptions};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
     DispatchPhase, Entity, FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers,
@@ -15,6 +16,9 @@ use tokio::{
     runtime::Handle,
     sync::{mpsc, watch},
 };
+
+const MENU_SIZE: Pixels = px(32.);
+const MENU_MARGIN: Pixels = px(8.);
 
 pub struct NativeSession {
     view: Entity<Desktop>,
@@ -48,6 +52,10 @@ impl NativeSession {
 
     pub fn view(&self) -> AnyView {
         self.view.clone().into()
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &App) {
+        window.focus(&self.view.read(cx).focus);
     }
 
     pub fn set_settings(&self, changes: Vec<(Key, u16)>) {
@@ -90,11 +98,11 @@ struct Desktop {
     focus: FocusHandle,
     frame: Frame,
     painted: Rc<RefCell<Option<Arc<gpui::RenderImage>>>>,
-    bounds: Option<Bounds<Pixels>>,
+    painted_display: Option<PaintedDisplay>,
     input: mpsc::UnboundedSender<Input>,
-    pointer: watch::Sender<Option<String>>,
+    pointer: watch::Sender<Option<Pointer>>,
     buttons: u8,
-    position: (u16, u16),
+    position: Option<(Resolution, (u16, u16))>,
     keys: HashMap<String, u32>,
     modifiers: Modifiers,
     scroll: (f32, f32),
@@ -103,7 +111,7 @@ struct Desktop {
 impl Desktop {
     fn new(
         input: mpsc::UnboundedSender<Input>,
-        pointer: watch::Sender<Option<String>>,
+        pointer: watch::Sender<Option<Pointer>>,
         mut frames: watch::Receiver<Frame>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -122,6 +130,12 @@ impl Desktop {
                 let frame = frames.borrow_and_update().clone();
                 if desktop
                     .update(cx, |desktop, cx| {
+                        if (desktop.frame.width, desktop.frame.height)
+                            != (frame.width, frame.height)
+                        {
+                            desktop.painted_display = None;
+                            desktop.release_pointer();
+                        }
                         desktop.frame = frame;
                         cx.notify();
                     })
@@ -136,11 +150,11 @@ impl Desktop {
             focus,
             frame: Frame::default(),
             painted: Rc::default(),
-            bounds: None,
+            painted_display: None,
             input,
             pointer,
             buttons: 0,
-            position: (0, 0),
+            position: None,
             keys: HashMap::new(),
             modifiers: Modifiers::default(),
             scroll: (0.0, 0.0),
@@ -152,31 +166,27 @@ impl Desktop {
     }
 
     fn mouse_position(&mut self, point: Point<Pixels>, clamp: bool) -> bool {
-        let Some(bounds) = self
-            .bounds
-            .filter(|b| b.size.width > px(0.) && b.size.height > px(0.))
-        else {
-            return false;
-        };
-        if !clamp && !bounds.contains(&point) {
-            return false;
-        }
-        let x = (point.x - bounds.origin.x) / bounds.size.width;
-        let y = (point.y - bounds.origin.y) / bounds.size.height;
-        self.position = (
-            (x * f32::from(self.frame.width))
-                .clamp(0., f32::from(self.frame.width.saturating_sub(1))) as u16,
-            (y * f32::from(self.frame.height))
-                .clamp(0., f32::from(self.frame.height.saturating_sub(1))) as u16,
-        );
-        true
+        self.position = self.painted_display.and_then(|display| {
+            display
+                .position(point, clamp)
+                .map(|position| (display.resolution, position))
+        });
+        self.position.is_some()
     }
 
-    fn mouse_state(&self) -> String {
-        format!(
-            "m,{},{},{},0",
-            self.position.0, self.position.1, self.buttons
-        )
+    fn mouse_state(&self) -> Option<Pointer> {
+        let (display, position) = self.position?;
+        Some(Pointer {
+            display,
+            position,
+            buttons: self.buttons,
+        })
+    }
+
+    fn send_pointer(&self) {
+        if let Some(pointer) = self.mouse_state() {
+            let _ = self.input.send(Input::Pointer(pointer));
+        }
     }
 
     fn mouse_button(&mut self, button: MouseButton, down: bool) {
@@ -192,7 +202,7 @@ impl Desktop {
             self.buttons &= !mask;
         }
         self.pointer.send_replace(None);
-        self.command(self.mouse_state());
+        self.send_pointer();
     }
 
     fn scroll(&mut self, event: &ScrollWheelEvent) {
@@ -234,25 +244,33 @@ impl Desktop {
             self.command(format!("ku,{key}"));
         }
         self.modifiers(Modifiers::default());
-        if self.buttons != 0 {
-            self.buttons = 0;
-            self.pointer.send_replace(None);
-            self.command(self.mouse_state());
+        self.release_pointer();
+    }
+
+    fn release_pointer(&mut self) {
+        self.pointer.send_replace(None);
+        self.position = None;
+        if std::mem::take(&mut self.buttons) != 0 {
+            self.command("m2,0,0,0,0".into());
         }
     }
 }
 
 impl Render for Desktop {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let desktop = cx.entity();
         let frame = self.frame.clone();
         let empty = frame.image.is_none();
+        let bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+        let menu = menu_position(bounds, frame.width, frame.height);
         let painted = self.painted.clone();
         let surface = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |bounds, hitbox, window, cx| {
-                let target = fit(bounds, frame.width, frame.height);
-                desktop.update(cx, |desktop, _| desktop.bounds = target);
+                let display = frame.image.as_ref().and_then(|_| {
+                    PaintedDisplay::new(bounds, Resolution(frame.width, frame.height))
+                });
+                desktop.update(cx, |desktop, _| desktop.painted_display = display);
                 let v = desktop.clone();
                 let hb = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
@@ -287,7 +305,7 @@ impl Render for Desktop {
                             if (hovered || dragging)
                                 && desktop.mouse_position(event.position, dragging)
                             {
-                                desktop.pointer.send_replace(Some(desktop.mouse_state()));
+                                desktop.pointer.send_replace(desktop.mouse_state());
                             }
                         });
                     }
@@ -298,14 +316,20 @@ impl Render for Desktop {
                         v.update(cx, |desktop, _| {
                             if desktop.mouse_position(event.position, false) {
                                 desktop.pointer.send_replace(None);
-                                desktop.command(desktop.mouse_state());
+                                desktop.send_pointer();
                                 desktop.scroll(event);
                             }
                         });
                     }
                 });
-                if let (Some(target), Some(image)) = (target, &frame.image) {
-                    let _ = window.paint_image(target, Corners::default(), image.clone(), 0, false);
+                if let (Some(display), Some(image)) = (display, &frame.image) {
+                    let _ = window.paint_image(
+                        display.bounds,
+                        Corners::default(),
+                        image.clone(),
+                        0,
+                        false,
+                    );
                 }
                 if let Some(old) = painted.replace(frame.image.clone()) {
                     if !frame
@@ -347,6 +371,28 @@ impl Render for Desktop {
                 },
             ))
             .child(surface)
+            .when_some(menu, |view, position| {
+                view.child(
+                    div()
+                        .id("session-controls-trigger")
+                        .absolute()
+                        .top(position.y)
+                        .left(position.x)
+                        .size(MENU_SIZE)
+                        .rounded_md()
+                        .bg(rgb(0x22262f))
+                        .text_color(rgb(0xf1f3f6))
+                        .hover(|button| button.bg(rgb(0x354258)))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child("•••")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleSessionControls), cx)
+                        }),
+                )
+            })
             .when(empty, |view| {
                 view.child(
                     div()
@@ -359,6 +405,42 @@ impl Render for Desktop {
                         .child("Waiting for the remote display…"),
                 )
             })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PaintedDisplay {
+    bounds: Bounds<Pixels>,
+    resolution: Resolution,
+}
+
+impl PaintedDisplay {
+    fn new(viewport: Bounds<Pixels>, resolution: Resolution) -> Option<Self> {
+        let bounds = fit(viewport, resolution.0, resolution.1)?;
+        Some(Self { bounds, resolution })
+    }
+
+    fn position(self, point: Point<Pixels>, clamp: bool) -> Option<(u16, u16)> {
+        let bounds = self.bounds;
+        if bounds.size.width <= px(0.)
+            || bounds.size.height <= px(0.)
+            || (!clamp && !bounds.contains(&point))
+        {
+            return None;
+        }
+        let coordinate = |fraction: f32, extent: u16| {
+            (fraction * f32::from(extent)).clamp(0., f32::from(extent - 1)) as u16
+        };
+        Some((
+            coordinate(
+                (point.x - bounds.origin.x) / bounds.size.width,
+                self.resolution.0,
+            ),
+            coordinate(
+                (point.y - bounds.origin.y) / bounds.size.height,
+                self.resolution.1,
+            ),
+        ))
     }
 }
 
@@ -377,6 +459,20 @@ fn fit(bounds: Bounds<Pixels>, width: u16, height: u16) -> Option<Bounds<Pixels>
         ),
         size(width, height),
     ))
+}
+
+fn menu_position(viewport: Bounds<Pixels>, width: u16, height: u16) -> Option<Point<Pixels>> {
+    let picture = fit(viewport, width, height)?;
+    let needed = MENU_SIZE + MENU_MARGIN * 2.;
+    let top_fits = picture.top() - viewport.top() >= needed;
+    let side_fits = viewport.right() - picture.right() >= needed;
+    (viewport.size.width >= needed && viewport.size.height >= needed && (top_fits || side_fits))
+        .then(|| {
+            point(
+                viewport.right() - MENU_MARGIN - MENU_SIZE,
+                viewport.top() + MENU_MARGIN,
+            )
+        })
 }
 
 fn keysym(key: &str, text: Option<&str>) -> Option<u32> {
@@ -417,4 +513,36 @@ fn keysym(key: &str, text: Option<&str>) -> Option<u32> {
         }
     };
     Some(special)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn click_uses_the_geometry_of_the_picture_that_was_painted() {
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(800.)));
+        let click = point(px(750.), px(400.));
+        let normal = PaintedDisplay::new(viewport, Resolution(1000, 500)).unwrap();
+        let retina = PaintedDisplay::new(viewport, Resolution(2000, 1000)).unwrap();
+        assert_eq!(normal.position(click, false), Some((750, 250)));
+        assert_eq!(retina.position(click, false), Some((1500, 500)));
+        assert_eq!(retina.position(point(px(750.), px(100.)), false), None);
+    }
+
+    #[test]
+    fn menu_button_fits_only_outside_the_picture() {
+        let viewport = |w, h| Bounds::new(point(px(0.), px(0.)), size(px(w), px(h)));
+        assert!(menu_position(viewport(1280., 720.), 1280, 720).is_none());
+        assert!(menu_position(viewport(1280., 740.), 1280, 720).is_none());
+        let tall = viewport(1280., 860.);
+        let wide = viewport(1500., 720.);
+        for available in [tall, wide] {
+            let position = menu_position(available, 1280, 720).unwrap();
+            let picture = fit(available, 1280, 720).unwrap();
+            assert!(position.y + MENU_SIZE <= picture.top() || position.x >= picture.right());
+            assert!(position.x + MENU_SIZE <= available.right());
+        }
+        assert!(menu_position(wide, 0, 0).is_none());
+    }
 }

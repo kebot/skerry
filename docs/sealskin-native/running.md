@@ -40,12 +40,12 @@ The GPUI dependency uses `runtime_shaders`, so the Xcode Metal toolchain does no
 ## 4. Using the app
 
 - **Applications / Running Sessions:** click **Launch** to start a new session or **Resume** to attach to an existing one. Click **Refresh** to reload the list.
-- **Toolbar:**
+- **Session Controls:** press **⌘⇧M**, choose **View → Session Controls**, or click **•••** when it appears in the space beside the picture. The controls open in a separate, movable macOS panel with collapsible **Screen**, **Video**, and **Stream Diagnostics** sections. Press **Esc** or **⌘W** to close the panel and return focus to the session.
   - **Mute / Unmute:** controls remote audio when a compatible output is available. Reconnect preserves your mute choice.
   - **Pause / Resume Video:** stops or restarts video delivery while keeping the session open.
   - **Video:** shows stream diagnostics and server-supported JPEG controls. Changes are saved per server. **Reset Video Settings** restores the defaults announced when the session opened.
   - **Display:** choose local **Fit**, **Match Window**, **Match Retina**, or a fixed remote resolution when the server permits resize. The live diagnostics show the size Selkies actually delivers.
-  - **Full Screen:** toggles macOS full-screen mode.
+  - **Full Screen:** toggles macOS full-screen mode. You can also press **⌃⌘F**.
   - **Reconnect:** tears down and re-opens the Selkies stream for the current session.
   - **Disconnect:** closes the local stream and returns to the launcher, leaving the remote session running on the server.
 - **Keyboard & mouse:** mouse, scroll wheel, and non-`Cmd` keys are forwarded to the remote application. `Cmd+Q` quits the app.

@@ -47,7 +47,8 @@ All SealSkin Native code lives in `crates/sealskin-native/src/`:
   - Screens:
     1. **Connect:** **Paste Application Key** button (and status/busy feedback).
     2. **Library:** sidebar with server address and **Remove Connection**; main pane with **Applications** (**Launch**), **Running Sessions** (**Resume**), and **Refresh**.
-    3. **Active session:** toolbar with playback controls, a Video panel with JPEG settings, stream diagnostics and sizing modes, plus Full Screen, Reconnect, and Disconnect.
+    3. **Active session:** the desktop fills the window content area. A separate macOS child window holds playback, display sizing, JPEG settings, diagnostics, Full Screen, Reconnect, and Disconnect. Its mouse trigger appears only when it fits outside the picture.
+  - `app/controls.rs` renders the floating panel and sends commands back to the owning session window. The session window owns the stream and its settings.
 
 ## Scope and non-goals (current version)
 

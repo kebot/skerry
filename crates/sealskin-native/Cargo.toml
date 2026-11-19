@@ -10,7 +10,10 @@ dotenvy = "0.15"
 futures-util = { version = "0.3", features = ["sink"] }
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSGraphics", "NSView", "NSWindow"] }
 opus-decoder = "0.1.1"
+raw-window-handle = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 security-framework = "3"
 serde = { version = "1", features = ["derive"] }

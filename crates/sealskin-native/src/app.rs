@@ -1,17 +1,21 @@
+mod controls;
+
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
 use crate::settings::{self, Key, Preferences, Settings};
 use crate::transport::{Resolution, SessionEvent, SessionOptions, StreamSample};
 use crate::view::NativeSession;
+use controls::ControlPanel;
 use gpui::{
     actions, div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Div, KeyBinding,
     Menu, MenuItem, SharedString, Stateful, TitlebarOptions, Window, WindowAppearance,
-    WindowBounds, WindowOptions,
+    WindowBounds, WindowHandle, WindowOptions,
 };
+use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
-const TOOLBAR_HEIGHT: f32 = 54.;
 
 pub fn run() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -20,12 +24,27 @@ pub fn run() {
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
     Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
+            KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
+            KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
+            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+        ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: APP_NAME.into(),
-            items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: APP_NAME.into(),
+                items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Session Controls", ToggleSessionControls),
+                    MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+                ],
+            },
+        ]);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -50,7 +69,15 @@ pub fn run() {
     });
 }
 
-actions!(sealskin, [Quit]);
+actions!(
+    sealskin,
+    [
+        Quit,
+        ToggleSessionControls,
+        CloseSessionControls,
+        ToggleFullScreen
+    ]
+);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DisplayMode {
@@ -71,7 +98,7 @@ struct Launcher {
     muted: bool,
     video: Option<bool>,
     settings: Option<Settings>,
-    settings_open: bool,
+    controls: Option<WindowHandle<ControlPanel>>,
     stats: Option<StreamSample>,
     display_mode: DisplayMode,
     resize_allowed: bool,
@@ -96,7 +123,7 @@ impl Launcher {
             muted: false,
             video: None,
             settings: None,
-            settings_open: false,
+            controls: None,
             stats: None,
             display_mode: DisplayMode::Fit,
             resize_allowed: false,
@@ -107,6 +134,11 @@ impl Launcher {
             busy: None,
             status: None,
         };
+        let owner = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            let _ = owner.update(cx, |launcher, cx| launcher.remove_controls(cx));
+            true
+        });
         cx.observe_window_bounds(window, |this, window, cx| {
             if matches!(
                 this.display_mode,
@@ -266,6 +298,7 @@ impl Launcher {
                 self.status = None;
                 window.set_window_title(&format!("{} — {APP_NAME}", session.app_name));
                 self.current = Some((session, stream));
+                session_chrome(window, false);
                 self.stream_events = Some(cx.spawn_in(window, async move |this, cx| {
                     while let Some(event) = incoming.recv().await {
                         if this
@@ -387,7 +420,7 @@ impl Launcher {
             DisplayMode::MatchWindow | DisplayMode::Retina => (
                 Resolution::from_window(
                     (f32::from(viewport.width) * scale) as u16,
-                    ((f32::from(viewport.height) - TOOLBAR_HEIGHT) * scale) as u16,
+                    (f32::from(viewport.height) * scale) as u16,
                 ),
                 Some(scale),
             ),
@@ -404,140 +437,34 @@ impl Launcher {
         }));
     }
 
-    fn display_settings(&self, colors: Colors, cx: &mut Context<Self>) -> Div {
-        let row = div()
-            .flex()
-            .gap_2()
-            .flex_wrap()
-            .items_center()
-            .child("Display");
-        if !self.resize_allowed {
-            return row.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(colors.muted))
-                    .child("Remote size controlled by server"),
-            );
+    fn toggle_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.controls.is_some() {
+            self.close_controls(window, cx);
+            return;
         }
-        row.children(
-            [
-                (DisplayMode::Fit, "Fit"),
-                (DisplayMode::MatchWindow, "Match Window"),
-                (DisplayMode::Retina, "Match Retina"),
-                (DisplayMode::Fixed(Resolution(1280, 720)), "1280×720"),
-                (DisplayMode::Fixed(Resolution(1920, 1080)), "1920×1080"),
-                (DisplayMode::Fixed(Resolution(3840, 2160)), "3840×2160"),
-            ]
-            .into_iter()
-            .map(|(mode, label)| {
-                colors
-                    .button(label, label, self.display_mode == mode)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.resize_task = None;
-                        this.display_mode = mode;
-                        this.resize_display(window, cx);
-                        cx.notify();
-                    }))
-            }),
-        )
+        if self.current.is_some() {
+            match ControlPanel::open(window, cx) {
+                Ok(panel) => self.controls = Some(panel),
+                Err(_) => self.status = Some("Couldn’t open Session Controls.".into()),
+            }
+            cx.notify();
+        }
     }
 
-    fn video_settings(&self, colors: Colors, cx: &mut Context<Self>) -> Div {
-        let mut panel = div().p_3().bg(rgb(colors.panel)).flex().flex_col().gap_2();
-        if let Some(stats) = &self.stats {
-            let rtt = stats
-                .rtt_ms
-                .map_or_else(|| "RTT unavailable".into(), |ms| format!("{ms:.0} ms RTT"));
-            let encoder = stats.server_encoder.as_deref().unwrap_or("unreported");
-            let summary = format!("JPEG over WebSocket · {}×{} · {:.0} FPS · {:.2} Mb/s received · {:.1} ms per stripe · {} rejected stripes · {rtt} · Server encoder {encoder}",
-                stats.width, stats.height, stats.fps, stats.wire_mbps, stats.decode_ms, stats.dropped);
-            panel = panel.child(div().text_sm().text_color(rgb(colors.muted)).child(summary));
+    fn remove_controls(&mut self, cx: &mut App) -> bool {
+        self.controls.take().is_some_and(|panel| {
+            let _ = panel.update(cx, |_, panel, _| panel.remove_window());
+            true
+        })
+    }
+
+    fn close_controls(&mut self, window: &mut Window, cx: &mut App) {
+        if self.remove_controls(cx) {
+            window.activate_window();
+            if let Some((_, stream)) = &self.current {
+                stream.focus(window, cx);
+            }
         }
-        let Some(settings) = &self.settings else {
-            return panel.child("Video settings are unavailable for this connection.");
-        };
-        panel
-            .child(self.display_settings(colors, cx))
-            .child(
-                div().flex().flex_wrap().gap_2().children(
-                    [
-                        (Key::Fps, "Frame rate", "fps", 5),
-                        (Key::Jpeg, "JPEG quality", "%", 5),
-                        (Key::PaintOver, "Paint over still areas", "", 1),
-                        (Key::PaintQuality, "Still JPEG quality", "%", 5),
-                    ]
-                    .into_iter()
-                    .filter_map(|(key, label, unit, step)| {
-                        let control = settings.get(key)?;
-                        let value = self
-                            .pending_settings
-                            .get(&key)
-                            .copied()
-                            .unwrap_or(control.current);
-                        let caption = if key == Key::PaintOver {
-                            format!("{label} · {}", if value == 0 { "Off" } else { "On" })
-                        } else {
-                            format!("{label} · {value} {unit}")
-                        };
-                        let group = div()
-                            .flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_sm().child(caption));
-                        if control.locked || control.min == control.max {
-                            return Some(
-                                group.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(colors.muted))
-                                        .child("Server controlled"),
-                                ),
-                            );
-                        }
-                        if key == Key::PaintOver {
-                            return Some(
-                                group.child(
-                                    colors
-                                        .button(
-                                            "paint-over",
-                                            if value == 0 { "Turn On" } else { "Turn Off" },
-                                            false,
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.change_setting(key, 1 - value, cx)
-                                        })),
-                                ),
-                            );
-                        }
-                        Some(
-                            group.children(
-                                [
-                                    (value.saturating_sub(step).max(control.min), "−"),
-                                    (value.saturating_add(step).min(control.max), "+"),
-                                ]
-                                .into_iter()
-                                .filter(|(next, _)| *next != value)
-                                .map(|(next, sign)| {
-                                    colors
-                                        .button(
-                                            SharedString::from(format!("{}{sign}", key.wire())),
-                                            sign,
-                                            false,
-                                        )
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.change_setting(key, next, cx)
-                                        }))
-                                }),
-                            ),
-                        )
-                    }),
-                ),
-            )
-            .child(
-                colors
-                    .button("reset-video-settings", "Reset Video Settings", false)
-                    .on_click(cx.listener(|this, _, _, cx| this.reset_settings(cx))),
-            )
     }
 
     fn close_stream(&mut self, window: &mut Window, cx: &mut App) {
@@ -549,7 +476,7 @@ impl Launcher {
         self.stats = None;
         self.resize_allowed = false;
         self.resize_task = None;
-        self.settings_open = false;
+        self.close_controls(window, cx);
         self.stream_events = None;
         if let Some((_, stream)) = self.current.take() {
             stream.release_focus(window, cx);
@@ -558,6 +485,45 @@ impl Launcher {
         self.audio_unavailable = None;
         self.video = None;
         window.set_window_title(APP_NAME);
+        session_chrome(window, true);
+    }
+}
+
+fn native_window(window: &Window) -> Option<objc2::rc::Retained<NSWindow>> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    // GPUI supplies its live NSView. This call runs on the main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    view.window()
+}
+
+fn session_chrome(window: &Window, visible: bool) {
+    let Some(native) = native_window(window) else {
+        return;
+    };
+    if !window.is_fullscreen() {
+        let mut style = native.styleMask();
+        style.set(NSWindowStyleMask::FullSizeContentView, !visible);
+        if native.styleMask() != style {
+            native.setStyleMask(style);
+        }
+        native.setTitlebarAppearsTransparent(!visible);
+    }
+    native.setTitleVisibility(if visible {
+        NSWindowTitleVisibility::Visible
+    } else {
+        NSWindowTitleVisibility::Hidden
+    });
+    for button in [
+        NSWindowButton::CloseButton,
+        NSWindowButton::MiniaturizeButton,
+        NSWindowButton::ZoomButton,
+    ] {
+        if let Some(button) = native.standardWindowButton(button) {
+            button.setHidden(!visible);
+        }
     }
 }
 
@@ -633,95 +599,31 @@ impl Render for Launcher {
             .size_full()
             .bg(rgb(colors.background))
             .text_color(rgb(colors.ink));
-        if let Some((session, stream)) = &self.current {
-            let view = stream.view();
-            let mut toolbar = div()
-                .h(px(TOOLBAR_HEIGHT))
-                .flex_none()
-                .w_full()
-                .px_4()
-                .flex()
-                .items_center()
-                .gap_2()
-                .bg(rgb(colors.sidebar))
-                .border_b_1()
-                .border_color(rgb(colors.edge))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(session.app_name.clone()),
-                );
-            if let Some(enabled) = self.audio {
-                toolbar = toolbar.child(
-                    colors
-                        .button("audio", if enabled { "Mute" } else { "Unmute" }, false)
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            if let Some((_, stream)) = &this.current {
-                                this.muted = enabled;
-                                stream.set_audio(!enabled);
-                            }
-                        })),
-                );
-            }
-            if let Some(enabled) = self.video {
-                toolbar = toolbar.child(
-                    colors
-                        .button(
-                            "video-playback",
-                            if enabled { "Pause" } else { "Resume Video" },
-                            false,
-                        )
-                        .on_click(cx.listener(move |this, _, _, _| {
-                            if let Some((_, stream)) = &this.current {
-                                stream.set_video(!enabled);
-                            }
-                        })),
-                );
-            }
+        if let Some((_, stream)) = &self.current {
             return root
+                .relative()
                 .bg(rgb(0x000000))
-                .flex()
-                .flex_col()
-                .child(
-                    toolbar
-                        .child(colors.button("video-settings", "Video", false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.settings_open = !this.settings_open;
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            colors
-                                .button("fullscreen", "Full Screen", false)
-                                .on_click(|_, window, _| window.toggle_fullscreen()),
-                        )
-                        .child(colors.button("reconnect", "Reconnect", false).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.reconnect(window, cx);
-                            }),
-                        ))
-                        .child(colors.button("disconnect", "Disconnect", false).on_click(
-                            cx.listener(|this, _, window, cx| {
-                                this.close_stream(window, cx);
-                                this.display_mode = DisplayMode::Fit;
-                                this.muted = false;
-                                this.refresh(cx);
-                            }),
-                        )),
-                )
+                .on_action(cx.listener(|this, _: &ToggleSessionControls, window, cx| {
+                    this.toggle_controls(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
+                    this.close_controls(window, cx);
+                    window.toggle_fullscreen();
+                }))
+                .child(stream.view())
                 .when_some(self.status.clone(), |root, status| {
-                    root.child(div().p_3().bg(rgb(colors.panel)).child(status))
-                })
-                .when_some(self.audio_unavailable, |root, reason| {
-                    root.child(div().p_2().text_sm().bg(rgb(colors.panel)).child(reason))
-                })
-                .when(self.settings_open, |root| {
-                    root.child(self.video_settings(colors, cx))
-                })
-                .child(div().flex_1().min_h_0().child(view));
+                    root.child(
+                        div()
+                            .absolute()
+                            .bottom_3()
+                            .left_3()
+                            .right_3()
+                            .p_3()
+                            .rounded_md()
+                            .bg(rgb(colors.panel))
+                            .child(status),
+                    )
+                });
         }
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
             return root.flex().items_center().justify_center().child(

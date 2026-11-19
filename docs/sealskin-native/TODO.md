@@ -1,10 +1,12 @@
 # SealSkin Native TODO
 
-[Selkies web feature research](tickets/research.md) · [SealSkin product comparison](tickets/product-audit.md)
+[Selkies web sidebar source reference](selkies-sidebar-reference.md) · [Selkies web feature research](tickets/research.md) · [SealSkin product comparison](tickets/product-audit.md)
 
 ## Video and screen
 
-### REVIEW
+### Milestone 1
+
+[QA results](milestone-1-qa.md)
 - [x] [Respect the server’s defaults, limits, and locked settings](tickets/server-settings.md)
 - [x] [Add controls for JPEG quality and frame rate](tickets/jpeg-settings.md)
 - [x] [Show stream performance and connection stats](tickets/stream-stats.md)

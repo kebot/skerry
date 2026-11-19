@@ -148,8 +148,25 @@ pub enum SessionEvent {
     Error(String),
 }
 
+#[derive(Clone, Copy)]
+pub struct Pointer {
+    pub display: Resolution,
+    pub position: (u16, u16),
+    pub buttons: u8,
+}
+
+impl Pointer {
+    fn command_for(self, display: Resolution) -> Option<String> {
+        (self.display == display).then(|| {
+            let (x, y) = self.position;
+            format!("m,{x},{y},{},0", self.buttons)
+        })
+    }
+}
+
 pub enum Input {
     Command(String),
+    Pointer(Pointer),
     Audio(bool),
     Video(bool),
     Settings(Vec<(Key, u16)>),
@@ -167,7 +184,7 @@ pub async fn run(
     url: Url,
     frames: watch::Sender<Frame>,
     mut input: mpsc::UnboundedReceiver<Input>,
-    pointer: watch::Receiver<Option<String>>,
+    pointer: watch::Receiver<Option<Pointer>>,
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<(), &'static str> {
@@ -333,6 +350,10 @@ pub async fn run(
             command = input.recv() => {
                 let text = match command {
                     Some(Input::Command(text)) => text,
+                    Some(Input::Pointer(position)) => {
+                        let Some(text) = position.command_for(Resolution(frame.width, frame.height)) else { continue; };
+                        text
+                    }
                     Some(Input::Video(enabled)) => {
                         if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
                     }
@@ -400,9 +421,9 @@ pub async fn run(
                     socket.send(format!("CLIENT_FRAME_ACK {id} 0").into()).await.map_err(|_| disconnected)?;
                 }
                 if pointer.has_changed().unwrap_or(false) {
-                    let position = pointer.borrow_and_update().clone();
-                    if let Some(position) = position {
-                        socket.send(position.into()).await.map_err(|_| disconnected)?;
+                    let position = *pointer.borrow_and_update();
+                    if let Some(command) = position.and_then(|p| p.command_for(Resolution(frame.width, frame.height))) {
+                        socket.send(command.into()).await.map_err(|_| disconnected)?;
                     }
                 }
             }
@@ -572,6 +593,20 @@ mod tests {
             )
             .unwrap();
         bytes
+    }
+
+    #[test]
+    fn discards_pointer_events_from_before_remote_resize() {
+        let pointer = Pointer {
+            display: Resolution(1280, 720),
+            position: (960, 360),
+            buttons: 1,
+        };
+        assert_eq!(
+            pointer.command_for(Resolution(1280, 720)).as_deref(),
+            Some("m,960,360,1,0")
+        );
+        assert_eq!(pointer.command_for(Resolution(2560, 1440)), None);
     }
 
     #[test]
