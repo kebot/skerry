@@ -1,7 +1,7 @@
 mod controls;
 
 use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
-use crate::settings::{self, Key, Preferences, Settings};
+use crate::settings::{self, Key, Preferences, ScreenPolicy, Settings};
 use crate::transport::{Resolution, SessionEvent, SessionOptions, StreamSample};
 use crate::view::NativeSession;
 use controls::ControlPanel;
@@ -101,6 +101,9 @@ struct Launcher {
     controls: Option<WindowHandle<ControlPanel>>,
     stats: Option<StreamSample>,
     display_mode: DisplayMode,
+    retina: bool,
+    scale_locally: bool,
+    screen_policy: ScreenPolicy,
     resize_allowed: bool,
     resize_task: Option<gpui::Task<()>>,
     preferences: Preferences,
@@ -126,6 +129,9 @@ impl Launcher {
             controls: None,
             stats: None,
             display_mode: DisplayMode::Fit,
+            retina: false,
+            scale_locally: true,
+            screen_policy: ScreenPolicy::default(),
             resize_allowed: false,
             resize_task: None,
             preferences: Preferences::new(),
@@ -297,6 +303,9 @@ impl Launcher {
                 self.audio = None;
                 self.status = None;
                 window.set_window_title(&format!("{} — {APP_NAME}", session.app_name));
+                if !self.scale_locally {
+                    stream.scale_locally(false, cx);
+                }
                 self.current = Some((session, stream));
                 session_chrome(window, false);
                 self.stream_events = Some(cx.spawn_in(window, async move |this, cx| {
@@ -313,6 +322,9 @@ impl Launcher {
                                         this.settings = Some(settings)
                                     }
                                     SessionEvent::Stats(sample) => this.stats = Some(sample),
+                                    SessionEvent::ScreenPolicy(policy) => {
+                                        this.screen_policy = policy
+                                    }
                                     SessionEvent::ResizeAllowed(allowed) => {
                                         if allowed && !this.resize_allowed {
                                             this.resize_allowed = true;
@@ -473,6 +485,7 @@ impl Launcher {
             self.apply_settings();
         }
         self.settings = None;
+        self.screen_policy = ScreenPolicy::default();
         self.stats = None;
         self.resize_allowed = false;
         self.resize_task = None;

@@ -1,5 +1,5 @@
 use crate::app::ToggleSessionControls;
-use crate::settings::Key;
+use crate::settings::{Key, ScreenChange};
 use crate::transport::{self, Frame, Input, Pointer, Resolution, SessionEvent, SessionOptions};
 use gpui::{
     canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
@@ -62,6 +62,19 @@ impl NativeSession {
         let _ = self.input.send(Input::Settings(changes));
     }
 
+    pub fn set_screen(&self, change: ScreenChange) {
+        let _ = self.input.send(Input::Screen(change));
+    }
+
+    pub fn scale_locally(&self, enabled: bool, cx: &mut App) {
+        self.view.update(cx, |desktop, cx| {
+            desktop.scale_locally = enabled;
+            desktop.painted_display = None;
+            desktop.release_pointer();
+            cx.notify();
+        });
+    }
+
     pub fn set_resolution(&self, size: Resolution, scale: Option<f32>) {
         let _ = self.input.send(Input::Resolution(size, scale));
     }
@@ -96,6 +109,7 @@ impl Drop for NativeSession {
 
 struct Desktop {
     focus: FocusHandle,
+    scale_locally: bool,
     frame: Frame,
     painted: Rc<RefCell<Option<Arc<gpui::RenderImage>>>>,
     painted_display: Option<PaintedDisplay>,
@@ -148,6 +162,7 @@ impl Desktop {
         .detach();
         Self {
             focus,
+            scale_locally: true,
             frame: Frame::default(),
             painted: Rc::default(),
             painted_display: None,
@@ -262,13 +277,20 @@ impl Render for Desktop {
         let frame = self.frame.clone();
         let empty = frame.image.is_none();
         let bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
-        let menu = menu_position(bounds, frame.width, frame.height);
+        let native_scale = (!self.scale_locally).then_some(window.scale_factor());
+        let picture = picture_bounds(bounds, frame.width, frame.height, native_scale);
+        let menu = picture.and_then(|picture| menu_position(bounds, picture));
         let painted = self.painted.clone();
         let surface = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |bounds, hitbox, window, cx| {
                 let display = frame.image.as_ref().and_then(|_| {
-                    PaintedDisplay::new(bounds, Resolution(frame.width, frame.height))
+                    picture_bounds(bounds, frame.width, frame.height, native_scale).map(|bounds| {
+                        PaintedDisplay {
+                            bounds,
+                            resolution: Resolution(frame.width, frame.height),
+                        }
+                    })
                 });
                 desktop.update(cx, |desktop, _| desktop.painted_display = display);
                 let v = desktop.clone();
@@ -346,6 +368,7 @@ impl Render for Desktop {
         div()
             .relative()
             .size_full()
+            .overflow_hidden()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.modifiers.platform {
@@ -415,8 +438,9 @@ struct PaintedDisplay {
 }
 
 impl PaintedDisplay {
+    #[cfg(test)]
     fn new(viewport: Bounds<Pixels>, resolution: Resolution) -> Option<Self> {
-        let bounds = fit(viewport, resolution.0, resolution.1)?;
+        let bounds = picture_bounds(viewport, resolution.0, resolution.1, None)?;
         Some(Self { bounds, resolution })
     }
 
@@ -444,12 +468,22 @@ impl PaintedDisplay {
     }
 }
 
-fn fit(bounds: Bounds<Pixels>, width: u16, height: u16) -> Option<Bounds<Pixels>> {
+fn picture_bounds(
+    bounds: Bounds<Pixels>,
+    width: u16,
+    height: u16,
+    native_scale: Option<f32>,
+) -> Option<Bounds<Pixels>> {
     if width == 0 || height == 0 {
         return None;
     }
-    let scale = (f32::from(bounds.size.width) / f32::from(width))
-        .min(f32::from(bounds.size.height) / f32::from(height));
+    let scale = native_scale.map_or_else(
+        || {
+            (f32::from(bounds.size.width) / f32::from(width))
+                .min(f32::from(bounds.size.height) / f32::from(height))
+        },
+        |backing_scale| 1.0 / backing_scale,
+    );
     let width = px(f32::from(width) * scale);
     let height = px(f32::from(height) * scale);
     Some(Bounds::new(
@@ -461,8 +495,7 @@ fn fit(bounds: Bounds<Pixels>, width: u16, height: u16) -> Option<Bounds<Pixels>
     ))
 }
 
-fn menu_position(viewport: Bounds<Pixels>, width: u16, height: u16) -> Option<Point<Pixels>> {
-    let picture = fit(viewport, width, height)?;
+fn menu_position(viewport: Bounds<Pixels>, picture: Bounds<Pixels>) -> Option<Point<Pixels>> {
     let needed = MENU_SIZE + MENU_MARGIN * 2.;
     let top_fits = picture.top() - viewport.top() >= needed;
     let side_fits = viewport.right() - picture.right() >= needed;
@@ -531,18 +564,32 @@ mod tests {
     }
 
     #[test]
+    fn native_scale_centers_and_maps_a_picture_larger_than_the_window() {
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(600.), px(400.)));
+        let bounds = picture_bounds(viewport, 1920, 1080, Some(2.)).unwrap();
+        assert_eq!(
+            bounds,
+            Bounds::new(point(px(-180.), px(-70.)), size(px(960.), px(540.)))
+        );
+        assert!(menu_position(viewport, bounds).is_none());
+    }
+
+    #[test]
     fn menu_button_fits_only_outside_the_picture() {
         let viewport = |w, h| Bounds::new(point(px(0.), px(0.)), size(px(w), px(h)));
-        assert!(menu_position(viewport(1280., 720.), 1280, 720).is_none());
-        assert!(menu_position(viewport(1280., 740.), 1280, 720).is_none());
+        let fit = |viewport| picture_bounds(viewport, 1280, 720, None).unwrap();
+        let exact = viewport(1280., 720.);
+        let narrow_margin = viewport(1280., 740.);
+        assert!(menu_position(exact, fit(exact)).is_none());
+        assert!(menu_position(narrow_margin, fit(narrow_margin)).is_none());
         let tall = viewport(1280., 860.);
         let wide = viewport(1500., 720.);
         for available in [tall, wide] {
-            let position = menu_position(available, 1280, 720).unwrap();
-            let picture = fit(available, 1280, 720).unwrap();
+            let picture = fit(available);
+            let position = menu_position(available, picture).unwrap();
             assert!(position.y + MENU_SIZE <= picture.top() || position.x >= picture.right());
             assert!(position.x + MENU_SIZE <= available.right());
         }
-        assert!(menu_position(wide, 0, 0).is_none());
+        assert!(picture_bounds(wide, 0, 0, None).is_none());
     }
 }

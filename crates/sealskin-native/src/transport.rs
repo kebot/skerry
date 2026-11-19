@@ -1,5 +1,5 @@
 use crate::audio::Playback;
-use crate::settings::{Key, Settings};
+use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use futures_util::{SinkExt, StreamExt};
 use gpui::RenderImage;
 use image::{ImageDecoder, ImageFormat, ImageReader};
@@ -22,6 +22,12 @@ const WAIT_FOR_VIDEO: Duration = Duration::from_secs(15);
 pub struct Resolution(pub u16, pub u16);
 
 impl Resolution {
+    pub fn manual(width: &str, height: &str) -> Option<Self> {
+        let (width, height): (u16, u16) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
+        ((2..=MAX_WIDTH).contains(&width) && (2..=MAX_HEIGHT).contains(&height))
+            .then(|| Self::from_window(width, height))
+    }
+
     pub fn from_window(width: u16, height: u16) -> Self {
         let scale = (f64::from(MAX_WIDTH) / f64::from(width.max(1)))
             .min(f64::from(MAX_HEIGHT) / f64::from(height.max(1)))
@@ -145,6 +151,7 @@ pub enum SessionEvent {
     Settings(Settings),
     Stats(StreamSample),
     ResizeAllowed(bool),
+    ScreenPolicy(ScreenPolicy),
     Error(String),
 }
 
@@ -171,6 +178,7 @@ pub enum Input {
     Video(bool),
     Settings(Vec<(Key, u16)>),
     Resolution(Resolution, Option<f32>),
+    Screen(ScreenChange),
     Appearance(bool),
 }
 
@@ -226,6 +234,7 @@ pub async fn run(
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capabilities = Settings::default();
     let mut resize_allowed = false;
+    let mut screen_policy = ScreenPolicy::default();
     let mut dark = options.dark;
     let mut video_playing = None;
     let mut appearance = Value::Null;
@@ -291,6 +300,8 @@ pub async fn run(
                                 } else {
                                     capabilities.announce(&data["settings"]);
                                     resize_allowed = allows_resize(&data["settings"]);
+                                    screen_policy = ScreenPolicy::from_server(&data["settings"]);
+                                    let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
                                     appearance = data["settings"]["color_scheme"].clone();
                                     let _ = events.send(SessionEvent::ResizeAllowed(resize_allowed));
                                     if !capabilities.jpeg_available {
@@ -367,6 +378,13 @@ pub async fn run(
                         // Some Selkies versions only echo changes to other controllers.
                         capabilities.live(&applied);
                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
+                    }
+                    Some(Input::Screen(change)) => {
+                        if let Some(settings) = screen_policy.apply(change) {
+                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
+                            let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
+                        }
                         continue;
                     }
                     Some(Input::Resolution(Resolution(width, height), scale)) => {
@@ -633,6 +651,17 @@ mod tests {
         assert!(!allows_resize(
             &json!({"manual_resolution": {"locked": true}})
         ));
+    }
+
+    #[test]
+    fn manual_resolution_rejects_dimensions_outside_client_limits() {
+        assert_eq!(
+            Resolution::manual("1367", "769"),
+            Some(Resolution(1366, 768))
+        );
+        assert_eq!(Resolution::manual("", "768"), None);
+        assert_eq!(Resolution::manual("4097", "2160"), None);
+        assert_eq!(Resolution::manual("1920", "2161"), None);
     }
 
     #[test]

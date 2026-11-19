@@ -135,6 +135,64 @@ fn parse(key: Key, entry: &Value, previous: Option<Control>) -> Option<Control> 
     })
 }
 
+#[derive(Clone, Default)]
+pub struct ScreenPolicy {
+    pub alignment: Option<(bool, bool)>,
+    pub dpi: Option<u16>,
+    pub dpi_choices: Vec<u16>,
+}
+
+#[derive(Clone, Copy)]
+pub enum ScreenChange {
+    Alignment(bool),
+    Dpi(u16),
+}
+
+impl ScreenPolicy {
+    pub fn from_server(payload: &Value) -> Self {
+        let aligned = &payload["force_aligned_resolution"];
+        let dpi = &payload["scaling_dpi"];
+        let number = |value: &Value| {
+            value
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .or_else(|| value.as_str()?.parse().ok())
+        };
+        Self {
+            alignment: aligned["value"]
+                .as_bool()
+                .map(|value| (value, aligned["locked"].as_bool() == Some(true))),
+            dpi: number(&dpi["value"]),
+            dpi_choices: if dpi["locked"] == true || dpi["overridden"] == true {
+                Vec::new()
+            } else {
+                dpi["allowed"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(number)
+                    .collect()
+            },
+        }
+    }
+
+    pub fn apply(&mut self, change: ScreenChange) -> Option<Value> {
+        match change {
+            ScreenChange::Alignment(value) if self.alignment.is_some_and(|(_, locked)| !locked) => {
+                self.alignment = Some((value, false));
+                Some(json!({"force_aligned_resolution": value}))
+            }
+            ScreenChange::Dpi(value)
+                if self.dpi_choices.len() > 1 && self.dpi_choices.contains(&value) =>
+            {
+                self.dpi = Some(value);
+                Some(json!({"scaling_dpi": value}))
+            }
+            _ => None,
+        }
+    }
+}
+
 pub type Preferences = BTreeMap<Key, u16>;
 
 fn path(server: &str) -> Option<PathBuf> {
@@ -184,6 +242,21 @@ mod tests {
         settings.live(&json!({"framerate": 45}));
         assert_eq!(settings.get(Key::Fps).unwrap().current, 45);
         assert_eq!(settings.get(Key::Fps).unwrap().initial, 24);
+    }
+
+    #[test]
+    fn screen_policy_only_sends_editable_and_advertised_values() {
+        let mut policy = ScreenPolicy::from_server(&json!({
+            "force_aligned_resolution": {"value": false, "locked": true},
+            "scaling_dpi": {"value": "96", "allowed": ["96", 192]}
+        }));
+        assert!(policy.apply(ScreenChange::Alignment(true)).is_none());
+        assert!(policy.apply(ScreenChange::Dpi(144)).is_none());
+        assert_eq!(
+            policy.apply(ScreenChange::Dpi(192)),
+            Some(json!({"scaling_dpi": 192}))
+        );
+        assert_eq!(policy.dpi, Some(192));
     }
 
     #[test]
