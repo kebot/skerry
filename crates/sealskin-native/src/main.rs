@@ -5,6 +5,8 @@ mod app;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod input;
+#[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]
 mod transport;

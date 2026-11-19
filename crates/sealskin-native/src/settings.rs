@@ -1,3 +1,4 @@
+use crate::input::InputSettings;
 use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -265,6 +266,8 @@ pub type VideoSettings = BTreeMap<Key, u32>;
 pub struct Preferences {
     #[serde(default)]
     pub codec: Codec,
+    #[serde(default, skip_serializing_if = "InputSettings::is_default")]
+    pub input: InputSettings,
     #[serde(flatten)]
     pub video: VideoSettings,
 }
@@ -343,6 +346,19 @@ mod tests {
             serde_json::from_value(serde_json::to_value(prefs).unwrap()).unwrap();
         assert_eq!(restored.codec, Codec::Hevc);
         assert_eq!(restored.video.get(&Key::Bitrate), Some(&80_000));
+    }
+
+    #[test]
+    fn input_switches_are_persisted_alongside_existing_video_preferences() {
+        let saved = json!({"jpeg": 45, "input": {"command_as_control": true, "mac_ime": true}});
+        let mut prefs: Preferences = serde_json::from_value(saved).unwrap();
+        assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
+        assert!(prefs.input.command_as_control && prefs.input.mac_ime);
+        assert!(!prefs.input.remote_cursor && prefs.input.trackpad_scroll);
+        crate::input::InputFeature::RemoteCursor.set(&mut prefs.input, true);
+        let restored: Preferences =
+            serde_json::from_value(serde_json::to_value(&prefs).unwrap()).unwrap();
+        assert!(restored.input.remote_cursor && restored.input.mac_ime);
     }
 
     #[test]

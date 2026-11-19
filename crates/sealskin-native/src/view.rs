@@ -1,19 +1,27 @@
+mod multitouch;
+mod pinch;
+
 use crate::app::ToggleSessionControls;
+use crate::input::{commit_command, InputSettings, RemoteChord};
 use crate::settings::{Key, ScreenChange};
 use crate::transport::{
-    self, DisplayRequest, Frame, Input, Picture, Pointer, Resolution, SessionEvent, SessionOptions,
+    self, DisplayRequest, Frame, Input, Picture, Pointer, RemoteCursor, Resolution, SessionEvent,
+    SessionOptions,
 };
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, Context, Corners,
-    DispatchPhase, Entity, FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta,
-    ScrollWheelEvent, Window,
+    canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, ContentMask, Context,
+    Corners, CursorStyle, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler,
+    FocusHandle, HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, UTF16Selection,
+    Window,
 };
 use reqwest::Url;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::{
     runtime::Handle,
     sync::{mpsc, watch},
@@ -26,6 +34,7 @@ pub struct NativeSession {
     view: Entity<Desktop>,
     input: mpsc::UnboundedSender<Input>,
     task: tokio::task::JoinHandle<()>,
+    _pinch: Option<pinch::Monitor>,
 }
 
 impl NativeSession {
@@ -41,6 +50,15 @@ impl NativeSession {
         let (input, commands) = mpsc::unbounded_channel();
         let (pointer, motion) = watch::channel(None);
         let view = cx.new(|cx| Desktop::new(input.clone(), pointer, frames, window, cx));
+        let pinch = crate::app::native_window(window).and_then(|native| {
+            let desktop = view.read(cx);
+            pinch::Monitor::install(
+                native,
+                desktop.pinch_target.clone(),
+                desktop.raw_active.clone(),
+                input.clone(),
+            )
+        });
         window.focus(&view.read(cx).focus);
         let task = runtime.spawn(async move {
             if let Err(message) =
@@ -49,7 +67,12 @@ impl NativeSession {
                 let _ = events.send(SessionEvent::Error(message.into()));
             }
         });
-        Self { view, input, task }
+        Self {
+            view,
+            input,
+            task,
+            _pinch: pinch,
+        }
     }
 
     pub fn view(&self) -> AnyView {
@@ -77,6 +100,59 @@ impl NativeSession {
         });
     }
 
+    pub fn set_input_settings(&self, settings: InputSettings, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |desktop, cx| {
+            if desktop.settings != settings {
+                desktop.release_input();
+                desktop.settings = settings;
+                desktop.sync_multitouch();
+                window.refresh();
+                cx.notify();
+            }
+        });
+    }
+
+    pub fn allow_multitouch(&self, available: bool, cx: &mut App) -> bool {
+        self.view.update(cx, |desktop, _| {
+            desktop.multitouch_available = available && desktop.multitouch.is_some();
+            desktop.sync_multitouch();
+            desktop.multitouch_available
+        })
+    }
+
+    pub fn allow_finger_scroll(&self, enabled: bool, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            if !enabled {
+                desktop.end_finger_scroll();
+            }
+            desktop.finger_scroll_allowed = enabled;
+        });
+    }
+
+    pub fn set_cursor(&self, cursor: RemoteCursor, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |desktop, cx| {
+            if let Some(RemoteCursor::Image { image, .. }) = desktop.cursor.replace(cursor) {
+                let _ = window.drop_image(image);
+            }
+            if desktop.settings.remote_cursor {
+                cx.notify();
+            }
+        });
+    }
+
+    pub fn send_chord(&self, chord: RemoteChord, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            desktop.release_input();
+            let keys = chord.keys();
+            for key in keys {
+                desktop.command(format!("kd,{key}"));
+            }
+            for key in keys.iter().rev() {
+                desktop.command(format!("ku,{key}"));
+            }
+        });
+    }
+
     pub fn set_resolution(&self, request: DisplayRequest) {
         let _ = self.input.send(Input::Resolution(request));
     }
@@ -96,6 +172,9 @@ impl NativeSession {
     pub fn release_focus(&self, window: &mut Window, cx: &mut App) {
         self.view.update(cx, |desktop, _| {
             desktop.release_input();
+            if let Some(RemoteCursor::Image { image, .. }) = desktop.cursor.take() {
+                let _ = window.drop_image(image);
+            }
             if let Some(image) = desktop.painted.borrow_mut().take() {
                 let _ = window.drop_image(image);
             }
@@ -115,6 +194,10 @@ struct Desktop {
     frame: Frame,
     painted: Rc<RefCell<Option<Arc<gpui::RenderImage>>>>,
     painted_display: Option<PaintedDisplay>,
+    pinch_target: pinch::Target,
+    raw_active: Rc<Cell<bool>>,
+    multitouch: Option<multitouch::Capture>,
+    multitouch_available: bool,
     input: mpsc::UnboundedSender<Input>,
     pointer: watch::Sender<Option<Pointer>>,
     buttons: u8,
@@ -122,6 +205,14 @@ struct Desktop {
     keys: HashMap<String, u32>,
     modifiers: Modifiers,
     scroll: (f32, f32),
+    finger_scroll_allowed: bool,
+    finger_scroll_task: Option<gpui::Task<()>>,
+    settings: InputSettings,
+    cursor: Option<RemoteCursor>,
+    marked: String,
+    selection: Range<usize>,
+    ime_click: Option<Point<Pixels>>,
+    ime_bounds: Option<Bounds<Pixels>>,
 }
 
 impl Desktop {
@@ -133,12 +224,20 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
-        cx.on_blur(&focus, window, |desktop, _, _| desktop.release_input())
-            .detach();
-        cx.observe_window_activation(window, |desktop, window, _| {
+        let pinch_target = pinch::Target::default();
+        let multitouch = crate::app::native_window(window).and_then(|native| {
+            multitouch::Capture::install(&native, pinch_target.clone(), input.clone())
+        });
+        cx.on_blur(&focus, window, |desktop, _, cx| {
+            desktop.release_input();
+            cx.notify();
+        })
+        .detach();
+        cx.observe_window_activation(window, |desktop, window, cx| {
             if !window.is_window_active() {
                 desktop.release_input();
             }
+            cx.notify();
         })
         .detach();
         cx.spawn(async move |desktop, cx| {
@@ -168,6 +267,10 @@ impl Desktop {
             frame: Frame::default(),
             painted: Rc::default(),
             painted_display: None,
+            pinch_target,
+            raw_active: Rc::default(),
+            multitouch,
+            multitouch_available: false,
             input,
             pointer,
             buttons: 0,
@@ -175,6 +278,24 @@ impl Desktop {
             keys: HashMap::new(),
             modifiers: Modifiers::default(),
             scroll: (0.0, 0.0),
+            finger_scroll_allowed: false,
+            finger_scroll_task: None,
+            settings: InputSettings::default(),
+            cursor: None,
+            marked: String::new(),
+            selection: 0..0,
+            ime_click: None,
+            ime_bounds: None,
+        }
+    }
+
+    fn sync_multitouch(&mut self) {
+        let active = self.multitouch_available && self.settings.multitouch;
+        if self.raw_active.replace(active) != active {
+            self.end_finger_scroll();
+            if let Some(capture) = &self.multitouch {
+                capture.set_enabled(active);
+            }
         }
     }
 
@@ -201,6 +322,14 @@ impl Desktop {
     }
 
     fn send_pointer(&self) {
+        if self
+            .multitouch
+            .as_ref()
+            .is_some_and(multitouch::Capture::has_contacts)
+        {
+            self.command(format!("m2,0,0,{},0", self.buttons));
+            return;
+        }
         if let Some(pointer) = self.mouse_state() {
             let _ = self.input.send(Input::Pointer(pointer));
         }
@@ -218,14 +347,50 @@ impl Desktop {
         } else {
             self.buttons &= !mask;
         }
+        if let Some((display, _)) = self.pinch_target.get() {
+            self.pinch_target.set(Some((display, self.buttons)));
+        }
         self.pointer.send_replace(None);
         self.send_pointer();
     }
 
-    fn scroll(&mut self, event: &ScrollWheelEvent) {
+    fn scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
+        if let ScrollDelta::Pixels(delta) = event.delta {
+            if self.raw_active.get() {
+                return;
+            }
+            if self.settings.trackpad_scroll && self.finger_scroll_allowed {
+                if let Some(display) = self.painted_display {
+                    let x = -f32::from(delta.x) * f32::from(display.resolution.0)
+                        / f32::from(display.bounds.size.width);
+                    let y = -f32::from(delta.y) * f32::from(display.resolution.1)
+                        / f32::from(display.bounds.size.height);
+                    if x != 0. || y != 0. {
+                        self.command(format!("sf,{x:.2},{y:.2}"));
+                        let idle = cx.background_executor().timer(Duration::from_millis(100));
+                        self.finger_scroll_task = Some(cx.spawn(async move |this, cx| {
+                            idle.await;
+                            let _ = this.update(cx, |desktop, _| desktop.end_finger_scroll());
+                        }));
+                    }
+                    return;
+                }
+            }
+        }
+        self.end_finger_scroll();
         let (x, y) = match event.delta {
             ScrollDelta::Lines(p) => (p.x, p.y),
-            ScrollDelta::Pixels(p) => (f32::from(p.x) / 40., f32::from(p.y) / 40.),
+            ScrollDelta::Pixels(p) => {
+                let points_per_step = if self.settings.trackpad_scroll {
+                    12.
+                } else {
+                    40.
+                };
+                (
+                    f32::from(p.x) / points_per_step,
+                    f32::from(p.y) / points_per_step,
+                )
+            }
         };
         self.scroll.0 += x;
         self.scroll.1 += y;
@@ -243,7 +408,15 @@ impl Desktop {
         }
     }
 
-    fn modifiers(&mut self, next: Modifiers) {
+    fn end_finger_scroll(&mut self) {
+        if self.finger_scroll_task.take().is_some() {
+            self.command("sfe".into());
+        }
+    }
+
+    fn modifiers(&mut self, mut next: Modifiers) {
+        next.control |= self.settings.command_as_control && next.platform;
+        next.platform = false;
         for (current, next, key) in [
             (self.modifiers.shift, next.shift, 0xffe1),
             (self.modifiers.control, next.control, 0xffe3),
@@ -261,15 +434,137 @@ impl Desktop {
             self.command(format!("ku,{key}"));
         }
         self.modifiers(Modifiers::default());
+        self.marked.clear();
+        self.selection = 0..0;
+        self.ime_click = None;
+        self.ime_bounds = None;
+        self.scroll = (0., 0.);
+        self.end_finger_scroll();
         self.release_pointer();
     }
 
     fn release_pointer(&mut self) {
+        if let Some(capture) = &self.multitouch {
+            capture.clear();
+        }
+        self.pinch_target.set(None);
         self.pointer.send_replace(None);
         self.position = None;
         if std::mem::take(&mut self.buttons) != 0 {
             self.command("m2,0,0,0,0".into());
         }
+    }
+}
+
+impl EntityInputHandler for Desktop {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted: &mut Option<Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let text: Vec<_> = self.marked.encode_utf16().collect();
+        let slice = text.get(range.clone())?;
+        let value = String::from_utf16(slice).ok()?;
+        *adjusted = Some(range);
+        Some(value)
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.selection.clone(),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<Range<usize>> {
+        (!self.marked.is_empty()).then(|| 0..self.marked.encode_utf16().count())
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+        self.marked.clear();
+        self.selection = 0..0;
+        self.ime_bounds = None;
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.mac_ime && self.focus.is_focused(window) && window.is_window_active() {
+            if let Some(command) = commit_command(text) {
+                self.modifiers(Modifiers::default());
+                if let Some(key) = keysym(text, None) {
+                    self.command(format!("kd,{key}"));
+                    self.command(format!("ku,{key}"));
+                } else {
+                    self.command(command);
+                }
+            }
+        }
+        self.unmark_text(window, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.mac_ime && self.focus.is_focused(window) && window.is_window_active() {
+            if self.marked.is_empty() {
+                let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+                self.ime_bounds = Some(composition_bounds(
+                    viewport,
+                    self.painted_display.map(|display| display.bounds),
+                    self.ime_click,
+                    window.mouse_position(),
+                ));
+            }
+            self.marked = text.into();
+            let len = text.encode_utf16().count();
+            self.selection =
+                selected.map_or(len..len, |range| range.start.min(len)..range.end.min(len));
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: Range<usize>,
+        element: Bounds<Pixels>,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.ime_bounds.or_else(|| {
+            Some(composition_bounds(
+                element,
+                self.painted_display.map(|display| display.bounds),
+                self.ime_click,
+                window.mouse_position(),
+            ))
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _: Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -283,6 +578,16 @@ impl Render for Desktop {
         let picture = picture_bounds(bounds, frame.width, frame.height, native_scale);
         let menu = picture.and_then(|picture| menu_position(bounds, picture));
         let painted = self.painted.clone();
+        let focus = self.focus.clone();
+        let mac_ime = self.settings.mac_ime;
+        let cursor = self.cursor.clone().filter(|_| self.settings.remote_cursor);
+        let marked = self.marked.clone();
+        let anchor = self
+            .ime_bounds
+            .unwrap_or_else(|| {
+                composition_bounds(bounds, picture, self.ime_click, window.mouse_position())
+            })
+            .origin;
         let surface = canvas(
             |bounds, window, _| window.insert_hitbox(bounds, HitboxBehavior::Normal),
             move |bounds, hitbox, window, cx| {
@@ -294,7 +599,21 @@ impl Render for Desktop {
                         }
                     })
                 });
-                desktop.update(cx, |desktop, _| desktop.painted_display = display);
+                desktop.update(cx, |desktop, _| {
+                    desktop.painted_display = display;
+                    desktop.pinch_target.set(
+                        display
+                            .filter(|_| focus.is_focused(window) && window.is_window_active())
+                            .map(|display| (display, desktop.buttons)),
+                    );
+                });
+                if mac_ime {
+                    window.handle_input(
+                        &focus,
+                        ElementInputHandler::new(bounds, desktop.clone()),
+                        cx,
+                    );
+                }
                 let v = desktop.clone();
                 let hb = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
@@ -302,6 +621,7 @@ impl Render for Desktop {
                         v.update(cx, |desktop, _| {
                             if desktop.mouse_position(event.position, false) {
                                 window.focus(&desktop.focus);
+                                desktop.ime_click = Some(event.position);
                                 desktop.modifiers(event.modifiers);
                                 desktop.mouse_button(event.button, true);
                             }
@@ -324,8 +644,18 @@ impl Render for Desktop {
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble {
                         let hovered = hb.is_hovered(window);
-                        v.update(cx, |desktop, _| {
+                        v.update(cx, |desktop, cx| {
+                            if desktop.settings.remote_cursor {
+                                cx.notify();
+                            }
                             let dragging = desktop.buttons != 0;
+                            if desktop
+                                .multitouch
+                                .as_ref()
+                                .is_some_and(multitouch::Capture::has_contacts)
+                            {
+                                return;
+                            }
                             if (hovered || dragging)
                                 && desktop.mouse_position(event.position, dragging)
                             {
@@ -335,13 +665,19 @@ impl Render for Desktop {
                     }
                 });
                 let v = desktop.clone();
+                let hb = hitbox.clone();
                 window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
-                    if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
-                        v.update(cx, |desktop, _| {
+                    if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
+                        v.update(cx, |desktop, cx| {
+                            if desktop.raw_active.get()
+                                && matches!(event.delta, ScrollDelta::Pixels(_))
+                            {
+                                return;
+                            }
                             if desktop.mouse_position(event.position, false) {
                                 desktop.pointer.send_replace(None);
                                 desktop.send_pointer();
-                                desktop.scroll(event);
+                                desktop.scroll(event, cx);
                             }
                         });
                     }
@@ -364,6 +700,50 @@ impl Render for Desktop {
                         }
                     }
                 }
+                if let (Some(cursor), Some(display)) = (&cursor, display) {
+                    let mouse = window.mouse_position();
+                    if window.is_window_active()
+                        && focus.is_focused(window)
+                        && hitbox.is_hovered(window)
+                        && display.bounds.contains(&mouse)
+                    {
+                        window.set_cursor_style(CursorStyle::None, &hitbox);
+                        if let RemoteCursor::Image {
+                            image,
+                            hotspot,
+                            size: (width, height),
+                        } = cursor
+                        {
+                            let scale = f32::from(display.bounds.size.width)
+                                / f32::from(display.resolution.0);
+                            let position = point(
+                                mouse.x - px(f32::from(hotspot.0) * scale),
+                                mouse.y - px(f32::from(hotspot.1) * scale),
+                            );
+                            let image_bounds = Bounds::new(
+                                position,
+                                size(
+                                    px(f32::from(*width) * scale),
+                                    px(f32::from(*height) * scale),
+                                ),
+                            );
+                            window.with_content_mask(
+                                Some(ContentMask {
+                                    bounds: display.bounds,
+                                }),
+                                |window| {
+                                    let _ = window.paint_image(
+                                        image_bounds,
+                                        Corners::default(),
+                                        image.clone(),
+                                        0,
+                                        false,
+                                    );
+                                },
+                            );
+                        }
+                    }
+                }
                 if let Some(old) = painted.replace(jpeg.clone()) {
                     if !jpeg.as_ref().is_some_and(|new| Arc::ptr_eq(new, &old)) {
                         let _ = window.drop_image(old);
@@ -378,12 +758,25 @@ impl Render for Desktop {
             .overflow_hidden()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.modifiers.platform {
+                let stroke = &event.keystroke;
+                if stroke.modifiers.platform && !desktop.settings.command_as_control {
                     return;
                 }
-                desktop.modifiers(event.keystroke.modifiers);
-                if let Some(key) = keysym(&event.keystroke.key, event.keystroke.key_char.as_deref())
+                let shortcut = stroke.modifiers.control || stroke.modifiers.platform;
+                // macOS can report an empty string for a dead key or an IME key.
+                let text_input = stroke
+                    .key_char
+                    .as_deref()
+                    .is_some_and(|text| text.chars().all(|ch| !ch.is_control()));
+                if desktop.settings.mac_ime
+                    && !shortcut
+                    && (text_input || !desktop.marked.is_empty())
                 {
+                    return;
+                }
+                desktop.modifiers(stroke.modifiers);
+                let text = (!shortcut).then_some(stroke.key_char.as_deref()).flatten();
+                if let Some(key) = keysym(&stroke.key, text) {
                     desktop.keys.insert(event.keystroke.key.clone(), key);
                     desktop.command(format!("kd,{key}"));
                     cx.stop_propagation();
@@ -401,6 +794,18 @@ impl Render for Desktop {
                 },
             ))
             .child(surface)
+            .when(!marked.is_empty(), |view| {
+                view.child(
+                    div()
+                        .absolute()
+                        .left(anchor.x)
+                        .top(anchor.y)
+                        .bg(rgb(0x22262f))
+                        .text_color(rgb(0xffffff))
+                        .px_2()
+                        .child(marked),
+                )
+            })
             .when_some(menu, |view, position| {
                 view.child(
                     div()
@@ -515,6 +920,31 @@ fn menu_position(viewport: Bounds<Pixels>, picture: Bounds<Pixels>) -> Option<Po
         })
 }
 
+fn composition_bounds(
+    viewport: Bounds<Pixels>,
+    picture: Option<Bounds<Pixels>>,
+    click: Option<Point<Pixels>>,
+    pointer: Point<Pixels>,
+) -> Bounds<Pixels> {
+    let visible = picture
+        .map(|bounds| viewport.intersect(&bounds))
+        .unwrap_or(viewport);
+    let anchor = click
+        .filter(|point| visible.contains(point))
+        .or_else(|| visible.contains(&pointer).then_some(pointer))
+        .unwrap_or_else(|| {
+            point(
+                visible.left() + visible.size.width * 0.5,
+                visible.top() + visible.size.height * 0.75,
+            )
+        });
+    let height = px(22.).min(visible.size.height);
+    Bounds::new(
+        point(anchor.x, anchor.y.min(visible.bottom() - height)),
+        size(px(1.), height),
+    )
+}
+
 fn keysym(key: &str, text: Option<&str>) -> Option<u32> {
     let special = match key {
         "backspace" => 0xff08,
@@ -558,6 +988,27 @@ fn keysym(key: &str, text: Option<&str>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ime_anchor_uses_click_pointer_or_visible_picture() {
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(800.), px(600.)));
+        let picture = Bounds::new(point(px(100.), px(100.)), size(px(600.), px(400.)));
+        let click = point(px(250.), px(200.));
+        let pointer = point(px(350.), px(300.));
+        let outside = point(px(5.), px(5.));
+        assert_eq!(
+            composition_bounds(viewport, Some(picture), Some(click), pointer).origin,
+            click
+        );
+        assert_eq!(
+            composition_bounds(viewport, Some(picture), Some(outside), pointer).origin,
+            pointer
+        );
+        assert_eq!(
+            composition_bounds(viewport, Some(picture), None, outside).origin,
+            point(px(400.), px(400.))
+        );
+    }
 
     #[test]
     fn click_uses_the_geometry_of_the_picture_that_was_painted() {

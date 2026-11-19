@@ -1,6 +1,7 @@
 use crate::audio::Playback;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use gpui::RenderImage;
 use image::{ImageDecoder, ImageFormat, ImageReader};
@@ -172,6 +173,80 @@ impl Diagnostics {
     }
 }
 
+#[derive(Clone)]
+pub enum RemoteCursor {
+    Hidden,
+    Image {
+        image: Arc<RenderImage>,
+        hotspot: (u16, u16),
+        size: (u16, u16),
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct CursorMessage<'a> {
+    #[serde(borrow)]
+    curdata: &'a str,
+    #[serde(default)]
+    handle: Option<CursorNumber>,
+    #[serde(default)]
+    hotx: Option<CursorNumber>,
+    #[serde(default)]
+    hoty: Option<CursorNumber>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum CursorNumber {
+    Integer(u32),
+    Text(String),
+}
+
+impl CursorNumber {
+    fn value(self) -> Option<u32> {
+        match self {
+            Self::Integer(value) => Some(value),
+            Self::Text(value) => value.parse().ok(),
+        }
+    }
+}
+
+impl RemoteCursor {
+    fn parse(text: &str) -> Option<Self> {
+        if text.len() > 512 * 1024 {
+            return None;
+        }
+        let message: CursorMessage<'_> = serde_json::from_str(text).ok()?;
+        if message.handle.and_then(CursorNumber::value) == Some(0) || message.curdata.is_empty() {
+            return Some(Self::Hidden);
+        }
+        let png = STANDARD.decode(message.curdata).ok()?;
+        let mut reader = ImageReader::with_format(Cursor::new(png), ImageFormat::Png);
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(256);
+        limits.max_image_height = Some(256);
+        limits.max_alloc = Some(2 * 1024 * 1024);
+        reader.limits(limits);
+        let mut pixels = reader.decode().ok()?.into_rgba8();
+        let (width, height) = (pixels.width() as u16, pixels.height() as u16);
+        for pixel in pixels.pixels_mut() {
+            pixel.0.swap(0, 2);
+        }
+        let image = Arc::new(RenderImage::new(smallvec![image::Frame::new(pixels)]));
+        let hotspot = |value: Option<CursorNumber>, extent: u16| {
+            value
+                .and_then(CursorNumber::value)
+                .unwrap_or_default()
+                .min(u32::from(extent.saturating_sub(1))) as u16
+        };
+        Some(Self::Image {
+            image,
+            hotspot: (hotspot(message.hotx, width), hotspot(message.hoty, height)),
+            size: (width, height),
+        })
+    }
+}
+
 pub enum SessionEvent {
     Audio(bool),
     AudioUnavailable(&'static str),
@@ -180,6 +255,9 @@ pub enum SessionEvent {
     Stats(StreamSample),
     ResizeAllowed(bool),
     ScreenPolicy(ScreenPolicy),
+    Cursor(RemoteCursor),
+    FingerScroll(bool),
+    Multitouch(bool),
     Error(String),
 }
 
@@ -199,9 +277,36 @@ impl Pointer {
     }
 }
 
+fn zoom_commands(
+    notches: i8,
+    position: Pointer,
+    display: Resolution,
+    control_held: bool,
+) -> Vec<String> {
+    let Some(move_pointer) = position.command_for(display).filter(|_| notches != 0) else {
+        return Vec::new();
+    };
+    let mask = position.buttons | if notches > 0 { 16 } else { 8 };
+    let mut commands = vec![move_pointer];
+    if !control_held {
+        commands.push("kd,65507".into());
+    }
+    commands.push(format!("m2,0,0,{mask},{}", notches.unsigned_abs()));
+    commands.push(format!("m2,0,0,{},0", position.buttons));
+    if !control_held {
+        commands.push("ku,65507".into());
+    }
+    commands
+}
+
+#[derive(serde::Serialize)]
+pub struct Contact(pub u16, pub u16, pub u16);
+
 pub enum Input {
     Command(String),
     Pointer(Pointer),
+    Zoom(i8, Pointer),
+    Contacts(Vec<Contact>),
     Audio(bool),
     Video(bool),
     Settings(Vec<(Key, u32)>),
@@ -329,6 +434,7 @@ pub async fn run(
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capabilities = Settings::default();
     let mut resize_allowed = false;
+    let mut multitouch = false;
     let mut screen_policy = ScreenPolicy::default();
     let mut dark = options.dark;
     let mut video_playing = None;
@@ -401,11 +507,23 @@ pub async fn run(
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
+                    if let Some(cursor) = text.strip_prefix("cursor,") {
+                        if let Some(cursor) = RemoteCursor::parse(cursor) {
+                            let _ = events.send(SessionEvent::Cursor(cursor));
+                        }
+                        continue;
+                    }
                     if text.starts_with("MODE ") && text != "MODE websockets" {
                         return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.");
                     }
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
                         match data["type"].as_str() {
+                            Some("display_config_update") => {
+                                let enabled = data["finger_scroll"].as_bool().unwrap_or(false);
+                                let _ = events.send(SessionEvent::FingerScroll(enabled));
+                                multitouch = data["multitouch_trackpad"].as_bool().unwrap_or(false);
+                                let _ = events.send(SessionEvent::Multitouch(multitouch));
+                            }
                             Some("stream_info") => {
                                 diagnostics.server_encoder = data["info"]["encoder"].as_str().map(str::to_owned);
                             }
@@ -499,6 +617,21 @@ pub async fn run(
                     Some(Input::Pointer(position)) => {
                         let Some(text) = position.command_for(active_size) else { continue; };
                         text
+                    }
+                    Some(Input::Contacts(contacts)) => {
+                        if multitouch {
+                            if let Ok(frame) = serde_json::to_string(&contacts) {
+                                socket.send(format!("mt,{frame}").into()).await.map_err(|_| disconnected)?;
+                            }
+                        }
+                        continue;
+                    }
+                    Some(Input::Zoom(notches, position)) => {
+                        let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
+                        for command in zoom_commands(notches, position, active_size, control_held) {
+                            socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
                     }
                     Some(Input::Video(enabled)) => {
                         if let Some(video) = &mut hardware {
@@ -812,6 +945,53 @@ mod tests {
         assert!(!allows_resize(
             &json!({"manual_resolution": {"locked": true}})
         ));
+    }
+
+    #[test]
+    fn pinch_preserves_buttons_and_preexisting_control() {
+        let display = Resolution(1280, 720);
+        let position = Pointer {
+            display,
+            position: (32, 48),
+            buttons: 1,
+        };
+        assert_eq!(
+            zoom_commands(2, position, display, false),
+            [
+                "m,32,48,1,0",
+                "kd,65507",
+                "m2,0,0,17,2",
+                "m2,0,0,1,0",
+                "ku,65507"
+            ]
+        );
+        assert_eq!(
+            zoom_commands(-1, position, display, true),
+            ["m,32,48,1,0", "m2,0,0,9,1", "m2,0,0,1,0"]
+        );
+        assert!(zoom_commands(2, position, Resolution(1920, 1080), false).is_empty());
+    }
+
+    #[test]
+    fn cursor_decode_preserves_the_hotspot_and_handles_hidden_cursors() {
+        assert!(matches!(
+            RemoteCursor::parse(r#"{"curdata":"","handle":0}"#),
+            Some(RemoteCursor::Hidden)
+        ));
+        let mut png = Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([255, 100, 10, 255]))
+            .write_to(&mut png, ImageFormat::Png)
+            .unwrap();
+        let payload = json!({"curdata": STANDARD.encode(png.into_inner()), "handle": "1", "hotx": "1", "hoty": 2});
+        assert!(matches!(
+            RemoteCursor::parse(&payload.to_string()),
+            Some(RemoteCursor::Image {
+                hotspot: (1, 2),
+                size: (2, 3),
+                ..
+            })
+        ));
+        assert!(RemoteCursor::parse(r#"{"curdata":"garbage","handle":1}"#).is_none());
     }
 
     #[test]

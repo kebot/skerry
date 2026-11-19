@@ -42,15 +42,17 @@ H.264 is the preferred codec for servers without a saved codec choice. To switch
 ## 4. Using the app
 
 - **Applications / Running Sessions:** click **Launch** to start a new session or **Resume** to attach to an existing one. Click **Refresh** to reload the list.
-- **Session Controls:** press **⌘⇧M**, choose **View → Session Controls**, or click **•••** when it appears in the space beside the picture. The controls open in a separate, movable macOS panel with collapsible **Screen Settings**, **Video**, and **Stream Diagnostics** sections. Press **Esc** or **⌘W** to close the panel and return focus to the session.
+- **Session Controls:** press **⌘⇧M**, choose **View → Session Controls**, or click **•••** when it appears in the space beside the picture. The controls open in a separate, movable macOS panel with collapsible **Input**, **Screen Settings**, **Video**, and **Stream Diagnostics** sections. Press **Esc** or **⌘W** to close the panel and return focus to the session.
   - **Mute / Unmute:** controls remote audio when a compatible output is available. Reconnect preserves your mute choice.
   - **Pause / Resume Video:** stops or restarts video delivery while keeping the session open.
+  - **Input** has switches for **Command sends Control**, **Remote Cursor**, **Smooth Trackpad Scrolling**, and **Use Mac Input Method**. Smooth Trackpad Scrolling starts enabled. The other switches are opt-in. Changes apply immediately and are saved per server. **Send Key Combination** sends **Alt+Tab** or **Ctrl+Alt+Delete** to the remote desktop. The session controls, quit, and fullscreen shortcuts stay local.
+  - **Forward Multitouch Trackpad** starts off and appears under **Input** on compatible patched X11 servers. It sends trackpad contacts to a virtual Linux trackpad. [Server patch and setup](tickets/multitouch-trackpad.md)
   - **Video** shows the codecs supported by both the Mac and the server. It offers JPEG quality and still-image settings for JPEG, and server-supported CBR target bitrate or CRF quality for hardware video. Frame rate cap applies to either. **Reset Video Settings** restores the server’s tuning defaults and keeps the codec preference.
   - **Screen Settings** opens each session in **Match Window** with **HiDPI** enabled and **UI Scaling** set to **Match Mac Display**. The requested remote resolution and UI scale follow the window when it is resized or moves between displays. The UI scale uses the server’s closest allowed value. For a non-HiDPI scaled mode, SealSkin can derive a fractional UI scale from the panel’s native pixels and the Mac’s logical display size. Use **Reset to Window** after a manual resolution or UI scale change to resume following the window and Mac display. **Scale Locally** fits the picture to the window.
   - **Full Screen:** toggles macOS full-screen mode. You can also press **⌃⌘F**.
   - **Reconnect:** tears down and re-opens the Selkies stream for the current session.
   - **Disconnect:** closes the local stream and returns to the launcher, leaving the remote session running on the server.
-- **Keyboard & mouse:** mouse, scroll wheel, and non-`Cmd` keys are forwarded to the remote application. `Cmd+Q` quits the app.
+- **Keyboard & mouse**. Mouse, scroll wheel, and non-`Cmd` keys are forwarded to the remote application by default. **Use Mac Input Method** keeps composition in macOS and sends the selected text to a supported Selkies server. **Smooth Trackpad Scrolling** uses precise two-finger scroll deltas when the server supports them and falls back to wheel steps. Pinch over the remote picture sends Control-wheel zoom. `Cmd+Q` quits the app.
 
 ## 5. Limitations
 

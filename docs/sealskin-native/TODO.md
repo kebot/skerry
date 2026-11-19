@@ -40,6 +40,7 @@
 
 - [ ] [Support copy and paste between the Mac and the session](tickets/clipboard.md)
 - [ ] [Improve Mac keyboard shortcuts and remote cursor behavior](tickets/keyboard-and-cursor.md)
+- [ ] [Offer opt-in multitouch trackpad forwarding to Linux](tickets/multitouch-trackpad.md)
 - [ ] [Upload and download files with native dialogs](tickets/file-transfers.md)
 - [ ] [Choose an audio output device and adjust audio quality](tickets/audio-devices.md)
 - [ ] [Save and print remote documents on the Mac](tickets/printing.md)

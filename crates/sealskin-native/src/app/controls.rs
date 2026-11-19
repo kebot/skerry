@@ -2,6 +2,7 @@ use super::{
     native_window, CloseSessionControls, Colors, DisplayMode, Launcher, ToggleFullScreen,
     ToggleSessionControls,
 };
+use crate::input::{InputFeature, InputSettings, RemoteChord};
 use crate::video::Codec;
 use crate::{
     settings::{Key, ScreenChange},
@@ -18,6 +19,7 @@ pub(super) struct ControlPanel {
     focus: FocusHandle,
     fullscreen: bool,
     screen: bool,
+    input: bool,
     video: bool,
     stats: bool,
     picker: Option<Picker>,
@@ -65,6 +67,8 @@ enum Command {
     Setting(Key, u32),
     Codec(Codec),
     ResetVideo,
+    Input(InputFeature, bool),
+    Chord(RemoteChord),
 }
 
 impl ControlPanel {
@@ -142,6 +146,7 @@ impl ControlPanel {
                         focus: cx.focus_handle(),
                         fullscreen,
                         screen: true,
+                        input: false,
                         video: false,
                         stats: false,
                         picker: None,
@@ -230,6 +235,15 @@ impl ControlPanel {
                     Command::Codec(codec) => launcher.change_codec(codec, window, cx),
                     Command::Setting(key, value) => launcher.change_setting(key, value, cx),
                     Command::ResetVideo => launcher.reset_settings(cx),
+                    Command::Input(feature, enabled) => {
+                        launcher.change_input(feature, enabled, window, cx)
+                    }
+                    Command::Chord(chord) => {
+                        launcher.close_controls(window, cx);
+                        if let Some((_, stream)) = &launcher.current {
+                            stream.send_chord(chord, cx);
+                        }
+                    }
                 }
                 cx.notify();
             });
@@ -576,6 +590,59 @@ impl ControlPanel {
         )
     }
 
+    fn input_settings(
+        &self,
+        input: InputSettings,
+        multitouch_available: bool,
+        colors: Colors,
+    ) -> Div {
+        let owner = self.owner;
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(
+                InputFeature::ALL
+                    .into_iter()
+                    .filter(|(feature, _)| {
+                        multitouch_available || *feature != InputFeature::Multitouch
+                    })
+                    .map(|(feature, label)| {
+                        let enabled = feature.enabled(input);
+                        switch_row(
+                            colors,
+                            label,
+                            enabled,
+                            Command::Input(feature, !enabled),
+                            owner,
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child("Send Key Combination")
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(self.action(
+                                colors,
+                                "Alt+Tab",
+                                Command::Chord(RemoteChord::SwitchApp),
+                            ))
+                            .child(self.action(
+                                colors,
+                                "Ctrl+Alt+Delete",
+                                Command::Chord(RemoteChord::ControlAltDelete),
+                            )),
+                    ),
+            )
+    }
+
     fn video_settings(&self, launcher: &Launcher, colors: Colors) -> Div {
         let panel = div().flex().flex_col().gap_2();
         let Some(settings) = &launcher.settings else {
@@ -794,6 +861,22 @@ impl Render for ControlPanel {
                     view.child(div().text_color(rgb(colors.muted)).child(reason))
                 }),
         )
+        .child(section(
+            colors,
+            "Input",
+            self.input,
+            || {
+                self.input_settings(
+                    launcher.preferences.input,
+                    launcher.multitouch_available,
+                    colors,
+                )
+            },
+            cx.listener(|this, _, _, cx| {
+                this.input = !this.input;
+                cx.notify();
+            }),
+        ))
         .child(section(
             colors,
             "Screen Settings",
