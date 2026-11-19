@@ -1,6 +1,6 @@
 # Selkies web feature research
 
-This backlog covers the Selkies web dashboard and session features relevant to the native macOS client. The inventory is pinned to upstream commit `715df7c`. An earlier smoke test against our SealSkin 0.4.2 deployment confirmed WebSocket/JPEG streaming and input. Availability of the other features depends on the Selkies build in each application image and on the server’s policy. [Selkies settings at 715df7c](https://github.com/selkies-project/selkies/blob/715df7cdea9c6c21ae339f93f194f718a879dc41/docs/settings.md) · [SealSkin Native design](../DESIGN.md)
+This backlog covers the Selkies web dashboard and session features relevant to the native macOS client. The inventory is pinned to upstream commit `715df7c`. An earlier smoke test against our SealSkin 0.4.2 deployment confirmed WebSocket/JPEG streaming and input. Availability of the other features depends on the Selkies build in each application image and on the server’s policy. [Selkies settings at 715df7c](https://github.com/selkies-project/selkies/blob/715df7cdea9c6c21ae339f93f194f718a879dc41/docs/settings.md) · [Skerry design](../DESIGN.md)
 
 ## What the web client offers
 

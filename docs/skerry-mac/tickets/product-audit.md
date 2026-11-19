@@ -2,7 +2,7 @@
 
 This comparison uses the official SealSkin 0.4.2 documentation, the version previously observed on our server. It covers the native launcher and related workflows. The [Selkies audit](research.md) covers streaming and remote desktop controls. These features were checked against upstream docs and our source. Deployment-specific permissions and workflows still need live testing. [SealSkin usage](https://github.com/selkies-project/sealskin/blob/0.4.2/docs/content/usage.md) · [SealSkin API](https://github.com/selkies-project/sealskin/blob/0.4.2/docs/content/api.md)
 
-SealSkin Native already accepts an application key, lists available apps and sessions, launches an app with server defaults, resumes an individual stream, and disconnects locally. The most visible product gaps are launch options and progress, stopping a session, and opening a link or file in a compatible app. The checklist links to tickets for those and for launcher organization, persistent storage, account recovery, and clustered deployments.
+Skerry already accepts an application key, lists available apps and sessions, launches an app with server defaults, resumes an individual stream, and disconnects locally. The most visible product gaps are launch options and progress, stopping a session, and opening a link or file in a compatible app. The checklist links to tickets for those and for launcher organization, persistent storage, account recovery, and clustered deployments.
 
 ## Product boundaries
 

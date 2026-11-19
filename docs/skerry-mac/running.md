@@ -1,27 +1,26 @@
-# Running SealSkin Native
+# Running Skerry
 
-## 1. Prerequisites
+## 1. What you need
 
+- A Mac. Hardware H.264, H.265 or AV1 decoding is used when available; otherwise Skerry uses JPEG.
 - A [SealSkin server](https://docs.sealskin.app/latest/) with a trusted HTTPS certificate.
-- Your account must allow the **Other** client type for application keys.
-- Individual sessions must support the Selkies WebSocket transport and allow a codec supported by the Mac.
+- An account that allows the **Other** client type for application keys.
+- Individual sessions that support the Selkies WebSocket transport and allow a codec the Mac can play.
 
 ## 2. Application key
 
-Sign in to your SealSkin server's web app, open **Settings → Application Keys**, and create a key. Copy the full value, including the server address after `@` (for example `ssk_<id>_<secret>@seal.example`).
+Sign in to your SealSkin server's web app, open **Settings → Application Keys**, and create a key. Copy the whole value, including the server address after `@` (for example `ssk_<id>_<secret>@seal.example`).
 
-You can supply the key in either of two ways:
+Give Skerry the key in one of two ways:
 
-- **In the app (Keychain):** click **Paste Application Key**. After a successful connection, SealSkin Native stores the key in macOS Keychain (`dev.kebot.sealskin` / `application-key`). Use **Remove Connection** in the sidebar to delete it from Keychain.
-- **Environment or `.env` (for development):** set `SEALSKIN_APPLICATION_KEY` in your environment or in `.env` in the working directory:
+- **In the app:** choose **Paste Application Key**. After it connects, Skerry saves the key in macOS Keychain (service `dev.kebot.sealskin`, account `application-key`). **Remove Connection** in the sidebar deletes it.
+- **For development:** set `SEALSKIN_APPLICATION_KEY` in the environment or in `.env` in the working directory. Skerry uses the key for that run only and doesn't save it to Keychain.
 
 ```sh
 SEALSKIN_APPLICATION_KEY=ssk_id_secret@seal.example
 ```
 
-Keys supplied via `SEALSKIN_APPLICATION_KEY` or `.env` are used for the current run only and are not written to Keychain.
-
-## 3. Run and bundle
+## 3. Build and run
 
 Run from source:
 
@@ -29,33 +28,58 @@ Run from source:
 cargo run -p skerry-mac
 ```
 
-Build a macOS `.app` bundle (ad-hoc signed, not notarised):
+Build an app bundle (ad-hoc signed, not notarised):
 
 ```sh
-scripts/bundle.sh skerry-mac   # produces dist/SealSkin Native.app
+scripts/bundle.sh   # produces dist/SealSkin Native.app
 ```
 
-The GPUI dependency uses `runtime_shaders`, so the Xcode Metal toolchain does not need to be installed to build (see [gpui-notes.md](../gpui-notes.md)).
+GPUI is built with `runtime_shaders`, so you don't need the Xcode Metal toolchain (see [gpui-notes.md](../gpui-notes.md)).
 
-H.264 is the preferred codec for servers without a saved codec choice. To switch codecs, open **Session Controls → Video → Codec** while connected. SealSkin reconnects to the same session and remembers the choice for this server. **Stream Diagnostics → Client decoder** shows the codec actually in use. SealSkin can use JPEG where the server allows it if H.264 is unavailable or hardware decoding cannot recover. [Codec support and verification](tickets/more-codecs.md)
+## 4. Using Skerry
 
-## 4. Using the app
+### Library
 
-- **Applications / Running Sessions:** click **Launch** to start a new session or **Resume** to attach to an existing one. Click **Refresh** to reload the list.
-- **Session Controls:** press **⌘⇧M**, choose **View → Session Controls**, or click **•••** when it appears in the space beside the picture. The controls open in a separate, movable macOS panel with collapsible **Input**, **Screen Settings**, **Video**, and **Stream Diagnostics** sections. Press **Esc** or **⌘W** to close the panel and return focus to the session.
-  - **Mute / Unmute:** controls remote audio when a compatible output is available. Reconnect preserves your mute choice.
-  - **Pause / Resume Video:** stops or restarts video delivery while keeping the session open.
-  - **Input** has switches for **Command sends Control**, **Remote Cursor**, **Smooth Trackpad Scrolling**, and **Use Mac Input Method**. Smooth Trackpad Scrolling starts enabled. The other switches are opt-in. Changes apply immediately and are saved per server. **Send Key Combination** sends **Alt+Tab** or **Ctrl+Alt+Delete** to the remote desktop. The session controls, quit, and fullscreen shortcuts stay local.
-  - **Video** shows the codecs supported by both the Mac and the server. It offers JPEG quality and still-image settings for JPEG, and server-supported CBR target bitrate or CRF quality for hardware video. Frame rate cap applies to either. **Reset Video Settings** restores the server’s tuning defaults and keeps the codec preference.
-  - **Screen Settings** opens each session in **Match Window** with **HiDPI** enabled and **UI Scaling** set to **Match Mac Display**. The requested remote resolution and UI scale follow the window when it is resized or moves between displays. The UI scale uses the server’s closest allowed value. For a non-HiDPI scaled mode, SealSkin can derive a fractional UI scale from the panel’s native pixels and the Mac’s logical display size. Use **Reset to Window** after a manual resolution or UI scale change to resume following the window and Mac display. **Scale Locally** fits the picture to the window.
-  - **Full Screen:** toggles macOS full-screen mode. You can also press **⌃⌘F**.
-  - **Reconnect:** tears down and re-opens the Selkies stream for the current session.
-  - **Disconnect:** closes the local stream and returns to the launcher, leaving the remote session running on the server.
-- **Keyboard & mouse**. Mouse, scroll wheel, and non-`Cmd` keys are forwarded to the remote application by default. **Use Mac Input Method** keeps composition in macOS and sends the selected text to a supported Selkies server. **Smooth Trackpad Scrolling** uses precise two-finger scroll deltas when the server supports them and falls back to wheel steps. Pinch over the remote picture sends Control-wheel zoom. `Cmd+Q` quits the app.
+- **Launch** starts a new session for an application.
+- **Resume** attaches to a session that's already running.
+- **Refresh** reloads both lists.
+
+### Session Controls
+
+Open the controls with **⌘⇧M**, **View → Session Controls**, or the **•••** button when there's room beside the picture. They open in a separate panel you can move. **Esc** or **⌘W** closes it and returns focus to the session.
+
+- **Mute / Unmute** turns remote audio on or off. Reconnecting keeps your choice.
+- **Pause / Resume Video** stops or restarts video while keeping the session open.
+- **Input** has four switches, saved per server and applied at once:
+  - **Command sends Control** (off by default)
+  - **Remote Cursor** (off by default)
+  - **Smooth Trackpad Scrolling** (on by default)
+  - **Use Mac Input Method** (off by default)
+
+  **Send Key Combination** sends **Alt+Tab** or **Ctrl+Alt+Delete**. Shortcuts for Session Controls, quit and full screen always stay on the Mac.
+- **Screen Settings:** each session starts in **Match Window** with **HiDPI** on and **UI Scaling** set to **Match Mac Display**. The remote resolution and UI scale follow the window as you resize it or move it to another display, using the closest UI scale the server allows. On scaled, non-HiDPI display modes Skerry works out a fractional UI scale from the panel's native pixels. After changing the resolution or UI scale by hand, **Reset to Window** goes back to following the window. **Scale Locally** fits the picture to the window instead.
+- **Video** lists the codecs both the Mac and the server support. JPEG has quality and still-image settings. Hardware codecs have a constant target bitrate or a CRF quality, depending on what the server offers. Frame rate cap applies to all codecs. **Reset Video Settings** restores the server's defaults and keeps your codec.
+- **Stream Diagnostics** shows frame rate, bandwidth, decode time, round-trip time, the remote resolution and the decoder in use (**Client decoder**).
+- **Full Screen** toggles full screen. **⌃⌘F** does the same.
+- **Reconnect** closes and reopens the stream for the same session.
+- **Disconnect** closes the stream and returns to the library. The session keeps running on the server.
+
+### Codecs
+
+With no saved choice for a server, Skerry prefers H.264. To switch, open **Session Controls → Video → Codec**. Skerry reconnects to the same session and remembers the codec for that server. If H.264 isn't available or hardware decoding can't recover, Skerry falls back to JPEG when the server allows it. See [Codec support and verification](tickets/more-codecs.md).
+
+### Keyboard, mouse and trackpad
+
+- Mouse, scroll wheel and keys without Command go to the remote application.
+- **Use Mac Input Method** composes text in macOS and sends the result, on servers that support it.
+- **Smooth Trackpad Scrolling** sends precise two-finger scroll deltas when the server supports them, and wheel steps otherwise.
+- Pinching over the picture sends Control-wheel zoom.
+- **⌘Q** quits Skerry.
 
 ## 5. Limitations
 
-- **Transport and codecs** are limited to Selkies WebSockets with JPEG or full-frame 8-bit H.264, H.265 (HEVC), and AV1 on Macs with compatible VideoToolbox hardware decoding.
-- **Remote resolution** follows the window up to the client’s 4096×2160 limit. The server may further constrain the resolution or lock UI scaling. Stream Diagnostics shows the resolution Selkies delivers.
-- **Individual sessions only:** collaboration rooms are not supported in this version.
-- **Audio:** requires a macOS output device supporting 48 kHz stereo `f32` audio; otherwise the session runs without audio.
+- **Transport:** Selkies WebSockets only. WebRTC isn't supported.
+- **Codecs:** JPEG, or full-frame 8-bit H.264, H.265 and AV1 where VideoToolbox can decode them in hardware.
+- **Resolution:** follows the window up to 4096×2160. The server can limit it further or lock UI scaling. Stream Diagnostics shows what Selkies actually delivers.
+- **Sessions:** individual sessions only, no collaboration rooms.
+- **Audio:** needs an output device that supports 48 kHz stereo `f32`. Otherwise the session runs without sound.

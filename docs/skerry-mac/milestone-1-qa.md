@@ -1,4 +1,4 @@
-# SealSkin Native Milestone 1 QA
+# Skerry milestone 1 QA
 
 Milestone 1 covers the six Video and Screen tickets in Review and the separate Session Controls panel. The live smoke test used the signed macOS app, a disposable Zen session on SealSkin 0.4.2, and an isolated local preferences directory. [Checklist](TODO.md)
 

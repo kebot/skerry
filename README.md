@@ -1,29 +1,48 @@
-# SealSkin Native for macOS
+# Skerry
 
-SealSkin Native is a Rust and GPUI app for launching and resuming applications on a [SealSkin server](https://docs.sealskin.app/latest/). It connects directly to the Selkies WebSocket, decodes JPEG video in Rust, and draws it in GPUI. Keyboard and mouse events go directly to Selkies. Stereo Opus audio plays through Core Audio on a compatible output device. Disconnect returns to the launcher and leaves the remote session running.
+Skerry is a native Mac client for [SealSkin](https://docs.sealskin.app/latest/) and [Selkies](https://github.com/selkies-project/selkies). It lists the applications and running sessions on a SealSkin server, launches or resumes one, and streams it into a Mac window over the Selkies WebSocket transport. It is written in Rust with [GPUI](https://gpui.rs/).
 
-Sign in to your server’s web app, create an application key in **Settings → Application Keys**, and copy the full value including the server address after `@`. In the Mac app, choose **Paste Application Key**. The app saves the key in macOS Keychain after connecting. The server must have a trusted HTTPS certificate and allow the **Other** client type.
+- **Video:** H.264, H.265 (HEVC) and AV1 decoded in hardware with VideoToolbox, or JPEG decoded in Rust.
+- **Audio:** stereo Opus played through Core Audio.
+- **Input:** keyboard, mouse, smooth trackpad scrolling, pinch to zoom, and optional Mac input method composition.
+- **Screen:** the remote desktop follows the window size, Retina scaling and the Mac display's UI scale.
+- **Session Controls:** a separate panel (⌘⇧M) for playback, screen, video codec and quality settings, and stream diagnostics.
 
-For development, the app also reads `SEALSKIN_APPLICATION_KEY` from the environment or from `.env` in the working directory. Keys supplied this way are used for the run and aren’t written to Keychain.
+Disconnecting returns to the launcher and leaves the remote session running.
 
-This version supports individual sessions with the Selkies WebSocket transport and JPEG enabled. It requests 1280×720 and scales the remote picture to the local window. WebRTC, other video codecs, and collaboration rooms are outside this version’s scope.
+> The window title, bundle name (`SealSkin Native.app`), Keychain service and Application Support folder still use the old SealSkin Native name. They will change when the app itself is renamed.
 
-See [docs/skerry-mac/DESIGN.md](docs/skerry-mac/DESIGN.md) for the architecture and [docs/skerry-mac/running.md](docs/skerry-mac/running.md) for setup, credentials, and usage. Shared GPUI notes are in [docs/gpui-notes.md](docs/gpui-notes.md).
+## Quick start
 
-The GPUI dependency uses the `runtime_shaders` feature, so the Xcode Metal toolchain is not needed to build.
+1. Sign in to your SealSkin server's web app, open **Settings → Application Keys**, and create a key. Copy the whole value, including the server address after `@`.
+2. Run Skerry and choose **Paste Application Key**. Skerry saves the key in macOS Keychain after it connects.
+
+The server needs a trusted HTTPS certificate and must allow the **Other** client type.
+
+For development, Skerry also reads `SEALSKIN_APPLICATION_KEY` from the environment or from `.env` in the working directory. A key supplied this way is used for that run only and is not saved to Keychain.
 
 ```sh
 cargo run -p skerry-mac
-scripts/bundle.sh skerry-mac   # produces dist/SealSkin Native.app
+scripts/bundle.sh   # produces dist/SealSkin Native.app (ad-hoc signed, not notarised)
 ```
+
+GPUI is built with the `runtime_shaders` feature, so you don't need the Xcode Metal toolchain.
+
+## Docs
+
+- [docs/skerry-mac/running.md](docs/skerry-mac/running.md): setup, keys and using the app
+- [docs/skerry-mac/DESIGN.md](docs/skerry-mac/DESIGN.md): architecture
+- [docs/skerry-mac/TODO.md](docs/skerry-mac/TODO.md): roadmap, linking to one ticket per feature in [docs/skerry-mac/tickets/](docs/skerry-mac/tickets/)
+- [docs/gpui-notes.md](docs/gpui-notes.md): GPUI notes and pitfalls
 
 ## Layout
 
 | Path | Contents |
 |------|----------|
-| `crates/skerry-mac` | The SealSkin launcher and API client, Selkies transport, GPUI desktop view, and Core Audio playback |
-| `design/skerry-mac/` | Static HTML mock of the UI |
-| `docs/` | Design notes, tickets, and shared GPUI notes |
+| `crates/skerry-mac` | The Mac app: SealSkin API client, Selkies transport, video decoding, GPUI views, Core Audio playback |
+| `design/skerry-mac/` | Static HTML mock-up of the UI |
+| `docs/` | Design notes, roadmap and tickets |
+| `scripts/bundle.sh` | Builds a release `.app` bundle in `dist/` |
 
 ## Develop
 

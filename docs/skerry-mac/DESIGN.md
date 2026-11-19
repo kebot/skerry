@@ -1,57 +1,101 @@
-# SealSkin Native: design and architecture
+# Skerry: design and architecture
 
-SealSkin Native (`crates/skerry-mac`, package `skerry-mac`) is a native macOS GPUI client for launching and resuming applications on a [SealSkin server](https://docs.sealskin.app/latest/).
+Skerry (`crates/skerry-mac`, package `skerry-mac`) is a native Mac client for [SealSkin](https://docs.sealskin.app/latest/) and Selkies. It signs in to a SealSkin server with an application key, lists the applications and running sessions, and streams one session into a GPUI window over the Selkies WebSocket transport.
 
-## Purpose
+## Goals
 
-Connect directly to a SealSkin server with an application key, list available applications and running sessions, and stream an individual remote application desktop over the Selkies WebSocket transport with JPEG video, mouse/keyboard input, and Opus audio.
+- Feel like a Mac app: native windows, menus, full screen, Keychain, Retina, trackpad gestures and input methods.
+- Talk to SealSkin and Selkies directly, with no embedded browser.
+- Use hardware video decoding where the Mac supports it, and fall back to JPEG when it doesn't.
+- Respect what the server allows: its codec list, setting ranges, locked settings and resize policy.
 
-## Architecture
+## How a session runs
 
-All SealSkin Native code lives in `crates/skerry-mac/src/`:
+1. **Sign in.** `api.rs` reads the application key and calls the SealSkin companion API to list applications and sessions.
+2. **Launch or resume.** The API returns a session URL. `transport.rs` exchanges it for a session cookie and opens the Selkies WebSocket.
+3. **Negotiate.** The client sends one `SETTINGS` message with the codec, initial resolution, display scale and audio options. The server answers with its capabilities, policy and encoder.
+4. **Stream.** Video and audio arrive as binary frames. The transport decodes them on a Tokio task and publishes the latest picture to the GPUI view about 30 times a second.
+5. **Interact.** The view turns mouse, keyboard, scroll and pinch events into Selkies commands. Session Controls sends settings changes back through the session window.
+6. **Disconnect.** Dropping the session aborts the transport task. The remote session keeps running on the server.
 
-- **`api.rs` — credentials and companion REST API**
-  - `Credential::parse` validates application keys of the form `ssk_<id>_<secret>@<host>[:port]`, requiring an `https` origin with no path, query, or credentials in the URL.
-  - `Credential::startup` checks `SEALSKIN_APPLICATION_KEY` in the environment, then `.env` in the working directory, and finally macOS Keychain (`dev.kebot.sealskin` / `application-key`). Env/`.env` keys are used for the current run only and are not saved to Keychain.
-  - `Api` sends `Authorization: Bearer <key>` and `x-sealskin-app: other` with redirects disabled:
-    - `POST /companion/api/applications` and `GET /companion/api/sessions` to load the library.
-    - `POST /companion/api/launch/simple` to launch an application.
-    - `Api::session_url` verifies that returned `session_url` paths stay on the same SealSkin origin.
+## Modules
 
-- **`transport.rs` — Selkies WebSocket transport**
-  - `socket_request` performs an unredirected `GET` on the session URL (which must carry `access_token` and end with `/`), expects `303 See Other` with a same-origin `Location` and `Set-Cookie`, and opens `wss://.../api/websockets` with the session `Cookie` and `Origin`.
-  - Negotiates JPEG video via `SETTINGS` and requests an initial 1280×720 display with Opus redundancy disabled. It uses the server’s frame-rate and quality defaults when announced, with the previous 30 fps and quality 75 requests available as a compatibility fallback.
-  - Incoming binary frames:
-    - Type `3`: JPEG stripe at vertical offset `y`, decoded off-UI on the Tokio task and composited into a BGRA `RgbaImage` canvas (bounded to `4096×2160`).
-    - Type `4`: non-JPEG video fallback; triggers an error after the 15 s video deadline if no JPEG arrives.
-    - Type `1`: Opus audio packet forwarded to `audio::Playback`.
-  - Incoming text messages handle stream resolution, server policy, and encoder information. Pause/resume and mute labels follow server playback messages. Audio startup respects the server policy and the local mute choice.
-  - A one-second sample reports published-frame rate, received binary payload rate, JPEG stripe processing time, rejected stripes, and WebSocket ping RTT. Encoder information comes separately from the server.
-  - Outgoing ticks: 33 ms presentation tick publishes changed `Frame` snapshots over a `watch` channel, sends `CLIENT_FRAME_ACK <id> 0`, and flushes coalesced pointer motion; 1 s heartbeat sends `kh,<keys>` while keys are held.
+All code lives in `crates/skerry-mac/src/`.
 
-- **`settings.rs` — JPEG controls and preferences**
-  - Reads numeric ranges and locks, filters unsupported controls, and reconciles live updates with the session’s initial defaults. Stores per-server preferences in Application Support.
+### `api.rs`: credentials and the SealSkin API
 
-- **`audio.rs` — Opus playback**
-  - `Playback` opens the default `cpal` output device at 48 kHz stereo `f32` and decodes incoming Opus packets with `opus-decoder` into a bounded ring queue (`48000 * 2 / 8` samples) to cap latency.
+- `Credential::parse` accepts keys of the form `ssk_<id>_<secret>@<host>[:port]` and requires an `https` origin with no path, query or user info.
+- `Credential::startup` looks for a key in `SEALSKIN_APPLICATION_KEY`, then `.env` in the working directory, then Keychain (service `dev.kebot.sealskin`, account `application-key`). Keys from the environment or `.env` are never saved to Keychain.
+- `Api` sends `Authorization: Bearer <key>` and `x-sealskin-app: other`, with redirects disabled:
+  - `POST /companion/api/applications` and `GET /companion/api/sessions` load the library.
+  - `POST /companion/api/launch/simple` launches an application.
+  - `Api::session_url` rejects session URLs that leave the SealSkin origin.
 
-- **`view.rs` — GPUI desktop view and input**
-  - `NativeSession` owns the `Desktop` GPUI entity and aborts the background Tokio transport task on drop.
-  - `Desktop` renders the latest `Arc<RenderImage>` scaled and letterboxed via `fit()`, and retires the previous image with `window.drop_image()` in the canvas paint closure (see [gpui-notes.md](../gpui-notes.md)).
-  - Maps mouse move, press/release, drag, and wheel events into remote pixel coordinates and sends Selkies `m,...` / `m2,...` commands.
-  - Maps key down/up and modifier changes to X11 keysyms (`kd,<sym>` / `ku,<sym>`). `Cmd` (`platform`) combinations are left for the macOS app (such as `Cmd+Q`).
-  - Releases held keys, modifiers, and mouse buttons on focus loss, window deactivation, or disconnect.
+### `transport.rs`: the Selkies WebSocket
 
-- **`app.rs` — Launcher and session UI**
-  - Runs a multi-threaded Tokio runtime alongside `gpui::Application`, respecting light/dark `WindowAppearance`.
-  - Screens:
-    1. **Connect:** **Paste Application Key** button (and status/busy feedback).
-    2. **Library:** sidebar with server address and **Remove Connection**; main pane with **Applications** (**Launch**), **Running Sessions** (**Resume**), and **Refresh**.
-    3. **Active session:** the desktop fills the window content area. A separate macOS child window holds playback, display sizing, JPEG settings, diagnostics, Full Screen, Reconnect, and Disconnect. Its mouse trigger appears only when it fits outside the picture.
-  - `app/controls.rs` renders the floating panel and sends commands back to the owning session window. The session window owns the stream and its settings.
+- `socket_request` makes an unredirected `GET` to the session URL (which must carry `access_token` and end in `/`), expects `303 See Other` with a same-origin `Location` and a cookie, then opens `wss://…/api/websockets` with that cookie and `Origin`.
+- `run` sends the initial `SETTINGS` message. It asks for the chosen codec with `encoderFallback`, 8-bit 4:2:0 video, the primary display, and an initial resolution taken from the window (`Resolution::from_window`, capped at 4096×2160 with even sizes).
+- Binary frames:
+  - **JPEG stripes** are decoded on the Tokio task and composited into a BGRA canvas.
+  - **H.264, H.265 and AV1 packets** go to the hardware decoder in `video.rs`.
+  - **Opus packets** go to `audio::Playback`.
+- Text messages carry server settings, display capabilities, playback state, cursor images and encoder information.
+- Timers:
+  - Every 33 ms: publish a changed frame, send `CLIENT_FRAME_ACK <id> 0`, and flush coalesced pointer motion.
+  - Every second: report stream statistics and measure WebSocket ping RTT.
+  - Every second while keys are held: send `kh,<keys>` so the server doesn't release them.
+- If hardware decoding stops producing frames and can't recover, the transport switches to JPEG when the server allows it, and otherwise reports an error.
 
-## Scope and non-goals (current version)
+### `video.rs`: hardware video decoding
 
-- Supports individual sessions using the Selkies WebSocket transport with JPEG enabled.
-- Requests 1280×720 initially and scales the remote picture to fit the local window.
-- WebRTC, other video codecs, and collaboration rooms are outside this version's scope.
+- `Codec` lists JPEG, H.264, H.265 and AV1, with their wire names, labels and a `supported()` check against `VTIsHardwareDecodeSupported`.
+- `Packet::parse` reads the Selkies video packet header. `Decoder` builds a `CMFormatDescription` from H.264/HEVC parameter sets or the AV1 sequence header, and runs a VideoToolbox decompression session that requires hardware acceleration.
+- Decoded frames are IOSurface-backed `CVPixelBuffer`s (`Surface`), which the view paints directly with `window.paint_surface`.
+
+### `settings.rs`: server settings and preferences
+
+- `Settings` reads the server's numeric ranges and locks for video controls, drops controls the server doesn't support, and merges live updates with the session's starting values.
+- `ScreenPolicy` reads whether the server allows resizing and UI scaling and turns local screen changes into Selkies messages.
+- `Preferences` are saved per server as JSON in `~/Library/Application Support/SealSkin Native/`.
+
+### `input.rs`: input options
+
+- `InputSettings` holds the per-server switches: Command sends Control, Remote Cursor, Smooth Trackpad Scrolling and Use Mac Input Method.
+- `RemoteChord` defines key combinations the Mac would otherwise intercept, such as Alt+Tab and Ctrl+Alt+Delete.
+
+### `audio.rs`: Opus playback
+
+- `Playback` opens the default output device at 48 kHz stereo `f32` and decodes Opus packets into a bounded queue (`48000 * 2 / 8` samples) to cap latency. Without a suitable device the session runs silently.
+
+### `view.rs` and `view/pinch.rs`: the desktop view
+
+- `NativeSession` owns the `Desktop` entity and aborts the transport task when dropped.
+- `Desktop` paints a JPEG frame as a `RenderImage`, or a hardware frame as a surface, letterboxed in the window. It retires the previous `RenderImage` with `window.drop_image()` (see [gpui-notes.md](../gpui-notes.md)).
+- Mouse, drag and wheel events are mapped to remote pixels and sent as `m,…` / `m2,…`. Keys and modifier changes become X11 keysyms (`kd,<sym>` / `ku,<sym>`). Combinations with Command stay with the Mac unless Command sends Control is on.
+- Held keys, modifiers and buttons are released when the window loses focus or the session ends.
+- `pinch.rs` installs an AppKit event monitor for trackpad magnification and turns pinches into Control-wheel zoom steps.
+
+### `app.rs`, `app/controls.rs` and `app/display.rs`: windows
+
+- `app.rs` runs a multi-threaded Tokio runtime next to `gpui::Application` and follows the Mac's light or dark appearance. It has three screens:
+  1. **Connect:** **Paste Application Key**, with status and progress.
+  2. **Library:** a sidebar with the server address and **Remove Connection**, and a main pane with **Applications** (**Launch**), **Running Sessions** (**Resume**) and **Refresh**.
+  3. **Session:** the remote desktop fills the window.
+- `controls.rs` draws **Session Controls** in a separate, movable child window: playback, input, screen settings, video codec and quality, stream diagnostics, full screen, reconnect and disconnect. It sends commands to the session window, which owns the stream and its settings.
+- `display.rs` works out the Mac display's effective UI scale from its native panel size and logical size, so the remote desktop can match it, including fractional scaled modes.
+
+## Scope
+
+Supported now:
+
+- Individual SealSkin sessions over the Selkies WebSocket transport.
+- JPEG, plus H.264, H.265 and AV1 on Macs with hardware decoding.
+- A remote resolution that follows the window, up to 4096×2160.
+
+Not supported yet:
+
+- WebRTC transport.
+- Collaboration rooms, view-only sessions and player slots.
+- Clipboard, file transfer, microphone, webcam, gamepads and printing.
+
+[TODO.md](TODO.md) tracks this work.

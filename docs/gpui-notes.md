@@ -1,138 +1,76 @@
-# GPUI notes (gpui 0.2.2, verified on this Mac)
+# GPUI notes (gpui 0.2.2, macOS)
 
-## Setup and toolchain
+Notes and pitfalls found while building on GPUI. Most were first measured in an earlier prototype and still apply to Skerry.
 
-- `crates/app/Cargo.toml`: `gpui = { version = "0.2.2", features = ["runtime_shaders"] }`.
-- Without `runtime_shaders`, gpui's build script runs `xcrun metal` and fails with
-  `cannot execute tool 'metal' due to missing Metal Toolchain`. Xcode 27 here has the toolchain
-  component "uninstalled". Two fixes:
-  1. (used) the `runtime_shaders` feature: Metal shaders are compiled at app start, no build-time
-     toolchain needed. Slight startup cost; fine for dev. Drop it if the toolchain is installed.
-  2. `xcodebuild -downloadComponent MetalToolchain` (downloads several hundred MB, changes system
-     state; not run by us).
-- Build time: cold build of gpui and deps about 25 s (debug, many cores); incremental rebuild of
-  rb-app about 2 s. `cargo clippy` cold about 28 s.
-- Sources for reference: `~/.cargo/registry/src/*/gpui-0.2.2/{examples,src}`. Examples used:
-  `hello_world.rs`, `set_menus.rs`, `image_loading.rs`.
+## Toolchain
+
+- `crates/skerry-mac/Cargo.toml` uses `gpui = { version = "0.2.2", features = ["runtime_shaders"] }`.
+- Without `runtime_shaders`, GPUI's build script runs `xcrun metal` and fails with `cannot execute tool 'metal' due to missing Metal Toolchain`. There are two fixes:
+  1. **Used here:** `runtime_shaders`, which compiles the Metal shaders when the app starts. It adds a small startup cost and needs no build-time toolchain.
+  2. `xcodebuild -downloadComponent MetalToolchain`, which downloads several hundred MB and changes system state.
+- A cold debug build of GPUI and its dependencies takes about 25 s on a many-core Mac. Incremental rebuilds take a few seconds.
+- `cargo` prints future-incompatibility warnings for `block v0.1.6` and `proc-macro-error2`, which come from GPUI's dependencies. They're harmless.
+- The GPUI examples in `~/.cargo/registry/src/*/gpui-0.2.2/examples` are the best reference, especially `hello_world.rs`, `set_menus.rs` and `image_loading.rs`.
 
 ## App skeleton
 
 ```rust
 Application::new().run(|cx: &mut App| {
-    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None), KeyBinding::new("cmd-b", ToggleSidebar, None)]);
-    cx.on_action(|_: &Quit, cx| cx.quit());                  // global action handler
+    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_window_closed(|cx| if cx.windows().is_empty() { cx.quit() }).detach();
-    cx.open_window(WindowOptions { titlebar: Some(TitlebarOptions { title: Some("rb".into()), ..Default::default() }),
-                   ..Default::default() },
-        |window, cx| { let root = cx.new(Root::new); window.focus(&root.read(cx).focus_handle(cx)); root }).unwrap();
+    cx.open_window(
+        WindowOptions { titlebar: Some(TitlebarOptions { title: Some("Skerry".into()), ..Default::default() }), ..Default::default() },
+        |window, cx| { let root = cx.new(Root::new); window.focus(&root.read(cx).focus_handle(cx)); root },
+    ).unwrap();
     cx.activate(true);
 });
 ```
 
-- `actions!(rb, [Quit, ToggleSidebar]);` declares unit actions.
-- `cx.new(...)` needs `use gpui::AppContext` in scope; `focus_handle` needs `Focusable`.
-- View-level action: `div().key_context("Root").track_focus(&focus).on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {...; cx.notify();}))`.
-  The view must be focused for the binding to dispatch (we focus it at window creation).
-- Click: `.on_mouse_down(MouseButton::Left, cx.listener(|this, ev, window, cx| {...; cx.notify()}))`.
-- Render fn: `fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement`.
-- Optional children: `.children(option_element)`.
+- `actions!(app, [Quit]);` declares unit actions.
+- `cx.new(...)` needs `use gpui::AppContext`, and `focus_handle` needs `Focusable`.
+- A view-level action needs `key_context`, `track_focus` and `on_action(cx.listener(...))`, and the view must be focused for its bindings to fire.
+- `Application::run` blocks the main thread, as macOS requires. Do Tokio setup before it.
+- Closing the last window doesn't quit by default. Register `on_window_closed` to quit.
 
-## Drawing a Frame (JPEG bytes) as an image
+## Tokio and GPUI
 
-Simplest path (verified to compile): wrap bytes in `gpui::Image` and use the `img` element. gpui decodes
-with the `image` crate and converts RGBA to BGRA itself.
+GPUI has its own executors. Futures it spawns don't run inside a Tokio runtime, so Tokio I/O (tokio-tungstenite, reqwest) panics there.
 
-```rust
-use gpui::{img, Image, ImageFormat, ObjectFit, StyledImage, Styled, px};
-self.frame = Some(Arc::new(Image::from_bytes(ImageFormat::Jpeg, jpeg_bytes)));
-cx.notify();
-// in render:
-img(self.frame.clone().unwrap()).object_fit(ObjectFit::Contain).w(px(w)).h(px(h))
-```
-
-- `ObjectFit::Contain` gives scale + letterbox; the element bounds are the letterbox container, so the
-  coordinate mapping helper (T6) must use the same fit math.
-- Each new `Arc<Image>` gets a new id, so a new texture is uploaded per Frame; gpui's image cache
-  (keyed by id) can grow with a stream of Frames. If memory grows, decode yourself and build
-  `RenderImage::new(SmallVec<[image::Frame; 1]>)` (pixels must be BGRA), then call
-  `window.drop_image(Arc<RenderImage>)` on the previous one. That needs a direct `image` dep (not added).
-  `img(ImageSource::Render(arc_render_image))` draws it. Lower-level: `Window::paint_image(bounds, corner_radii,
-  Arc<RenderImage>, frame_index, grayscale)` inside a custom element's paint.
-- Decode JPEG off the main thread: `cx.background_spawn(async move { ... })` then update the view.
-
-## Tokio and GPUI executors
-
-gpui has its own executors (main-thread `ForegroundExecutor`, thread-pool `BackgroundExecutor`); futures
-spawned by gpui are not inside a tokio runtime, so tokio I/O (tokio-tungstenite, reqwest) panics there.
-Recommended bridge: own a tokio `Runtime` (create it in `main` before `Application::run`, keep it in a
-`Global`/state), run all CDP and Manager I/O on it, and push results to the UI through a channel that the
-gpui side awaits:
+- Create a Tokio `Runtime` in `main`, before `Application::run`, and keep it alive for the life of the app. **Gotcha:** the closure passed to `Application::run` returns right after setup, so a runtime moved into it is dropped and every network task dies silently.
+- Run all network I/O on the Tokio runtime and send results to the UI over a channel. Tokio's `mpsc` and `watch` receivers only need a waker, so GPUI tasks can await them:
 
 ```rust
-// UI side (compiles; `rx` is any async receiver, e.g. futures/async-channel/tokio mpsc recv().await)
-cx.spawn(async move |this, cx| {            // this: WeakEntity<V>, cx: &mut AsyncApp
+cx.spawn(async move |this, cx| {
     while let Some(msg) = rx.recv().await {
-        if this.update(cx, |v, cx| { v.apply(msg); cx.notify(); }).is_err() { break; } // entity dropped
+        if this.update(cx, |v, cx| { v.apply(msg); cx.notify(); }).is_err() { break; }
     }
 }).detach();
-// tokio side
-runtime.spawn(async move { tx.send(msg).await.ok(); });
 ```
 
-- Tokio's `mpsc::Receiver::recv()` is runtime-agnostic (it only needs a waker), so it can be awaited in
-  gpui's executor. Prefer bounded channels for Frames (drop or coalesce stale Frames; ack after decode).
-- Input back to tokio: call `runtime.spawn(...)` or send on an `UnboundedSender` from event handlers.
-- `cx.spawn` closures are `AsyncFnOnce(WeakEntity<T>, &mut AsyncApp)` (async closures, Rust 2021 with
-  recent stable is fine). `cx.background_spawn(fut)` runs on gpui's pool (not tokio).
+- For input going the other way, call `runtime.spawn(...)` or send on an unbounded channel from event handlers.
+- Use bounded or `watch` channels for video, so stale frames are replaced rather than queued.
 
-## Findings and caveats
+## Drawing video frames
 
-- `Application::new().run(...)` blocks the main thread (macOS requires it); do tokio setup before it.
-- Closing the last window does not quit by default; we register `on_window_closed` to quit.
-- Cmd+Q: bound globally via `bind_keys` with no context, plus `on_action`.
-- The binary window runs and has title "rb" (confirmed through System Events); the Cmd+Q keystroke test
-  via osascript was not confirmed (likely no Accessibility permission for the terminal), so verify
-  Cmd+Q, Cmd+B and click counter by hand once.
-- `cargo` prints a future-incompat warning for `block v0.1.6` and `proc-macro-error2` (gpui deps); harmless.
+### JPEG: `RenderImage` and `drop_image`
 
-## Mirror (T7): Frame textures, input, IME
+The simple path, `img(Arc<Image>)`, gives every frame a new image id and a new texture, and GPUI's image cache never releases them. Instead:
 
-Code: `crates/app/src/mirror/` (`mod.rs` view, `input_map.rs` pure mapping,
-`backend.rs` `MirrorBackend`), demo: `cargo run -p rb-app --example mirror_demo`.
+- Decode the JPEG yourself, off the main thread, into BGRA pixels and build `RenderImage::new(smallvec![image::Frame::new(pixels)])`.
+- Paint it with `Window::paint_image` inside a `canvas`, using your own letterbox rectangle.
+- Call `window.drop_image(previous)` once a newer frame is on screen. `drop_image` needs a `Window`, so queue retired images and drain the queue in the paint closure.
 
-* **Texture growth, measured.** The Mirror decodes JPEG itself (image crate,
-  off the main thread) into a BGRA `RenderImage`, paints it with
-  `Window::paint_image` into the `FrameFit` dest rect, and calls
-  `Window::drop_image(previous)` from the paint closure once a newer Frame is
-  shown. Demo at 60 fps requested (1000x700 JPEG Frames, debug build, about
-  40 s): RSS stayed flat at about 114-123 MB. Control run with the drop
-  disabled (previous images leaked): RSS grew from 170 MB to 595 MB in
-  about 36 s (roughly 10 MB/s). So the drop is required; each new
-  `RenderImage` gets a new id and a new atlas tile. The simple `img(Image)` path was
-  not measured separately; it caches by image id and has no per-Frame drop
-  hook, so use the explicit path.
-* `drop_image` needs a `Window`, so retired images go in a shared queue that
-  the canvas paint closure drains.
-* **Ack contract:** the `cx.spawn` loop receives a Frame, decodes on the
-  background executor, updates the view (`cx.notify()`), and only then spawns
-  `Frame::ack()` on the tokio runtime. Decode failures still ack.
-* **Gotcha:** `Application::run`'s closure returns right after setup. A tokio
-  `Runtime` moved into it is dropped and all CDP tasks die silently. Keep the
-  runtime in `main`'s scope (alive until `run` returns) or a Global.
-* **Mouse:** registered with `window.on_mouse_event` in paint (not div
-  handlers) so drags outside the Mirror still arrive; presses/moves/wheel need
-  `hitbox.is_hovered`, releases and drag moves do not. Letterbox bars: ignored;
-  while a button is held: clamped to the remote viewport.
-* **Wheel:** `ScrollWheelEvent` delta follows the macOS content-movement
-  direction with the user's natural-scrolling setting already applied, so CDP
-  deltas are simply negated (lines x 40 px). Not verified with a real trackpad.
-* **Keyboard:** `on_key_down/up` on the focused Mirror. Cmd combinations are
-  not forwarded and not stopped (app bindings such as Cmd+Q, Cmd+B and macOS
-  key equivalents keep working). Mapped keys call `cx.stop_propagation()`.
-  Modifier-only presses are not forwarded.
-* **IME:** gpui exposes `EntityInputHandler` + `Window::handle_input`; the
-  Mirror implements it and forwards committed text via `Input.insertText`
-  (emoji picker, dictation). Because mapped printable keys are consumed in
-  `on_key_down` (macOS calls the key handler before the IME), composition of
-  typed keys (CJK input methods) does not start. Supporting it needs a mode
-  that lets printable keys fall through to the IME; left as an open issue.
+Measured at 60 fps with 1000×700 frames: memory stayed flat at about 120 MB with `drop_image`, and grew by about 10 MB/s without it.
+
+### Hardware video: `paint_surface`
+
+VideoToolbox can output IOSurface-backed, Metal-compatible `CVPixelBuffer`s in full-range NV12 (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`). `window.paint_surface(bounds, pixel_buffer)` draws these directly, with no copy and no atlas tile, so there's nothing to drop.
+
+## Input
+
+- **Mouse:** register with `window.on_mouse_event` during paint rather than with `div` handlers, so drags that leave the picture still arrive. Presses, moves and wheel events need `hitbox.is_hovered`; releases and drag moves don't. Ignore the letterbox bars, and clamp to the remote picture while a button is held.
+- **Wheel:** `ScrollWheelEvent` deltas already include the user's natural-scrolling setting and follow content movement.
+- **Keyboard:** handle `on_key_down`/`on_key_up` on the focused view and call `cx.stop_propagation()` for keys you forward. Leave Command combinations alone so app bindings such as ⌘Q and macOS key equivalents keep working.
+- **Input methods:** GPUI exposes `EntityInputHandler` and `Window::handle_input`. Because macOS calls the key handler before the input method, a view that consumes printable keys in `on_key_down` stops CJK composition from starting. To support it, let printable keys fall through to the input method and send the committed text instead. Skerry's **Use Mac Input Method** switch does this.
+- **Trackpad gestures:** GPUI doesn't expose magnification events. Skerry installs an AppKit event monitor (`view/pinch.rs`) for pinch gestures.

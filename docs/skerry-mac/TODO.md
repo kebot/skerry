@@ -1,4 +1,4 @@
-# SealSkin Native TODO
+# Skerry roadmap
 
 [Selkies web sidebar source reference](selkies-sidebar-reference.md) · [Selkies web feature research](tickets/research.md) · [SealSkin product comparison](tickets/product-audit.md)
 
