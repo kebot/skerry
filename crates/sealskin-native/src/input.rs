@@ -7,7 +7,6 @@ pub struct InputSettings {
     pub remote_cursor: bool,
     pub trackpad_scroll: bool,
     pub mac_ime: bool,
-    pub multitouch: bool,
 }
 
 impl Default for InputSettings {
@@ -17,7 +16,6 @@ impl Default for InputSettings {
             remote_cursor: false,
             trackpad_scroll: true,
             mac_ime: false,
-            multitouch: false,
         }
     }
 }
@@ -34,16 +32,14 @@ pub enum InputFeature {
     RemoteCursor,
     TrackpadScroll,
     MacIme,
-    Multitouch,
 }
 
 impl InputFeature {
-    pub const ALL: [(Self, &'static str); 5] = [
+    pub const ALL: [(Self, &'static str); 4] = [
         (Self::CommandAsControl, "Command sends Control"),
         (Self::RemoteCursor, "Remote Cursor"),
         (Self::TrackpadScroll, "Smooth Trackpad Scrolling"),
         (Self::MacIme, "Use Mac Input Method"),
-        (Self::Multitouch, "Forward Multitouch Trackpad"),
     ];
 
     fn value(self, settings: &mut InputSettings) -> &mut bool {
@@ -52,7 +48,6 @@ impl InputFeature {
             Self::RemoteCursor => &mut settings.remote_cursor,
             Self::TrackpadScroll => &mut settings.trackpad_scroll,
             Self::MacIme => &mut settings.mac_ime,
-            Self::Multitouch => &mut settings.multitouch,
         }
     }
 

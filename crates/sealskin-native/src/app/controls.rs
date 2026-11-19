@@ -590,34 +590,22 @@ impl ControlPanel {
         )
     }
 
-    fn input_settings(
-        &self,
-        input: InputSettings,
-        multitouch_available: bool,
-        colors: Colors,
-    ) -> Div {
+    fn input_settings(&self, input: InputSettings, colors: Colors) -> Div {
         let owner = self.owner;
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .children(
-                InputFeature::ALL
-                    .into_iter()
-                    .filter(|(feature, _)| {
-                        multitouch_available || *feature != InputFeature::Multitouch
-                    })
-                    .map(|(feature, label)| {
-                        let enabled = feature.enabled(input);
-                        switch_row(
-                            colors,
-                            label,
-                            enabled,
-                            Command::Input(feature, !enabled),
-                            owner,
-                        )
-                    }),
-            )
+            .children(InputFeature::ALL.into_iter().map(|(feature, label)| {
+                let enabled = feature.enabled(input);
+                switch_row(
+                    colors,
+                    label,
+                    enabled,
+                    Command::Input(feature, !enabled),
+                    owner,
+                )
+            }))
             .child(
                 div()
                     .flex()
@@ -865,13 +853,7 @@ impl Render for ControlPanel {
             colors,
             "Input",
             self.input,
-            || {
-                self.input_settings(
-                    launcher.preferences.input,
-                    launcher.multitouch_available,
-                    colors,
-                )
-            },
+            || self.input_settings(launcher.preferences.input, colors),
             cx.listener(|this, _, _, cx| {
                 this.input = !this.input;
                 cx.notify();

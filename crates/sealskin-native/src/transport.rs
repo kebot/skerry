@@ -257,7 +257,6 @@ pub enum SessionEvent {
     ScreenPolicy(ScreenPolicy),
     Cursor(RemoteCursor),
     FingerScroll(bool),
-    Multitouch(bool),
     Error(String),
 }
 
@@ -299,14 +298,10 @@ fn zoom_commands(
     commands
 }
 
-#[derive(serde::Serialize)]
-pub struct Contact(pub u16, pub u16, pub u16);
-
 pub enum Input {
     Command(String),
     Pointer(Pointer),
     Zoom(i8, Pointer),
-    Contacts(Vec<Contact>),
     Audio(bool),
     Video(bool),
     Settings(Vec<(Key, u32)>),
@@ -371,16 +366,13 @@ impl HardwareVideo {
     }
 }
 
-fn display_config(text: &str) -> Option<(bool, bool)> {
+fn finger_scroll_capability(text: &str) -> Option<bool> {
     let payload = text.strip_prefix("DISPLAY_CONFIG_UPDATE,").unwrap_or(text);
     let data: Value = serde_json::from_str(payload).ok()?;
     if data["type"] != "display_config_update" {
         return None;
     }
-    Some((
-        data["finger_scroll"].as_bool().unwrap_or(false),
-        data["multitouch_trackpad"].as_bool().unwrap_or(false),
-    ))
+    Some(data["finger_scroll"].as_bool().unwrap_or(false))
 }
 
 pub async fn run(
@@ -446,7 +438,6 @@ pub async fn run(
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut capabilities = Settings::default();
     let mut resize_allowed = false;
-    let mut multitouch = false;
     let mut screen_policy = ScreenPolicy::default();
     let mut dark = options.dark;
     let mut video_playing = None;
@@ -528,10 +519,8 @@ pub async fn run(
                     if text.starts_with("MODE ") && text != "MODE websockets" {
                         return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.");
                     }
-                    if let Some((finger_scroll, supported)) = display_config(&text) {
-                        multitouch = supported;
+                    if let Some(finger_scroll) = finger_scroll_capability(&text) {
                         let _ = events.send(SessionEvent::FingerScroll(finger_scroll));
-                        let _ = events.send(SessionEvent::Multitouch(multitouch));
                         continue;
                     }
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
@@ -629,14 +618,6 @@ pub async fn run(
                     Some(Input::Pointer(position)) => {
                         let Some(text) = position.command_for(active_size) else { continue; };
                         text
-                    }
-                    Some(Input::Contacts(contacts)) => {
-                        if multitouch {
-                            if let Ok(frame) = serde_json::to_string(&contacts) {
-                                socket.send(format!("mt,{frame}").into()).await.map_err(|_| disconnected)?;
-                            }
-                        }
-                        continue;
                     }
                     Some(Input::Zoom(notches, position)) => {
                         let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
@@ -909,16 +890,16 @@ mod tests {
     #[test]
     fn reads_selkies_prefixed_display_capabilities() {
         assert_eq!(
-            display_config(
-                r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","finger_scroll":true,"multitouch_trackpad":true}"#
+            finger_scroll_capability(
+                r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","finger_scroll":true}"#
             ),
-            Some((true, true))
+            Some(true)
         );
         assert_eq!(
-            display_config(r#"{"type":"display_config_update"}"#),
-            Some((false, false))
+            finger_scroll_capability(r#"{"type":"display_config_update"}"#),
+            Some(false)
         );
-        assert_eq!(display_config(r#"{"type":"stream_info"}"#), None);
+        assert_eq!(finger_scroll_capability(r#"{"type":"stream_info"}"#), None);
     }
 
     fn jpeg(color: [u8; 3]) -> Vec<u8> {

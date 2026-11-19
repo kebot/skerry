@@ -20,7 +20,6 @@ impl Monitor {
     pub(super) fn install(
         window: Retained<NSWindow>,
         target: Target,
-        raw: Rc<Cell<bool>>,
         input: mpsc::UnboundedSender<Input>,
     ) -> Option<Self> {
         let carry = Cell::new(0.);
@@ -58,9 +57,6 @@ impl Monitor {
                 carry.set(0.);
                 return event.as_ptr();
             };
-            if raw.get() {
-                return null_mut();
-            }
             if !phase.intersects(NSEventPhase::Cancelled | NSEventPhase::Ended) {
                 let (notches, next) = zoom_steps(carry.get(), native.magnification());
                 carry.set(next);

@@ -152,7 +152,6 @@ struct Launcher {
     applied_resolution: Option<DisplayRequest>,
     applied_dpi: Option<u16>,
     resize_allowed: bool,
-    multitouch_available: bool,
     resize_task: Option<gpui::Task<()>>,
     preferences: Preferences,
     pending_settings: VideoSettings,
@@ -185,7 +184,6 @@ impl Launcher {
             applied_resolution: None,
             applied_dpi: None,
             resize_allowed: false,
-            multitouch_available: false,
             resize_task: None,
             preferences: Preferences::default(),
             pending_settings: VideoSettings::new(),
@@ -387,12 +385,6 @@ impl Launcher {
                                         this.settings = Some(settings)
                                     }
                                     SessionEvent::Stats(sample) => this.stats = Some(sample),
-                                    SessionEvent::Multitouch(enabled) => {
-                                        if let Some((_, stream)) = &this.current {
-                                            this.multitouch_available =
-                                                stream.allow_multitouch(enabled, cx);
-                                        }
-                                    }
                                     SessionEvent::FingerScroll(enabled) => {
                                         if let Some((_, stream)) = &this.current {
                                             stream.allow_finger_scroll(enabled, cx);
@@ -416,10 +408,6 @@ impl Launcher {
                                     }
                                     SessionEvent::Error(error) => {
                                         this.resize_allowed = false;
-                                        this.multitouch_available = false;
-                                        if let Some((_, stream)) = &this.current {
-                                            stream.allow_multitouch(false, cx);
-                                        }
                                         this.settings = None;
                                         this.audio = None;
                                         this.video = None;
@@ -625,7 +613,6 @@ impl Launcher {
         self.applied_dpi = None;
         self.stats = None;
         self.resize_allowed = false;
-        self.multitouch_available = false;
         self.resize_task = None;
         self.close_controls(window, cx);
         self.stream_events = None;

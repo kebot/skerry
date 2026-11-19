@@ -1,4 +1,3 @@
-mod multitouch;
 mod pinch;
 
 use crate::app::ToggleSessionControls;
@@ -16,7 +15,7 @@ use gpui::{
     Window,
 };
 use reqwest::Url;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
@@ -52,12 +51,7 @@ impl NativeSession {
         let view = cx.new(|cx| Desktop::new(input.clone(), pointer, frames, window, cx));
         let pinch = crate::app::native_window(window).and_then(|native| {
             let desktop = view.read(cx);
-            pinch::Monitor::install(
-                native,
-                desktop.pinch_target.clone(),
-                desktop.raw_active.clone(),
-                input.clone(),
-            )
+            pinch::Monitor::install(native, desktop.pinch_target.clone(), input.clone())
         });
         window.focus(&view.read(cx).focus);
         let task = runtime.spawn(async move {
@@ -105,19 +99,10 @@ impl NativeSession {
             if desktop.settings != settings {
                 desktop.release_input();
                 desktop.settings = settings;
-                desktop.sync_multitouch();
                 window.refresh();
                 cx.notify();
             }
         });
-    }
-
-    pub fn allow_multitouch(&self, available: bool, cx: &mut App) -> bool {
-        self.view.update(cx, |desktop, _| {
-            desktop.multitouch_available = available && desktop.multitouch.is_some();
-            desktop.sync_multitouch();
-            desktop.multitouch_available
-        })
     }
 
     pub fn allow_finger_scroll(&self, enabled: bool, cx: &mut App) {
@@ -195,9 +180,6 @@ struct Desktop {
     painted: Rc<RefCell<Option<Arc<gpui::RenderImage>>>>,
     painted_display: Option<PaintedDisplay>,
     pinch_target: pinch::Target,
-    raw_active: Rc<Cell<bool>>,
-    multitouch: Option<multitouch::Capture>,
-    multitouch_available: bool,
     input: mpsc::UnboundedSender<Input>,
     pointer: watch::Sender<Option<Pointer>>,
     buttons: u8,
@@ -225,9 +207,6 @@ impl Desktop {
     ) -> Self {
         let focus = cx.focus_handle();
         let pinch_target = pinch::Target::default();
-        let multitouch = crate::app::native_window(window).and_then(|native| {
-            multitouch::Capture::install(&native, pinch_target.clone(), input.clone())
-        });
         cx.on_blur(&focus, window, |desktop, _, cx| {
             desktop.release_input();
             cx.notify();
@@ -268,9 +247,6 @@ impl Desktop {
             painted: Rc::default(),
             painted_display: None,
             pinch_target,
-            raw_active: Rc::default(),
-            multitouch,
-            multitouch_available: false,
             input,
             pointer,
             buttons: 0,
@@ -286,16 +262,6 @@ impl Desktop {
             selection: 0..0,
             ime_click: None,
             ime_bounds: None,
-        }
-    }
-
-    fn sync_multitouch(&mut self) {
-        let active = self.multitouch_available && self.settings.multitouch;
-        if self.raw_active.replace(active) != active {
-            self.end_finger_scroll();
-            if let Some(capture) = &self.multitouch {
-                capture.set_enabled(active);
-            }
         }
     }
 
@@ -322,14 +288,6 @@ impl Desktop {
     }
 
     fn send_pointer(&self) {
-        if self
-            .multitouch
-            .as_ref()
-            .is_some_and(multitouch::Capture::has_contacts)
-        {
-            self.command(format!("m2,0,0,{},0", self.buttons));
-            return;
-        }
         if let Some(pointer) = self.mouse_state() {
             let _ = self.input.send(Input::Pointer(pointer));
         }
@@ -356,9 +314,6 @@ impl Desktop {
 
     fn scroll(&mut self, event: &ScrollWheelEvent, cx: &mut Context<Self>) {
         if let ScrollDelta::Pixels(delta) = event.delta {
-            if self.raw_active.get() {
-                return;
-            }
             if self.settings.trackpad_scroll && self.finger_scroll_allowed {
                 if let Some(display) = self.painted_display {
                     let x = -f32::from(delta.x) * f32::from(display.resolution.0)
@@ -444,9 +399,6 @@ impl Desktop {
     }
 
     fn release_pointer(&mut self) {
-        if let Some(capture) = &self.multitouch {
-            capture.clear();
-        }
         self.pinch_target.set(None);
         self.pointer.send_replace(None);
         self.position = None;
@@ -649,13 +601,6 @@ impl Render for Desktop {
                                 cx.notify();
                             }
                             let dragging = desktop.buttons != 0;
-                            if desktop
-                                .multitouch
-                                .as_ref()
-                                .is_some_and(multitouch::Capture::has_contacts)
-                            {
-                                return;
-                            }
                             if (hovered || dragging)
                                 && desktop.mouse_position(event.position, dragging)
                             {
@@ -669,11 +614,6 @@ impl Render for Desktop {
                 window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
                         v.update(cx, |desktop, cx| {
-                            if desktop.raw_active.get()
-                                && matches!(event.delta, ScrollDelta::Pixels(_))
-                            {
-                                return;
-                            }
                             if desktop.mouse_position(event.position, false) {
                                 desktop.pointer.send_replace(None);
                                 desktop.send_pointer();

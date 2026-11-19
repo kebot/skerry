@@ -8,7 +8,7 @@ The **Input** section in Session Controls exposes Command-as-Control, Remote Cur
 
 Two-finger panning and pinch zoom work with today’s Selkies server. Panning uses precise deltas and an end-of-scroll event on servers that advertise finger scrolling, or wheel steps elsewhere. Pinch uses AppKit magnification events and sends a Control-wheel sequence over the remote picture, as the web client does. Verify horizontal and vertical panning, slow and fast movement, momentum, zoom in both directions, and ordinary mouse wheels. [Selkies zoom and scroll](https://github.com/selkies-project/selkies/blob/715df7cdea9c6c21ae339f93f194f718a879dc41/web/selkies-web-core/lib/input.ts#L4932)
 
-Forwarding individual contacts to Linux is an off-by-default option tracked separately. [Multitouch trackpad forwarding](multitouch-trackpad.md)
+Raw contact forwarding is deferred after high latency in Chrome during hands-on testing. [Multitouch trackpad forwarding](multitouch-trackpad.md)
 
 ## IME and composed text
 
