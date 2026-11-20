@@ -1,0 +1,3 @@
+# .agents/prose/prose.lock — pinned dependency versions
+# Do not edit unless you know what you're doing
+github.com/openprose/prose 0ab7237ced4ac29ca002c94878e69c5cbf6b1ea6

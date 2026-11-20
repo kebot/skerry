@@ -28,20 +28,13 @@ scripts/bundle.sh   # produces dist/SealSkin Native.app (ad-hoc signed, not nota
 
 GPUI is built with the `runtime_shaders` feature, so you don't need the Xcode Metal toolchain.
 
-## Docs
-
-- [docs/skerry-mac/running.md](docs/skerry-mac/running.md): setup, keys and using the app
-- [docs/skerry-mac/DESIGN.md](docs/skerry-mac/DESIGN.md): architecture
-- [docs/skerry-mac/TODO.md](docs/skerry-mac/TODO.md): roadmap, linking to one ticket per feature in [docs/skerry-mac/tickets/](docs/skerry-mac/tickets/)
-- [docs/gpui-notes.md](docs/gpui-notes.md): GPUI notes and pitfalls
-
 ## Layout
 
 | Path | Contents |
 |------|----------|
 | `crates/skerry-mac` | The Mac app: SealSkin API client, Selkies transport, video decoding, GPUI views, Core Audio playback |
 | `design/skerry-mac/` | Static HTML mock-up of the UI |
-| `docs/` | Design notes, roadmap and tickets |
+| `.agents/prose/` | OpenProse contracts (`src/`), architecture decisions (`architecture/`), and agent-managed specs, roadmap and tickets (`specs/`) |
 | `scripts/bundle.sh` | Builds a release `.app` bundle in `dist/` |
 
 ## Develop

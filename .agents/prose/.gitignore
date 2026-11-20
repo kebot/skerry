@@ -1,0 +1,7 @@
+# OpenProse runtime, compiled artifacts, and dependency cache
+deps/
+dist/
+runs/
+state/
+.env
+architecture/view.html
