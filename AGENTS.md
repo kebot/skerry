@@ -28,7 +28,7 @@ All architecture, settled module contracts, GPUI invariants, and feature backlog
    - Mark the previous `ARCH-*` decision in `.agents/prose/architecture/decisions.md` as `superseded by ARCH-xxx` with rationale rather than deleting history.
    - Update the affected `.prose.md` contract region and `skerry.test.prose.md` assertions in the same turn.
 3. **When Implementing a Feature (`prose run` / `implement-feature`):**
-   - Follow the invariants in `.agents/prose/src/skerry/index.prose.md` (GPUI 0.2.2 `runtime_shaders`, Tokio runtime lifetime, `window.drop_image` for JPEG frames, zero-copy `window.paint_surface` for VideoToolbox NV12 surfaces, and strict SealSkin/Selkies origin and credential policies).
+   - Follow the invariants in `.agents/prose/src/skerry/index.prose.md` (`gpui-kit` `0.10.0` `Root`-wrapped windows and deferred child-window opening, Tokio runtime lifetime, `window.drop_image` for JPEG frames, zero-copy `window.paint_surface` for VideoToolbox NV12 surfaces, and strict SealSkin/Selkies origin and credential policies).
    - Verify all Rust changes with:
      ```sh
      cargo test --workspace

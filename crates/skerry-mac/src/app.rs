@@ -46,53 +46,53 @@ pub fn run() {
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
-        gpui_kit::init(cx);
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
-            KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
-            KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
-            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-        ]);
-        cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.set_menus(vec![
-            Menu {
-                name: APP_NAME.into(),
-                items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
-                disabled: false,
-            },
-            Menu {
-                name: "View".into(),
-                items: vec![
-                    MenuItem::action("Session Controls", ToggleSessionControls),
-                    MenuItem::action("Toggle Full Screen", ToggleFullScreen),
-                ],
-                disabled: false,
-            },
-        ]);
-        cx.on_window_closed(|cx, _| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
-        let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(640.), px(420.))),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(APP_NAME.into()),
+            gpui_kit::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
+                KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
+                KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
+                KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+            ]);
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.set_menus(vec![
+                Menu {
+                    name: APP_NAME.into(),
+                    items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
+                    disabled: false,
+                },
+                Menu {
+                    name: "View".into(),
+                    items: vec![
+                        MenuItem::action("Session Controls", ToggleSessionControls),
+                        MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+                    ],
+                    disabled: false,
+                },
+            ]);
+            cx.on_window_closed(|cx, _| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(640.), px(420.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(APP_NAME.into()),
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
-                ..Default::default()
-            },
-            cx,
-            move |window, cx| cx.new(|cx| Launcher::new(handle.clone(), window, cx)),
-        )
-        .expect("open SealSkin window");
-        cx.activate(true);
-    });
+                },
+                cx,
+                move |window, cx| cx.new(|cx| Launcher::new(handle.clone(), window, cx)),
+            )
+            .expect("open SealSkin window");
+            cx.activate(true);
+        });
 }
 
 actions!(
@@ -115,11 +115,7 @@ enum DisplayMode {
 }
 
 impl DisplayMode {
-    fn request(
-        self,
-        viewport: Size<Pixels>,
-        backing_scale: f32,
-    ) -> Option<DisplayRequest> {
+    fn request(self, viewport: Size<Pixels>, backing_scale: f32) -> Option<DisplayRequest> {
         let scale = match self {
             Self::Fit => return None,
             Self::Fixed(resolution) => {
@@ -591,11 +587,23 @@ impl Launcher {
             return;
         }
         if self.current.is_some() {
-            match ControlPanel::open(window, cx) {
-                Ok(panel) => self.controls = Some(panel),
-                Err(_) => self.status = Some("Couldn’t open Session Controls.".into()),
-            }
-            cx.notify();
+            let display_mode = self.display_mode;
+            let owner_window = Window::window_handle(window);
+            let launcher = cx.entity();
+            cx.defer(move |cx| {
+                let _ = owner_window.update(cx, |_, window, cx| {
+                    let result = ControlPanel::open(display_mode, window, launcher.clone(), cx);
+                    launcher.update(cx, |launcher, cx| {
+                        match result {
+                            Ok(panel) => launcher.controls = Some(panel),
+                            Err(_) => {
+                                launcher.status = Some("Couldn’t open Session Controls.".into())
+                            }
+                        }
+                        cx.notify();
+                    });
+                });
+            });
         }
     }
 
@@ -820,7 +828,12 @@ impl Render for Launcher {
                     }),
             )
             .when_some(self.busy.clone(), |view, busy| {
-                view.child(div().text_sm().text_color(theme.muted_foreground).child(busy))
+                view.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child(busy),
+                )
             })
             .when_some(self.status.clone(), |view, status| {
                 view.child(div().text_sm().child(status))

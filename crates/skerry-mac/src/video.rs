@@ -538,8 +538,7 @@ impl Decoder {
         if (
             CVPixelBufferGetWidth(&surface.0),
             CVPixelBufferGetHeight(&surface.0),
-        )
-            != (usize::from(packet.size.0), usize::from(packet.size.1))
+        ) != (usize::from(packet.size.0), usize::from(packet.size.1))
         {
             return Err("The decoded picture size doesn’t match the packet.");
         }
@@ -640,7 +639,8 @@ mod tests {
         let stride = objc2_core_video::CVPixelBufferGetBytesPerRowOfPlane(&surface, 0);
         // Core Video provides a read-only luma plane for the lifetime of the lock.
         let (black, white) = unsafe {
-            let plane = objc2_core_video::CVPixelBufferGetBaseAddressOfPlane(&surface, 0).cast::<u8>();
+            let plane =
+                objc2_core_video::CVPixelBufferGetBaseAddressOfPlane(&surface, 0).cast::<u8>();
             (*plane.add(48 * stride + 16), *plane.add(144 * stride + 16))
         };
         assert_eq!(

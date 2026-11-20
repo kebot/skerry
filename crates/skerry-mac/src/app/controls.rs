@@ -20,12 +20,18 @@ use gpui_kit::component::{
 use gpui_kit::{
     div, point, prelude::*, px, size, AnyElement, AnyWindowHandle, App, Bounds, ClickEvent,
     Context, Div, Entity, FocusHandle, FontWeight, SharedString, TitlebarOptions, Window,
-    WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    WindowBounds, WindowKind, WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 
+#[derive(Clone)]
+struct Owner {
+    window: AnyWindowHandle,
+    launcher: Entity<Launcher>,
+}
+
 pub(super) struct ControlPanel {
-    owner: WindowHandle<Launcher>,
+    owner: Owner,
     focus: FocusHandle,
     fullscreen: bool,
     screen: bool,
@@ -67,14 +73,15 @@ enum Command {
 
 impl ControlPanel {
     pub(super) fn open(
+        display_mode: DisplayMode,
         window: &Window,
-        cx: &mut Context<Launcher>,
+        launcher: Entity<Launcher>,
+        cx: &mut App,
     ) -> gpui_kit::Result<AnyWindowHandle> {
-        let owner = window
-            .window_handle()
-            .downcast::<Launcher>()
-            .expect("launcher window");
-        let launcher = cx.entity();
+        let owner = Owner {
+            window: window.window_handle(),
+            launcher: launcher.clone(),
+        };
         let parent = native_window(window);
         let fullscreen = window.is_fullscreen();
         let bounds = window.bounds();
@@ -126,17 +133,17 @@ impl ControlPanel {
                         };
                     }
                 }
+                let panel_owner = owner.clone();
                 let panel = cx.new(|cx: &mut Context<Self>| {
                     cx.observe(&launcher, |_, _, cx| cx.notify()).detach();
-                    let initial = owner.read(cx).ok().and_then(|launcher| {
-                        if let DisplayMode::Fixed(size) = launcher.display_mode {
-                            Some(size)
-                        } else {
-                            None
-                        }
-                    });
-                    let digit_filter =
-                        |s: &str, _: &mut App| s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit());
+                    let initial = if let DisplayMode::Fixed(size) = display_mode {
+                        Some(size)
+                    } else {
+                        None
+                    };
+                    let digit_filter = |s: &str, _: &mut App| {
+                        s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit())
+                    };
                     let width = cx.new(|cx| {
                         let state = InputState::new(window, cx)
                             .placeholder("e.g. 1920")
@@ -163,14 +170,18 @@ impl ControlPanel {
                         }
                     })
                     .detach();
-                    cx.subscribe_in(&height, window, |this, _, event: &InputEvent, window, cx| {
-                        if matches!(event, InputEvent::PressEnter { .. }) {
-                            this.apply_size(window, cx);
-                        }
-                    })
+                    cx.subscribe_in(
+                        &height,
+                        window,
+                        |this, _, event: &InputEvent, window, cx| {
+                            if matches!(event, InputEvent::PressEnter { .. }) {
+                                this.apply_size(window, cx);
+                            }
+                        },
+                    )
                     .detach();
                     Self {
-                        owner,
+                        owner: panel_owner,
                         focus: cx.focus_handle(),
                         fullscreen,
                         screen: true,
@@ -184,7 +195,7 @@ impl ControlPanel {
                     }
                 });
                 window.on_window_should_close(cx, move |_, cx| {
-                    Self::send(owner, Command::Close, cx);
+                    Self::send(owner.clone(), Command::Close, cx);
                     false
                 });
                 let focus = panel.read(cx).focus.clone();
@@ -196,97 +207,99 @@ impl ControlPanel {
         Ok(handle)
     }
 
-    fn send(owner: WindowHandle<Launcher>, command: Command, cx: &mut App) {
+    fn send(owner: Owner, command: Command, cx: &mut App) {
         // Window removal and focus changes are performed after the panel event dispatch finishes.
         cx.defer(move |cx| {
-            let _ = owner.update(cx, |launcher, window, cx| {
-                match command {
-                    Command::Close => launcher.close_controls(window, cx),
-                    Command::FullScreen => {
-                        launcher.close_controls(window, cx);
-                        window.toggle_fullscreen();
-                    }
-                    Command::Reconnect => launcher.reconnect(window, cx),
-                    Command::Disconnect => {
-                        launcher.close_stream(window, cx);
-                        launcher.muted = false;
-                        launcher.refresh(cx);
-                    }
-                    Command::Audio(enabled) => {
-                        if let Some((_, stream)) = &launcher.current {
-                            launcher.muted = !enabled;
-                            stream.set_audio(enabled);
+            let _ = owner.window.update(cx, |_, window, cx| {
+                owner.launcher.update(cx, |launcher, cx| {
+                    match command {
+                        Command::Close => launcher.close_controls(window, cx),
+                        Command::FullScreen => {
+                            launcher.close_controls(window, cx);
+                            window.toggle_fullscreen();
+                        }
+                        Command::Reconnect => launcher.reconnect(window, cx),
+                        Command::Disconnect => {
+                            launcher.close_stream(window, cx);
+                            launcher.muted = false;
+                            launcher.refresh(cx);
+                        }
+                        Command::Audio(enabled) => {
+                            if let Some((_, stream)) = &launcher.current {
+                                launcher.muted = !enabled;
+                                stream.set_audio(enabled);
+                            }
+                        }
+                        Command::Playback(enabled) => {
+                            if let Some((_, stream)) = &launcher.current {
+                                stream.set_video(enabled);
+                            }
+                        }
+                        Command::Display(mode) => {
+                            launcher.resize_task = None;
+                            launcher.display_mode = mode;
+                            launcher.resize_display(window, cx);
+                        }
+                        Command::Retina(enabled) => {
+                            launcher.retina = enabled;
+                            launcher.resize_task = None;
+                            launcher.display_mode = if enabled {
+                                DisplayMode::Retina
+                            } else {
+                                DisplayMode::MatchWindow
+                            };
+                            launcher.resize_display(window, cx);
+                        }
+                        Command::ResetToWindow => {
+                            launcher.dpi_override = None;
+                            launcher.display_mode = if launcher.retina {
+                                DisplayMode::Retina
+                            } else {
+                                DisplayMode::MatchWindow
+                            };
+                            launcher.resize_display(window, cx);
+                        }
+                        Command::UiScaling(dpi) => {
+                            launcher.dpi_override = dpi;
+                            launcher.resize_display(window, cx);
+                        }
+                        Command::ScaleLocally(enabled) => {
+                            launcher.scale_locally = enabled;
+                            if let Some((_, stream)) = &launcher.current {
+                                stream.scale_locally(enabled, cx);
+                            }
+                        }
+                        Command::Screen(change) => {
+                            if let Some((_, stream)) = &launcher.current {
+                                stream.set_screen(change);
+                            }
+                        }
+                        Command::Codec(codec) => launcher.change_codec(codec, window, cx),
+                        Command::Setting(key, value) => launcher.change_setting(key, value, cx),
+                        Command::ResetVideo => launcher.reset_settings(cx),
+                        Command::Input(feature, enabled) => {
+                            launcher.change_input(feature, enabled, window, cx)
+                        }
+                        Command::Chord(chord) => {
+                            launcher.close_controls(window, cx);
+                            if let Some((_, stream)) = &launcher.current {
+                                stream.send_chord(chord, cx);
+                            }
                         }
                     }
-                    Command::Playback(enabled) => {
-                        if let Some((_, stream)) = &launcher.current {
-                            stream.set_video(enabled);
-                        }
-                    }
-                    Command::Display(mode) => {
-                        launcher.resize_task = None;
-                        launcher.display_mode = mode;
-                        launcher.resize_display(window, cx);
-                    }
-                    Command::Retina(enabled) => {
-                        launcher.retina = enabled;
-                        launcher.resize_task = None;
-                        launcher.display_mode = if enabled {
-                            DisplayMode::Retina
-                        } else {
-                            DisplayMode::MatchWindow
-                        };
-                        launcher.resize_display(window, cx);
-                    }
-                    Command::ResetToWindow => {
-                        launcher.dpi_override = None;
-                        launcher.display_mode = if launcher.retina {
-                            DisplayMode::Retina
-                        } else {
-                            DisplayMode::MatchWindow
-                        };
-                        launcher.resize_display(window, cx);
-                    }
-                    Command::UiScaling(dpi) => {
-                        launcher.dpi_override = dpi;
-                        launcher.resize_display(window, cx);
-                    }
-                    Command::ScaleLocally(enabled) => {
-                        launcher.scale_locally = enabled;
-                        if let Some((_, stream)) = &launcher.current {
-                            stream.scale_locally(enabled, cx);
-                        }
-                    }
-                    Command::Screen(change) => {
-                        if let Some((_, stream)) = &launcher.current {
-                            stream.set_screen(change);
-                        }
-                    }
-                    Command::Codec(codec) => launcher.change_codec(codec, window, cx),
-                    Command::Setting(key, value) => launcher.change_setting(key, value, cx),
-                    Command::ResetVideo => launcher.reset_settings(cx),
-                    Command::Input(feature, enabled) => {
-                        launcher.change_input(feature, enabled, window, cx)
-                    }
-                    Command::Chord(chord) => {
-                        launcher.close_controls(window, cx);
-                        if let Some((_, stream)) = &launcher.current {
-                            stream.send_chord(chord, cx);
-                        }
-                    }
-                }
-                cx.notify();
+                    cx.notify();
+                });
             });
         });
     }
 
     fn action(&self, label: &'static str, command: Command) -> Button {
-        let owner = self.owner;
+        let owner = self.owner.clone();
         Button::new(label)
             .outline()
             .small()
             .label(label)
-            .on_click(move |_, _, cx| Self::send(owner, command, cx))
+            .on_click(move |_, _, cx| Self::send(owner.clone(), command, cx))
     }
 
     fn picker_button(&self, picker: Picker, label: String, cx: &Context<Self>) -> Button {
@@ -336,13 +349,17 @@ impl ControlPanel {
                 .update(cx, |s, cx| s.set_value(size.0.to_string(), window, cx));
             self.height
                 .update(cx, |s, cx| s.set_value(size.1.to_string(), window, cx));
-            Self::send(self.owner, Command::Display(DisplayMode::Fixed(size)), cx);
+            Self::send(
+                self.owner.clone(),
+                Command::Display(DisplayMode::Fixed(size)),
+                cx,
+            );
         }
         cx.notify();
     }
 
     fn display_settings(&self, launcher: &Launcher, theme: &Theme, cx: &Context<Self>) -> Div {
-        let owner = self.owner;
+        let owner = self.owner.clone();
         let matching_retina = launcher.display_mode == DisplayMode::Retina;
         let mut panel = div().v_flex().gap_3();
         if launcher.resize_allowed {
@@ -350,7 +367,7 @@ impl ControlPanel {
                 "HiDPI (Pixel Perfect)",
                 matching_retina,
                 Command::Retina(!matching_retina),
-                owner,
+                owner.clone(),
             ));
         } else {
             panel = panel.child(
@@ -376,7 +393,7 @@ impl ControlPanel {
                     "Force Aligned Resolution",
                     aligned,
                     Command::Screen(ScreenChange::Alignment(!aligned)),
-                    owner,
+                    owner.clone(),
                 )
             });
         }
@@ -388,39 +405,33 @@ impl ControlPanel {
                 if automatic {
                     label.push_str(" · Match Mac Display");
                 }
-                panel = panel.child(
-                    row.child(self.picker_button(Picker::Dpi, label, cx))
-                        .when(self.picker == Some(Picker::Dpi), |row| {
-                            row.children(
-                                std::iter::once(None)
-                                    .chain(
-                                        launcher
-                                            .screen_policy
-                                            .dpi_choices
-                                            .iter()
-                                            .copied()
-                                            .map(Some),
-                                    )
-                                    .map(|dpi| {
-                                        let label = dpi
-                                            .map_or_else(|| "Match Mac Display".into(), dpi_label);
-                                        let button = Button::new(SharedString::from(label.clone()))
-                                            .small()
-                                            .label(label);
-                                        let button = if launcher.dpi_override == dpi {
-                                            button.primary()
-                                        } else {
-                                            button.outline()
-                                        };
-                                        button.on_click(cx.listener(move |this, _, _, cx| {
-                                            this.picker = None;
-                                            Self::send(owner, Command::UiScaling(dpi), cx);
-                                            cx.notify();
-                                        }))
-                                    }),
-                            )
-                        }),
-                );
+                panel = panel.child(row.child(self.picker_button(Picker::Dpi, label, cx)).when(
+                    self.picker == Some(Picker::Dpi),
+                    |row| {
+                        row.children(
+                            std::iter::once(None)
+                                .chain(launcher.screen_policy.dpi_choices.iter().copied().map(Some))
+                                .map(|dpi| {
+                                    let owner = owner.clone();
+                                    let label =
+                                        dpi.map_or_else(|| "Match Mac Display".into(), dpi_label);
+                                    let button = Button::new(SharedString::from(label.clone()))
+                                        .small()
+                                        .label(label);
+                                    let button = if launcher.dpi_override == dpi {
+                                        button.primary()
+                                    } else {
+                                        button.outline()
+                                    };
+                                    button.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.picker = None;
+                                        Self::send(owner.clone(), Command::UiScaling(dpi), cx);
+                                        cx.notify();
+                                    }))
+                                }),
+                        )
+                    },
+                ));
             } else {
                 panel = panel.child(row.child(label));
             }
@@ -439,7 +450,8 @@ impl ControlPanel {
                         .child(Label::new("Preset"))
                         .child(self.picker_button(Picker::Preset, preset, cx))
                         .when(self.picker == Some(Picker::Preset), |row| {
-                            row.child(
+                            row.child({
+                                let owner = owner.clone();
                                 Button::new("fit")
                                     .outline()
                                     .small()
@@ -447,10 +459,14 @@ impl ControlPanel {
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.picker = None;
                                         this.size_error = false;
-                                        Self::send(owner, Command::Display(DisplayMode::Fit), cx);
+                                        Self::send(
+                                            owner.clone(),
+                                            Command::Display(DisplayMode::Fit),
+                                            cx,
+                                        );
                                         cx.notify();
-                                    })),
-                            )
+                                    }))
+                            })
                             .children(
                                 [
                                     Resolution(1280, 720),
@@ -496,11 +512,12 @@ impl ControlPanel {
                                 .primary()
                                 .small()
                                 .label("Set Manual Resolution")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.apply_size(window, cx)
-                                })),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.apply_size(window, cx)),
+                                ),
                         )
-                        .child(
+                        .child({
+                            let owner = owner.clone();
                             Button::new("reset-to-window")
                                 .outline()
                                 .small()
@@ -510,10 +527,10 @@ impl ControlPanel {
                                     this.width.update(cx, |s, cx| s.set_value("", window, cx));
                                     this.height.update(cx, |s, cx| s.set_value("", window, cx));
                                     this.size_error = false;
-                                    Self::send(owner, Command::ResetToWindow, cx);
+                                    Self::send(owner.clone(), Command::ResetToWindow, cx);
                                     cx.notify();
-                                })),
-                        ),
+                                }))
+                        }),
                 )
                 .when(self.size_error, |panel| {
                     panel.child(
@@ -537,13 +554,18 @@ impl ControlPanel {
     }
 
     fn input_settings(&self, input: InputSettings) -> Div {
-        let owner = self.owner;
+        let owner = self.owner.clone();
         div()
             .v_flex()
             .gap_3()
             .children(InputFeature::ALL.into_iter().map(|(feature, label)| {
                 let enabled = feature.enabled(input);
-                switch_row(label, enabled, Command::Input(feature, !enabled), owner)
+                switch_row(
+                    label,
+                    enabled,
+                    Command::Input(feature, !enabled),
+                    owner.clone(),
+                )
             }))
             .child(
                 div()
@@ -569,7 +591,7 @@ impl ControlPanel {
         let Some(settings) = &launcher.settings else {
             return panel.child("Video settings are unavailable for this connection.");
         };
-        let owner = self.owner;
+        let owner = self.owner.clone();
         let preferred = launcher.preferences.codec;
         let codec = launcher
             .stats
@@ -599,6 +621,7 @@ impl ControlPanel {
                     .flex_wrap()
                     .gap_2()
                     .children(settings.codecs.iter().map(|&choice| {
+                        let owner = owner.clone();
                         let button = Button::new(choice.wire()).small().label(choice.label());
                         let button = if choice == codec {
                             button.primary()
@@ -607,7 +630,7 @@ impl ControlPanel {
                         };
                         button.on_click(move |_, _, cx| {
                             if choice != codec || choice != preferred {
-                                Self::send(owner, Command::Codec(choice), cx);
+                                Self::send(owner.clone(), Command::Codec(choice), cx);
                             }
                         })
                     })),
@@ -661,6 +684,7 @@ impl ControlPanel {
                         let text = if value == 0 { "Off" } else { "On" };
                         values = values.child(text);
                         if settings.request(key, 1 - value).is_some() {
+                            let owner = owner.clone();
                             let label = if value == 0 { "Turn On" } else { "Turn Off" };
                             values = values.child(
                                 Button::new("paint-over")
@@ -668,13 +692,18 @@ impl ControlPanel {
                                     .small()
                                     .label(label)
                                     .on_click(move |_, _, cx| {
-                                        Self::send(owner, Command::Setting(key, 1 - value), cx);
+                                        Self::send(
+                                            owner.clone(),
+                                            Command::Setting(key, 1 - value),
+                                            cx,
+                                        );
                                     }),
                             );
                         }
                     } else if key == Key::RateControl {
                         for (mode, label) in [(0, "CBR"), (1, "CRF")] {
                             if value == mode || settings.request(key, mode).is_some() {
+                                let owner = owner.clone();
                                 let button = Button::new(label).small().label(label);
                                 let button = if value == mode {
                                     button.primary()
@@ -683,7 +712,7 @@ impl ControlPanel {
                                 };
                                 values = values.child(button.on_click(move |_, _, cx| {
                                     if value != mode {
-                                        Self::send(owner, Command::Setting(key, mode), cx);
+                                        Self::send(owner.clone(), Command::Setting(key, mode), cx);
                                     }
                                 }));
                             }
@@ -695,15 +724,18 @@ impl ControlPanel {
                             (value.saturating_add(step).min(control.max), "+"),
                         ] {
                             if next != value && settings.request(key, next).is_some() {
+                                let owner = owner.clone();
                                 let id = SharedString::from(format!("{}{sign}", key.wire()));
                                 values = values.child(
-                                    Button::new(id)
-                                        .outline()
-                                        .small()
-                                        .label(sign)
-                                        .on_click(move |_, _, cx| {
-                                            Self::send(owner, Command::Setting(key, next), cx);
-                                        }),
+                                    Button::new(id).outline().small().label(sign).on_click(
+                                        move |_, _, cx| {
+                                            Self::send(
+                                                owner.clone(),
+                                                Command::Setting(key, next),
+                                                cx,
+                                            );
+                                        },
+                                    ),
                                 );
                             }
                         }
@@ -722,7 +754,10 @@ impl ControlPanel {
 impl Render for ControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let owner = self.owner;
+        let owner = self.owner.clone();
+        let close_owner = owner.clone();
+        let toggle_owner = owner.clone();
+        let fullscreen_owner = owner.clone();
         let root = div()
             .id("session-controls")
             .size_full()
@@ -732,16 +767,16 @@ impl Render for ControlPanel {
             .text_sm()
             .track_focus(&self.focus)
             .key_context("SessionControls")
-            .on_action(move |_: &CloseSessionControls, _, cx| Self::send(owner, Command::Close, cx))
+            .on_action(move |_: &CloseSessionControls, _, cx| {
+                Self::send(close_owner.clone(), Command::Close, cx)
+            })
             .on_action(move |_: &ToggleSessionControls, _, cx| {
-                Self::send(owner, Command::Close, cx)
+                Self::send(toggle_owner.clone(), Command::Close, cx)
             })
             .on_action(move |_: &ToggleFullScreen, _, cx| {
-                Self::send(owner, Command::FullScreen, cx)
+                Self::send(fullscreen_owner.clone(), Command::FullScreen, cx)
             });
-        let Ok(launcher) = owner.read(cx) else {
-            return root;
-        };
+        let launcher = owner.launcher.read(cx);
         let Some((session, _)) = &launcher.current else {
             return root;
         };
@@ -917,12 +952,7 @@ fn dpi_label(dpi: u16) -> String {
     format!("{}%", (u32::from(dpi) * 100 + 48) / 96)
 }
 
-fn switch_row(
-    label: &'static str,
-    enabled: bool,
-    command: Command,
-    owner: WindowHandle<Launcher>,
-) -> AnyElement {
+fn switch_row(label: &'static str, enabled: bool, command: Command, owner: Owner) -> AnyElement {
     div()
         .h_flex()
         .items_center()
@@ -932,7 +962,7 @@ fn switch_row(
         .child(
             Switch::new(label)
                 .checked(enabled)
-                .on_click(move |_, _, cx| ControlPanel::send(owner, command, cx)),
+                .on_click(move |_, _, cx| ControlPanel::send(owner.clone(), command, cx)),
         )
         .into_any_element()
 }

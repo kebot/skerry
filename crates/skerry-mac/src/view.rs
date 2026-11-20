@@ -741,11 +741,9 @@ impl Render for Desktop {
                     cx.stop_propagation();
                 }
             }))
-            .on_modifiers_changed(cx.listener(
-                |desktop, event: &ModifiersChangedEvent, _, _| {
-                    desktop.modifiers(event.modifiers);
-                },
-            ))
+            .on_modifiers_changed(cx.listener(|desktop, event: &ModifiersChangedEvent, _, _| {
+                desktop.modifiers(event.modifiers);
+            }))
             .child(surface)
             .when(!marked.is_empty(), |view| {
                 view.child(

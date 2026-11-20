@@ -10,7 +10,7 @@ id: 067NC4KG01SKERRY0000000001
 
 ### Goal
 
-Provide a native macOS client (`crates/skerry-mac`, GPUI 0.2.2) for SealSkin and Selkies that signs in with an application key, lists and launches remote applications and running sessions, and streams remote desktops over the Selkies transport with hardware-accelerated VideoToolbox decoding, Core Audio playback, and native macOS input and window integration.
+Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for SealSkin and Selkies that signs in with an application key, lists and launches remote applications and running sessions, and streams remote desktops over the Selkies transport with hardware-accelerated VideoToolbox decoding, Core Audio playback, and native macOS input and window integration.
 
 ### Requires
 
@@ -29,7 +29,7 @@ Provide a native macOS client (`crates/skerry-mac`, GPUI 0.2.2) for SealSkin and
   - `input.rs`: `InputSettings` (Command sends Control, Remote Cursor, Smooth Trackpad Scrolling, Use Mac Input Method) and `RemoteChord` (Alt+Tab, Ctrl+Alt+Delete).
   - `audio.rs`: 48 kHz stereo `f32` Opus `Playback` with bounded latency queue (`48000 * 2 / 8` samples).
   - `view.rs` & `view/pinch.rs`: `NativeSession`, `Desktop` canvas (`RenderImage` with `window.drop_image()` retirement for JPEG; `paint_surface` for hardware frames), mouse/wheel/keyboard/IME dispatch, and AppKit magnification monitor.
-  - `app.rs`, `app/controls.rs`, & `app/display.rs`: multi-threaded Tokio runtime beside `gpui::Application`, Connect/Library/Session screens, movable Session Controls child window (`cmd-shift-m`), and native display UI scale detection.
+  - `app.rs`, `app/controls.rs`, & `app/display.rs`: multi-threaded Tokio runtime beside `gpui_kit::application()`, Connect/Library/Session screens using `gpui_kit::component` + `Theme::sync_system_appearance`, movable Session Controls child window (`cmd-shift-m`, opened via `cx.defer` with `Owner { window: AnyWindowHandle, launcher: Entity<Launcher> }`), and native display UI scale detection.
 - `domain-readiness`:
   - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled; second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
   - `launcher-and-sessions`: simple launch/resume settled; launch options, session stop/previews, open links/files, library search/favorites, persistent storage, account recovery, and cluster origins open on the frontier.
@@ -55,7 +55,8 @@ input-driven
 
 ### Invariants
 
-- `crates/skerry-mac/Cargo.toml` uses `gpui = { version = "0.2.2", features = ["runtime_shaders"] }` so Xcode Metal Toolchain is not required at build time.
+- `crates/skerry-mac/Cargo.toml` uses `gpui-kit = "0.10.0"` (initialized via `gpui_kit::init(cx)` with `gpui_kit::assets::Assets`; windows opened via `gpui_kit::open_window` are wrapped in `gpui_kit::base::Root`).
+- Cross-window handles must store `(AnyWindowHandle, Entity<T>)` instead of calling `window.window_handle().downcast::<T>()` (since `gpui_kit::open_window` mounts `Root`), and child windows whose initial render reads `Launcher` must be opened via `cx.defer(...)` outside `Launcher` update closures to avoid re-entrant entity lease panics.
 - The multi-threaded Tokio `Runtime` is created in `main` before `Application::run` and kept alive for the lifetime of the app; all network I/O runs on Tokio and communicates with GPUI via `mpsc` / `watch` channels.
 - JPEG frames decoded off the main thread into `RenderImage` must retire previous frames via `window.drop_image(previous)` inside the paint closure to prevent texture leaks (~10 MB/s at 60 fps).
 - Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.
