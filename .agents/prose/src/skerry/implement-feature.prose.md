@@ -3,19 +3,26 @@ name: implement-feature
 kind: function
 ---
 
-# Implement Skerry Feature Ticket
+# Implement Skerry Architectural Concept
 
 ### Parameters
 
-- `ticket`: ticket filename or feature request under `.agents/prose/specs/skerry-mac/tickets/`
+- `target`: an unresolved `ARCH-GAP-*` identifier, concept name, or feature request from `video-and-screen`, `launcher-and-sessions`, or `desktop-and-collaboration`
 
 ### Returns
 
-- `summary`: implemented changes, verification output (`cargo test`, `cargo clippy`, `cargo fmt`), and updated spec paths in `.agents/prose/specs/`
+- `summary`: resolved constraints, Rust modules changed in `crates/skerry-mac/`, verification evidence (`cargo test`, `cargo clippy`, `cargo fmt`), and updated OpenProse contracts
+
+### Invariants
+
+- Never introduce an embedded browser or bypass `api.rs` / `transport.rs` origin and credential checks.
+- Respect GPUI 0.2.2 invariants in `index.prose.md` (`runtime_shaders`, Tokio runtime lifetime, `window.drop_image` for JPEG, `window.paint_surface` for VideoToolbox surfaces).
+- Every new control must handle server defaults, server-locked values, missing server capabilities, and reconnect persistence.
 
 ### Strategies
 
-- Read `.agents/prose/specs/skerry-mac/DESIGN.md` and `.agents/prose/specs/gpui-notes.md` before touching `crates/skerry-mac/src/`.
-- Keep changes minimal and aligned with existing module boundaries (`api.rs`, `transport.rs`, `video.rs`, `settings.rs`, `input.rs`, `audio.rs`, `view.rs`, `app.rs`).
-- Gate completion on passing `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`.
-- Update `.agents/prose/specs/skerry-mac/TODO.md` and `.agents/prose/specs/skerry-mac/DESIGN.md` once verified.
+- Locate the target concept's `<!-- compose:unresolved id=ARCH-GAP-... -->` marker in `video-and-screen.prose.md`, `launcher-and-sessions.prose.md`, or `desktop-and-collaboration.prose.md`.
+- If a design boundary is genuinely ambiguous, run `prose compose` to settle the constraint with the architect before writing code.
+- Implement the change in `crates/skerry-mac/src/` with unit tests covering defaults, locks, bounds, and protocol parsing.
+- Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`.
+- Promote the resolved concept in its domain `.prose.md` contract from `unresolved` to `settled`, remove the `<!-- compose:unresolved -->` marker, and record the `ARCH-*` decision in `.agents/prose/architecture/decisions.md`.

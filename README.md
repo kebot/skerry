@@ -34,7 +34,7 @@ GPUI is built with the `runtime_shaders` feature, so you don't need the Xcode Me
 |------|----------|
 | `crates/skerry-mac` | The Mac app: SealSkin API client, Selkies transport, video decoding, GPUI views, Core Audio playback |
 | `design/skerry-mac/` | Static HTML mock-up of the UI |
-| `.agents/prose/` | OpenProse contracts (`src/`), architecture decisions (`architecture/`), and agent-managed specs, roadmap and tickets (`specs/`) |
+| `.agents/prose/` | OpenProse responsibility contracts (`src/skerry/`) and architecture decision lattice (`architecture/`) |
 | `scripts/bundle.sh` | Builds a release `.app` bundle in `dist/` |
 
 ## Develop

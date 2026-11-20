@@ -4,41 +4,66 @@ kind: responsibility
 id: 067NC4KG01SKERRY0000000001
 ---
 
-# Skerry Product & Architecture World-Model
+# Skerry Native Mac Client
+
+<!-- compose:status=settled provenance=compose-managed -->
 
 ### Goal
 
-Own and maintain Skerry's product roadmap, feature specifications, architecture notes, and implementation readiness inside `.agents/prose/specs/` in lockstep with the Rust/GPUI codebase (`crates/skerry-mac/`).
+Provide a native macOS client (`crates/skerry-mac`, GPUI 0.2.2) for SealSkin and Selkies that signs in with an application key, lists and launches remote applications and running sessions, and streams remote desktops over the Selkies transport with hardware-accelerated VideoToolbox decoding, Core Audio playback, and native macOS input and window integration.
 
 ### Requires
 
-- `rust-workspace`: Rust source and manifest in `crates/skerry-mac/**` and `Cargo.toml`
-- `product-specs`: Migrated architecture, roadmap, GPUI notes, and ticket specifications in `.agents/prose/specs/**`
+- `rust-workspace`: Rust implementation in `crates/skerry-mac/src/**` and `Cargo.toml`
+- `video-and-screen`: video decoding, resolution, HiDPI, playback, and diagnostics truth from `video-and-screen.prose.md`
+- `launcher-and-sessions`: SealSkin companion API, launch options, session lifecycle, and storage truth from `launcher-and-sessions.prose.md`
+- `desktop-and-collaboration`: macOS input, clipboard, file transfer, audio/video devices, printing, and collaboration truth from `desktop-and-collaboration.prose.md`
 
 ### Maintains
 
-- `design`: `.agents/prose/specs/skerry-mac/DESIGN.md` and `.agents/prose/specs/gpui-notes.md` — current module boundaries, Selkies/SealSkin protocol wiring, and GPUI implementation invariants
-- `roadmap`: `.agents/prose/specs/skerry-mac/TODO.md` and `.agents/prose/specs/skerry-mac/tickets/*.md` — milestone status, completed features, and implementation-ready ticket specs
-- `qa-evidence`: `.agents/prose/specs/skerry-mac/milestone-1-qa.md` and `.agents/prose/specs/skerry-mac/running.md` — operational and QA truth
+- `system-architecture`: verified module boundaries across `crates/skerry-mac/src/`:
+  - `api.rs`: `Credential::parse` (`ssk_<id>_<secret>@<host>[:port]`, HTTPS-only), `Credential::startup` (`SEALSKIN_APPLICATION_KEY` -> `.env` -> macOS Keychain `dev.kebot.sealskin`), and `Api` (`POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/launch/simple`, same-origin `session_url`).
+  - `transport.rs`: `socket_request` (unredirected `GET` -> `303 See Other` cookie exchange -> `wss://.../api/websockets`), initial `SETTINGS` handshake, 33 ms frame publish + `CLIENT_FRAME_ACK`, 1 s stream stats/ping RTT, and `kh,<keys>` held-key keepalive.
+  - `video.rs`: `Codec` (JPEG, H.264, H.265, AV1), `VTIsHardwareDecodeSupported`, Annex B / parameter-set / AV1 sequence-header parsing, and IOSurface-backed `CVPixelBuffer` (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`) painted via `window.paint_surface`.
+  - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`.
+  - `input.rs`: `InputSettings` (Command sends Control, Remote Cursor, Smooth Trackpad Scrolling, Use Mac Input Method) and `RemoteChord` (Alt+Tab, Ctrl+Alt+Delete).
+  - `audio.rs`: 48 kHz stereo `f32` Opus `Playback` with bounded latency queue (`48000 * 2 / 8` samples).
+  - `view.rs` & `view/pinch.rs`: `NativeSession`, `Desktop` canvas (`RenderImage` with `window.drop_image()` retirement for JPEG; `paint_surface` for hardware frames), mouse/wheel/keyboard/IME dispatch, and AppKit magnification monitor.
+  - `app.rs`, `app/controls.rs`, & `app/display.rs`: multi-threaded Tokio runtime beside `gpui::Application`, Connect/Library/Session screens, movable Session Controls child window (`cmd-shift-m`), and native display UI scale detection.
+- `domain-readiness`:
+  - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled; second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
+  - `launcher-and-sessions`: simple launch/resume settled; launch options, session stop/previews, open links/files, library search/favorites, persistent storage, account recovery, and cluster origins open on the frontier.
+  - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME settled; clipboard, file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
 
 Facets:
-- `architecture` — module structure and protocol boundaries in `DESIGN.md` & `gpui-notes.md`
-- `backlog` — roadmap state in `TODO.md` and feature tickets in `tickets/*.md`
-- `verification` — `cargo test`, `cargo clippy`, and QA readiness
+- `architecture` — module boundaries and GPUI/Tokio/VideoToolbox invariants
+- `video-and-screen` — transport, codecs, display resolution, HiDPI, playback, and diagnostics
+- `launcher-and-sessions` — SealSkin API, launching, session management, storage, and cluster origins
+- `desktop-and-collaboration` — macOS input, clipboard, file transfers, media devices, printing, and sharing
 
-Material: structural changes to `crates/skerry-mac/src/**`, ticket completion transitions, new feature requirements, and protocol/codec capability changes.
-Immaterial: check timestamps, build timings, and formatting-only edits.
+Material: structural changes to `crates/skerry-mac/src/**`, newly resolved or changed `ARCH-*` constraints, and postcondition pass/fail transitions.
+Immaterial: build timestamps, local target cache state, and formatting-only edits.
 
 Postconditions:
-- Every ticket in `.agents/prose/specs/skerry-mac/tickets/*.md` is reflected in `.agents/prose/specs/skerry-mac/TODO.md`.
-- `DESIGN.md` accurately describes the modules in `crates/skerry-mac/src/`.
-- Any code change gated by this package passes `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`.
+- `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` pass.
+- No embedded browser is used; Skerry talks directly to SealSkin and Selkies.
+- Session URLs and application keys are never written to preferences files; environment/`.env` keys are never persisted to Keychain.
 
 ### Continuity
 
 input-driven
 
-### Strategies
+### Invariants
 
-- When asked to plan, refine, or check status of a feature: inspect and update `.agents/prose/specs/skerry-mac/TODO.md` and `.agents/prose/specs/skerry-mac/tickets/<feature>.md`.
-- When asked to implement a feature ticket: call `implement-feature` with the ticket slug, verify against `DESIGN.md` and `gpui-notes.md`, run Cargo verification gates, and update `TODO.md` and `DESIGN.md`.
+- `crates/skerry-mac/Cargo.toml` uses `gpui = { version = "0.2.2", features = ["runtime_shaders"] }` so Xcode Metal Toolchain is not required at build time.
+- The multi-threaded Tokio `Runtime` is created in `main` before `Application::run` and kept alive for the lifetime of the app; all network I/O runs on Tokio and communicates with GPUI via `mpsc` / `watch` channels.
+- JPEG frames decoded off the main thread into `RenderImage` must retire previous frames via `window.drop_image(previous)` inside the paint closure to prevent texture leaks (~10 MB/s at 60 fps).
+- Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.
+
+### Execution
+
+```prose
+let result = call implement-feature
+  target: target
+return result
+```
