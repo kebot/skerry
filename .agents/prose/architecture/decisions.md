@@ -38,7 +38,7 @@
 
 - **Status:** settled — SealSkin 0.4.2 version baseline superseded by `ARCH-008`, itself superseded by `ARCH-009` (the product/protocol boundaries below remain in force)
 - **Decision:**
-  - **Operator vs. Client Settings:** Capture backends, GPU selection, TLS, TURN credentials, audit/recording policy, and server administration (users, groups, app stores, templates, cluster nodes, audit logs) remain operator/web-dashboard responsibilities. Skerry only requests session changes permitted by server policy.
+  - **Operator vs. Client Settings:** Capture backends, GPU selection (*per-launch GPU choice superseded by `ARCH-016`: the operator still defines which GPUs exist, and the user picks among those at launch, as the web launcher does*), TLS, TURN credentials, audit/recording policy, and server administration (users, groups, app stores, templates, cluster nodes, audit logs) remain operator/web-dashboard responsibilities. Skerry only requests session changes permitted by server policy.
   - **Control-Plane vs. In-Session:** SealSkin companion API owns application keys, catalog, launching, persistent homes/shares, and stopping sessions. Selkies WebSocket owns live stream settings, input, clipboard, in-session file transfer, printing, and media uplinks.
   - **Native Presentation:** Skerry uses native macOS windows, menus, and Session Controls (`cmd-shift-m`). Browser-specific layouts (Sidebar/Wish/Edge), CSS translucency, browser extensions, and touch-only overlays are excluded.
 - **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/video-and-screen.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/desktop-and-collaboration.prose.md`
@@ -139,6 +139,25 @@
 - **Affected Contracts:** `src/skerry/index.prose.md` (Invariants)
 - **Affected Rust:** `crates/skerry-mac/src/app.rs`
 
+## ARCH-016: Launch Dialog Options Match SealSkin's Web Launcher
+
+- **Status:** settled — settles more of `ARCH-GAP-LS-01` (named homes, timezone, GPU, VPN) and the per-app launch preferences of `ARCH-GAP-LS-04`; amends `ARCH-005` (per-launch GPU choice) and `ARCH-013` (Auto storage)
+- **Finding (2026-11-21):** Skerry's dialog had a GPU field that was never filled, and its "Auto (per-app persistence)" storage sent no `home_name`, which the server treats as a temporary home for any non-meta app (`server/app/launch.py`): Auto sessions were really Cleanroom ones and lost their data.
+- **Decision:** The Launch Dialog follows SealSkin's web launcher (`client/src/ui/home.js`, `lib/gpus.js`, `lib/homes.js`, `lib/languages.js`, at `selkies-project/sealskin@1ba09a7`) for a single SealSkin node, in the same order:
+  - **Storage:** shown only when the user has `persistent_storage` and the app `home_directories`; Auto, Cleanroom, then the user's named homes (`GET /companion/api/homedirs`, without `_sealskin_shared_files` and `auto-*`; none for a meta app). Auto sends `home_name = auto-<app name>` (lower case, spaces/underscores → `-`, other characters dropped) after creating it with `POST /companion/api/homedirs` when it is missing (409 counts as present; a meta app's is made by the server). Without storage the launch sends `cleanroom`.
+  - **GPU:** shown only when `settings.gpu` is on and a GPU from `POST /companion/api/admin/status` fits the app (`nvidia` driver → `nvidia_support`, any other driver → `dri3_support`); "None" first. Labels are `model (node)` or `node (driver)` where node is the device's last path part, so a Kubernetes PodTemplate reads `intel-gpu (i915)`. The id goes to `selected_gpu` unchanged (a render node on Docker, a template name on Kubernetes).
+  - **VPN / VPN endpoint:** shown when `status.vpns` is not empty, "No VPN" first; the endpoint field shows when the chosen profile has two or more endpoints, and a new VPN picks its first endpoint. Sent as `vpn` and `vpn_endpoint`.
+  - **Language:** the launcher's 261 session locales, searchable, labelled with the Mac's name for each (`NSLocale`): "German (Germany) · de_DE" (user's choice over raw ids). The default is the locale nearest the Mac's (`default_language`, the web launcher's rule).
+  - **Timezone:** no control; every launch sends the Mac's time zone (`NSTimeZone`).
+  - **Remembered options:** after a successful launch, every option is saved per app in the server's preferences file (`Preferences::launch`, `~/Library/Application Support/SealSkin Native/<server>.json`); the next dialog for that app starts from them where they still hold, else the defaults (Auto, no GPU, no VPN, nearest locale, Wayland on).
+  - **Copy link:** `/app/<id>/` with only what differs from a default launch: `home` (not Auto), `gpu`, `vpn`, `vpn_endpoint`, `room=1`, `lang` (not the default), `wayland=0`.
+  - A status the server won't give leaves GPU and VPN hidden and storage off; the Library still loads.
+- **Out of scope:** SealSkin cluster choices (`auto:<kind>`, `<device>@<node>`, the Where field) stay with `ARCH-GAP-LS-07`; startup progress stages and one-click launch stay with `ARCH-GAP-LS-01`.
+- **Design review:** the dialog was built in the preview workbench first (stories **Launch Dialog** and **Launch Dialog · Minimal**; `SKERRY_PREVIEW_STORY=<story id>` opens one) and approved in the Plannotator Inbox on 2026-11-21.
+- **Evidence:** `launch_options::tests::*` and `api::tests::{decodes_the_status_launch_rights_gpus_and_vpns, launch_body_carries_only_the_chosen_options, deep_link_carries_the_launch_options}`; read-only check against `sealskin.kebot.me` (Kubernetes): the companion lane returns `settings`, five GPU options (`intel-gpu`/`i915` and four `cpu` node templates), no VPNs, and Auto homes only. A live launch from the new dialog has not been run yet.
+- **Affected Contracts:** `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/index.prose.md`, `src/skerry/skerry.test.prose.md`, `src/skerry/skerry.qa.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/launch_options.rs` (new), `crates/skerry-mac/src/{api,app,settings,main}.rs`, `crates/skerry-mac/Cargo.toml` (`NSLocale`, `NSTimeZone`), `crates/skerry-ui/src/launch_dialog.rs`, `crates/skerry-ui/examples/preview.rs`
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -148,10 +167,10 @@
 | `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | unresolved (backlog) | Open a second remote display in its own GPUI window following server display placement while primary session owns audio. |
 | `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
-| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | partially settled (`ARCH-013`) | Settled: Auto/Cleanroom storage, language, Wayland, collaborative. Open: named homes, timezone, GPU/VPN, startup progress stages, and remembered 1-click launch. |
+| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | partially settled (`ARCH-013`, `ARCH-016`) | Settled: storage (Auto/Cleanroom/named homes), GPU, VPN, language, timezone, Wayland, collaborative, remembered options, Copy link options. Open: startup progress stages and one-click remembered launch. |
 | `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | partially settled (`ARCH-013`) | Settled: thumbnails and confirmed Stop. Open: Send File. |
 | `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
-| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | partially settled (`ARCH-013`) | Settled: search (apps + sessions), app icons, category filters. Open: recents, favorites, hidden apps, per-app launch preferences, and matching running-session reuse. |
+| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | partially settled (`ARCH-013`, `ARCH-016`) | Settled: search (apps + sessions), app icons, category filters, per-app launch preferences. Open: recents, favorites, hidden apps, and matching running-session reuse. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |

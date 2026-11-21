@@ -19,7 +19,7 @@ objc2-core-foundation = { version = "0.3.2", default-features = false, features 
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "objc2", "objc2-io-surface"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSDictionary", "NSString", "NSUserDefaults", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDictionary", "NSLocale", "NSString", "NSTimeZone", "NSUserDefaults", "NSValue"] }
 # Enable the CF type implementation required by Core Video's IOSurface getter.
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation"] }
 objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "objc2", "objc2-core-media", "objc2-core-video"] }
