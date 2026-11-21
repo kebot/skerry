@@ -184,6 +184,79 @@
 - **Evidence:** `clipboard::tests::*` and `pasteboard::tests::*` (private pasteboard round-trip); `cargo test --workspace`, Clippy, and fmt pass.
 - **Affected Rust:** new `crates/skerry-mac/src/{clipboard,pasteboard}.rs`; `Cargo.toml` (`NSPasteboard`, `NSData`, image `tiff`); `transport.rs`, `view.rs`, `app.rs`, `app/controls.rs`, `settings.rs`; `crates/skerry-ui/src/controls.rs`
 
+## ARCH-018: Session Controls Look and Work Like the Selkies Web Sidebar
+
+- **Status:** settled — design approved in the preview workbench on 2026-11-21; amends the Session Controls layout of `ARCH-007`, partially settles `ARCH-GAP-VS-05`
+- **Finding (2026-11-21):** Selkies' web sidebar (`selkies-dashboard/src/layouts/sidebar/sidebar.css`, `panels/settings.tsx`, `translations.ts`) shows each section as its own rounded card, 10px apart, with uppercase titles. Inside, every setting is a label above a full-width control: dropdowns for Encoder, Rate Control, UI Scaling, and Preset; sliders with the value in the label ("Frames per second (60 FPS)", "Video CRF (25)", "Video Bitrate (8 Mbps)"); switches for on/off settings; full-width 40px buttons. Skerry stacked flush sections and used segmented button rows, −/+ steppers, "Turn On/Off" buttons, and inline option lists.
+- **Decision:** `skerry-ui::controls` follows the web sidebar for the settings Skerry already supports (no new settings):
+  - **Cards:** sections inset 16px with a 10px gap; 1px border, 12px radius, 11×14px header, 4/14/14px body; titles upper case, chevron down when closed and up when open.
+  - **Rhythm:** 14px between settings, 6px from a label to its control, labels semibold.
+  - **Dropdowns:** Encoder (codec), Encoder Rate Control Mode ("CBR (Constant Bitrate)", "CRF (Constant Quality)"), UI Scaling, and Preset are full-width 40px dropdown buttons opening a popup menu with the current choice checked (no `SelectState`; the inline picker lists and `ControlsAction::TogglePicker` go away).
+  - **Sliders:** Frames per second, Video Bitrate (Mbps), Video CRF, JPEG Base Quality, and Paintover Quality are `gpui-kit` sliders over the server's min..max. Their live value shows in the label while dragging, and the setting is requested once, on release. `skerry-ui` keeps each slider's state with `window.use_keyed_state`, so callers pass only values.
+  - **Switches:** Use Paint-Overs, HiDPI, Force Aligned Resolution, and Input options; a server-locked one is a disabled switch.
+  - **Buttons:** Set Manual Resolution and Reset to Window side by side at equal width; Scale Locally, Reset Video Settings, and key combinations full width.
+  - Skerry keeps its own theme colors (no pink accent) and native-only rows (Preferred codec notice, Stream Diagnostics).
+  - The Clipboard section (`ARCH-017`) takes the same switches (a server-locked Seamless is a disabled switch) and full-width Send Mac Clipboard / Copy Session Clipboard buttons.
+- **Design review:** approved in the preview workbench (`cargo run -p skerry-ui --example preview`, Session Controls stories) on 2026-11-21.
+- **Evidence:** `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`; screenshots of the Hardware H.265 story. Dropdown menus and slider drags have not yet been exercised in a live session.
+- **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-ui/src/controls.rs`, `crates/skerry-ui/examples/preview.rs`, `crates/skerry-mac/src/app/controls.rs`
+
+## ARCH-019: Stats Section Follows the Selkies Web Sidebar's Stats
+
+- **Status:** settled — design approved in the preview workbench on 2026-11-21; amends the 1-second Stream Diagnostics of `ARCH-003` (`playback-and-diagnostics`)
+- **Finding (2026-11-21):** Selkies' web sidebar Stats (`selkies-dashboard/src/panels/stats.tsx` `StatsSection`, `stats-data.ts`, `selkies-web-core/lib/stream-stats{,-view}.ts`) shows four status rows, three history graphs, figure tiles, and host meters, and copies a plain-text report. Its numbers come from the server only while the stats are on screen: the page sends `_stats,1`, and the server answers once a second with `stream_stats` (`encode_ms`, `encoded_fps`, `pipeline_ms` with `pipeline_min_ms`/`pipeline_max_ms`, `send_ms` with its range, `video_mbps`, `peak_mbps`, `target_mbps` under CBR, `rtt_ms`, `throttled`, and the host's `cpu_percent`, `mem_used`/`mem_total`, `gpu_percent`, `gpu_mem_used`/`gpu_mem_total`). `stream_info` describes the encoder and capture path. Skerry showed nine label/value lines from its own counters and read only `stream_info.encoder`.
+- **Decision:** The Session Controls section is titled **Stats** and draws, in order, what the web sidebar draws for a WebSockets session:
+  - **Rows** with a status mark (good ✓ / warn ⚠ / neutral •), worded by the web's rules (`streamRows`): **Encoder** (encoder · codec 4:2:0/4:4:4 · 10-bit · Striped; GPU · node · driver; warns when hardware was expected and fell back, with the server's reason), **Capture** (X11/Wayland · Zero-copy or Readback; warns on a readback where zero-copy was available), **Decoder** (Hardware via VideoToolbox for H.264/H.265/AV1, Software for JPEG — neutral, since no hardware JPEG path is expected; codec · resolution), **Connection** (WebSockets; warns while the server is `throttled`). A copy button puts the web's plain-text report (`streamReport`) on the clipboard, with "SealSkin Native" in place of the user agent.
+  - **Graphs**, 44px high, line plus 12% area, a midline, and the axis top in the corner: **FPS** (client, with the server's `encoded_fps` as a second series when it reports one; axis from the configured frame rate up), **Bandwidth** (received Mbps), **Latency** (ms; Skerry's own WebSocket ping, else the server's `rtt_ms`). History starts when the section opens, keeps 600 s, and is bucketed by maximum to 120 points.
+  - **Tiles**, two columns: Encode, Capture to encoded and Capture to sent (with the server's least–most), Decode, Video rate (against the CBR target; warns over 110%), Peak 250 ms, Received, Lost frames (rejected packets), Key frame requests. A time with nothing measured this second shows the last one within 5 s, else "idle" when no frame moved. Skerry leaves out the tiles it does not measure (Arrival to screen, Audio buffer, Frames not shown) instead of showing dashes.
+  - **Meters**: CPU and GPU as bars, memory and VRAM as "used / total GiB", when the server reports them.
+  - **Subscription:** Skerry sends `_stats,1` while the Stats section is open in Session Controls and `_stats,0` when it closes or the panel closes; a reconnect re-sends it. Server figures older than 3 s are left out of a sample.
+- **Out of scope:** the floating panel's gauges and the "Show over the stream" strip (`ARCH-GAP-VS-06`), and mic/webcam uplinks (`ARCH-GAP-DC-05`).
+- **Design review:** approved in the preview workbench (Session Controls stories, which open with Stats expanded) on 2026-11-21.
+- **Evidence:** `stats::tests::*` (7 tests) and the workspace checks. Not yet run against a live server: the `_stats,1` subscription, the server-side tiles, and the host meters are verified only against fixtures and Selkies `715df7c` source (`crates/selkies/src/ws/server.rs` `send_stream_stats`, `stats/mod.rs`, `ws/host.rs`).
+- **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/{transport,app,stats}.rs` (`stats.rs` new), `crates/skerry-mac/src/app/controls.rs`, `crates/skerry-ui/src/{stats,controls,lib}.rs` (`stats.rs` new), `crates/skerry-ui/examples/preview.rs`
+
+## ARCH-020: Selkies Web Sidebar Panel Inventory (Reference)
+
+- **Status:** reference — records what each panel of Selkies' web sidebar holds, so future Session Controls work starts from it; each open row is owned by the `ARCH-GAP-*` named in it
+- **Source:** Selkies `715df7c` web dashboard: the panel catalog `selkies-dashboard/src/panels/catalog.ts` (`PANELS` and the `STREAMS` toggles), the sidebar layout `layouts/sidebar/index.tsx` and `sidebar.css`, panel bodies under `panels/` (`settings.tsx`, `stats.tsx`, `clipboard.tsx`, `files.tsx`/`file-manager.tsx`, `printing.tsx`, `apps.tsx`, `sharing.tsx`, `gamepads.tsx`, `shortcuts.tsx`, `catalog-bodies.tsx`, `soft-keys.tsx`, `appearance.tsx`), and strings in `translations.ts`. A panel shows only where the server allows it (`renderable.*` from `server_settings`) and only on the primary display's page; a view-only (`#shared`) page has no dashboard.
+- **The sidebar, top to bottom:**
+
+| Web element | What it holds | Skerry today | Owner |
+|---|---|---|---|
+| Header | Wordmark; theme pill (dark/light, also sent as the desktop's color scheme); layout toggle (sidebar / toolbar / edge); translucency knob | Follows the Mac's appearance (`Theme::sync_system_appearance`) and sends the color scheme; no layout or translucency choice | Excluded: native presentation (`ARCH-005`) |
+| Mode buttons | Fullscreen (Ctrl+Shift+F); gaming mode (Ctrl+Shift+X: hides the dashboard and locks the pointer); a touch client's keyboard and trackpad | Full Screen button and the window's own full screen | Gaming mode: `ARCH-GAP-DC-06`; touch buttons excluded (`ARCH-005`) |
+| Stream tiles | Five toggles: video, audio, microphone, webcam, gamepad input, each shown only where the server allows it | Pause Video / Mute buttons in the Session Controls header | Icon-tile row: `ARCH-GAP-VS-05`; mic/webcam: `ARCH-GAP-DC-05`; gamepad: `ARCH-GAP-DC-06` |
+| Soft keys | A touch client's held modifiers, missing keys, chord palette, trackpad switch | — | Excluded: touch-only overlay (`ARCH-005`) |
+| **Video Settings** | Format card: Encoder, Webcam Encoder, FullColor 4:4:4, 10-bit; Performance card: Frames per second, Rate Control, Video Bitrate, Video CRF, Turbo, Base/Paintover JPEG quality, Use Paint-Overs, Paint-Overs CRF, Paint-Over Burst Frames, CPU Encoding, Multithreaded CPU Encoding | Encoder, FPS, Rate Control, Bitrate, CRF, JPEG Base/Paintover Quality, Use Paint-Overs (`ARCH-018`) | 4:4:4, 10-bit, Turbo, Paint-Over CRF/Burst, CPU encoding: `ARCH-GAP-VS-03`; Webcam Encoder: `ARCH-GAP-DC-05` |
+| **Screen Settings** | Display card: Add Screen +, Anti-aliasing, Use CSS cursors, Raw pointer motion, Command sends Control, HiDPI, Force Aligned Resolution, UI Scaling; Resolution card: Preset, Width/Height, Set Manual Resolution, Reset to Window, Scale Locally | HiDPI, Force Aligned Resolution, UI Scaling, Preset, Width/Height, Set/Reset, Scale Locally (`ARCH-018`); Command sends Control lives in **Input** | Add Screen: `ARCH-GAP-VS-01`; Raw pointer motion: `ARCH-GAP-DC-06`; anti-aliasing and CSS cursors are browser rendering, excluded |
+| **Audio Settings** | Quality card: Audio Bitrate slider (kbps choices); Devices card: Input (microphone) and Output (speaker) pickers, "not supported" where the browser cannot pick an output | Mute only; 48 kHz Opus to the default output | Bitrate and output device: `ARCH-GAP-DC-03`; input device: `ARCH-GAP-DC-05` |
+| **Stats** | "Show over the stream" switch; status rows, graphs, tiles, meters, copy (`StatsSection`) | Rows, graphs, tiles, meters, copy (`ARCH-019`) | Strip and floating gauges: `ARCH-GAP-VS-06` |
+| **Clipboard** | The server clipboard's text, editable (sent on blur, `clipboardUpdateFromUI`); image upload when binary clipboard is on (`enable_binary_clipboard`); masked-secret copy button | Clipboard section: Send to Session, Receive from Session, Seamless; Send Mac Clipboard / Copy Session Clipboard when Seamless is off; `NSPasteboard` sync on focus (`ARCH-017`). No editable text box: the Mac's own pasteboard is the clipboard | Settled: `ARCH-017` (`ARCH-GAP-DC-01`) |
+| **Files** | Opens the file manager: browse the session's directories, upload and download (shown when the server allows either transfer) | — | `ARCH-GAP-DC-02` |
+| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` |
+| **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
+| **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
+| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
+| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` |
+| **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
+| Footer | "Cite our paper academically" link | — | Excluded |
+
+- **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/desktop-and-collaboration.prose.md`
+
+## ARCH-021: Decoded Frames Are Presented as They Arrive, Not on a 30 Hz Tick
+
+- **Status:** settled — amends the presentation pacing of `ARCH-003` (`codec-and-rate-control`)
+- **Finding (2026-11-21):** the Stats FPS graph (`ARCH-019`) showed the client at 30 fps while the server encoded 60. `transport::run` handed frames to the window only on its 33 ms `present` tick, which the first client (`e0835a5`) used to gather a JPEG frame's stripes into one picture. A hardware frame decoded between ticks waited in `decoded`, and a second one replaced it unseen, so H.264/H.265/AV1 were shown, and counted, at 30 fps at most.
+- **Decision:**
+  - **Hardware codecs:** each VideoToolbox frame is a whole picture, so it goes to the window (`frames.send_replace`) and is counted the moment it decodes; the `decoded` hold is gone.
+  - **JPEG:** stripes still gather into one canvas, now flushed by an 8 ms `jpeg_flush` tick while anything changed, so a 60 fps JPEG stream is not capped at 30. A frame is counted once per frame id, so stripes of one frame split across two flushes do not count twice.
+  - The 33 ms tick keeps only what does not need frame rate: `CLIENT_FRAME_ACK` of the newest frame (Selkies needs one every 50 ms), pointer motion, and the hardware-decode expiry check.
+- **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/transport.rs`
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -211,8 +284,12 @@
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
 | `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
-| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | unresolved (todo) | Session Controls forgets section state/scroll; Preset picker inconsistent; popovers lack shadow. |
+| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | partially settled (`ARCH-018`) | Settled: web-sidebar cards, dropdowns, sliders, switches. Open: Session Controls forgets section state/scroll; popovers lack shadow; the web's stream-toggle tile row (`ARCH-020`). |
 | `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | unresolved (todo) | Disconnect Server confirmation, wide-window Library density, Refresh/Copy feedback, live "Started … ago". |
 | `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | unresolved (todo) | No Bearer key on logo fetches, off-main-thread preference/key writes, fewer per-render clones. |
 | `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | unresolved (needs repro) | Remote start menu opened during a codec switch while focus moved; possible unreleased Cmd/Super. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
+| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | unresolved (backlog) | The web's "Show over the stream" strip (status marks, fps, video rate vs target, capture-to-sent, RTT over the picture, no pointer input) and its compact/detailed floating gauges (FPS, Mbps, RTT, CPU, GPU, MEM, VRAM half-circles) (`ARCH-020`). |
+| `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | unresolved (backlog) | The web's Apps panel: proot-apps catalog by category with search, install/remove/update/launch and job consoles, gated by the server's `command_enabled` (`ARCH-020`). |
+| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | unresolved (backlog) | A Shortcuts panel listing Skerry's own chords (`cmd-shift-m`, full screen, and any gaming-mode / pointer-lock chord from `ARCH-GAP-DC-06`) with a switch that hands them to the remote session instead, as the web's "Shortcuts active" (`ARCH-020`). |
+| `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | unresolved (backlog) | The web's Pelorus panel: a prompt against the server's `/pelorus/api`, which describes the desktop as text for a caller without vision; evaluate whether Skerry should surface it (`ARCH-020`). |

@@ -14,6 +14,7 @@ mod launch_options;
 mod pasteboard;
 #[cfg(target_os = "macos")]
 mod settings;
+mod stats;
 #[cfg(target_os = "macos")]
 mod transport;
 #[cfg(target_os = "macos")]

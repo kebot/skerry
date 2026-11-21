@@ -23,6 +23,10 @@ subject: skerry
 - `api::tests::decodes_the_status_launch_rights_gpus_and_vpns`, `launch_body_carries_only_the_chosen_options`, and `deep_link_carries_the_launch_options` pass (`ARCH-016`).
 - `clipboard::tests::*` pass: text, Unicode, and LF line ends go as one `cw` frame; payloads of 16383 bytes or more go multipart (`cws`/`cwd`/`cwe`, `cbs`/`cbd`/`cbe`) with their declared size; rich text rides the `application/x-selkies-clipboard-flavours` envelope; `Receiver` reassembles `clipboard_start`/`data`/`finish`, carries `clipboard_secret` and `clipboard_reply,cr`, drops truncated or superseded payloads; and server policy bounds the person's switches, with a locked Seamless winning (`ARCH-017`).
 - `pasteboard::tests::contents_round_trip_and_secrets_are_concealed` passes on a private `NSPasteboard`: text, HTML with its text, and PNG round-trip, every write bumps the change count, and a secret carries `org.nspasteboard.ConcealedType` (`ARCH-017`).
+- Session Controls follows the Selkies web sidebar (`ARCH-018`): sections are separate cards 10px apart; Encoder, Rate Control, UI Scaling, and Preset are dropdowns; numeric video settings are sliders that request a value only on release; on/off settings are switches.
+- `stats::tests::*` pass: rows warn only on a hardware fallback, a readback where zero-copy was available, or throttling; tiles hold a time for 5 s then read idle; Video rate warns over 110% of its CBR target; meters appear only when the server reports them; a history longer than 120 points is bucketed by maximum (`ARCH-019`).
+- The Stats section subscribes with `_stats,1` only while it is open, and re-subscribes after a reconnect (`ARCH-019`).
+- A 60 fps H.264/H.265/AV1 stream reads about 60 Client FPS in Stats, not 30 (`ARCH-021`).
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

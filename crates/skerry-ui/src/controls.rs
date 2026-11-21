@@ -1,23 +1,18 @@
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
+    button::Button,
     collapsible::Collapsible,
     input::{Input, InputState},
-    label::Label,
+    menu::{DropdownMenu as _, PopupMenuItem},
+    slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
-    IconName, Sizable as _, StyledExt as _, Theme,
+    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
-    div, prelude::*, AnyElement, App, ClickEvent, Div, Entity, FontWeight, SharedString, Window,
+    div, prelude::*, px, AnyElement, App, ClickEvent, Div, Entity, FontWeight, SharedString, Window,
 };
 use std::rc::Rc;
 
 pub type ControlsHandler = Rc<dyn Fn(ControlsAction, &mut Window, &mut App)>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Picker {
-    Preset,
-    Dpi,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -35,7 +30,6 @@ pub struct ControlsUiState {
     pub screen_open: bool,
     pub video_open: bool,
     pub stats_open: bool,
-    pub picker: Option<Picker>,
     pub size_error: bool,
 }
 
@@ -47,7 +41,6 @@ impl Default for ControlsUiState {
             screen_open: true,
             video_open: false,
             stats_open: false,
-            picker: None,
             size_error: false,
         }
     }
@@ -56,7 +49,6 @@ impl Default for ControlsUiState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControlsAction {
     ToggleSection(Section),
-    TogglePicker(Picker),
     SetAudio(bool),
     SetPlayback(bool),
     ToggleFullScreen,
@@ -88,6 +80,7 @@ pub enum ControlsAction {
         value: u32,
     },
     ResetVideo,
+    CopyStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,19 +126,46 @@ pub struct CodecChoice {
     pub selected: bool,
 }
 
+/// How a slider's value reads in its label, as the web sidebar writes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SliderUnit {
+    /// The bare number: "Video CRF (25)".
+    Plain,
+    /// "Frames per second (60 FPS)".
+    Fps,
+    /// A value in kbps, shown in Mbps: "Video Bitrate (8 Mbps)".
+    Kbps,
+}
+
+impl SliderUnit {
+    pub fn format(self, value: u32) -> String {
+        match self {
+            SliderUnit::Plain => value.to_string(),
+            SliderUnit::Fps => format!("{value} FPS"),
+            SliderUnit::Kbps if value.is_multiple_of(1000) => format!("{} Mbps", value / 1000),
+            SliderUnit::Kbps => format!("{:.1} Mbps", f64::from(value) / 1000.0),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VideoSettingControl {
-    Toggle {
+    Switch {
         enabled: bool,
-        can_toggle: bool,
+        locked: bool,
     },
-    Segmented {
-        options: Vec<(u32, String, bool)>,
+    Select {
+        value: u32,
+        options: Vec<(u32, String)>,
+        locked: bool,
     },
-    Stepper {
-        display: String,
-        decrement: Option<u32>,
-        increment: Option<u32>,
+    Slider {
+        value: u32,
+        min: u32,
+        max: u32,
+        step: u32,
+        unit: SliderUnit,
+        locked: bool,
     },
 }
 
@@ -163,7 +183,7 @@ pub struct VideoProps {
     pub rows: Vec<VideoSettingRow>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ControlsProps {
     pub app_name: String,
     pub fullscreen: bool,
@@ -176,7 +196,10 @@ pub struct ControlsProps {
     pub clipboard: Option<ClipboardProps>,
     pub screen: ScreenProps,
     pub video_settings: Option<VideoProps>,
-    pub diagnostics: Option<Vec<(String, String)>>,
+    /// The Stats section; `None` until the first reading arrives.
+    pub stats: Option<crate::stats::StatsProps>,
+    /// Shows the copy button's check for a moment after a copy.
+    pub stats_copied: bool,
 }
 
 pub fn dpi_label(dpi: u16) -> String {
@@ -184,13 +207,15 @@ pub fn dpi_label(dpi: u16) -> String {
 }
 
 pub fn render(
-    theme: &Theme,
     props: &ControlsProps,
     state: &ControlsUiState,
     width: &Entity<InputState>,
     height: &Entity<InputState>,
     on_action: ControlsHandler,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Div {
+    let theme = &cx.theme().clone();
     let actions = div()
         .h_flex()
         .flex_wrap()
@@ -258,51 +283,68 @@ pub fn render(
                     view.child(div().text_color(theme.muted_foreground).child(reason))
                 }),
         )
-        .child(section(
-            theme,
-            "Input",
-            state.input_open,
-            || render_input(props, &on_action),
-            toggle(Section::Input),
-        ))
-        .child(section(
-            theme,
-            "Clipboard",
-            state.clipboard_open,
-            || render_clipboard(theme, props.clipboard.as_ref(), &on_action),
-            toggle(Section::Clipboard),
-        ))
-        .child(section(
-            theme,
-            "Screen Settings",
-            state.screen_open,
-            || render_screen(theme, &props.screen, state, width, height, &on_action),
-            toggle(Section::Screen),
-        ))
-        .child(section(
-            theme,
-            "Video",
-            state.video_open,
-            || render_video(theme, props.video_settings.as_ref(), &on_action),
-            toggle(Section::Video),
-        ))
-        .child(section(
-            theme,
-            "Stream Diagnostics",
-            state.stats_open,
-            || render_diagnostics(theme, props.diagnostics.as_deref()),
-            toggle(Section::Stats),
-        ))
+        // Sections are separate cards with a 10px gap, as in the web sidebar
+        // (`.sidebar-section { margin-bottom: 10px }`).
+        .child(
+            div()
+                .px_4()
+                .pb_4()
+                .v_flex()
+                .gap(px(10.))
+                .child(section(
+                    theme,
+                    "Input",
+                    state.input_open,
+                    || render_input(props, &on_action),
+                    toggle(Section::Input),
+                ))
+                .child(section(
+                    theme,
+                    "Clipboard",
+                    state.clipboard_open,
+                    || render_clipboard(theme, props.clipboard.as_ref(), &on_action),
+                    toggle(Section::Clipboard),
+                ))
+                .child(section(
+                    theme,
+                    "Screen Settings",
+                    state.screen_open,
+                    || render_screen(theme, &props.screen, state, width, height, &on_action),
+                    toggle(Section::Screen),
+                ))
+                .child(section(
+                    theme,
+                    "Video Settings",
+                    state.video_open,
+                    || render_video(theme, props.video_settings.as_ref(), &on_action, window, cx),
+                    toggle(Section::Video),
+                ))
+                .child(section(
+                    theme,
+                    "Stats",
+                    state.stats_open,
+                    || render_stats(theme, props, &on_action),
+                    toggle(Section::Stats),
+                )),
+        )
 }
+
+/// The web sidebar's rhythm: 14px between settings, 6px from a label to its control.
+const STACK_GAP: f32 = 14.;
+const FIELD_GAP: f32 = 6.;
+/// The web sidebar's control height and corner radius.
+const CONTROL_H: f32 = 40.;
+const CONTROL_RADIUS: f32 = 8.;
 
 fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
     div()
         .v_flex()
-        .gap_3()
+        .gap(px(STACK_GAP))
         .children(props.input_switches.iter().map(|item| {
             switch_row(
                 item.label.clone(),
                 item.enabled,
+                false,
                 ControlsAction::SetInput {
                     id: item.id.clone(),
                     enabled: !item.enabled,
@@ -310,25 +352,20 @@ fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
                 on_action,
             )
         }))
-        .child(
+        .child(field(
+            "Send Key Combination",
             div()
-                .v_flex()
+                .h_flex()
                 .gap_2()
-                .child(Label::new("Send Key Combination"))
-                .child(
-                    div()
-                        .h_flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(props.chords.iter().map(|chord| {
-                            action_button_owned(
-                                chord.label.clone(),
-                                ControlsAction::SendChord(chord.id.clone()),
-                                on_action,
-                            )
-                        })),
-                ),
-        )
+                .children(props.chords.iter().map(|chord| {
+                    div().flex_1().min_w_0().child(field_button(
+                        SharedString::from(chord.id.clone()),
+                        chord.label.clone(),
+                        ControlsAction::SendChord(chord.id.clone()),
+                        on_action,
+                    ))
+                })),
+        ))
 }
 
 fn render_clipboard(
@@ -343,11 +380,12 @@ fn render_clipboard(
     if clipboard.send.is_none() && clipboard.receive.is_none() {
         return div().child(note("Clipboard turned off by the server"));
     }
-    let mut panel = div().v_flex().gap_3();
+    let mut panel = div().v_flex().gap(px(STACK_GAP));
     if let Some(send) = clipboard.send {
         panel = panel.child(switch_row(
             "Send to Session",
             send,
+            false,
             ControlsAction::SetClipboardSend(!send),
             on_action,
         ));
@@ -356,29 +394,18 @@ fn render_clipboard(
         panel = panel.child(switch_row(
             "Receive from Session",
             receive,
+            false,
             ControlsAction::SetClipboardReceive(!receive),
             on_action,
         ));
     }
-    panel = panel.child(if clipboard.seamless_locked {
-        div()
-            .h_flex()
-            .justify_between()
-            .child("Seamless")
-            .child(if clipboard.seamless {
-                "On · Locked"
-            } else {
-                "Off · Locked"
-            })
-            .into_any_element()
-    } else {
-        switch_row(
-            "Seamless",
-            clipboard.seamless,
-            ControlsAction::SetClipboardSeamless(!clipboard.seamless),
-            on_action,
-        )
-    });
+    panel = panel.child(switch_row(
+        "Seamless",
+        clipboard.seamless,
+        clipboard.seamless_locked,
+        ControlsAction::SetClipboardSeamless(!clipboard.seamless),
+        on_action,
+    ));
     if clipboard.seamless {
         return panel.child(note(
             "A copy on either side is ready to paste on the other.",
@@ -389,26 +416,23 @@ fn render_clipboard(
     panel
         .child(note("Nothing moves until you choose."))
         .when(send || receive, |panel| {
-            panel.child(
-                div()
-                    .h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .when(send, |row| {
-                        row.child(action_button(
-                            "Send Mac Clipboard",
-                            ControlsAction::SendClipboard,
-                            on_action,
-                        ))
-                    })
-                    .when(receive, |row| {
-                        row.child(action_button(
-                            "Copy Session Clipboard",
-                            ControlsAction::CopySessionClipboard,
-                            on_action,
-                        ))
-                    }),
-            )
+            panel
+                .when(send, |panel| {
+                    panel.child(field_button(
+                        "send-clipboard",
+                        "Send Mac Clipboard",
+                        ControlsAction::SendClipboard,
+                        on_action,
+                    ))
+                })
+                .when(receive, |panel| {
+                    panel.child(field_button(
+                        "copy-session-clipboard",
+                        "Copy Session Clipboard",
+                        ControlsAction::CopySessionClipboard,
+                        on_action,
+                    ))
+                })
         })
 }
 
@@ -420,11 +444,12 @@ fn render_screen(
     height: &Entity<InputState>,
     on_action: &ControlsHandler,
 ) -> Div {
-    let mut panel = div().v_flex().gap_3();
+    let mut panel = div().v_flex().gap(px(STACK_GAP));
     if screen.resize_allowed {
         panel = panel.child(switch_row(
             "HiDPI (Pixel Perfect)",
             screen.matching_retina,
+            false,
             ControlsAction::SetRetina(!screen.matching_retina),
             on_action,
         ));
@@ -437,111 +462,65 @@ fn render_screen(
     }
 
     if let Some((aligned, locked)) = screen.alignment {
-        panel = panel.child(if locked {
-            div()
-                .h_flex()
-                .justify_between()
-                .child("Force Aligned Resolution")
-                .child(if aligned {
-                    "On · Locked"
-                } else {
-                    "Off · Locked"
-                })
-                .into_any_element()
-        } else {
-            switch_row(
-                "Force Aligned Resolution",
-                aligned,
-                ControlsAction::SetAlignment(!aligned),
-                on_action,
-            )
-        });
+        panel = panel.child(switch_row(
+            "Force Aligned Resolution",
+            aligned,
+            locked,
+            ControlsAction::SetAlignment(!aligned),
+            on_action,
+        ));
     }
 
     if let Some(dpi) = screen.dpi {
         let mut label = dpi_label(dpi);
-        let row = div().v_flex().gap_1().child(Label::new("UI Scaling"));
-        if screen.dpi_choices.len() > 1 {
-            if screen.dpi_override.is_none() {
-                label.push_str(" · Match Mac Display");
-            }
-            panel = panel.child(
-                row.child(picker_button(Picker::Dpi, label, state.picker, on_action))
-                    .when(state.picker == Some(Picker::Dpi), |row| {
-                        row.children(
-                            std::iter::once(None)
-                                .chain(screen.dpi_choices.iter().copied().map(Some))
-                                .map(|choice| {
-                                    let on_action = Rc::clone(on_action);
-                                    let label = choice
-                                        .map_or_else(|| "Match Mac Display".into(), dpi_label);
-                                    let button = Button::new(SharedString::from(label.clone()))
-                                        .small()
-                                        .label(label);
-                                    let button = if screen.dpi_override == choice {
-                                        button.primary()
-                                    } else {
-                                        button.outline()
-                                    };
-                                    button.on_click(move |_, window, cx| {
-                                        on_action(ControlsAction::SetUiScaling(choice), window, cx);
-                                    })
-                                }),
-                        )
-                    }),
-            );
-        } else {
-            panel = panel.child(row.child(label));
+        if screen.dpi_choices.len() > 1 && screen.dpi_override.is_none() {
+            label.push_str(" · Match Mac Display");
         }
+        let items = std::iter::once(None)
+            .chain(screen.dpi_choices.iter().copied().map(Some))
+            .map(|choice| {
+                (
+                    choice.map_or_else(|| "Match Mac Display".into(), dpi_label),
+                    screen.dpi_override == choice,
+                    ControlsAction::SetUiScaling(choice),
+                )
+            })
+            .collect();
+        panel = panel.child(field(
+            "UI Scaling",
+            dropdown(
+                "dpi-picker",
+                label,
+                items,
+                screen.dpi_choices.len() <= 1,
+                on_action,
+            ),
+        ));
     }
 
     if screen.resize_allowed {
-        let on_apply = Rc::clone(on_action);
-        let on_reset = Rc::clone(on_action);
-        let on_fit = Rc::clone(on_action);
-        panel = panel
-            .child(
-                div()
-                    .v_flex()
-                    .gap_1()
-                    .child(Label::new("Preset"))
-                    .child(picker_button(
-                        Picker::Preset,
-                        screen.preset_label.clone(),
-                        state.picker,
-                        on_action,
-                    ))
-                    .when(state.picker == Some(Picker::Preset), |row| {
-                        row.child(
-                            Button::new("fit")
-                                .outline()
-                                .small()
-                                .label("Keep Remote Size")
-                                .on_click(move |_, window, cx| {
-                                    on_fit(ControlsAction::SetFitMode, window, cx);
-                                }),
-                        )
-                        .children(
-                            [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)]
-                                .into_iter()
-                                .map(|(w, h)| {
-                                    let on_action = Rc::clone(on_action);
-                                    let label = format!("{w} × {h}");
-                                    Button::new(SharedString::from(label.clone()))
-                                        .outline()
-                                        .small()
-                                        .label(label)
-                                        .on_click(move |_, window, cx| {
-                                            on_action(
-                                                ControlsAction::SelectPreset(w, h),
-                                                window,
-                                                cx,
-                                            );
-                                        })
-                                }),
-                        )
-                    }),
+        let presets = std::iter::once(("Keep Remote Size".to_string(), ControlsAction::SetFitMode))
+            .chain(
+                [(1280, 720), (1920, 1080), (2560, 1440), (3840, 2160)]
+                    .into_iter()
+                    .map(|(w, h)| (format!("{w} × {h}"), ControlsAction::SelectPreset(w, h))),
             )
+            .map(|(label, action)| {
+                let checked = label == screen.preset_label;
+                (label, checked, action)
+            })
+            .collect();
+        panel = panel
+            .child(field(
+                "Preset",
+                dropdown(
+                    "preset-picker",
+                    screen.preset_label.clone(),
+                    presets,
+                    false,
+                    on_action,
+                ),
+            ))
             .child(
                 div()
                     .h_flex()
@@ -552,26 +531,19 @@ fn render_screen(
             .child(
                 div()
                     .h_flex()
-                    .flex_wrap()
                     .gap_2()
-                    .child(
-                        Button::new("apply-manual")
-                            .primary()
-                            .small()
-                            .label("Set Manual Resolution")
-                            .on_click(move |_, window, cx| {
-                                on_apply(ControlsAction::ApplyManualSize, window, cx);
-                            }),
-                    )
-                    .child(
-                        Button::new("reset-to-window")
-                            .outline()
-                            .small()
-                            .label("Reset to Window")
-                            .on_click(move |_, window, cx| {
-                                on_reset(ControlsAction::ResetToWindow, window, cx);
-                            }),
-                    ),
+                    .child(div().flex_1().min_w_0().child(wrapping_button(
+                        "apply-manual",
+                        "Set Manual Resolution",
+                        ControlsAction::ApplyManualSize,
+                        on_action,
+                    )))
+                    .child(div().flex_1().min_w_0().child(wrapping_button(
+                        "reset-to-window",
+                        "Reset to Window",
+                        ControlsAction::ResetToWindow,
+                        on_action,
+                    ))),
             )
             .when(state.size_error, |panel| {
                 panel.child(
@@ -582,176 +554,151 @@ fn render_screen(
             });
     }
 
-    panel.child(
-        action_button(
-            if screen.scale_locally {
-                "Scale Locally: On"
-            } else {
-                "Scale Locally: Off"
-            },
-            ControlsAction::SetScaleLocally(!screen.scale_locally),
-            on_action,
-        )
-        .w_full(),
-    )
+    panel.child(field_button(
+        "scale-locally",
+        if screen.scale_locally {
+            "Scale Locally: ON"
+        } else {
+            "Scale Locally: OFF"
+        },
+        ControlsAction::SetScaleLocally(!screen.scale_locally),
+        on_action,
+    ))
 }
 
-fn render_video(theme: &Theme, video: Option<&VideoProps>, on_action: &ControlsHandler) -> Div {
-    let panel = div().v_flex().gap_2();
+fn render_video(
+    theme: &Theme,
+    video: Option<&VideoProps>,
+    on_action: &ControlsHandler,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
+    let panel = div().v_flex().gap(px(STACK_GAP));
     let Some(video) = video else {
         return panel.child("Video settings are unavailable for this connection.");
     };
 
-    panel
-        .child(Label::new("Codec"))
-        .child(
-            div()
-                .h_flex()
-                .flex_wrap()
-                .gap_2()
-                .children(video.codecs.iter().map(|choice| {
-                    let on_action = Rc::clone(on_action);
-                    let id = choice.id.clone();
-                    let button = Button::new(SharedString::from(choice.id.clone()))
-                        .small()
-                        .label(choice.label.clone());
-                    let button = if choice.selected {
-                        button.primary()
-                    } else {
-                        button.outline()
-                    };
-                    button.on_click(move |_, window, cx| {
-                        on_action(ControlsAction::SelectCodec(id.clone()), window, cx);
-                    })
-                })),
-        )
+    let current = video
+        .codecs
+        .iter()
+        .find(|choice| choice.selected)
+        .map_or_else(String::new, |choice| choice.label.clone());
+    let codecs = video
+        .codecs
+        .iter()
+        .map(|choice| {
+            (
+                choice.label.clone(),
+                choice.selected,
+                ControlsAction::SelectCodec(choice.id.clone()),
+            )
+        })
+        .collect();
+
+    let mut panel = panel
+        .child(field(
+            "Encoder",
+            dropdown(
+                "codec-picker",
+                current,
+                codecs,
+                video.codecs.len() <= 1,
+                on_action,
+            ),
+        ))
         .when_some(video.preferred_notice.clone(), |panel, notice| {
             panel.child(div().text_color(theme.muted_foreground).child(notice))
-        })
-        .children(video.rows.iter().map(|row| {
-            let group = div()
-                .h_flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(row.label.clone());
-            let mut values = div()
-                .h_flex()
-                .items_center()
-                .gap_2()
-                .text_color(theme.muted_foreground);
+        });
 
-            match &row.control {
-                VideoSettingControl::Toggle {
-                    enabled,
-                    can_toggle,
-                } => {
-                    values = values.child(if *enabled { "On" } else { "Off" });
-                    if *can_toggle {
-                        let on_action = Rc::clone(on_action);
-                        let id = row.id.clone();
-                        let next = if *enabled { 0 } else { 1 };
-                        let label = if *enabled { "Turn Off" } else { "Turn On" };
-                        values = values.child(
-                            Button::new(SharedString::from(row.id.clone()))
-                                .outline()
-                                .small()
-                                .label(label)
-                                .on_click(move |_, window, cx| {
-                                    on_action(
-                                        ControlsAction::SetVideoSetting {
-                                            id: id.clone(),
-                                            value: next,
-                                        },
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                        );
-                    }
-                }
-                VideoSettingControl::Segmented { options } => {
-                    for (mode, label, selected) in options {
-                        let on_action = Rc::clone(on_action);
-                        let id = row.id.clone();
-                        let mode = *mode;
-                        let selected = *selected;
-                        let button = Button::new(SharedString::from(label.clone()))
-                            .small()
-                            .label(label.clone());
-                        let button = if selected {
-                            button.primary()
-                        } else {
-                            button.outline()
-                        };
-                        values = values.child(button.on_click(move |_, window, cx| {
-                            if !selected {
-                                on_action(
-                                    ControlsAction::SetVideoSetting {
-                                        id: id.clone(),
-                                        value: mode,
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }
-                        }));
-                    }
-                }
-                VideoSettingControl::Stepper {
-                    display,
-                    decrement,
-                    increment,
-                } => {
-                    values = values.child(display.clone());
-                    for (next, sign) in [(*decrement, "−"), (*increment, "+")] {
-                        if let Some(next) = next {
-                            let on_action = Rc::clone(on_action);
-                            let id = row.id.clone();
-                            let button_id = SharedString::from(format!("{}{sign}", row.id));
-                            values = values.child(
-                                Button::new(button_id)
-                                    .outline()
-                                    .small()
-                                    .label(sign)
-                                    .on_click(move |_, window, cx| {
-                                        on_action(
-                                            ControlsAction::SetVideoSetting {
-                                                id: id.clone(),
-                                                value: next,
-                                            },
-                                            window,
-                                            cx,
-                                        );
-                                    }),
-                            );
-                        }
-                    }
-                }
+    for row in &video.rows {
+        panel = panel.child(match &row.control {
+            VideoSettingControl::Switch { enabled, locked } => switch_row(
+                row.label.clone(),
+                *enabled,
+                *locked,
+                ControlsAction::SetVideoSetting {
+                    id: row.id.clone(),
+                    value: u32::from(!*enabled),
+                },
+                on_action,
+            ),
+            VideoSettingControl::Select {
+                value,
+                options,
+                locked,
+            } => {
+                let current = options
+                    .iter()
+                    .find(|(mode, _)| mode == value)
+                    .map_or_else(|| value.to_string(), |(_, label)| label.clone());
+                let items = options
+                    .iter()
+                    .map(|(mode, label)| {
+                        (
+                            label.clone(),
+                            mode == value,
+                            ControlsAction::SetVideoSetting {
+                                id: row.id.clone(),
+                                value: *mode,
+                            },
+                        )
+                    })
+                    .collect();
+                field(
+                    row.label.clone(),
+                    dropdown(
+                        SharedString::from(format!("{}-picker", row.id)),
+                        current,
+                        items,
+                        *locked || options.len() <= 1,
+                        on_action,
+                    ),
+                )
+                .into_any_element()
             }
-            group.child(values)
-        }))
-        .child(div().pt_1().child(action_button(
-            "Reset Video Settings",
-            ControlsAction::ResetVideo,
-            on_action,
-        )))
+            VideoSettingControl::Slider {
+                value,
+                min,
+                max,
+                step,
+                unit,
+                locked,
+            } => slider_field(
+                &row.id,
+                &row.label,
+                SliderSpec {
+                    value: *value,
+                    min: *min,
+                    max: *max,
+                    step: *step,
+                    unit: *unit,
+                    locked: *locked,
+                },
+                on_action,
+                window,
+                cx,
+            ),
+        });
+    }
+
+    panel.child(field_button(
+        "reset-video",
+        "Reset Video Settings",
+        ControlsAction::ResetVideo,
+        on_action,
+    ))
 }
 
-fn render_diagnostics(theme: &Theme, diagnostics: Option<&[(String, String)]>) -> Div {
-    let mut rows = div().v_flex().gap_2();
-    if let Some(fields) = diagnostics {
-        rows = rows.children(fields.iter().map(|(label, value)| {
-            div().h_flex().justify_between().child(label.clone()).child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child(value.clone()),
-            )
-        }));
-    } else {
-        rows = rows.child("Waiting for stream diagnostics…");
-    }
-    rows
+fn render_stats(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
+    let Some(stats) = props.stats.as_ref() else {
+        return div()
+            .text_color(theme.muted_foreground)
+            .child("Waiting for stream stats…");
+    };
+    let on_action = Rc::clone(on_action);
+    crate::stats::render(theme, stats, props.stats_copied, move |window, cx| {
+        on_action(ControlsAction::CopyStats, window, cx)
+    })
 }
 
 fn action_button(
@@ -767,53 +714,186 @@ fn action_button(
         .on_click(move |_, window, cx| on_action(action.clone(), window, cx))
 }
 
-fn action_button_owned(
-    label: String,
+/// A label over its control, as the web sidebar's `.setting-item`.
+fn field(label: impl Into<SharedString>, control: impl IntoElement) -> Div {
+    div()
+        .v_flex()
+        .gap(px(FIELD_GAP))
+        .child(div().font_weight(FontWeight::SEMIBOLD).child(label.into()))
+        .child(control)
+}
+
+/// A full-width button at the web sidebar's control height.
+fn field_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
     action: ControlsAction,
     on_action: &ControlsHandler,
 ) -> Button {
     let on_action = Rc::clone(on_action);
-    Button::new(SharedString::from(label.clone()))
+    Button::new(id.into())
         .outline()
-        .small()
-        .label(label)
+        .w_full()
+        .h(px(CONTROL_H))
+        .rounded(px(CONTROL_RADIUS))
+        .label(label.into())
         .on_click(move |_, window, cx| on_action(action.clone(), window, cx))
 }
 
-fn picker_button(
-    picker: Picker,
-    label: String,
-    active: Option<Picker>,
+/// A full-width button whose label wraps onto a second line rather than being
+/// cut, as the web sidebar's Set Manual Resolution / Reset to Window pair.
+fn wrapping_button(
+    id: &'static str,
+    label: &'static str,
+    action: ControlsAction,
     on_action: &ControlsHandler,
 ) -> Button {
     let on_action = Rc::clone(on_action);
-    let id = match picker {
-        Picker::Preset => "preset-picker",
-        Picker::Dpi => "dpi-picker",
-    };
-    let button = Button::new(id)
-        .small()
+    Button::new(id)
+        .outline()
         .w_full()
-        .label(label)
-        .dropdown_caret(true);
-    let button = if active == Some(picker) {
-        button.primary()
-    } else {
-        button.outline()
-    };
-    button.on_click(move |_, window, cx| {
-        on_action(ControlsAction::TogglePicker(picker), window, cx);
-    })
+        .h_auto()
+        .min_h(px(CONTROL_H))
+        .py(px(6.))
+        .px(px(8.))
+        .rounded(px(CONTROL_RADIUS))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .whitespace_normal()
+                .text_center()
+                .child(label),
+        )
+        .on_click(move |_, window, cx| on_action(action.clone(), window, cx))
 }
 
-fn input_field(label: &'static str, field: &Entity<InputState>) -> Div {
+/// A full-width dropdown, the web sidebar's `<select>`: the current choice
+/// on the button, the choices in a popup menu with the current one checked.
+fn dropdown(
+    id: impl Into<SharedString>,
+    current: String,
+    items: Vec<(String, bool, ControlsAction)>,
+    disabled: bool,
+    on_action: &ControlsHandler,
+) -> AnyElement {
+    let on_action = Rc::clone(on_action);
+    let items = Rc::new(items);
+    Button::new(id.into())
+        .outline()
+        .w_full()
+        .h(px(CONTROL_H))
+        .rounded(px(CONTROL_RADIUS))
+        .label(current)
+        .dropdown_caret(true)
+        .disabled(disabled)
+        .dropdown_menu(move |menu, _, _| {
+            items.iter().fold(menu, |menu, (label, checked, action)| {
+                let on_action = Rc::clone(&on_action);
+                let action = action.clone();
+                menu.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(*checked)
+                        .on_click(move |_, window, cx| on_action(action.clone(), window, cx)),
+                )
+            })
+        })
+        .into_any_element()
+}
+
+struct SliderSpec {
+    value: u32,
+    min: u32,
+    max: u32,
+    step: u32,
+    unit: SliderUnit,
+    locked: bool,
+}
+
+/// A slider's state, kept by `skerry-ui` across renders so callers pass only
+/// values. `synced` is the last value the caller passed: a new one (the
+/// server's answer, a reset) moves the thumb; otherwise a drag is left alone.
+struct LiveSlider {
+    state: Entity<SliderState>,
+    synced: u32,
+}
+
+/// A slider with its live value in the label ("Frames per second (60 FPS)").
+/// The setting is requested once, when the thumb is released.
+fn slider_field(
+    id: &str,
+    label: &str,
+    spec: SliderSpec,
+    on_action: &ControlsHandler,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let SliderSpec {
+        value,
+        min,
+        max,
+        step,
+        unit,
+        locked,
+    } = spec;
+    let key = SharedString::from(format!("controls-slider-{id}-{min}-{max}-{step}"));
+    let live = window.use_keyed_state(key, cx, |window, cx| {
+        let state = cx.new(|_| {
+            SliderState::new()
+                .min(min as f32)
+                .max(max as f32)
+                .step(step as f32)
+                .default_value(value as f32)
+        });
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
+        let on_action = Rc::clone(on_action);
+        let id = id.to_string();
+        cx.subscribe_in(
+            &state,
+            window,
+            move |live: &mut LiveSlider, _, event: &SliderEvent, window, cx| {
+                if let SliderEvent::Release(released) = event {
+                    let released = released.end().round() as u32;
+                    if released != live.synced {
+                        on_action(
+                            ControlsAction::SetVideoSetting {
+                                id: id.clone(),
+                                value: released,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            },
+        )
+        .detach();
+        LiveSlider {
+            state,
+            synced: value,
+        }
+    });
+    if live.read(cx).synced != value {
+        live.update(cx, |live, cx| {
+            live.synced = value;
+            live.state
+                .update(cx, |state, cx| state.set_value(value as f32, window, cx));
+        });
+    }
+    let state = live.read(cx).state.clone();
+    let shown = state.read(cx).value().end().round() as u32;
+    field(
+        format!("{label} ({})", unit.format(shown)),
+        Slider::new(&state).disabled(locked),
+    )
+    .into_any_element()
+}
+
+fn input_field(label: &'static str, input: &Entity<InputState>) -> Div {
     div()
         .flex_1()
         .min_w_0()
-        .v_flex()
-        .gap_1()
-        .child(Label::new(label))
-        .child(Input::new(field).small())
+        .child(field(label, Input::new(input).h(px(CONTROL_H))))
 }
 
 fn section(
@@ -823,39 +903,46 @@ fn section(
     body: impl FnOnce() -> Div,
     toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    // Card metrics follow the web sidebar: 1px border, 12px radius,
+    // 11px/14px header padding, 4px/14px/14px content padding.
     div()
-        .border_t_1()
+        .border_1()
         .border_color(theme.border)
+        .rounded(px(12.))
+        .overflow_hidden()
+        .bg(theme.secondary)
         .child(
             div()
                 .id(title)
-                .px_4()
-                .py_3()
-                .bg(theme.secondary)
+                .px(px(14.))
+                .py(px(11.))
                 .cursor_pointer()
                 .h_flex()
                 .items_center()
                 .justify_between()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(title)
-                .child(if open {
-                    IconName::ChevronDown
+                .font_weight(FontWeight::BOLD)
+                .child(title.to_uppercase())
+                .child(div().text_color(theme.muted_foreground).child(if open {
+                    IconName::ChevronUp
                 } else {
-                    IconName::ChevronRight
-                })
+                    IconName::ChevronDown
+                }))
                 .on_click(toggle),
         )
         .child(
             Collapsible::new()
                 .open(open)
                 .motion_id(SharedString::from(format!("section-{title}")))
-                .content(div().p_4().child(body())),
+                .content(div().pt_1().px(px(14.)).pb(px(14.)).child(body())),
         )
 }
 
+/// A label with its switch at the row's end, as the web sidebar's
+/// `.toggle-item`; a server-locked setting shows a disabled switch.
 fn switch_row(
     label: impl Into<String>,
     enabled: bool,
+    locked: bool,
     action: ControlsAction,
     on_action: &ControlsHandler,
 ) -> AnyElement {
@@ -865,11 +952,17 @@ fn switch_row(
         .h_flex()
         .items_center()
         .justify_between()
-        .gap_2()
-        .child(Label::new(label.clone()))
+        .gap(px(10.))
+        .child(
+            div()
+                .min_w_0()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(label.clone()),
+        )
         .child(
             Switch::new(SharedString::from(label))
                 .checked(enabled)
+                .disabled(locked)
                 .on_click(move |_, window, cx| on_action(action.clone(), window, cx)),
         )
         .into_any_element()
