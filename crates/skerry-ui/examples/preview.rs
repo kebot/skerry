@@ -13,15 +13,15 @@ use skerry_ui::{
     connect::{self, ConnectProps},
     controls::{
         self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps,
-        ControlsUiState, ScreenProps, Section, SwitchItem, VideoProps, VideoSettingControl,
-        VideoSettingRow,
+        ControlsUiState, ScreenProps, Section, SliderUnit, SwitchItem, VideoProps,
+        VideoSettingControl, VideoSettingRow,
     },
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
         LaunchOptions, LaunchSelect,
     },
     library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
-    session,
+    session, stats,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -260,11 +260,10 @@ impl PreviewApp {
                 clipboard_open: false,
                 screen_open: true,
                 video_open: true,
-                stats_open: false,
-                picker: None,
+                stats_open: true,
                 size_error: false,
             },
-            controls_props: Self::fixture_controls(Story::ControlsHardware),
+            controls_props: Self::fixture_controls(story),
             width,
             height,
         }
@@ -298,8 +297,7 @@ impl PreviewApp {
                 clipboard_open: false,
                 screen_open: true,
                 video_open: true,
-                stats_open: matches!(story, Story::ControlsServerLocked),
-                picker: None,
+                stats_open: true,
                 size_error: false,
             };
             self.width.update(cx, |s, cx| s.set_value("", window, cx));
@@ -536,10 +534,6 @@ impl PreviewApp {
                 Section::Video => self.controls_ui.video_open = !self.controls_ui.video_open,
                 Section::Stats => self.controls_ui.stats_open = !self.controls_ui.stats_open,
             },
-            ControlsAction::TogglePicker(picker) => {
-                self.controls_ui.picker =
-                    (self.controls_ui.picker != Some(picker)).then_some(picker);
-            }
             ControlsAction::SetAudio(enabled) => self.controls_props.audio = Some(enabled),
             ControlsAction::SetPlayback(enabled) => self.controls_props.video = Some(enabled),
             ControlsAction::ToggleFullScreen => {
@@ -584,19 +578,16 @@ impl PreviewApp {
                 }
             }
             ControlsAction::SetUiScaling(dpi) => {
-                self.controls_ui.picker = None;
                 self.controls_props.screen.dpi_override = dpi;
                 if let Some(dpi) = dpi {
                     self.controls_props.screen.dpi = Some(dpi);
                 }
             }
             ControlsAction::SetFitMode => {
-                self.controls_ui.picker = None;
                 self.controls_ui.size_error = false;
                 self.controls_props.screen.preset_label = "Keep Remote Size".into();
             }
             ControlsAction::SelectPreset(w, h) => {
-                self.controls_ui.picker = None;
                 self.controls_ui.size_error = false;
                 self.width
                     .update(cx, |s, cx| s.set_value(w.to_string(), window, cx));
@@ -611,7 +602,6 @@ impl PreviewApp {
                 if let (Some(w), Some(h)) = (w, h) {
                     if (2..=4096).contains(&w) && (2..=2160).contains(&h) {
                         self.controls_ui.size_error = false;
-                        self.controls_ui.picker = None;
                         self.controls_props.screen.preset_label = format!("{w} × {h}");
                         self.controls_props.screen.matching_retina = false;
                     } else {
@@ -622,7 +612,6 @@ impl PreviewApp {
                 }
             }
             ControlsAction::ResetToWindow => {
-                self.controls_ui.picker = None;
                 self.controls_ui.size_error = false;
                 self.width.update(cx, |s, cx| s.set_value("", window, cx));
                 self.height.update(cx, |s, cx| s.set_value("", window, cx));
@@ -644,24 +633,15 @@ impl PreviewApp {
                 if let Some(video) = self.controls_props.video_settings.as_mut() {
                     if let Some(row) = video.rows.iter_mut().find(|r| r.id == id) {
                         match &mut row.control {
-                            VideoSettingControl::Toggle { enabled, .. } => *enabled = value != 0,
-                            VideoSettingControl::Segmented { options } => {
-                                for (mode, _, selected) in options {
-                                    *selected = *mode == value;
-                                }
-                            }
-                            VideoSettingControl::Stepper {
-                                display,
-                                decrement,
-                                increment,
-                            } => {
-                                *display = format!("{value}");
-                                *decrement = value.checked_sub(5);
-                                *increment = Some(value + 5);
-                            }
+                            VideoSettingControl::Switch { enabled, .. } => *enabled = value != 0,
+                            VideoSettingControl::Select { value: v, .. }
+                            | VideoSettingControl::Slider { value: v, .. } => *v = value,
                         }
                     }
                 }
+            }
+            ControlsAction::CopyStats => {
+                self.controls_props.stats_copied = !self.controls_props.stats_copied;
             }
             ControlsAction::Reconnect
             | ControlsAction::Disconnect
@@ -752,52 +732,52 @@ impl PreviewApp {
                     rows: vec![
                         VideoSettingRow {
                             id: "framerate".into(),
-                            label: "Frame rate cap".into(),
-                            control: VideoSettingControl::Stepper {
-                                display: "60 fps".into(),
-                                decrement: Some(55),
-                                increment: None,
+                            label: "Frames per second".into(),
+                            control: VideoSettingControl::Slider {
+                                value: 60,
+                                min: 15,
+                                max: 60,
+                                step: 1,
+                                unit: SliderUnit::Fps,
+                                locked: false,
                             },
                         },
                         VideoSettingRow {
                             id: "jpeg_quality".into(),
-                            label: "JPEG quality".into(),
-                            control: VideoSettingControl::Stepper {
-                                display: "60 %".into(),
-                                decrement: Some(55),
-                                increment: Some(65),
+                            label: "Base Quality".into(),
+                            control: VideoSettingControl::Slider {
+                                value: 60,
+                                min: 1,
+                                max: 100,
+                                step: 1,
+                                unit: SliderUnit::Plain,
+                                locked: false,
                             },
                         },
                         VideoSettingRow {
                             id: "paint_over".into(),
-                            label: "Improve still areas".into(),
-                            control: VideoSettingControl::Toggle {
+                            label: "Use Paint-Overs".into(),
+                            control: VideoSettingControl::Switch {
                                 enabled: true,
-                                can_toggle: true,
+                                locked: false,
                             },
                         },
                         VideoSettingRow {
                             id: "paint_quality".into(),
-                            label: "Still image quality".into(),
-                            control: VideoSettingControl::Stepper {
-                                display: "90 %".into(),
-                                decrement: Some(85),
-                                increment: Some(95),
+                            label: "Paintover Quality".into(),
+                            control: VideoSettingControl::Slider {
+                                value: 90,
+                                min: 1,
+                                max: 100,
+                                step: 1,
+                                unit: SliderUnit::Plain,
+                                locked: false,
                             },
                         },
                     ],
                 }),
-                diagnostics: Some(vec![
-                    ("Resolution".into(), "1966×2160".into()),
-                    ("Client FPS".into(), "58".into()),
-                    ("Received bitrate".into(), "14.20 Mb/s".into()),
-                    ("Decode time".into(), "4.3 ms per packet".into()),
-                    ("Rejected packets".into(), "0".into()),
-                    ("Round trip".into(), "12 ms".into()),
-                    ("Transport".into(), "WebSocket".into()),
-                    ("Client decoder".into(), "JPEG (Software)".into()),
-                    ("Server encoder".into(), "jpeg".into()),
-                ]),
+                stats: Some(Self::fixture_stats(false)),
+                stats_copied: false,
             },
             Story::ControlsServerLocked => ControlsProps {
                 app_name: "Locked Enterprise Desktop".into(),
@@ -824,7 +804,8 @@ impl PreviewApp {
                     scale_locally: true,
                 },
                 video_settings: None,
-                diagnostics: None,
+                stats: None,
+                stats_copied: false,
             },
             _ => ControlsProps {
                 app_name: "Visual Studio Code".into(),
@@ -877,47 +858,265 @@ impl PreviewApp {
                     rows: vec![
                         VideoSettingRow {
                             id: "framerate".into(),
-                            label: "Frame rate cap".into(),
-                            control: VideoSettingControl::Stepper {
-                                display: "60 fps".into(),
-                                decrement: Some(55),
-                                increment: None,
+                            label: "Frames per second".into(),
+                            control: VideoSettingControl::Slider {
+                                value: 60,
+                                min: 15,
+                                max: 60,
+                                step: 1,
+                                unit: SliderUnit::Fps,
+                                locked: false,
                             },
                         },
                         VideoSettingRow {
                             id: "rate_control".into(),
-                            label: "Rate control".into(),
-                            control: VideoSettingControl::Segmented {
-                                options: vec![(0, "CBR".into(), true), (1, "CRF".into(), false)],
+                            label: "Encoder Rate Control Mode".into(),
+                            control: VideoSettingControl::Select {
+                                value: 0,
+                                options: vec![
+                                    (0, "CBR (Constant Bitrate)".into()),
+                                    (1, "CRF (Constant Quality)".into()),
+                                ],
+                                locked: false,
                             },
                         },
                         VideoSettingRow {
                             id: "bitrate".into(),
-                            label: "Target bitrate".into(),
-                            control: VideoSettingControl::Stepper {
-                                display: "8000 kbps".into(),
-                                decrement: Some(7500),
-                                increment: Some(8500),
+                            label: "Video Bitrate".into(),
+                            control: VideoSettingControl::Slider {
+                                value: 8000,
+                                min: 1000,
+                                max: 100000,
+                                step: 500,
+                                unit: SliderUnit::Kbps,
+                                locked: false,
                             },
                         },
                     ],
                 }),
-                diagnostics: Some(vec![
-                    ("Resolution".into(), "1966×2160".into()),
-                    ("Client FPS".into(), "60".into()),
-                    ("Received bitrate".into(), "6.45 Mb/s".into()),
-                    ("Decode time".into(), "0.8 ms per packet".into()),
-                    ("Rejected packets".into(), "0".into()),
-                    ("Round trip".into(), "9 ms".into()),
-                    ("Transport".into(), "WebSocket".into()),
-                    ("Client decoder".into(), "H.265 (VideoToolbox)".into()),
-                    ("Server encoder".into(), "x265_vaapi".into()),
-                ]),
+                stats: Some(Self::fixture_stats(true)),
+                stats_copied: false,
             },
         }
     }
 
-    fn render_story(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+    /// Stats as a session shows them a minute after the section opened:
+    /// `hardware` is an H.265 stream on a GPU host, else a JPEG stream whose
+    /// capture fell back to a readback and whose rate overshoots its target.
+    fn fixture_stats(hardware: bool) -> stats::StatsProps {
+        use stats::{Graph, Meter, Series, StatRow, StatsProps, Status, Tile};
+        let wave = |base: f32, swing: f32, seed: f32| -> Vec<f32> {
+            (0..60)
+                .map(|i| {
+                    let t = i as f32 + seed;
+                    (base + swing * (t * 0.37).sin() + swing * 0.5 * (t * 1.3).cos()).max(0.)
+                })
+                .collect()
+        };
+        let row = |label: &str, status, value: &str, detail: &str, reason: &str| StatRow {
+            label: label.into(),
+            status,
+            value: value.into(),
+            detail: detail.into(),
+            reason: reason.into(),
+        };
+        let tile = |label: &str, value: &str, detail: &str, warn| Tile {
+            label: label.into(),
+            value: value.into(),
+            detail: detail.into(),
+            warn,
+        };
+        let fps = wave(if hardware { 58. } else { 27. }, 2., 0.);
+        let encoded = wave(if hardware { 59. } else { 29. }, 1., 3.);
+        if hardware {
+            StatsProps {
+                rows: vec![
+                    row(
+                        "Encoder",
+                        Status::Good,
+                        "nvh265enc · H.265 4:2:0",
+                        "NVIDIA RTX A2000 · renderD128 · nvidia",
+                        "",
+                    ),
+                    row(
+                        "Capture",
+                        Status::Good,
+                        "Wayland · Zero-copy",
+                        "GL on renderD128 · NVIDIA RTX A2000",
+                        "",
+                    ),
+                    row(
+                        "Decoder",
+                        Status::Good,
+                        "Hardware",
+                        "VideoToolbox · H.265 · 1966×2160",
+                        "",
+                    ),
+                    row("Connection", Status::Neutral, "WebSockets", "", ""),
+                ],
+                graphs: vec![
+                    Graph {
+                        label: "FPS".into(),
+                        unit: "fps".into(),
+                        max: 66.,
+                        series: vec![
+                            Series {
+                                name: "Client".into(),
+                                values: fps,
+                            },
+                            Series {
+                                name: "Server".into(),
+                                values: encoded,
+                            },
+                        ],
+                    },
+                    Graph {
+                        label: "Bandwidth".into(),
+                        unit: "Mbps".into(),
+                        max: 10.,
+                        series: vec![Series {
+                            name: String::new(),
+                            values: wave(6.4, 1.8, 1.),
+                        }],
+                    },
+                    Graph {
+                        label: "Latency".into(),
+                        unit: "ms".into(),
+                        max: 20.,
+                        series: vec![Series {
+                            name: String::new(),
+                            values: wave(9., 2., 5.),
+                        }],
+                    },
+                ],
+                tiles: vec![
+                    tile("Encode", "2.1 ms", "", false),
+                    tile("Capture to encoded", "4.6 ms", "3.9–6.2", false),
+                    tile("Capture to sent", "5.3 ms", "4.4–7.8", false),
+                    tile("Decode", "0.8 ms", "", false),
+                    tile("Video rate", "6.45 / 8 Mbps", "", false),
+                    tile("Peak, 250 ms", "11.2 Mbps", "", false),
+                    tile("Received", "48.37 MB", "", false),
+                    tile("Lost frames", "0", "", false),
+                    tile("Key frame requests", "0", "", false),
+                ],
+                meters: vec![
+                    Meter {
+                        label: "CPU".into(),
+                        percent: 23.,
+                        text: "23%".into(),
+                        bar: true,
+                    },
+                    Meter {
+                        label: "GPU".into(),
+                        percent: 41.,
+                        text: "41%".into(),
+                        bar: true,
+                    },
+                    Meter {
+                        label: "MEM".into(),
+                        percent: 37.,
+                        text: "5.9 GiB / 15.6 GiB · 38%".into(),
+                        bar: false,
+                    },
+                    Meter {
+                        label: "VRAM".into(),
+                        percent: 19.,
+                        text: "1.1 GiB / 6.0 GiB · 19%".into(),
+                        bar: false,
+                    },
+                ],
+            }
+        } else {
+            StatsProps {
+                rows: vec![
+                    row(
+                        "Encoder",
+                        Status::Neutral,
+                        "jpeg · JPEG · Striped",
+                        "No GPU exposed to the server",
+                        "",
+                    ),
+                    row("Capture", Status::Neutral, "X11 · Readback (xshm)", "", ""),
+                    row(
+                        "Decoder",
+                        Status::Neutral,
+                        "Software",
+                        "JPEG · 1966×2160",
+                        "",
+                    ),
+                    row(
+                        "Connection",
+                        Status::Warn,
+                        "WebSockets",
+                        "",
+                        "The server is holding frames back because this client is falling behind",
+                    ),
+                ],
+                graphs: vec![
+                    Graph {
+                        label: "FPS".into(),
+                        unit: "fps".into(),
+                        max: 33.,
+                        series: vec![Series {
+                            name: String::new(),
+                            values: fps,
+                        }],
+                    },
+                    Graph {
+                        label: "Bandwidth".into(),
+                        unit: "Mbps".into(),
+                        max: 21.,
+                        series: vec![Series {
+                            name: String::new(),
+                            values: wave(14., 4., 2.),
+                        }],
+                    },
+                    Graph {
+                        label: "Latency".into(),
+                        unit: "ms".into(),
+                        max: 48.,
+                        series: vec![Series {
+                            name: String::new(),
+                            values: wave(31., 9., 4.),
+                        }],
+                    },
+                ],
+                tiles: vec![
+                    tile("Encode", "idle", "", false),
+                    tile("Capture to encoded", "11.8 ms", "9.1–17.4", false),
+                    tile("Capture to sent", "14.2 ms", "10.3–21", false),
+                    tile("Decode", "4.3 ms", "", false),
+                    tile("Video rate", "14.2 / 12 Mbps", "", true),
+                    tile("Peak, 250 ms", "22.6 Mbps", "", false),
+                    tile("Received", "106.4 MB", "", false),
+                    tile("Lost frames", "3", "", false),
+                    tile("Key frame requests", "–", "", false),
+                ],
+                meters: vec![
+                    Meter {
+                        label: "CPU".into(),
+                        percent: 78.,
+                        text: "78%".into(),
+                        bar: true,
+                    },
+                    Meter {
+                        label: "MEM".into(),
+                        percent: 52.,
+                        text: "8.1 GiB / 15.6 GiB · 52%".into(),
+                        bar: false,
+                    },
+                ],
+            }
+        }
+    }
+
+    fn render_story(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Div {
         let entity = cx.entity().clone();
         match self.story {
             Story::ConnectDefault => {
@@ -1104,12 +1303,13 @@ impl PreviewApp {
                             .text_color(theme.foreground)
                             .text_sm()
                             .child(controls::render(
-                                theme,
                                 &self.controls_props,
                                 &self.controls_ui,
                                 &self.width,
                                 &self.height,
                                 handler,
+                                window,
+                                cx,
                             )),
                     )
             }
@@ -1195,7 +1395,7 @@ impl PreviewApp {
 }
 
 impl Render for PreviewApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let active_story = self.story;
         let appearance = self.appearance;
@@ -1326,7 +1526,7 @@ impl Render for PreviewApp {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_story(&theme, cx)),
+                    .child(self.render_story(&theme, window, cx)),
             );
 
         div()

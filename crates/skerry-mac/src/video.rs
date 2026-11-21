@@ -56,15 +56,6 @@ impl Codec {
         }
     }
 
-    pub fn decoder_label(self) -> &'static str {
-        match self {
-            Self::Jpeg => "JPEG",
-            Self::H264 => "H.264 · VideoToolbox",
-            Self::Hevc => "H.265 · VideoToolbox",
-            Self::Av1 => "AV1 · VideoToolbox",
-        }
-    }
-
     pub fn supported(self) -> bool {
         let code = match self {
             Self::Jpeg => return true,

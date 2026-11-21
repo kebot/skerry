@@ -208,6 +208,10 @@ impl NativeSession {
         });
     }
 
+    pub fn set_stats(&self, open: bool) {
+        let _ = self.input.send(Input::Stats(open));
+    }
+
     pub fn release_focus(&self, window: &mut Window, cx: &mut App) {
         self.view.update(cx, |desktop, _| {
             desktop.release_input();

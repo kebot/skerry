@@ -7,7 +7,10 @@ use crate::launch_options::{self, LaunchContext, LaunchSelection};
 use crate::settings::{
     self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
 };
-use crate::transport::{DisplayRequest, Resolution, SessionEvent, SessionOptions, StreamSample};
+use crate::stats;
+use crate::transport::{
+    DisplayRequest, Resolution, SessionEvent, SessionOptions, StreamInfo, StreamSample,
+};
 use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
@@ -34,7 +37,7 @@ use skerry_ui::{
     session,
 };
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -164,6 +167,12 @@ struct Launcher {
     settings: Option<Settings>,
     controls: Option<AnyWindowHandle>,
     stats: Option<StreamSample>,
+    /// Whether the Stats section is open in Session Controls, which is what
+    /// subscribes the session to the server's `stream_stats` (`ARCH-019`).
+    stats_open: bool,
+    /// Every second since the Stats section opened, up to `stats::HISTORY_MAX`.
+    stats_history: VecDeque<StreamSample>,
+    stream_info: Option<StreamInfo>,
     display_mode: DisplayMode,
     retina: bool,
     scale_locally: bool,
@@ -237,6 +246,9 @@ impl Launcher {
             settings: None,
             controls: None,
             stats: None,
+            stats_open: false,
+            stats_history: VecDeque::new(),
+            stream_info: None,
             display_mode: DisplayMode::default(),
             retina: true,
             scale_locally: true,
@@ -830,6 +842,7 @@ impl Launcher {
                     dark: dark_appearance(window),
                     muted: self.muted,
                     codec: self.preferences.codec,
+                    stats: self.stats_open,
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -865,7 +878,18 @@ impl Launcher {
                                         SessionEvent::Settings(settings) => {
                                             this.settings = Some(settings)
                                         }
-                                        SessionEvent::Stats(sample) => this.stats = Some(sample),
+                                        SessionEvent::Stats(sample) => {
+                                            if this.stats_open {
+                                                if this.stats_history.len() == stats::HISTORY_MAX {
+                                                    this.stats_history.pop_front();
+                                                }
+                                                this.stats_history.push_back(sample.clone());
+                                            }
+                                            this.stats = Some(sample);
+                                        }
+                                        SessionEvent::StreamInfo(info) => {
+                                            this.stream_info = Some(*info)
+                                        }
                                         SessionEvent::FingerScroll(enabled) => {
                                             if let Some((_, stream)) = &this.current {
                                                 stream.allow_finger_scroll(enabled, cx);
@@ -1119,7 +1143,21 @@ impl Launcher {
         }
     }
 
+    /// The Stats section opened or shut: a fresh history, and the session
+    /// subscribes to the server's figures only while it is open.
+    pub(super) fn set_stats_open(&mut self, open: bool) {
+        if open == self.stats_open {
+            return;
+        }
+        self.stats_open = open;
+        self.stats_history.clear();
+        if let Some((_, stream)) = &self.current {
+            stream.set_stats(open);
+        }
+    }
+
     fn remove_controls(&mut self, cx: &mut App) -> bool {
+        self.set_stats_open(false);
         self.controls.take().is_some_and(|panel| {
             let _ = panel.update(cx, |_, panel, _| panel.remove_window());
             true
@@ -1150,6 +1188,8 @@ impl Launcher {
         self.applied_resolution = None;
         self.applied_dpi = None;
         self.stats = None;
+        self.stats_history.clear();
+        self.stream_info = None;
         self.resize_allowed = false;
         self.resize_task = None;
         if close_controls {

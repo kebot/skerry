@@ -4,6 +4,7 @@ use super::{
 };
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
+use crate::stats;
 use crate::video::Codec;
 use crate::{
     settings::{Key, ScreenChange},
@@ -15,13 +16,13 @@ use gpui_kit::component::{
     ActiveTheme as _,
 };
 use gpui_kit::{
-    div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle,
-    TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
+    div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context, Entity,
+    FocusHandle, Task, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
     self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
-    ScreenProps, Section, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    ScreenProps, Section, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
 
@@ -38,6 +39,8 @@ pub(super) struct ControlPanel {
     ui: ControlsUiState,
     width: Entity<InputState>,
     height: Entity<InputState>,
+    /// Shows the Stats copy button's check, and clears it after a moment.
+    copied: Option<Task<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +63,7 @@ enum Command {
     Input(InputFeature, bool),
     Chord(RemoteChord),
     Clipboard(ClipboardAction),
+    Stats(bool),
 }
 
 impl ControlPanel {
@@ -178,6 +182,7 @@ impl ControlPanel {
                         ui: ControlsUiState::default(),
                         width,
                         height,
+                        copied: None,
                     }
                 });
                 window.on_window_should_close(cx, move |_, cx| {
@@ -273,6 +278,7 @@ impl ControlPanel {
                             launcher.change_input(feature, enabled, window, cx)
                         }
                         Command::Clipboard(action) => launcher.change_clipboard(action, window, cx),
+                        Command::Stats(open) => launcher.set_stats_open(open),
                         Command::Chord(chord) => {
                             launcher.close_controls(window, cx);
                             if let Some((_, stream)) = &launcher.current {
@@ -292,7 +298,6 @@ impl ControlPanel {
         let resolution = Resolution::manual(&width_val, &height_val);
         self.ui.size_error = resolution.is_none();
         if let Some(size) = resolution {
-            self.ui.picker = None;
             self.width
                 .update(cx, |s, cx| s.set_value(size.0.to_string(), window, cx));
             self.height
@@ -319,12 +324,11 @@ impl ControlPanel {
                     Section::Clipboard => self.ui.clipboard_open = !self.ui.clipboard_open,
                     Section::Screen => self.ui.screen_open = !self.ui.screen_open,
                     Section::Video => self.ui.video_open = !self.ui.video_open,
-                    Section::Stats => self.ui.stats_open = !self.ui.stats_open,
+                    Section::Stats => {
+                        self.ui.stats_open = !self.ui.stats_open;
+                        Self::send(self.owner.clone(), Command::Stats(self.ui.stats_open), cx);
+                    }
                 }
-                cx.notify();
-            }
-            ControlsAction::TogglePicker(picker) => {
-                self.ui.picker = (self.ui.picker != Some(picker)).then_some(picker);
                 cx.notify();
             }
             ControlsAction::SetAudio(enabled) => {
@@ -390,18 +394,15 @@ impl ControlPanel {
                 cx,
             ),
             ControlsAction::SetUiScaling(dpi) => {
-                self.ui.picker = None;
                 Self::send(self.owner.clone(), Command::UiScaling(dpi), cx);
                 cx.notify();
             }
             ControlsAction::SetFitMode => {
-                self.ui.picker = None;
                 self.ui.size_error = false;
                 Self::send(self.owner.clone(), Command::Display(DisplayMode::Fit), cx);
                 cx.notify();
             }
             ControlsAction::SelectPreset(w, h) => {
-                self.ui.picker = None;
                 self.width
                     .update(cx, |s, cx| s.set_value(w.to_string(), window, cx));
                 self.height
@@ -410,7 +411,6 @@ impl ControlPanel {
             }
             ControlsAction::ApplyManualSize => self.apply_size(window, cx),
             ControlsAction::ResetToWindow => {
-                self.ui.picker = None;
                 self.width.update(cx, |s, cx| s.set_value("", window, cx));
                 self.height.update(cx, |s, cx| s.set_value("", window, cx));
                 self.ui.size_error = false;
@@ -436,6 +436,22 @@ impl ControlPanel {
                 }
             }
             ControlsAction::ResetVideo => Self::send(self.owner.clone(), Command::ResetVideo, cx),
+            ControlsAction::CopyStats => {
+                let launcher = self.owner.launcher.read(cx);
+                let history: Vec<_> = launcher.stats_history.iter().cloned().collect();
+                let text = stats::report(launcher.stream_info.as_ref(), &history);
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.copied = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1500))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.copied = None;
+                        cx.notify();
+                    });
+                }));
+                cx.notify();
+            }
         }
     }
 
@@ -490,41 +506,14 @@ impl ControlPanel {
 
         let video_settings = build_video_props(launcher);
 
-        let diagnostics = launcher.stats.as_ref().map(|stats| {
-            vec![
-                (
-                    "Resolution".into(),
-                    format!("{}×{}", stats.width, stats.height),
-                ),
-                ("Client FPS".into(), format!("{:.0}", stats.fps)),
-                (
-                    "Received bitrate".into(),
-                    format!("{:.2} Mb/s", stats.wire_mbps),
-                ),
-                (
-                    "Decode time".into(),
-                    format!("{:.1} ms per packet", stats.decode_ms),
-                ),
-                ("Rejected packets".into(), stats.dropped.to_string()),
-                (
-                    "Round trip".into(),
-                    stats
-                        .rtt_ms
-                        .map_or("Unavailable".into(), |ms| format!("{ms:.0} ms")),
-                ),
-                ("Transport".into(), "WebSocket".into()),
-                (
-                    "Client decoder".into(),
-                    stats
-                        .client_codec
-                        .map_or("Waiting for video", Codec::decoder_label)
-                        .into(),
-                ),
-                (
-                    "Server encoder".into(),
-                    stats.server_encoder.clone().unwrap_or("Unreported".into()),
-                ),
-            ]
+        let stats = (!launcher.stats_history.is_empty()).then(|| {
+            let history: Vec<_> = launcher.stats_history.iter().cloned().collect();
+            let framerate = launcher
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.get(Key::Fps))
+                .map_or(0, |fps| fps.current);
+            stats::props(launcher.stream_info.as_ref(), &history, framerate)
         });
 
         ControlsProps {
@@ -538,7 +527,8 @@ impl ControlPanel {
             clipboard,
             screen,
             video_settings,
-            diagnostics,
+            stats,
+            stats_copied: self.copied.is_some(),
         }
     }
 }
@@ -591,13 +581,18 @@ fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
         .then(|| format!("Preferred codec · {}", launcher.preferences.codec.label()));
 
     let rows = [
-        (Key::Fps, "Frame rate cap", "fps", 5),
-        (Key::Jpeg, "JPEG quality", "%", 5),
-        (Key::PaintOver, "Improve still areas", "", 1),
-        (Key::PaintQuality, "Still image quality", "%", 5),
-        (Key::RateControl, "Rate control", "", 1),
-        (Key::Bitrate, "Target bitrate", "kbps", 500),
-        (Key::Crf, "Constant quality (CRF)", "", 1),
+        (Key::Fps, "Frames per second", SliderUnit::Fps, 1),
+        (Key::Jpeg, "Base Quality", SliderUnit::Plain, 1),
+        (Key::PaintOver, "Use Paint-Overs", SliderUnit::Plain, 1),
+        (Key::PaintQuality, "Paintover Quality", SliderUnit::Plain, 1),
+        (
+            Key::RateControl,
+            "Encoder Rate Control Mode",
+            SliderUnit::Plain,
+            1,
+        ),
+        (Key::Bitrate, "Video Bitrate", SliderUnit::Kbps, 500),
+        (Key::Crf, "Video CRF", SliderUnit::Plain, 1),
     ]
     .into_iter()
     .filter_map(|(key, label, unit, step)| {
@@ -619,24 +614,29 @@ fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
             .unwrap_or(control_spec.current);
 
         let control = if key == Key::PaintOver {
-            VideoSettingControl::Toggle {
+            VideoSettingControl::Switch {
                 enabled: value != 0,
-                can_toggle: settings.request(key, 1 - value).is_some(),
+                locked: settings.request(key, 1 - value).is_none(),
             }
         } else if key == Key::RateControl {
-            let options = [(0, "CBR"), (1, "CRF")]
+            let options: Vec<_> = [(0, "CBR (Constant Bitrate)"), (1, "CRF (Constant Quality)")]
                 .into_iter()
                 .filter(|&(mode, _)| value == mode || settings.request(key, mode).is_some())
-                .map(|(mode, label)| (mode, label.to_string(), value == mode))
+                .map(|(mode, label)| (mode, label.to_string()))
                 .collect();
-            VideoSettingControl::Segmented { options }
+            VideoSettingControl::Select {
+                value,
+                locked: options.len() <= 1,
+                options,
+            }
         } else {
-            let dec = value.saturating_sub(step).max(control_spec.min);
-            let inc = value.saturating_add(step).min(control_spec.max);
-            VideoSettingControl::Stepper {
-                display: format!("{value} {unit}").trim_end().to_owned(),
-                decrement: (dec != value && settings.request(key, dec).is_some()).then_some(dec),
-                increment: (inc != value && settings.request(key, inc).is_some()).then_some(inc),
+            VideoSettingControl::Slider {
+                value,
+                min: control_spec.min,
+                max: control_spec.max,
+                step,
+                unit,
+                locked: settings.request(key, value).is_none(),
             }
         };
 
@@ -656,7 +656,7 @@ fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
 }
 
 impl Render for ControlPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let owner = self.owner.clone();
         let close_owner = owner.clone();
@@ -694,12 +694,13 @@ impl Render for ControlPanel {
         );
 
         root.child(controls::render(
-            &theme,
             &props,
             &self.ui,
             &self.width,
             &self.height,
             handler,
+            window,
+            cx,
         ))
     }
 }

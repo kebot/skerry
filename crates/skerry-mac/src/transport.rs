@@ -11,7 +11,10 @@ use serde_json::{json, Value};
 use smallvec::smallvec;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeSet, io::Cursor};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Cursor,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, protocol::WebSocketConfig, Message,
@@ -140,8 +143,74 @@ pub struct StreamSample {
     pub decode_ms: f64,
     pub dropped: u64,
     pub client_codec: Option<Codec>,
-    pub server_encoder: Option<String>,
     pub rtt_ms: Option<f64>,
+    /// The server's `stream_stats` figures, when fresh (`ARCH-019`).
+    pub server: Option<ServerFigures>,
+    /// Stream bytes received since the stats opened.
+    pub received_bytes: u64,
+    /// Key frames requested since the stats opened.
+    pub keyframe_requests: u64,
+}
+
+/// Server figures older than this are left out of a sample (the web's `SERVER_FRESH_MS`).
+const SERVER_FRESH: Duration = Duration::from_secs(3);
+
+/// One `stream_stats` message: its numeric figures by key, and whether the
+/// server is holding frames back.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServerFigures {
+    pub numbers: BTreeMap<String, f64>,
+    pub throttled: bool,
+}
+
+impl ServerFigures {
+    pub fn parse(stats: &Value) -> Self {
+        let numbers = stats
+            .as_object()
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| Some((key.clone(), value.as_f64()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            numbers,
+            throttled: stats["throttled"].as_bool().unwrap_or(false),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<f64> {
+        self.numbers.get(key).copied()
+    }
+}
+
+/// The server's description of the stream (`stream_info`), as Selkies'
+/// `ScreenCapture::stream_info` sends it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct StreamInfo {
+    pub backend: String,
+    pub capture: String,
+    pub zero_copy: bool,
+    pub zero_copy_available: bool,
+    pub capture_reason: String,
+    pub encoder: String,
+    pub hardware: bool,
+    pub gpu_present: Option<bool>,
+    pub hardware_expected: bool,
+    pub encoder_reason: String,
+    pub codec: String,
+    pub fullcolor: bool,
+    pub bit_depth: Option<u8>,
+    pub striped: bool,
+    pub gpu: String,
+    pub driver: String,
+    pub encode_node: String,
+    pub renderer: String,
+    pub render_node: String,
+    pub render_gpu: String,
+    pub renderer_reason: String,
 }
 
 #[derive(Default)]
@@ -152,11 +221,22 @@ struct Diagnostics {
     codec: Option<Codec>,
     dropped: u64,
     decode: Duration,
-    server_encoder: Option<String>,
     rtt_ms: Option<f64>,
+    stats_on: bool,
+    received_bytes: u64,
+    keyframe_requests: u64,
+    server: Option<(Instant, ServerFigures)>,
 }
 
 impl Diagnostics {
+    /// The stats opened or shut: counts start again from the opening.
+    fn set_stats(&mut self, on: bool) {
+        self.stats_on = on;
+        self.received_bytes = 0;
+        self.keyframe_requests = 0;
+        self.server = None;
+    }
+
     fn sample(&mut self, elapsed: Duration, width: u16, height: u16) -> StreamSample {
         let seconds = elapsed.as_secs_f64();
         StreamSample {
@@ -168,8 +248,14 @@ impl Diagnostics {
                 / std::mem::take(&mut self.packets).max(1) as f64,
             client_codec: self.codec,
             dropped: self.dropped,
-            server_encoder: self.server_encoder.clone(),
             rtt_ms: self.rtt_ms,
+            server: self
+                .server
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() <= SERVER_FRESH)
+                .map(|(_, figures)| figures.clone()),
+            received_bytes: self.received_bytes,
+            keyframe_requests: self.keyframe_requests,
         }
     }
 }
@@ -254,6 +340,7 @@ pub enum SessionEvent {
     Video(bool),
     Settings(Settings),
     Stats(StreamSample),
+    StreamInfo(Box<StreamInfo>),
     ResizeAllowed(bool),
     ScreenPolicy(ScreenPolicy),
     Cursor(RemoteCursor),
@@ -313,6 +400,8 @@ pub enum Input {
     Appearance(bool),
     /// Write this into the session's clipboard (`ARCH-017`).
     Clipboard(clipboard::Content),
+    /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
+    Stats(bool),
 }
 
 pub struct SessionOptions {
@@ -321,6 +410,8 @@ pub struct SessionOptions {
     pub muted: bool,
     pub codec: Codec,
     pub display: Option<DisplayRequest>,
+    /// Whether the Stats section is open, so the session subscribes once ready.
+    pub stats: bool,
 }
 
 struct HardwareVideo {
@@ -451,6 +542,7 @@ pub async fn run(
     let mut audio = None;
     let mut ready = false;
     let mut diagnostics = Diagnostics::default();
+    diagnostics.set_stats(options.stats);
     let mut sample_start = Instant::now();
     let mut ping = None;
     let mut sample_tick = tokio::time::interval_at(
@@ -480,6 +572,7 @@ pub async fn run(
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
+                    diagnostics.received_bytes += data.len() as u64;
                     match data.first().copied() {
                     Some(3) if data.len() > 6 && hardware.as_ref().is_none_or(|video| !video.decoded) => {
                         frame.resize(jpeg_size.0, jpeg_size.1)?;
@@ -518,6 +611,7 @@ pub async fn run(
                             } else {
                                 diagnostics.dropped += 1;
                                 if video.recover(Instant::now()) {
+                                    diagnostics.keyframe_requests += 1;
                                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                                 }
                             }
@@ -558,7 +652,12 @@ pub async fn run(
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
                         match data["type"].as_str() {
                             Some("stream_info") => {
-                                diagnostics.server_encoder = data["info"]["encoder"].as_str().map(str::to_owned);
+                                if let Ok(info) = serde_json::from_value::<StreamInfo>(data["info"].clone()) {
+                                    let _ = events.send(SessionEvent::StreamInfo(Box::new(info)));
+                                }
+                            }
+                            Some("stream_stats") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
+                                diagnostics.server = Some((Instant::now(), ServerFigures::parse(&data["stats"])));
                             }
                             Some("stream_resolution") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
                                 let width = dimension(&data["width"])?;
@@ -604,6 +703,9 @@ pub async fn run(
                                 }
                                 if data["type"] == "server_settings" && !ready {
                                     ready = true;
+                                    if diagnostics.stats_on {
+                                        socket.send("_stats,1".into()).await.map_err(|_| disconnected)?;
+                                    }
                                     if let Some(legacy) = legacy_settings(&capabilities) {
                                         socket.send(legacy.into()).await.map_err(|_| disconnected)?;
                                     }
@@ -708,6 +810,12 @@ pub async fn run(
                             socket.send(frame.into()).await.map_err(|_| disconnected)?;
                         }
                         continue;
+                    }
+                    Some(Input::Stats(on)) => {
+                        if on == diagnostics.stats_on { continue; }
+                        diagnostics.set_stats(on);
+                        if !ready { continue; }
+                        format!("_stats,{}", u8::from(on))
                     }
                     None => { let _ = socket.close(None).await; return Ok(()); }
                 };
