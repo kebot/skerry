@@ -1,7 +1,7 @@
 mod controls;
 mod display;
 
-use crate::api::{Api, Credential, Library, RemoteApp, RemoteSession};
+use crate::api::{Api, Credential, LaunchParams, Library, RemoteApp, RemoteSession};
 use crate::input::InputFeature;
 use crate::settings::{
     self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
@@ -11,19 +11,31 @@ use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    scroll::ScrollableElement as _,
-    ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
+    input::{InputEvent, InputState},
+    select::SelectEvent,
+    ActiveTheme as _, Theme,
 };
 use gpui_kit::{
-    actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, Context, Div,
-    FontWeight, KeyBinding, Menu, MenuItem, Pixels, SharedString, Size, Task, TitlebarOptions,
-    Window, WindowAppearance, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context,
+    Entity, KeyBinding, Menu, MenuItem, Pixels, RenderImage, Size, Task, TitlebarOptions, Window,
+    WindowAppearance, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::time::Duration;
+use skerry_ui::{
+    connect::{self, ConnectProps},
+    launch_dialog::{
+        self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
+    },
+    library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
+    session,
+};
+use smallvec::smallvec;
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
@@ -163,12 +175,37 @@ struct Launcher {
     preferences: Preferences,
     pending_settings: VideoSettings,
     settings_task: Option<Task<()>>,
+    key_input: Entity<InputState>,
+    search_input: Entity<InputState>,
+    selected_filter: String,
+    app_icons: HashMap<String, Arc<RenderImage>>,
+    session_thumbnails: HashMap<String, Arc<RenderImage>>,
+    launch_dialog: Option<(RemoteApp, LaunchDialogProps, LaunchDialogSelects)>,
+    pending_stop: Option<RemoteSession>,
     busy: Option<String>,
     status: Option<String>,
 }
 
 impl Launcher {
     fn new(rt: Handle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let key_input = connect::new_key_input(window, cx);
+        cx.subscribe_in(
+            &key_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_key(window, cx);
+                }
+            },
+        )
+        .detach();
+        let search_input = library::new_search_input(window, cx);
+        cx.subscribe_in(&search_input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         let mut launcher = Self {
             rt,
             api: None,
@@ -195,6 +232,13 @@ impl Launcher {
             preferences: Preferences::default(),
             pending_settings: VideoSettings::new(),
             settings_task: None,
+            key_input,
+            search_input,
+            selected_filter: "All".into(),
+            app_icons: HashMap::new(),
+            session_thumbnails: HashMap::new(),
+            launch_dialog: None,
+            pending_stop: None,
             busy: None,
             status: None,
         };
@@ -222,14 +266,23 @@ impl Launcher {
         launcher
     }
 
-    fn paste(&mut self, cx: &mut Context<Self>) {
-        let result = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .ok_or_else(|| "Copy a SealSkin application key first.".to_string())
-            .and_then(|text| Credential::parse(&text));
+    fn submit_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let text = self.key_input.read(cx).value().to_string();
+        let trimmed = text.trim();
+        let result = if trimmed.is_empty() {
+            Err("Enter a SealSkin application key first.".to_string())
+        } else {
+            Credential::parse(trimmed)
+        };
         match result {
-            Ok(credential) => self.connect(credential, true, cx),
+            Ok(credential) => {
+                self.key_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.connect(credential, true, cx);
+            }
             Err(error) => self.status = Some(error),
         }
         cx.notify();
@@ -277,9 +330,12 @@ impl Launcher {
                 this.busy = None;
                 match result {
                     Ok(library) => {
-                        this.api = Some(api);
+                        let apps = library.apps.clone();
+                        let sessions = library.sessions.clone();
+                        this.api = Some(api.clone());
                         this.library = Some(library);
                         this.status = save.and_then(|credential| credential.save().err());
+                        this.fetch_library_media(api, apps, sessions, cx);
                     }
                     Err(error) => this.status = Some(error),
                 }
@@ -290,20 +346,224 @@ impl Launcher {
         cx.notify();
     }
 
+    fn fetch_library_media(
+        &self,
+        api: Api,
+        apps: Vec<RemoteApp>,
+        sessions: Vec<RemoteSession>,
+        cx: &mut Context<Self>,
+    ) {
+        let missing_apps: Vec<RemoteApp> = apps
+            .into_iter()
+            .filter(|app| !self.app_icons.contains_key(&app.id))
+            .collect();
+        for app in missing_apps {
+            let api = api.clone();
+            let app_id = app.id.clone();
+            let pending = self
+                .rt
+                .spawn(async move { api.app_icon(&app).await.and_then(|b| decode_image(&b)) });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Some(image)) = pending.await {
+                    let _ = this.update(cx, |this, cx| {
+                        this.app_icons.insert(app_id, image);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        for session in sessions {
+            let api = api.clone();
+            let session_id = session.session_id.clone();
+            let pending = self.rt.spawn(async move {
+                api.session_thumbnail(&session_id)
+                    .await
+                    .and_then(|b| decode_image(&b))
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Some(image)) = pending.await {
+                    let _ = this.update(cx, |this, cx| {
+                        this.session_thumbnails.insert(session.session_id, image);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+    }
+
     fn forget(&mut self, cx: &mut Context<Self>) {
         self.status = Credential::forget().err();
         self.api = None;
         self.library = None;
+        self.app_icons.clear();
+        self.session_thumbnails.clear();
+        self.launch_dialog = None;
+        self.pending_stop = None;
         cx.notify();
     }
 
-    fn launch(&mut self, app: RemoteApp, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_launch_dialog(&mut self, app: RemoteApp, window: &mut Window, cx: &mut Context<Self>) {
+        let storage_options = if app.home_directories {
+            vec![
+                LaunchOption {
+                    id: "auto".into(),
+                    label: "Auto (per-app persistence)".into(),
+                },
+                LaunchOption {
+                    id: "cleanroom".into(),
+                    label: "Cleanroom (temporary)".into(),
+                },
+            ]
+        } else {
+            vec![LaunchOption {
+                id: "cleanroom".into(),
+                label: "Cleanroom (temporary)".into(),
+            }]
+        };
+        let selected_storage = storage_options[0].id.clone();
+        let language_options = vec![
+            LaunchOption {
+                id: "".into(),
+                label: "Default (en_US)".into(),
+            },
+            LaunchOption {
+                id: "zh_CN.UTF-8".into(),
+                label: "简体中文 (zh_CN)".into(),
+            },
+            LaunchOption {
+                id: "ja_JP.UTF-8".into(),
+                label: "日本語 (ja_JP)".into(),
+            },
+            LaunchOption {
+                id: "de_DE.UTF-8".into(),
+                label: "Deutsch (de_DE)".into(),
+            },
+        ];
+        let props = LaunchDialogProps {
+            app_id: app.id.clone(),
+            app_name: app.name.clone(),
+            app_icon: self.app_icons.get(&app.id).cloned(),
+            favorite: false,
+            hidden: false,
+            storage_options,
+            selected_storage,
+            gpu_options: vec![],
+            selected_gpu: String::new(),
+            language_options,
+            selected_language: String::new(),
+            collaborative: false,
+            wayland: true,
+            busy: false,
+            show_copy_link: true,
+        };
+        let selects = LaunchDialogSelects::from_props(&props, window, cx);
+        if let Some(storage) = &selects.storage {
+            cx.subscribe_in(
+                storage,
+                window,
+                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if let Some((_, dialog, _)) = this.launch_dialog.as_mut() {
+                            dialog.selected_storage = value.clone();
+                        }
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+        }
+        if let Some(language) = &selects.language {
+            cx.subscribe_in(
+                language,
+                window,
+                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if let Some((_, dialog, _)) = this.launch_dialog.as_mut() {
+                            dialog.selected_language = value.clone();
+                        }
+                        cx.notify();
+                    }
+                },
+            )
+            .detach();
+        }
+        self.launch_dialog = Some((app, props, selects));
+        cx.notify();
+    }
+
+    fn handle_launch_dialog_action(
+        &mut self,
+        action: LaunchDialogAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            LaunchDialogAction::Close => {
+                self.launch_dialog = None;
+            }
+            LaunchDialogAction::ToggleFavorite => {
+                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.favorite = !dialog.favorite;
+                }
+            }
+            LaunchDialogAction::ToggleHidden => {
+                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.hidden = !dialog.hidden;
+                }
+            }
+            LaunchDialogAction::SetCollaborative(enabled) => {
+                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.collaborative = enabled;
+                }
+            }
+            LaunchDialogAction::SetWayland(enabled) => {
+                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.wayland = enabled;
+                }
+            }
+            LaunchDialogAction::CopyLink => {
+                if let (Some(api), Some((app, _, _))) = (&self.api, &self.launch_dialog) {
+                    if let Some(link) = api.app_deep_link(&app.id) {
+                        cx.write_to_clipboard(ClipboardItem::new_string(link));
+                        self.status = Some(format!("Copied link for {}.", app.name));
+                    }
+                }
+            }
+            LaunchDialogAction::Launch => {
+                if let Some((app, dialog, _)) = self.launch_dialog.take() {
+                    let home_name = storage_home_name(&dialog.selected_storage);
+                    let language =
+                        (!dialog.selected_language.is_empty()).then_some(dialog.selected_language);
+                    let params = LaunchParams {
+                        home_name,
+                        language,
+                        wayland_mode: dialog.wayland,
+                        launch_in_room_mode: dialog.collaborative,
+                    };
+                    self.launch_with_options(app, params, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn launch_with_options(
+        &mut self,
+        app: RemoteApp,
+        params: LaunchParams,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(api) = self.api.clone().filter(|_| self.busy.is_none()) else {
             return;
         };
         self.status = None;
         self.busy = Some(format!("Launching {}…", app.name));
-        let pending = self.rt.spawn(async move { api.launch(app).await });
+        let pending = self
+            .rt
+            .spawn(async move { api.launch_with_options(app, params).await });
         cx.spawn_in(window, async move |this, cx| {
             let result = pending
                 .await
@@ -316,6 +576,41 @@ impl Launcher {
                             library.sessions.insert(0, session.clone());
                         }
                         this.open_session(session, window, cx);
+                    }
+                    Err(error) => this.status = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn stop_session(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone().filter(|_| self.busy.is_none()) else {
+            return;
+        };
+        self.pending_stop = None;
+        self.status = None;
+        self.busy = Some(format!("Stopping {}…", session.app_name));
+        let session_id = session.session_id.clone();
+        let pending = self
+            .rt
+            .spawn(async move { api.stop_session(&session_id).await });
+        cx.spawn(async move |this, cx| {
+            let result = pending
+                .await
+                .unwrap_or_else(|_| Err("Stopping the session was interrupted.".into()));
+            let _ = this.update(cx, |this, cx| {
+                this.busy = None;
+                match result {
+                    Ok(()) => {
+                        if let Some(library) = &mut this.library {
+                            library
+                                .sessions
+                                .retain(|s| s.session_id != session.session_id);
+                        }
+                        this.session_thumbnails.remove(&session.session_id);
                     }
                     Err(error) => this.status = Some(error),
                 }
@@ -696,14 +991,12 @@ fn dark_appearance(window: &Window) -> bool {
 impl Render for Launcher {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let root = div()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground);
         if let Some((_, stream)) = &self.current {
-            return root
+            return div()
+                .size_full()
                 .relative()
                 .bg(rgb(0x000000))
+                .text_color(theme.foreground)
                 .on_action(cx.listener(|this, _: &ToggleSessionControls, window, cx| {
                     this.toggle_controls(window, cx);
                 }))
@@ -713,200 +1006,184 @@ impl Render for Launcher {
                 }))
                 .child(stream.view())
                 .when_some(self.status.clone(), |root, status| {
-                    root.child(
-                        div()
-                            .absolute()
-                            .bottom_3()
-                            .left_3()
-                            .right_3()
-                            .p_3()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.popover)
-                            .child(status),
-                    )
+                    root.child(session::status_banner(&theme, status))
                 });
         }
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
-            return root.flex().items_center().justify_center().child(
-                div()
-                    .w(px(416.))
-                    .p_6()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.popover)
-                    .v_flex()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Connect to SealSkin"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Copy an application key from Settings → Application Keys on your SealSkin server. SealSkin stores it in macOS Keychain after connecting."),
-                    )
-                    .when_some(self.status.clone(), |view, status| view.child(status))
-                    .when_some(self.busy.clone(), |view, busy| view.child(busy))
-                    .when(self.busy.is_none(), |view| {
-                        view.child(
-                            Button::new("paste")
-                                .primary()
-                                .label("Paste Application Key")
-                                .on_click(cx.listener(|this, _, _, cx| this.paste(cx))),
-                        )
-                    }),
+            let props = ConnectProps {
+                status: self.status.clone(),
+                busy: self.busy.clone(),
+            };
+            return connect::render(
+                &theme,
+                &props,
+                &self.key_input,
+                cx.listener(|this, _, window, cx| this.submit_key(window, cx)),
             );
         };
-        let sidebar = div()
-            .w(px(222.))
-            .flex_none()
-            .h_full()
-            .p_5()
-            .v_flex()
-            .gap_3()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(APP_NAME),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(api.server().to_string()),
-            )
-            .child(div().flex_1())
-            .when(self.busy.is_none(), |view| {
-                view.child(
-                    Button::new("forget")
-                        .outline()
-                        .label("Remove Connection")
-                        .on_click(cx.listener(|this, _, _, cx| this.forget(cx))),
-                )
-            });
-        let enabled = self.busy.is_none();
-        let content = div()
-            .id("library")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_y_scrollbar()
-            .p_6()
-            .v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Applications"),
-                    )
-                    .when(enabled, |view| {
-                        view.child(
-                            Button::new("refresh")
-                                .outline()
-                                .small()
-                                .label("Refresh")
-                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                        )
+
+        let props = LibraryProps {
+            app_name: APP_NAME.to_string(),
+            server: api.server().to_string(),
+            apps: library
+                .apps
+                .iter()
+                .map(|app| AppItem {
+                    id: app.id.clone(),
+                    name: app.name.clone(),
+                    categories: if app.kind.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![app.kind.clone()]
+                    },
+                    recent: false,
+                    icon: self.app_icons.get(&app.id).cloned(),
+                })
+                .collect(),
+            sessions: library
+                .sessions
+                .iter()
+                .map(|session| SessionItem {
+                    id: session.session_id.clone(),
+                    app_name: session.app_name.clone(),
+                    started_label: format_started_ago(session.created_at),
+                    gpu: session.gpu,
+                    storage_label: (!session.home.is_empty()).then(|| session.home.clone()),
+                    thumbnail: self.session_thumbnails.get(&session.session_id).cloned(),
+                    app_icon: self.app_icons.get(&session.app_id).cloned(),
+                })
+                .collect(),
+            search_query: self.search_input.read(cx).value().to_string(),
+            selected_filter: self.selected_filter.clone(),
+            status: self.status.clone(),
+            busy: self.busy.clone(),
+        };
+
+        let apps_by_id = library.apps.clone();
+        let sessions_by_id = library.sessions.clone();
+        let sessions_for_stop = library.sessions.clone();
+        let launcher_for_launch = cx.entity().clone();
+        let launcher_for_resume = cx.entity().clone();
+        let launcher_for_stop = cx.entity().clone();
+        let launcher_for_filter = cx.entity().clone();
+        let launcher_for_dialog = cx.entity().clone();
+
+        div()
+            .size_full()
+            .relative()
+            .child(library::render(
+                &theme,
+                &props,
+                &self.search_input,
+                LibraryHandlers {
+                    on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    on_forget: Box::new(cx.listener(|this, _, _, cx| this.forget(cx))),
+                    on_launch: Rc::new(move |app_id, window, cx| {
+                        if let Some(app) = apps_by_id.iter().find(|a| a.id == app_id).cloned() {
+                            launcher_for_launch
+                                .update(cx, |this, cx| this.open_launch_dialog(app, window, cx));
+                        }
                     }),
-            )
-            .when_some(self.busy.clone(), |view, busy| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(busy),
-                )
+                    on_resume: Rc::new(move |session_id, window, cx| {
+                        if let Some(session) = sessions_by_id
+                            .iter()
+                            .find(|s| s.session_id == session_id)
+                            .cloned()
+                        {
+                            launcher_for_resume
+                                .update(cx, |this, cx| this.open_session(session, window, cx));
+                        }
+                    }),
+                    on_stop: Some(Rc::new(move |session_id, _, cx| {
+                        if let Some(session) = sessions_for_stop
+                            .iter()
+                            .find(|s| s.session_id == session_id)
+                            .cloned()
+                        {
+                            launcher_for_stop.update(cx, |this, cx| {
+                                this.pending_stop = Some(session);
+                                cx.notify();
+                            });
+                        }
+                    })),
+                    on_select_filter: Rc::new(move |filter, _, cx| {
+                        launcher_for_filter.update(cx, |this, cx| {
+                            this.selected_filter = filter;
+                            cx.notify();
+                        });
+                    }),
+                },
+            ))
+            .when_some(self.launch_dialog.as_ref(), |view, (_, dialog, selects)| {
+                let on_action = Rc::new(
+                    move |action: LaunchDialogAction, window: &mut Window, cx: &mut App| {
+                        launcher_for_dialog.update(cx, |this, cx| {
+                            this.handle_launch_dialog_action(action, window, cx)
+                        });
+                    },
+                );
+                view.child(launch_dialog::render_modal(
+                    &theme, dialog, selects, on_action,
+                ))
             })
-            .when_some(self.status.clone(), |view, status| {
-                view.child(div().text_sm().child(status))
+            .when_some(self.pending_stop.clone(), |view, pending_session| {
+                let app_name = pending_session.app_name.clone();
+                view.child(session::stop_confirm_modal(
+                    &theme,
+                    app_name,
+                    cx.listener(|this, _, _, cx| {
+                        this.pending_stop = None;
+                        cx.notify();
+                    }),
+                    cx.listener(move |this, _, _, cx| {
+                        this.stop_session(pending_session.clone(), cx);
+                    }),
+                ))
             })
-            .when(library.apps.is_empty(), |view| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No applications are available for this account."),
-                )
-            })
-            .children(library.apps.iter().map(|app| {
-                let app = app.clone();
-                row(&theme, app.name.clone()).when(enabled, |view| {
-                    view.child(
-                        Button::new(SharedString::from(format!("launch-{}", app.id)))
-                            .primary()
-                            .small()
-                            .label("Launch")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.launch(app.clone(), window, cx)
-                            })),
-                    )
-                })
-            }))
-            .child(
-                div()
-                    .mt_4()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Running Sessions"),
-            )
-            .when(library.sessions.is_empty(), |view| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No running sessions."),
-                )
-            })
-            .children(library.sessions.iter().map(|session| {
-                let session = session.clone();
-                row(&theme, session.app_name.clone()).when(enabled, |view| {
-                    view.child(
-                        Button::new(SharedString::from(format!("resume-{}", session.session_id)))
-                            .outline()
-                            .small()
-                            .label("Resume")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_session(session.clone(), window, cx)
-                            })),
-                    )
-                })
-            }));
-        root.flex().child(sidebar).child(content)
     }
 }
 
-fn row(theme: &Theme, name: String) -> Div {
-    div()
-        .h_flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .min_h(px(48.))
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.popover)
-        .child(div().min_w_0().truncate().child(name))
+fn storage_home_name(selected: &str) -> Option<String> {
+    match selected {
+        "auto" | "" => None,
+        "cleanroom" => Some("cleanroom".to_string()),
+        named => Some(named.to_string()),
+    }
+}
+
+fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let mut pixels = image::load_from_memory(bytes).ok()?.into_rgba8();
+    for pixel in pixels.pixels_mut() {
+        pixel.0.swap(0, 2); // RGBA -> BGRA for GPUI RenderImage
+    }
+    Some(Arc::new(RenderImage::new(smallvec![image::Frame::new(
+        pixels
+    )])))
+}
+
+fn format_started_ago(created_at: f64) -> Option<String> {
+    if created_at <= 0.0 {
+        return None;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let elapsed = now.saturating_sub(created_at as u64);
+    let label = if elapsed < 60 {
+        "Just started".to_string()
+    } else if elapsed < 3600 {
+        let mins = elapsed / 60;
+        format!("Started {mins}m ago")
+    } else if elapsed < 86_400 {
+        let hours = elapsed / 3600;
+        format!("Started {hours}h ago")
+    } else {
+        let days = elapsed / 86_400;
+        if days == 1 {
+            "Started 1 day ago".to_string()
+        } else {
+            format!("Started {days} days ago")
+        }
+    };
+    Some(label)
 }
 
 #[cfg(test)]
@@ -934,5 +1211,39 @@ mod tests {
         );
         let fixed = DisplayMode::Fixed(Resolution(1280, 720));
         assert_eq!(fixed.request(viewport, 2.), fixed.request(viewport, 1.));
+    }
+
+    #[test]
+    fn storage_home_name_maps_auto_cleanroom_and_named_homes() {
+        assert_eq!(storage_home_name("auto"), None);
+        assert_eq!(storage_home_name(""), None);
+        assert_eq!(storage_home_name("cleanroom").as_deref(), Some("cleanroom"));
+        assert_eq!(storage_home_name("work-home").as_deref(), Some("work-home"));
+    }
+
+    #[test]
+    fn format_started_ago_handles_zero_and_recent_timestamps() {
+        assert_eq!(format_started_ago(0.0), None);
+        assert_eq!(format_started_ago(-5.0), None);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64;
+        assert_eq!(
+            format_started_ago(now - 10.0).as_deref(),
+            Some("Just started")
+        );
+        assert_eq!(
+            format_started_ago(now - 300.0).as_deref(),
+            Some("Started 5m ago")
+        );
+        assert_eq!(
+            format_started_ago(now - 7200.0).as_deref(),
+            Some("Started 2h ago")
+        );
+        assert_eq!(
+            format_started_ago(now - 172_800.0).as_deref(),
+            Some("Started 2 days ago")
+        );
     }
 }

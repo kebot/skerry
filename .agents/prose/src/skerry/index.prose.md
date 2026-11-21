@@ -14,7 +14,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
 
 ### Requires
 
-- `rust-workspace`: Rust implementation in `crates/skerry-mac/src/**` and `Cargo.toml`
+- `rust-workspace`: Rust implementation in `crates/skerry-ui/src/**`, `crates/skerry-mac/src/**`, and `Cargo.toml`
 - `video-and-screen`: video decoding, resolution, HiDPI, playback, and diagnostics truth from `video-and-screen.prose.md`
 - `launcher-and-sessions`: SealSkin companion API, launch options, session lifecycle, and storage truth from `launcher-and-sessions.prose.md`
 - `desktop-and-collaboration`: macOS input, clipboard, file transfer, audio/video devices, printing, and collaboration truth from `desktop-and-collaboration.prose.md`
@@ -22,17 +22,18 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
 ### Maintains
 
 - `system-architecture`: verified module boundaries across `crates/skerry-mac/src/`:
-  - `api.rs`: `Credential::parse` (`ssk_<id>_<secret>@<host>[:port]`, HTTPS-only), `Credential::startup` (`SEALSKIN_APPLICATION_KEY` -> `.env` -> macOS Keychain `dev.kebot.sealskin`), and `Api` (`POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/launch/simple`, same-origin `session_url`).
+  - `api.rs`: `Credential::parse` (`ssk_<id>_<secret>@<host>[:port]`, HTTPS-only), `Credential::startup` (`SEALSKIN_APPLICATION_KEY` -> `.env` -> macOS Keychain `dev.kebot.sealskin`), and `Api` (`MINIMUM_SEALSKIN_VERSION = 0.5.0` gate via `GET /companion/api/ui/version` before any other call, `POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/launch/simple`, same-origin `session_url`).
   - `transport.rs`: `socket_request` (unredirected `GET` -> `303 See Other` cookie exchange -> `wss://.../api/websockets`), initial `SETTINGS` handshake, 33 ms frame publish + `CLIENT_FRAME_ACK`, 1 s stream stats/ping RTT, and `kh,<keys>` held-key keepalive.
   - `video.rs`: `Codec` (JPEG, H.264, H.265, AV1), `VTIsHardwareDecodeSupported`, Annex B / parameter-set / AV1 sequence-header parsing, and IOSurface-backed `CVPixelBuffer` (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`) painted via `window.paint_surface`.
   - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`.
   - `input.rs`: `InputSettings` (Command sends Control, Remote Cursor, Smooth Trackpad Scrolling, Use Mac Input Method) and `RemoteChord` (Alt+Tab, Ctrl+Alt+Delete).
   - `audio.rs`: 48 kHz stereo `f32` Opus `Playback` with bounded latency queue (`48000 * 2 / 8` samples).
   - `view.rs` & `view/pinch.rs`: `NativeSession`, `Desktop` canvas (`RenderImage` with `window.drop_image()` retirement for JPEG; `paint_surface` for hardware frames), mouse/wheel/keyboard/IME dispatch, and AppKit magnification monitor.
-  - `app.rs`, `app/controls.rs`, & `app/display.rs`: multi-threaded Tokio runtime beside `gpui_kit::application()`, Connect/Library/Session screens using `gpui_kit::component` + `Theme::sync_system_appearance`, movable Session Controls child window (`cmd-shift-m`, opened via `cx.defer` with `Owner { window: AnyWindowHandle, launcher: Entity<Launcher> }`), and native display UI scale detection.
+  - `crates/skerry-ui`: pure `gpui-kit` `0.10.0` UI library (`components.rs`, `connect.rs`, `library.rs`, `controls.rs`, `session.rs`) with zero networking/macOS-platform dependencies, plus a standalone interactive preview workbench (`examples/preview.rs`, launched via `cargo run -p skerry-ui --example preview`) covering Connect, Library, Session Controls, and Session Overlays across Light/Dark/System themes.
+  - `app.rs`, `app/controls.rs`, & `app/display.rs`: multi-threaded Tokio runtime beside `gpui_kit::application()`, Connect/Library/Session screens delegated to `skerry-ui` + `Theme::sync_system_appearance`, movable Session Controls child window (`cmd-shift-m`, opened via `cx.defer` with `Owner { window: AnyWindowHandle, launcher: Entity<Launcher> }`), and native display UI scale detection.
 - `domain-readiness`:
   - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled; second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
-  - `launcher-and-sessions`: simple launch/resume settled; launch options, session stop/previews, open links/files, library search/favorites, persistent storage, account recovery, and cluster origins open on the frontier.
+  - `launcher-and-sessions`: simple launch/resume settled; launch options, session stop/previews, open links/files, library search/favorites, persistent storage, account recovery, cluster origins, multi-window sessions (`ARCH-010` / `ARCH-GAP-LS-08`), and native Mac app presence (`ARCH-GAP-LS-09`) open on the frontier.
   - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME settled; clipboard, file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
 
 Facets:
@@ -60,6 +61,7 @@ input-driven
 - The multi-threaded Tokio `Runtime` is created in `main` before `Application::run` and kept alive for the lifetime of the app; all network I/O runs on Tokio and communicates with GPUI via `mpsc` / `watch` channels.
 - JPEG frames decoded off the main thread into `RenderImage` must retire previous frames via `window.drop_image(previous)` inside the paint closure to prevent texture leaks (~10 MB/s at 60 fps).
 - Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.
+- Skerry supports SealSkin `0.5.0` or newer (`ARCH-009`): it refuses to connect to a server whose `GET /companion/api/ui/version` reports an older or unparseable version, or that has no such route. Changing the minimum is a new superseding `ARCH-*` decision.
 
 ### Execution
 

@@ -7,18 +7,15 @@ use crate::transport::{
     self, DisplayRequest, Frame, Input, Picture, Pointer, RemoteCursor, Resolution, SessionEvent,
     SessionOptions,
 };
-use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    IconName, Sizable as _,
-};
 use gpui_kit::{
-    canvas, div, point, prelude::*, px, rgb, size, AnyView, App, Bounds, ContentMask, Context,
-    Corners, DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    HitboxBehavior, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta,
-    ScrollEvent, Task, UTF16Selection, Window,
+    canvas, div, point, prelude::*, px, size, AnyView, App, Bounds, ContentMask, Context, Corners,
+    DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, HitboxBehavior,
+    KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, Task,
+    UTF16Selection, Window,
 };
 use reqwest::Url;
+use skerry_ui::session;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -746,49 +743,16 @@ impl Render for Desktop {
             }))
             .child(surface)
             .when(!marked.is_empty(), |view| {
-                view.child(
-                    div()
-                        .absolute()
-                        .left(anchor.x)
-                        .top(anchor.y)
-                        .bg(rgb(0x22262f))
-                        .text_color(rgb(0xffffff))
-                        .px_2()
-                        .child(marked),
-                )
+                view.child(session::ime_preedit(anchor, marked))
             })
             .when_some(menu, |view, position| {
-                view.child(
-                    div()
-                        .absolute()
-                        .top(position.y)
-                        .left(position.x)
-                        .size(MENU_SIZE)
-                        .child(
-                            Button::new("session-controls-trigger")
-                                .secondary()
-                                .small()
-                                .size(MENU_SIZE)
-                                .icon(IconName::Ellipsis)
-                                .tooltip("Session Controls")
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ToggleSessionControls), cx)
-                                }),
-                        ),
-                )
+                view.child(session::controls_trigger(
+                    position,
+                    MENU_SIZE,
+                    |_, window, cx| window.dispatch_action(Box::new(ToggleSessionControls), cx),
+                ))
             })
-            .when(empty, |view| {
-                view.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(0xb6bdcc))
-                        .child("Waiting for the remote display…"),
-                )
-            })
+            .when(empty, |view| view.child(session::waiting_overlay()))
     }
 }
 

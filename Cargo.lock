@@ -6158,10 +6158,20 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "skerry-ui",
  "smallvec",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "skerry-ui"
+version = "0.0.1"
+dependencies = [
+ "gpui-kit",
+ "image",
+ "smallvec",
 ]
 
 [[package]]
