@@ -1,8 +1,11 @@
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    IconName, Sizable as _, Theme,
+    IconName, Sizable as _, StyledExt as _, Theme,
 };
-use gpui_kit::{div, prelude::*, rgb, App, ClickEvent, Div, Pixels, Point, SharedString, Window};
+use gpui_kit::{
+    div, prelude::*, px, rgb, rgba, App, ClickEvent, Div, FontWeight, Pixels, Point, SharedString,
+    Window,
+};
 
 /// Floating status banner shown over an active remote desktop session.
 pub fn status_banner(theme: &Theme, status: impl Into<String>) -> Div {
@@ -64,4 +67,73 @@ pub fn waiting_overlay() -> Div {
         .justify_center()
         .text_color(rgb(0xb6bdcc))
         .child("Waiting for the remote display…")
+}
+
+/// Confirmation dialog shown before stopping a running remote session.
+pub fn stop_confirm_modal(
+    theme: &Theme,
+    app_name: impl Into<String>,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    let app_name = app_name.into();
+    let on_cancel = std::rc::Rc::new(on_cancel);
+    let backdrop_cancel = std::rc::Rc::clone(&on_cancel);
+    div()
+        .id("stop-session-backdrop")
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x00000099))
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_6()
+        .on_click(move |event, window, cx| backdrop_cancel(event, window, cx))
+        .child(
+            div()
+                .id("stop-session-card")
+                .w(px(420.))
+                .max_w_full()
+                .p_5()
+                .rounded_xl()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .text_color(theme.foreground)
+                .v_flex()
+                .gap_4()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Stop {app_name}?")),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme.muted_foreground)
+                        .child("Stopping this session terminates the remote application and permanently deletes any temporary cleanroom data."),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("stop-cancel")
+                                .outline()
+                                .small()
+                                .label("Cancel")
+                                .on_click(move |event, window, cx| on_cancel(event, window, cx)),
+                        )
+                        .child(
+                            Button::new("stop-confirm")
+                                .danger()
+                                .small()
+                                .label("Stop Session")
+                                .on_click(on_confirm),
+                        ),
+                ),
+        )
 }
