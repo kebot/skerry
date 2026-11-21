@@ -26,6 +26,7 @@ subject: skerry
 - Session Controls follows the Selkies web sidebar (`ARCH-018`): sections are separate cards 10px apart; Encoder, Rate Control, UI Scaling, and Preset are dropdowns; numeric video settings are sliders that request a value only on release; on/off settings are switches.
 - `stats::tests::*` pass: rows warn only on a hardware fallback, a readback where zero-copy was available, or throttling; tiles hold a time for 5 s then read idle; Video rate warns over 110% of its CBR target; meters appear only when the server reports them; a history longer than 120 points is bucketed by maximum (`ARCH-019`).
 - The Stats section subscribes with `_stats,1` only while it is open, and re-subscribes after a reconnect (`ARCH-019`).
+- A 60 fps H.264/H.265/AV1 stream reads about 60 Client FPS in Stats, not 30 (`ARCH-021`).
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

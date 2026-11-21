@@ -30,6 +30,7 @@ Deliver low-latency hardware-accelerated or JPEG-fallback remote desktop video, 
   - Accepts H.264 predicted frames by reference chaining and H.265/AV1 predicted frames (Selkies 2.3.0 sends `reference == id`) by continuity from the last decoded frame (`ARCH-012`).
   - Converts Annex B / parameter sets / AV1 sequence headers into `CMFormatDescription`, requires hardware VideoToolbox decode into full-range NV12 `CVPixelBuffer` surfaces, and falls back to JPEG when hardware decode cannot recover and the server permits JPEG.
   - Exposes JPEG quality, hardware CBR target bitrate, CRF quality, frame-rate cap, and **Reset Video Settings** according to server policy.
+  - Presents each hardware-decoded frame as it decodes, and flushes gathered JPEG stripes every 8 ms, so neither is capped at 30 fps; acks and pointer motion stay on the 33 ms tick (`ARCH-021`).
 - `resolution-hidpi-and-appearance` (settled):
   - Supports **Match Window**, **Match Retina**, **Scale Locally** (fit picture independently of remote resolution), and fixed resolution presets up to 4096x2160 (even dimensions).
   - Negotiates `enable_resize`, `manual_resolution`, dimensions, `stream_resolution`, and effective macOS display UI scale (including fractional scaled modes) plus light/dark desktop appearance.

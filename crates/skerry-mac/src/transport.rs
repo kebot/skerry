@@ -534,8 +534,11 @@ pub async fn run(
     let mut frame = Canvas::default();
     let mut jpeg_size = Resolution(1280, 720);
     let mut active_size = jpeg_size;
-    let mut decoded = None;
     let mut changed = false;
+    // The JPEG frame id last gathered, and the one last shown, so a frame whose
+    // stripes straddle two flushes is counted once (`ARCH-021`).
+    let mut jpeg_frame = None;
+    let mut shown_jpeg_frame = None;
     let mut last_frame = None;
     let mut seen_video = false;
     let mut unsupported_video = false;
@@ -561,6 +564,9 @@ pub async fn run(
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
     present.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // JPEG stripes gather into one canvas, flushed this often while any changed.
+    let mut jpeg_flush = tokio::time::interval(Duration::from_millis(8));
+    jpeg_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
     let mut clipboard_in = clipboard::Receiver::default();
@@ -580,6 +586,7 @@ pub async fn run(
                         let id = u16::from_be_bytes([data[2], data[3]]);
                         let y = u16::from_be_bytes([data[4], data[5]]);
                         last_frame = Some(id);
+                        jpeg_frame = Some(id);
                         let started = Instant::now();
                         if frame.stripe(y, &data[6..]).is_some() {
                             diagnostics.packets += 1;
@@ -602,7 +609,10 @@ pub async fn run(
                             if let Some(picture) = packet.as_ref().and_then(|packet| video.decode(packet)) {
                                 frame = Canvas::default();
                                 active_size = Resolution(picture.width, picture.height);
-                                decoded = Some(picture);
+                                // A hardware frame is a whole picture: show it now rather
+                                // than on the next tick, which capped video at 30 fps (`ARCH-021`).
+                                diagnostics.frames += 1;
+                                frames.send_replace(picture);
                                 changed = false;
                                 diagnostics.codec = Some(video.codec);
                                 diagnostics.packets += 1;
@@ -686,7 +696,6 @@ pub async fn run(
                                     if !capabilities.codecs.contains(&codec) {
                                         codec = capabilities.codecs.first().copied().ok_or("This server offers no video codec this Mac can play.")?;
                                         hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
-                                        decoded = None;
                                         seen_video = false;
                                         let command = codec_command(codec);
                                         socket.send(command.into()).await.map_err(|_| disconnected)?;
@@ -840,6 +849,15 @@ pub async fn run(
                     ping = Some(now);
                 }
             }
+            _ = jpeg_flush.tick(), if changed => {
+                let picture = frame.snapshot();
+                if picture.picture.is_some() && jpeg_frame != shown_jpeg_frame {
+                    diagnostics.frames += 1;
+                    shown_jpeg_frame = jpeg_frame;
+                }
+                frames.send_replace(picture);
+                changed = false;
+            }
             _ = present.tick() => {
                 if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
                     if !capabilities.codecs.contains(&Codec::Jpeg) {
@@ -847,17 +865,11 @@ pub async fn run(
                     }
                     codec = Codec::Jpeg;
                     hardware = None;
-                    decoded = None;
                     seen_video = false;
                     unsupported_video = false;
                     video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
                     socket.send(codec_command(codec).into()).await.map_err(|_| disconnected)?;
                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
-                }
-                if let Some(picture) = decoded.take().or_else(|| changed.then(|| frame.snapshot())) {
-                    if picture.picture.is_some() { diagnostics.frames += 1; }
-                    frames.send_replace(picture);
-                    changed = false;
                 }
                 if let Some(id) = last_frame.take() {
                     socket.send(format!("CLIENT_FRAME_ACK {id} 0").into()).await.map_err(|_| disconnected)?;
