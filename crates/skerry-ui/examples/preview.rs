@@ -4417,7 +4417,7 @@ impl PreviewApp {
             }
             Story::LibraryEmpty => {
                 let props = LibraryProps {
-                    app_name: "SealSkin Native".into(),
+                    app_name: "Skerry".into(),
                     server: "sealskin.example.internal".into(),
                     apps: Rc::from([]),
                     sessions: Rc::from([]),
@@ -4431,7 +4431,7 @@ impl PreviewApp {
             }
             Story::LibraryBusy => {
                 let props = LibraryProps {
-                    app_name: "SealSkin Native".into(),
+                    app_name: "Skerry".into(),
                     server: "sealskin.example.internal".into(),
                     apps: vec![AppItem {
                         icon: None,

@@ -734,13 +734,23 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
-/// Where `server`'s preferences live. Writes go only through `persist::WriteQueue`.
-pub(crate) fn path(server: &str) -> Option<PathBuf> {
+fn path_in(folder: &str, server: &str) -> Option<PathBuf> {
     Some(
         PathBuf::from(std::env::var_os("HOME")?)
-            .join("Library/Application Support/SealSkin Native")
+            .join("Library/Application Support")
+            .join(folder)
             .join(format!("{server}.json")),
     )
+}
+
+/// Where `server`'s preferences live. Writes go only through `persist::WriteQueue`.
+pub(crate) fn path(server: &str) -> Option<PathBuf> {
+    path_in("Skerry", server)
+}
+
+/// Legacy preferences path from before the bundle rename to Skerry.
+pub(crate) fn legacy_path(server: &str) -> Option<PathBuf> {
+    path_in("SealSkin Native", server)
 }
 
 /// Re-reads the saved preferences, applies `change`, and saves them, so that windows

@@ -1577,7 +1577,7 @@ async fn stream(
                         }
                     }
                     if text.starts_with("MODE ") && text != "MODE websockets" {
-                        return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.".into());
+                        return Err("This server requires WebRTC. Skerry currently uses WebSockets.".into());
                     }
                     if let Some(event) = capture_event(&text) {
                         let _ = events.send(event);

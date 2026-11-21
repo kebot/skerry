@@ -1,0 +1,142 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm64:
+    name: Build & Publish macOS arm64
+    # Defaults to macos-latest (Apple Silicon on GitHub Actions).
+    # On self-hosted Forgejo Actions, set repository variable MACOS_RUNNER if your runner uses a custom label.
+    runs-on: ${{ vars.MACOS_RUNNER || 'macos-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure Rust toolchain (aarch64-apple-darwin)
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup target add aarch64-apple-darwin
+          rustup component add clippy rustfmt
+          rustc --version
+          cargo --version
+
+      - name: Resolve release version
+        id: version
+        run: |
+          CARGO_VERSION="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "skerry-mac"))')"
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+            if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+              echo "error: tag v$TAG_VERSION does not match Cargo.toml version $CARGO_VERSION" >&2
+              exit 1
+            fi
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify workspace (test, clippy, fmt)
+        run: |
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo fmt --check
+
+      - name: Build & package macOS arm64 release artifacts
+        env:
+          SKERRY_VERSION: ${{ steps.version.outputs.version }}
+          CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+          NOTARYTOOL_PROFILE: ${{ secrets.NOTARYTOOL_PROFILE }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          scripts/bundle.sh --target aarch64-apple-darwin
+          ls -lh dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload build artifacts
+        if: github.server_url == 'https://github.com'
+        uses: actions/upload-artifact@v4
+        with:
+          name: skerry-macos-arm64-${{ steps.version.outputs.version }}
+          path: |
+            dist/Skerry-*.dmg
+            dist/Skerry-*.zip
+            dist/SHA256SUMS
+
+      - name: Publish release (GitHub / Forgejo compatible)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG="dist/Skerry-${VERSION}-arm64.dmg"
+          ZIP="dist/Skerry-${VERSION}-arm64.zip"
+          SUMS="dist/SHA256SUMS"
+
+          NOTES="$(cat <<EOF
+          ## Skerry ${TAG} (macOS Apple Silicon)
+
+          > **Note:** This release is ad-hoc signed (not notarized with a paid Apple Developer account).
+
+          ### Install via Homebrew
+          \`\`\`sh
+          brew install --cask --no-quarantine ./packaging/homebrew/Casks/skerry.rb
+          \`\`\`
+
+          ### Install from DMG
+          1. Download \`Skerry-${VERSION}-arm64.dmg\` and drag **Skerry.app** into \`/Applications\`.
+          2. Clear the macOS Gatekeeper quarantine attribute before first launch:
+          \`\`\`sh
+          xattr -cr /Applications/Skerry.app
+          \`\`\`
+
+          ### SHA-256 Checksums
+          \`\`\`
+          $(cat "$SUMS")
+          \`\`\`
+          EOF
+          )"
+
+          if [[ "${GITHUB_SERVER_URL:-}" == "https://github.com" ]]; then
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "$DMG" "$ZIP" "$SUMS" --clobber
+            else
+              gh release create "$TAG" "$DMG" "$ZIP" "$SUMS" --title "Skerry $TAG" --notes "$NOTES"
+            fi
+          else
+            # Forgejo / Gitea Releases API
+            API="${GITHUB_API_URL%/}/repos/${GITHUB_REPOSITORY}/releases"
+            AUTH_HEADER="Authorization: token ${GITHUB_TOKEN}"
+
+            RELEASE_ID="$(curl -fsSL -H "$AUTH_HEADER" "$API/tags/$TAG" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))' || true)"
+            if [[ -z "$RELEASE_ID" ]]; then
+              PAYLOAD="$(python3 -c 'import json,sys; print(json.dumps({"tag_name": sys.argv[1], "name": f"Skerry {sys.argv[1]}", "body": sys.argv[2], "draft": False, "prerelease": "-" in sys.argv[1]}))' "$TAG" "$NOTES")"
+              RELEASE_ID="$(curl -fsSL -X POST -H "$AUTH_HEADER" -H "Content-Type: application/json" -d "$PAYLOAD" "$API" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+            fi
+
+            for FILE in "$DMG" "$ZIP" "$SUMS"; do
+              NAME="$(basename "$FILE")"
+              # Remove existing asset with the same name if re-running a tag release.
+              EXISTING_ID="$(curl -fsSL -H "$AUTH_HEADER" "$API/$RELEASE_ID/assets" | python3 -c 'import json,sys; name=sys.argv[1]; print(next((str(a["id"]) for a in json.load(sys.stdin) if a["name"]==name), ""))' "$NAME")"
+              if [[ -n "$EXISTING_ID" ]]; then
+                curl -fsSL -X DELETE -H "$AUTH_HEADER" "$API/$RELEASE_ID/assets/$EXISTING_ID"
+              fi
+              curl -fsSL -X POST -H "$AUTH_HEADER" -F "attachment=@${FILE}" "$API/$RELEASE_ID/assets?name=${NAME}" >/dev/null
+            done
+          fi

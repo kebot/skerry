@@ -114,6 +114,7 @@ subject: skerry
   - `kd` p95 ≤ 150 ms at 1 Mbps with 60–120 KB keyframes, with and without 150 ms RTT, and 10 Mbps with 150 ms RTT reaches ≥ 1 Mbps.
   - Bounded queues let the stall stop fire.
   - Camera and mic frames never go on Display 2, and Killed stops the camera.
+- `scripts/bundle.sh` produces a verified ad-hoc signed `dist/Skerry.app` (`dev.kebot.skerry`, `Skerry.icns`), `dist/Skerry-<version>-<arch>.dmg`, `dist/Skerry-<version>-<arch>.zip`, and `dist/SHA256SUMS` (`ARCH-040`).
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

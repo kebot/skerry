@@ -81,9 +81,16 @@ impl Root {
     }
 
     fn load(&self, server: &str) -> Preferences {
-        self.preferences(server)
-            .map(|path| settings::load_at(&path))
-            .unwrap_or_default()
+        match self {
+            Self::Home => [settings::path(server), settings::legacy_path(server)]
+                .into_iter()
+                .flatten()
+                .find(|path| path.exists())
+                .map(|path| settings::load_at(&path))
+                .unwrap_or_default(),
+            #[cfg(test)]
+            Self::Under(root) => settings::load_at(&root.join(format!("{server}.json"))),
+        }
     }
 }
 
