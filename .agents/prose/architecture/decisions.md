@@ -52,6 +52,13 @@
 - **Rationale:** Adopts a unified, system-appearance-synced component library instead of custom buttons, inputs, switches, and collapsibles, while honoring `gpui-kit`'s `Root` wrapper and GPUI's single-writer entity lease rules.
 - **Affected Contracts:** `src/skerry/index.prose.md`
 
+## ARCH-007: Pure `skerry-ui` Screen Library & Interactive Preview Workbench
+
+- **Status:** settled
+- **Decision:** Extract all of Skerry's GPUI screens, overlays, and shared UI primitives into a dedicated workspace crate `crates/skerry-ui` (`components.rs`, `connect.rs`, `library.rs`, `controls.rs`, `session.rs`) that depends only on `gpui-kit = "0.10.0"`, with `crates/skerry-mac` delegating its Connect, Library, Session Controls panel, and Desktop overlays (status banner, IME preedit, controls trigger, waiting placeholder) to `skerry-ui`. Provide a standalone `examples/preview.rs` workbench (`cargo run -p skerry-ui --example preview`) with interactive fixture states (Connect default/busy/error, Library populated/empty/busy, Session Controls H.265/JPEG/server-locked, and Session Overlays), Light/Dark/System theme switching, and live callback event feedback.
+- **Rationale:** Keeps Skerry on `gpui-kit 0.10.0` (avoiding `gpui-storybook 0.8.0`'s `gpui-kit 0.9.0` pin and `gpui-preview`'s incompatible `gpui 0.2.2` stack) while giving a fast, self-contained UI iteration loop with no Keychain auth, Tokio runtime, or SealSkin/Selkies connection required—and ensuring previewed changes are the exact code rendered by `skerry-mac`.
+- **Affected Contracts:** `src/skerry/index.prose.md`
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)

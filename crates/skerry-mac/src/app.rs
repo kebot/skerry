@@ -11,18 +11,23 @@ use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
 use gpui_kit::component::{
-    button::{Button, ButtonVariants as _},
-    scroll::ScrollableElement as _,
-    ActiveTheme as _, Sizable as _, StyledExt as _, Theme,
+    input::{InputEvent, InputState},
+    ActiveTheme as _, Theme,
 };
 use gpui_kit::{
-    actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, Context, Div,
-    FontWeight, KeyBinding, Menu, MenuItem, Pixels, SharedString, Size, Task, TitlebarOptions,
-    Window, WindowAppearance, WindowBounds, WindowOptions,
+    actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, Context, Entity,
+    KeyBinding, Menu, MenuItem, Pixels, Size, Task, TitlebarOptions, Window, WindowAppearance,
+    WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use skerry_ui::{
+    connect::{self, ConnectProps},
+    library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
+    session,
+};
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 
@@ -163,12 +168,24 @@ struct Launcher {
     preferences: Preferences,
     pending_settings: VideoSettings,
     settings_task: Option<Task<()>>,
+    key_input: Entity<InputState>,
     busy: Option<String>,
     status: Option<String>,
 }
 
 impl Launcher {
     fn new(rt: Handle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let key_input = connect::new_key_input(window, cx);
+        cx.subscribe_in(
+            &key_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit_key(window, cx);
+                }
+            },
+        )
+        .detach();
         let mut launcher = Self {
             rt,
             api: None,
@@ -195,6 +212,7 @@ impl Launcher {
             preferences: Preferences::default(),
             pending_settings: VideoSettings::new(),
             settings_task: None,
+            key_input,
             busy: None,
             status: None,
         };
@@ -222,14 +240,23 @@ impl Launcher {
         launcher
     }
 
-    fn paste(&mut self, cx: &mut Context<Self>) {
-        let result = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .ok_or_else(|| "Copy a SealSkin application key first.".to_string())
-            .and_then(|text| Credential::parse(&text));
+    fn submit_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() {
+            return;
+        }
+        let text = self.key_input.read(cx).value().to_string();
+        let trimmed = text.trim();
+        let result = if trimmed.is_empty() {
+            Err("Enter a SealSkin application key first.".to_string())
+        } else {
+            Credential::parse(trimmed)
+        };
         match result {
-            Ok(credential) => self.connect(credential, true, cx),
+            Ok(credential) => {
+                self.key_input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.connect(credential, true, cx);
+            }
             Err(error) => self.status = Some(error),
         }
         cx.notify();
@@ -696,14 +723,12 @@ fn dark_appearance(window: &Window) -> bool {
 impl Render for Launcher {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let root = div()
-            .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground);
         if let Some((_, stream)) = &self.current {
-            return root
+            return div()
+                .size_full()
                 .relative()
                 .bg(rgb(0x000000))
+                .text_color(theme.foreground)
                 .on_action(cx.listener(|this, _: &ToggleSessionControls, window, cx| {
                     this.toggle_controls(window, cx);
                 }))
@@ -713,200 +738,74 @@ impl Render for Launcher {
                 }))
                 .child(stream.view())
                 .when_some(self.status.clone(), |root, status| {
-                    root.child(
-                        div()
-                            .absolute()
-                            .bottom_3()
-                            .left_3()
-                            .right_3()
-                            .p_3()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.popover)
-                            .child(status),
-                    )
+                    root.child(session::status_banner(&theme, status))
                 });
         }
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
-            return root.flex().items_center().justify_center().child(
-                div()
-                    .w(px(416.))
-                    .p_6()
-                    .rounded_xl()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.popover)
-                    .v_flex()
-                    .gap_4()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Connect to SealSkin"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child("Copy an application key from Settings → Application Keys on your SealSkin server. SealSkin stores it in macOS Keychain after connecting."),
-                    )
-                    .when_some(self.status.clone(), |view, status| view.child(status))
-                    .when_some(self.busy.clone(), |view, busy| view.child(busy))
-                    .when(self.busy.is_none(), |view| {
-                        view.child(
-                            Button::new("paste")
-                                .primary()
-                                .label("Paste Application Key")
-                                .on_click(cx.listener(|this, _, _, cx| this.paste(cx))),
-                        )
-                    }),
+            let props = ConnectProps {
+                status: self.status.clone(),
+                busy: self.busy.clone(),
+            };
+            return connect::render(
+                &theme,
+                &props,
+                &self.key_input,
+                cx.listener(|this, _, window, cx| this.submit_key(window, cx)),
             );
         };
-        let sidebar = div()
-            .w(px(222.))
-            .flex_none()
-            .h_full()
-            .p_5()
-            .v_flex()
-            .gap_3()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(APP_NAME),
-            )
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .truncate()
-                    .child(api.server().to_string()),
-            )
-            .child(div().flex_1())
-            .when(self.busy.is_none(), |view| {
-                view.child(
-                    Button::new("forget")
-                        .outline()
-                        .label("Remove Connection")
-                        .on_click(cx.listener(|this, _, _, cx| this.forget(cx))),
-                )
-            });
-        let enabled = self.busy.is_none();
-        let content = div()
-            .id("library")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_y_scrollbar()
-            .p_6()
-            .v_flex()
-            .gap_3()
-            .child(
-                div()
-                    .h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Applications"),
-                    )
-                    .when(enabled, |view| {
-                        view.child(
-                            Button::new("refresh")
-                                .outline()
-                                .small()
-                                .label("Refresh")
-                                .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                        )
-                    }),
-            )
-            .when_some(self.busy.clone(), |view, busy| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(busy),
-                )
-            })
-            .when_some(self.status.clone(), |view, status| {
-                view.child(div().text_sm().child(status))
-            })
-            .when(library.apps.is_empty(), |view| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No applications are available for this account."),
-                )
-            })
-            .children(library.apps.iter().map(|app| {
-                let app = app.clone();
-                row(&theme, app.name.clone()).when(enabled, |view| {
-                    view.child(
-                        Button::new(SharedString::from(format!("launch-{}", app.id)))
-                            .primary()
-                            .small()
-                            .label("Launch")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.launch(app.clone(), window, cx)
-                            })),
-                    )
-                })
-            }))
-            .child(
-                div()
-                    .mt_4()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Running Sessions"),
-            )
-            .when(library.sessions.is_empty(), |view| {
-                view.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No running sessions."),
-                )
-            })
-            .children(library.sessions.iter().map(|session| {
-                let session = session.clone();
-                row(&theme, session.app_name.clone()).when(enabled, |view| {
-                    view.child(
-                        Button::new(SharedString::from(format!("resume-{}", session.session_id)))
-                            .outline()
-                            .small()
-                            .label("Resume")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.open_session(session.clone(), window, cx)
-                            })),
-                    )
-                })
-            }));
-        root.flex().child(sidebar).child(content)
-    }
-}
 
-fn row(theme: &Theme, name: String) -> Div {
-    div()
-        .h_flex()
-        .items_center()
-        .justify_between()
-        .gap_3()
-        .px_4()
-        .py_2()
-        .min_h(px(48.))
-        .rounded_lg()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.popover)
-        .child(div().min_w_0().truncate().child(name))
+        let props = LibraryProps {
+            app_name: APP_NAME.to_string(),
+            server: api.server().to_string(),
+            apps: library
+                .apps
+                .iter()
+                .map(|app| AppItem {
+                    id: app.id.clone(),
+                    name: app.name.clone(),
+                })
+                .collect(),
+            sessions: library
+                .sessions
+                .iter()
+                .map(|session| SessionItem {
+                    id: session.session_id.clone(),
+                    app_name: session.app_name.clone(),
+                })
+                .collect(),
+            status: self.status.clone(),
+            busy: self.busy.clone(),
+        };
+
+        let apps_by_id = library.apps.clone();
+        let sessions_by_id = library.sessions.clone();
+        let launcher_for_launch = cx.entity().clone();
+        let launcher_for_resume = cx.entity().clone();
+
+        library::render(
+            &theme,
+            &props,
+            LibraryHandlers {
+                on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                on_forget: Box::new(cx.listener(|this, _, _, cx| this.forget(cx))),
+                on_launch: Rc::new(move |app_id, window, cx| {
+                    if let Some(app) = apps_by_id.iter().find(|a| a.id == app_id).cloned() {
+                        launcher_for_launch.update(cx, |this, cx| this.launch(app, window, cx));
+                    }
+                }),
+                on_resume: Rc::new(move |session_id, window, cx| {
+                    if let Some(session) = sessions_by_id
+                        .iter()
+                        .find(|s| s.session_id == session_id)
+                        .cloned()
+                    {
+                        launcher_for_resume
+                            .update(cx, |this, cx| this.open_session(session, window, cx));
+                    }
+                }),
+            },
+        )
+    }
 }
 
 #[cfg(test)]

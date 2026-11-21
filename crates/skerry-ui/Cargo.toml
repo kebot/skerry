@@ -1,0 +1,8 @@
+[package]
+name = "skerry-ui"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpui-kit = "0.10.0"
