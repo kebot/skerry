@@ -209,6 +209,15 @@ impl PreviewApp {
         )
         .detach();
 
+        // "System" is the initial choice, so start in the system appearance and follow it.
+        Theme::sync_system_appearance(Some(window), cx);
+        cx.observe_window_appearance(window, |this, window, cx| {
+            if matches!(this.appearance, Appearance::System) {
+                Theme::sync_system_appearance(Some(window), cx);
+                cx.notify();
+            }
+        })
+        .detach();
         let assets = PreviewAssets::build();
         let initial_dialog = Self::fixture_launch_dialog(
             "lightcraft",
@@ -328,6 +337,8 @@ impl PreviewApp {
             wayland: true,
             busy: false,
             show_copy_link: true,
+            show_organize: true,
+            link_copied: false,
         }
     }
 

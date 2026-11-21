@@ -58,10 +58,7 @@ pub struct LibraryHandlers {
 
 /// Creates a borderless omnibar input configured for searching apps or pasting URLs.
 pub fn new_search_input(window: &mut Window, cx: &mut App) -> Entity<InputState> {
-    cx.new(|cx| {
-        InputState::new(window, cx)
-            .placeholder("Search applications, or paste an address to open it in a session")
-    })
+    cx.new(|cx| InputState::new(window, cx).placeholder("Search applications and running sessions"))
 }
 
 pub fn render(
@@ -120,6 +117,14 @@ pub fn render(
         })
         .collect();
 
+    let filtered_sessions: Vec<&SessionItem> = props
+        .sessions
+        .iter()
+        .filter(|session| {
+            query.is_empty() || session.app_name.to_ascii_lowercase().contains(&query)
+        })
+        .collect();
+
     let header = div()
         .h_flex()
         .items_center()
@@ -173,6 +178,7 @@ pub fn render(
                         .ghost()
                         .xsmall()
                         .label("Disconnect Server")
+                        .tooltip("Disconnect and forget the saved application key")
                         .disabled(!enabled)
                         .on_click(move |event, window, cx| on_forget(event, window, cx)),
                 ),
@@ -202,42 +208,46 @@ pub fn render(
             ),
         );
 
-    let sessions_section =
-        div()
-            .v_flex()
-            .gap_3p5()
-            .child(
+    let sessions_section = div()
+        .v_flex()
+        .gap_3p5()
+        .child(
+            div()
+                .text_lg()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child("Running sessions"),
+        )
+        .when(filtered_sessions.is_empty(), |section| {
+            let message = if props.sessions.is_empty() {
+                "No running sessions. Launch an application below to start one."
+            } else {
+                "No running sessions match your search."
+            };
+            section.child(
                 div()
-                    .text_lg()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Running sessions"),
+                    .p_4()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(message),
             )
-            .when(props.sessions.is_empty(), |section| {
-                section.child(
-                    div()
-                        .p_4()
-                        .rounded_xl()
-                        .border_1()
-                        .border_color(theme.border)
-                        .bg(theme.popover)
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No running sessions. Launch an application below to start one."),
-                )
-            })
-            .when(!props.sessions.is_empty(), |section| {
-                section.child(div().h_flex().flex_wrap().gap_4().children(
-                    props.sessions.iter().map(|session| {
-                        render_session_card(
-                            theme,
-                            session,
-                            enabled,
-                            Rc::clone(&on_resume),
-                            on_stop.clone(),
-                        )
-                    }),
-                ))
-            });
+        })
+        .when(!filtered_sessions.is_empty(), |section| {
+            section.child(div().h_flex().flex_wrap().items_stretch().gap_4().children(
+                filtered_sessions.iter().map(|session| {
+                    render_session_card(
+                        theme,
+                        session,
+                        enabled,
+                        Rc::clone(&on_resume),
+                        on_stop.clone(),
+                    )
+                }),
+            ))
+        });
 
     let filter_bar =
         div()
@@ -454,7 +464,8 @@ fn render_session_card(
                             .outline()
                             .small()
                             .icon(IconName::Square)
-                            .tooltip("Stop Session")
+                            .label("Stop")
+                            .tooltip("Stop Session…")
                             .disabled(!enabled)
                             .on_click(move |_, window, cx| on_stop(stop_id.clone(), window, cx)),
                     )
@@ -470,7 +481,8 @@ fn render_session_card(
         .bg(theme.popover)
         .v_flex()
         .child(preview)
-        .child(footer)
+        // Fill the row height so cards in one row line up even when one card's pills wrap.
+        .child(footer.flex_1())
 }
 
 fn render_app_tile(

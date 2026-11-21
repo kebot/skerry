@@ -53,7 +53,7 @@ pub fn render(
                     div()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("Enter an application key from Settings → Application Keys on your SealSkin server. SealSkin stores it in macOS Keychain after connecting."),
+                        .child("Enter an application key from Settings → Application Keys on your SealSkin server. Skerry saves it to ~/.config/skerry/config.toml after connecting."),
                 )
                 .child(
                     div()

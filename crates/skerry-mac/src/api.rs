@@ -4,15 +4,24 @@ use reqwest::{Client, Method, RequestBuilder, StatusCode, Url};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const KEY_VARIABLE: &str = "SEALSKIN_APPLICATION_KEY";
-const KEYCHAIN_SERVICE: &str = "dev.kebot.sealskin";
-const KEYCHAIN_ACCOUNT: &str = "application-key";
+
+/// Why a Library load failed. `Refused` means the server failed the minimum-version gate
+/// (ARCH-009): Skerry must not keep using that server, even on Refresh.
+#[derive(Debug)]
+pub enum LibraryError {
+    Refused(String),
+    Failed(String),
+}
 
 /// The oldest SealSkin server version Skerry supports (ARCH-009). Older servers are refused.
 pub const MINIMUM_SEALSKIN_VERSION: (u64, u64, u64) = (0, 5, 0);
 
+#[derive(Clone)]
 pub struct Credential {
     raw: String,
     base: Url,
@@ -59,6 +68,9 @@ impl Credential {
         })
     }
 
+    /// Loads the key from `SEALSKIN_APPLICATION_KEY`, then `.env`, then `application_key` in
+    /// `~/.config/skerry/config.toml`. Skerry never reads or writes the macOS Keychain
+    /// (ARCH-011).
     pub fn startup() -> Result<Option<Self>, String> {
         if let Ok(value) = std::env::var(KEY_VARIABLE) {
             return Self::parse(&value).map(Some);
@@ -70,35 +82,113 @@ impl Credential {
                 }
             }
         }
-        match security_framework::passwords::get_generic_password(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-        ) {
-            Ok(bytes) => Self::parse(&String::from_utf8_lossy(&bytes)).map(Some),
-            Err(error) if error.code() == -25300 => Ok(None), // errSecItemNotFound
-            Err(_) => Err("Couldn’t read the saved application key from Keychain.".into()),
-        }
+        read_saved_key(&config_file()?)?
+            .map(|raw| Self::parse(&raw))
+            .transpose()
     }
 
     pub fn save(&self) -> Result<(), String> {
-        security_framework::passwords::set_generic_password(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-            self.raw.as_bytes(),
-        )
-        .map_err(|_| "Connected for this run. Keychain couldn’t save the key.".into())
+        write_saved_key(&config_file()?, Some(&self.raw)).map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                format!(
+                    "Connected for this run. The key wasn’t saved because {CONFIG_DISPLAY} isn’t valid TOML. Fix or delete that file, then connect again."
+                )
+            } else {
+                format!("Connected for this run. Skerry couldn’t save the key to {CONFIG_DISPLAY}.")
+            }
+        })
     }
 
     pub fn forget() -> Result<(), String> {
-        match security_framework::passwords::delete_generic_password(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_ACCOUNT,
-        ) {
-            Ok(()) => Ok(()),
-            Err(error) if error.code() == -25300 => Ok(()),
-            Err(_) => Err("Couldn’t remove the saved application key from Keychain.".into()),
+        write_saved_key(&config_file()?, None).map_err(|_| {
+            format!("Couldn’t remove the saved application key from {CONFIG_DISPLAY}.")
+        })
+    }
+}
+
+const CONFIG_DISPLAY: &str = "~/.config/skerry/config.toml";
+const CONFIG_KEY: &str = "application_key";
+
+fn config_file() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or("Skerry can’t find your home folder to keep the application key.")?;
+    Ok(config_file_in(Path::new(&home)))
+}
+
+fn config_file_in(home: &Path) -> PathBuf {
+    home.join(".config/skerry/config.toml")
+}
+
+fn read_config(path: &Path) -> io::Result<Option<toml_edit::DocumentMut>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .parse()
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_saved_key(path: &Path) -> Result<Option<String>, String> {
+    let document = read_config(path)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::InvalidData {
+                format!("{CONFIG_DISPLAY} isn’t valid TOML, so the saved key couldn’t be read. Fix or delete that file, or paste a key to connect for this run.")
+            } else {
+                format!("Couldn’t read the saved application key in {CONFIG_DISPLAY}.")
+            }
+        })?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    match document.get(CONFIG_KEY) {
+        None => Ok(None),
+        Some(item) => match item.as_str().map(str::trim) {
+            Some("") => Ok(None),
+            Some(raw) => Ok(Some(raw.to_string())),
+            None => Err(format!(
+                "`{CONFIG_KEY}` in {CONFIG_DISPLAY} must be a quoted string."
+            )),
+        },
+    }
+}
+
+/// Sets (`Some`) or removes (`None`) `application_key`, keeping every other setting and
+/// comment in the file. The folder is private to the user (0700) and the file is replaced
+/// atomically by a temporary file created 0600 before any secret bytes are written.
+fn write_saved_key(path: &Path, raw: Option<&str>) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    let existing = read_config(path)?;
+    if raw.is_none() && existing.is_none() {
+        return Ok(());
+    }
+    let mut document = existing.unwrap_or_default();
+    match raw {
+        Some(raw) => document[CONFIG_KEY] = toml_edit::value(raw.trim()),
+        None => {
+            if document.remove(CONFIG_KEY).is_none() {
+                return Ok(());
+            }
         }
     }
+    let dir = path
+        .parent()
+        .ok_or_else(|| io::Error::other("no config folder"))?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut file = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o600))
+        .tempfile_in(dir)?;
+    file.write_all(document.to_string().as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
 }
 
 #[derive(Clone, Deserialize)]
@@ -235,33 +325,35 @@ impl Api {
 
     /// Refuses any SealSkin server whose `GET /companion/api/ui/version` is older than
     /// [`MINIMUM_SEALSKIN_VERSION`] or unreadable. Servers older than 0.5.0 have no such route.
-    pub async fn check_version(&self) -> Result<(), String> {
+    pub async fn check_version(&self) -> Result<(), LibraryError> {
         let response = self
             .request(Method::GET, "/companion/api/ui/version")
             .send()
             .await
             .map_err(|_| {
-                "Couldn’t reach the SealSkin server. Check the address, network, and HTTPS certificate."
-                    .to_string()
+                LibraryError::Failed(
+                    "Couldn’t reach the SealSkin server. Check the address, network, and HTTPS certificate."
+                        .to_string(),
+                )
             })?;
         if !response.status().is_success() {
-            return Err(unsupported_version(None));
+            return Err(LibraryError::Refused(unsupported_version(None)));
         }
         let server: ServerVersion = response
             .json()
             .await
-            .map_err(|_| unsupported_version(None))?;
-        supported_version(&server.version)
+            .map_err(|_| LibraryError::Refused(unsupported_version(None)))?;
+        supported_version(&server.version).map_err(LibraryError::Refused)
     }
 
-    pub async fn library(&self) -> Result<Library, String> {
+    pub async fn library(&self) -> Result<Library, LibraryError> {
         self.check_version().await?;
         let apps = send(
             self.request(Method::POST, "/companion/api/applications")
                 .json(&json!({})),
         );
         let sessions = send(self.request(Method::GET, "/companion/api/sessions"));
-        let (apps, sessions) = tokio::try_join!(apps, sessions)?;
+        let (apps, sessions) = tokio::try_join!(apps, sessions).map_err(LibraryError::Failed)?;
         Ok(Library { apps, sessions })
     }
 
@@ -498,6 +590,56 @@ async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn saved_key_round_trips_through_a_private_config_toml() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_file_in(home.path());
+        assert_eq!(path, home.path().join(".config/skerry/config.toml"));
+        assert_eq!(read_saved_key(&path).unwrap(), None);
+        write_saved_key(&path, None).unwrap();
+        assert!(
+            !path.exists(),
+            "forgetting with no config must not create one"
+        );
+
+        write_saved_key(&path, Some(" ssk_id_secret@seal.example ")).unwrap();
+        assert_eq!(
+            read_saved_key(&path).unwrap().as_deref(),
+            Some("ssk_id_secret@seal.example")
+        );
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+
+        write_saved_key(&path, None).unwrap();
+        assert_eq!(read_saved_key(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn saving_the_key_keeps_other_settings_and_comments() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_file_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# my notes\ntheme = \"dark\"\n").unwrap();
+        write_saved_key(&path, Some("ssk_id_secret@seal.example")).unwrap();
+        write_saved_key(&path, None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my notes") && text.contains("theme = \"dark\""));
+        assert!(!text.contains("application_key"));
+    }
+
+    #[test]
+    fn malformed_saved_keys_are_reported_not_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let path = config_file_in(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "application_key = 42\n").unwrap();
+        assert!(read_saved_key(&path).is_err());
+        std::fs::write(&path, "application_key = [unterminated\n").unwrap();
+        assert!(read_saved_key(&path).is_err());
+    }
 
     #[test]
     fn application_key_requires_a_trusted_https_origin() {

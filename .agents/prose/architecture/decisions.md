@@ -72,12 +72,13 @@
 ## ARCH-009: Minimum SealSkin Server Version (0.5.0 or Newer)
 
 - **Status:** settled (pinned minimum) — supersedes `ARCH-008`
-- **Decision:** Skerry supports SealSkin `0.5.0` and every newer version (`api::MINIMUM_SEALSKIN_VERSION = (0, 5, 0)`). Before any other companion API call, `Api::check_version` reads `GET /companion/api/ui/version` and parses `version` as SemVer `MAJOR.MINOR.PATCH[-pre][+build]`. Skerry refuses to continue when the version is older than `0.5.0`, is a pre-release of `0.5.0` (e.g. `0.5.0-rc1`, which SemVer orders before `0.5.0`), is not a plain three-part version (e.g. `0.5`, `v0.5.0`), the route is missing (servers before 0.5.0), or the reply is unreadable. A refused server leaves Skerry on the Connect screen with an error naming the minimum and the found version; the library is not loaded, the `Api` is not stored, and the key is not saved to Keychain. The same gate runs on every Refresh.
+- **Decision:** Skerry supports SealSkin `0.5.0` and every newer version (`api::MINIMUM_SEALSKIN_VERSION = (0, 5, 0)`). Before any other companion API call, `Api::check_version` reads `GET /companion/api/ui/version` and parses `version` as SemVer `MAJOR.MINOR.PATCH[-pre][+build]`. Skerry refuses to continue when the version is older than `0.5.0`, is a pre-release of `0.5.0` (e.g. `0.5.0-rc1`, which SemVer orders before `0.5.0`), is not a plain three-part version (e.g. `0.5`, `v0.5.0`), the route is missing (servers before 0.5.0), or the reply is unreadable. A refused server leaves Skerry on the Connect screen with an error naming the minimum and the found version; the library is not loaded, the `Api` is not stored, and the key is not saved to Keychain (since `ARCH-011`: to `~/.config/skerry/config.toml`). The same gate runs on every Refresh.
 - **Rationale:** 0.5.0 is the first release with the behaviour these contracts rely on (`ARCH-008` lists it: per-origin session cookie exchange, alias-only room messages, launch address scheme rule, `open_url`, Selkies 2.3.0 images, forced hardening). A minimum rather than an exact pin lets operators take SealSkin patch and feature releases without waiting for a Skerry update.
 - **Risk accepted:** Newer SealSkin releases are accepted without being verified. When a release changes a route or behaviour Skerry relies on, raising the minimum (or fixing Skerry) is a new decision that supersedes this one.
-- **Open verification:** Re-run `ARCH-003` codec QA on a 0.5.0 server; its recorded evidence is from SealSkin 0.4.2.
+- **Refresh (decided 2026-11-21, was `ARCH-GAP-LS-12`):** Before, a refusal during Refresh showed the error and kept the old Library on screen. Now `Api::library` returns `LibraryError::Refused` for any version-gate refusal, and the Launcher goes back to the Connect screen, dropping the Library and its textures. Connect with an empty key field checks that server again. Network failures (`LibraryError::Failed`) still keep the Library and show the error. This has not been tested live, because no server older than 0.5.0 is available.
+- **Open verification:** ~~Re-run `ARCH-003` codec QA on a 0.5.0 server~~ done in QA 2026-11-21 against SealSkin 0.5.x (JPEG, H.264, H.265, AV1; `ARCH-012`).
 - **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/skerry.test.prose.md`
-- **Affected Rust:** `crates/skerry-mac/src/api.rs` (`MINIMUM_SEALSKIN_VERSION`, `parse_version`, `Api::check_version`, `Api::library`)
+- **Affected Rust:** `crates/skerry-mac/src/api.rs` (`MINIMUM_SEALSKIN_VERSION`, `parse_version`, `Api::check_version`, `Api::library`, `LibraryError`), `crates/skerry-mac/src/app.rs` (`Launcher::load`, `leave_server`)
 
 ## ARCH-010: Multi-Window Session Architecture & Native Mac App Presence Scope
 
@@ -88,6 +89,56 @@
   - **Protocol boundary:** Because Selkies streams a whole virtual framebuffer rather than rootless per-window surfaces, individual Linux windows opened inside a single remote application stay inside that session's virtual display (a second virtual monitor remains tracked in `ARCH-GAP-VS-01`).
 - **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`
 
+## ARCH-011: Application Key Stored in `~/.config/skerry/config.toml`, Not the macOS Keychain
+
+- **Status:** settled — replaces the Keychain store (`dev.kebot.sealskin` / `application-key`) that `Credential::startup`, `Credential::save`, and `Credential::forget` used before; no earlier `ARCH-*` decision recorded the Keychain choice.
+- **Decision:** After a successful Connect from the key field, Skerry saves the application key as `application_key = "ssk_…@host"` in `~/.config/skerry/config.toml`. Startup loads `SEALSKIN_APPLICATION_KEY` → `.env` → that file. The folder is created `0700`, and the file is replaced atomically through a temporary file created `0600` before any secret bytes are written. Writes go through `toml_edit`, so other settings and comments in the file survive; **Disconnect Server** removes only `application_key`. A non-string `application_key` or an unparseable file is reported on the Connect screen, and Skerry does not overwrite it. Skerry never reads or writes the macOS Keychain, and there is no migration from it (reading the old item would itself show a Keychain prompt). The `security-framework` dependency is removed.
+- **Rationale:** Rebuilt and unsigned development binaries make macOS show a Keychain access prompt on every new build, which blocks startup until someone answers it and gets in the way of unattended QA. A user-private config file is the convention for CLI-adjacent tools and is easy to inspect and edit.
+- **Risk accepted:** The key sits in plaintext on disk, guarded only by file permissions (`0600`/`0700`). Any process running as the user can read it, the same exposure as `.env`.
+- **Verification:** `api::tests::saved_key_round_trips_through_a_private_config_toml`, `saving_the_key_keeps_other_settings_and_comments`, `malformed_saved_keys_are_reported_not_ignored`; live: Skerry connected to `sealskin.kebot.me` from `config.toml` with no Keychain prompt.
+- **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/api.rs` (`Credential::startup`/`save`/`forget`, `config_file`, `read_saved_key`, `write_saved_key`), `crates/skerry-mac/Cargo.toml`, `crates/skerry-ui/src/connect.rs` (Connect copy)
+
+## ARCH-012: H.265 and AV1 Predicted Frames on Selkies 2.3.0 Follow Continuity, Not the Reference Field
+
+- **Status:** settled — amends the `ARCH-003` codec baseline for SealSkin 0.5 / Selkies 2.3.0 servers
+- **Finding (QA 2026-11-21):** On SealSkin 0.5.x, H.265 and AV1 streamed at ~1 fps with "Rejected packets" climbing. Packet traces showed that H.264 packets carry `reference` = id of the previous emitted packet, but Selkies 2.3.0's `x265` and `svt-av1` packets carry `reference == id`. `video::Decoder` only accepted a P-frame whose reference equalled the last decoded id, so every H.265/AV1 P-frame was dropped and only the once-per-second recovery keyframes showed.
+- **Decision:** `video::follows(last, id, reference)`: when `reference != id`, a predicted frame must reference the last decoded packet (H.264 chaining, unchanged). When `reference == id` (no chain information), it is accepted if the previous frame decoded. The WebSocket is ordered and lossless, and any decode failure still clears `last`, requests a keyframe, and waits for it.
+- **Evidence:** live traces on `sealskin.kebot.me` went from H.265 3/22 and AV1 3/26 packets decoded to 21/21 and 26/26; unit test `video::tests::predicted_frames_follow_chained_or_unchained_references`.
+- **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/video.rs` (`follows`, `Decoder::decode`)
+
+## ARCH-013: Settled Launcher Library, Launch Dialog, Thumbnails, and Stop Session
+
+- **Status:** settled — partially settles `ARCH-GAP-LS-01`, `ARCH-GAP-LS-02`, `ARCH-GAP-LS-04`
+- **Decision:** The Library (search over apps and running sessions, category chips, app icons, session thumbnails with GPU and storage pills), the Launch Dialog (Auto/Cleanroom storage, language, Wayland, collaborative, Copy link with in-place "Copied" confirmation), and Stop with a data-loss confirmation are settled behaviour; the QA plan `skerry.qa.test.prose.md` covers them. Favorite and Hide stay hidden (`LaunchDialogProps::show_organize = false`) until favorites and hidden apps are saved and a hidden app can be shown again (`ARCH-GAP-LS-04`). The search placeholder no longer promises opening addresses (`ARCH-GAP-LS-03`).
+- **Evidence:** QA run 2026-11-21 (L1–L3, D2, K1, K2 passed against SealSkin 0.5.x).
+- **Affected Contracts:** `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/index.prose.md`
+- **Affected Rust:** `crates/skerry-ui/src/{library,launch_dialog,session}.rs`, `crates/skerry-mac/src/{app,api}.rs`
+
+## ARCH-014: Session Resilience, Modal Hit-Testing, and Library Texture Lifecycle
+
+- **Status:** settled
+- **Decision:**
+  - **WebSocket startup retry:** `transport::run` retries the Selkies WebSocket for up to 45 s (`SOCKET_STARTUP_GRACE`, every 1.5 s) on I/O errors and 404/502/503/504, reusing the cookie from the single `access_token` exchange. Other failures still fail at once.
+  - **Recoverable session errors:** the session status banner has **Reconnect** and **Disconnect** buttons. The ⋯ Session Controls trigger also appears when the pointer enters the window's top-right corner, so it is reachable when the picture fills the window. The trigger occludes, so clicking it never also clicks the remote desktop. Reconnects for codec or HiDPI changes keep Session Controls open. cmd-w is deliberately not bound in a session, because remote apps need it (ctrl-w with **Command sends Control**).
+  - **Modals:** the Launch Dialog and Stop confirmation backdrops `occlude()` the Library, and Escape dismisses them.
+  - **Library textures:** like JPEG frames, app icons and session thumbnails are GPU textures that GPUI frees only through `window.drop_image`. Replaced, removed, stale, and forgotten images are queued in `Launcher::retired_images` and dropped on the next render. Downloads started for an older Library (`media_generation`) are discarded. Server images are decoded with limits (≤ 8192 px, ≤ 256 MB) and downscaled (icons 256 px, thumbnails 960 px).
+  - **Force Aligned Resolution:** Selkies aligns its stored display size, not the client's desired size, so after toggling alignment Skerry re-sends its desired resolution, which the server then aligns (or restores exactly when alignment is off).
+  - **Full screen:** leaving full screen re-applies the session chrome, so the restored title bar never covers the picture.
+  - **Connect:** a failed connect keeps the typed key. When the saved key fails at startup, Connect with an empty field retries it. A malformed `config.toml` is reported as invalid TOML with "fix or delete" guidance.
+- **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/video-and-screen.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/{transport,view,app,api}.rs`, `crates/skerry-mac/src/app/controls.rs`, `crates/skerry-ui/src/{session,launch_dialog,library}.rs`
+
+## ARCH-015: Async Launcher Updates Resolve Their Window by Handle
+
+- **Status:** settled
+- **Finding (QA 2026-11-21, RT-BUG-1 / BUG-8 / RT-BUG-2):** In `gpui-pre 0.3.12`, `WeakEntity::update_in` and `AsyncWindowContext::update_window_entity` do not use the window the task was spawned in. They resolve the entity's *current window* (`App::with_window(entity_id)`), which is the last window that rendered or updated it. Session Controls renders the `Launcher`, so after it opened, the session-event task's `ScreenPolicy` / `ResizeAllowed` handlers ran `resize_display` against the 388×680 pt panel. That sent `r,776x1360` after codec reconnects, and Force Aligned Resolution turned it into 768×1360. It also made UI Scaling read the panel's display. Debug traces showed `resize viewport=388×680 from app.rs:786/792`.
+- **Decision:** Long-lived or async work on an entity that another window renders must capture `Window::window_handle(window)` up front and run `handle.update(cx, |_, window, cx| entity.update(cx, …))`. Never use `update_in` for it. `Launcher::open` (session events) and `Launcher::launch_with_options` follow this. Force Aligned Resolution also re-requests the desired resolution after toggling (`ARCH-014`), so turning it off restores the exact size.
+- **Evidence:** final retest on a 1267×1392 pt window (1966×2160 remote): H.264 → H.265 → AV1 → JPEG → H.264 with Session Controls open kept 1966×2160 with the stream running. Force Aligned Resolution on gave 1952×2160; off went back to 1966×2160 with no Reset. UI Scaling stayed at 200 % throughout. Run record: `runs/2026-11-21-qa/`.
+- **Affected Contracts:** `src/skerry/index.prose.md` (Invariants)
+- **Affected Rust:** `crates/skerry-mac/src/app.rs`
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -97,10 +148,10 @@
 | `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | unresolved (backlog) | Open a second remote display in its own GPUI window following server display placement while primary session owns audio. |
 | `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
-| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | unresolved (todo) | Storage mode (auto/cleanroom/named home), locale/timezone, Wayland/X11, GPU/VPN, startup progress stages, and remembered 1-click launch. |
-| `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | unresolved (todo) | Session thumbnail previews, Send File, and Stop (distinct from Disconnect, with cleanroom data loss confirmation). |
+| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | partially settled (`ARCH-013`) | Settled: Auto/Cleanroom storage, language, Wayland, collaborative. Open: named homes, timezone, GPU/VPN, startup progress stages, and remembered 1-click launch. |
+| `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | partially settled (`ARCH-013`) | Settled: thumbnails and confirmed Stop. Open: Send File. |
 | `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
-| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | unresolved (todo) | Search, app icons, recents, favorites, hidden apps, per-app launch preferences, and matching running-session reuse. |
+| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | partially settled (`ARCH-013`) | Settled: search (apps + sessions), app icons, category filters. Open: recents, favorites, hidden apps, per-app launch preferences, and matching running-session reuse. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
@@ -114,3 +165,8 @@
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
+| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
+| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | unresolved (todo) | Session Controls forgets section state/scroll; Preset picker inconsistent; popovers lack shadow. |
+| `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | unresolved (todo) | Disconnect Server confirmation, wide-window Library density, Refresh/Copy feedback, live "Started … ago". |
+| `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | unresolved (todo) | No Bearer key on logo fetches, off-main-thread preference/key writes, fewer per-render clones. |
+| `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | unresolved (needs repro) | Remote start menu opened during a codec switch while focus moved; possible unreleased Cmd/Super. |

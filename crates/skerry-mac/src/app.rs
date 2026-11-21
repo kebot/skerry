@@ -1,7 +1,7 @@
 mod controls;
 mod display;
 
-use crate::api::{Api, Credential, LaunchParams, Library, RemoteApp, RemoteSession};
+use crate::api::{Api, Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession};
 use crate::input::InputFeature;
 use crate::settings::{
     self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
@@ -17,8 +17,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context,
-    Entity, KeyBinding, Menu, MenuItem, Pixels, RenderImage, Size, Task, TitlebarOptions, Window,
-    WindowAppearance, WindowBounds, WindowOptions,
+    Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage, Size, Task,
+    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
@@ -182,6 +182,19 @@ struct Launcher {
     session_thumbnails: HashMap<String, Arc<RenderImage>>,
     launch_dialog: Option<(RemoteApp, LaunchDialogProps, LaunchDialogSelects)>,
     pending_stop: Option<RemoteSession>,
+    /// Images replaced or removed since the last render; their GPU textures are freed with
+    /// `window.drop_image` on the next render (GPUI never frees them on drop).
+    retired_images: Vec<Arc<RenderImage>>,
+    /// Bumped on every Library load and on Disconnect Server, so icon/thumbnail downloads
+    /// started for an older Library never write into a newer one.
+    media_generation: u64,
+    /// The saved key from startup, kept so Connect can retry it after a failed first connect.
+    startup_credential: Option<Credential>,
+    /// A server refused on Refresh (ARCH-009); Connect with an empty field checks it again.
+    retry_api: Option<Api>,
+    focus_handle: FocusHandle,
+    /// Set after a typed key connects; the next render clears the key field (needs a Window).
+    clear_key_input: bool,
     busy: Option<String>,
     status: Option<String>,
 }
@@ -239,6 +252,12 @@ impl Launcher {
             session_thumbnails: HashMap::new(),
             launch_dialog: None,
             pending_stop: None,
+            retired_images: Vec::new(),
+            media_generation: 0,
+            startup_credential: None,
+            retry_api: None,
+            focus_handle: cx.focus_handle(),
+            clear_key_input: false,
             busy: None,
             status: None,
         };
@@ -247,8 +266,15 @@ impl Launcher {
             let _ = owner.update(cx, |launcher, cx| launcher.remove_controls(cx));
             true
         });
-        cx.observe_window_bounds(window, |this, window, cx| this.resize_display(window, cx))
-            .detach();
+        cx.observe_window_bounds(window, |this, window, cx| {
+            // Leaving full screen restores the standard title bar; hide it again so it doesn't
+            // cover the top of the remote picture.
+            if this.current.is_some() {
+                session_chrome(window, false);
+            }
+            this.resize_display(window, cx)
+        })
+        .detach();
         Theme::sync_system_appearance(Some(window), cx);
         cx.observe_window_appearance(window, |this, window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
@@ -259,28 +285,37 @@ impl Launcher {
         })
         .detach();
         match Credential::startup() {
-            Ok(Some(credential)) => launcher.connect(credential, false, cx),
+            Ok(Some(credential)) => {
+                launcher.startup_credential = Some(credential.clone());
+                launcher.connect(credential, false, cx)
+            }
             Ok(None) => {}
             Err(error) => launcher.status = Some(error),
         }
         launcher
     }
 
-    fn submit_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn submit_key(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
         }
         let text = self.key_input.read(cx).value().to_string();
         let trimmed = text.trim();
-        let result = if trimmed.is_empty() {
-            Err("Enter a SealSkin application key first.".to_string())
-        } else {
-            Credential::parse(trimmed)
-        };
-        match result {
+        if trimmed.is_empty() {
+            if let Some(api) = self.retry_api.take() {
+                self.load(api, None, true, cx);
+            } else if let Some(saved) = self.startup_credential.clone() {
+                self.connect(saved, false, cx);
+            } else {
+                self.status = Some("Enter a SealSkin application key first.".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        match Credential::parse(trimmed) {
             Ok(credential) => {
-                self.key_input
-                    .update(cx, |state, cx| state.set_value("", window, cx));
+                // The field is cleared once the key is accepted (see `load`), so a failed
+                // connect leaves it in place to fix or retry.
                 self.connect(credential, true, cx);
             }
             Err(error) => self.status = Some(error),
@@ -322,22 +357,42 @@ impl Launcher {
         self.status = None;
         let client = api.clone();
         let pending = self.rt.spawn(async move { client.library().await });
+        let saved_startup_key = connecting && save.is_none();
         cx.spawn(async move |this, cx| {
-            let result = pending
-                .await
-                .unwrap_or_else(|_| Err("The connection was interrupted.".into()));
+            let result = pending.await.unwrap_or_else(|_| {
+                Err(LibraryError::Failed(
+                    "The connection was interrupted.".into(),
+                ))
+            });
             let _ = this.update(cx, |this, cx| {
                 this.busy = None;
                 match result {
                     Ok(library) => {
                         let apps = library.apps.clone();
                         let sessions = library.sessions.clone();
+                        if save.is_some() {
+                            this.clear_key_input = true;
+                        }
+                        this.startup_credential = None;
+                        this.retry_api = None;
                         this.api = Some(api.clone());
                         this.library = Some(library);
                         this.status = save.and_then(|credential| credential.save().err());
                         this.fetch_library_media(api, apps, sessions, cx);
                     }
-                    Err(error) => this.status = Some(error),
+                    Err(LibraryError::Refused(error)) => {
+                        // ARCH-009: a server that fails the version gate is never used, even
+                        // on Refresh, so drop back to Connect. Connect (empty field) retries.
+                        this.retry_api = Some(api.clone());
+                        this.leave_server();
+                        this.status = Some(error);
+                    }
+                    Err(LibraryError::Failed(error)) if saved_startup_key && this.api.is_none() => {
+                        this.status = Some(format!(
+                            "{error} Choose Connect to try the saved key again, or paste a new one."
+                        ));
+                    }
+                    Err(LibraryError::Failed(error)) => this.status = Some(error),
                 }
                 cx.notify();
             });
@@ -347,12 +402,28 @@ impl Launcher {
     }
 
     fn fetch_library_media(
-        &self,
+        &mut self,
         api: Api,
         apps: Vec<RemoteApp>,
         sessions: Vec<RemoteSession>,
         cx: &mut Context<Self>,
     ) {
+        self.media_generation += 1;
+        let generation = self.media_generation;
+        // Drop thumbnails of sessions that are gone; their textures are retired on render.
+        let live: std::collections::HashSet<&str> =
+            sessions.iter().map(|s| s.session_id.as_str()).collect();
+        let gone: Vec<String> = self
+            .session_thumbnails
+            .keys()
+            .filter(|id| !live.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in gone {
+            if let Some(image) = self.session_thumbnails.remove(&id) {
+                self.retired_images.push(image);
+            }
+        }
         let missing_apps: Vec<RemoteApp> = apps
             .into_iter()
             .filter(|app| !self.app_icons.contains_key(&app.id))
@@ -360,13 +431,21 @@ impl Launcher {
         for app in missing_apps {
             let api = api.clone();
             let app_id = app.id.clone();
-            let pending = self
-                .rt
-                .spawn(async move { api.app_icon(&app).await.and_then(|b| decode_image(&b)) });
+            let pending = self.rt.spawn(async move {
+                api.app_icon(&app)
+                    .await
+                    .and_then(|b| decode_image(&b, ICON_MAX_EDGE))
+            });
             cx.spawn(async move |this, cx| {
                 if let Ok(Some(image)) = pending.await {
                     let _ = this.update(cx, |this, cx| {
-                        this.app_icons.insert(app_id, image);
+                        if this.media_generation != generation {
+                            this.retired_images.push(image);
+                            return;
+                        }
+                        if let Some(old) = this.app_icons.insert(app_id, image) {
+                            this.retired_images.push(old);
+                        }
                         cx.notify();
                     });
                 }
@@ -379,12 +458,19 @@ impl Launcher {
             let pending = self.rt.spawn(async move {
                 api.session_thumbnail(&session_id)
                     .await
-                    .and_then(|b| decode_image(&b))
+                    .and_then(|b| decode_image(&b, THUMBNAIL_MAX_EDGE))
             });
             cx.spawn(async move |this, cx| {
                 if let Ok(Some(image)) = pending.await {
                     let _ = this.update(cx, |this, cx| {
-                        this.session_thumbnails.insert(session.session_id, image);
+                        if this.media_generation != generation {
+                            this.retired_images.push(image);
+                            return;
+                        }
+                        if let Some(old) = this.session_thumbnails.insert(session.session_id, image)
+                        {
+                            this.retired_images.push(old);
+                        }
                         cx.notify();
                     });
                 }
@@ -395,13 +481,23 @@ impl Launcher {
 
     fn forget(&mut self, cx: &mut Context<Self>) {
         self.status = Credential::forget().err();
+        self.startup_credential = None;
+        self.retry_api = None;
+        self.leave_server();
+        cx.notify();
+    }
+
+    /// Returns to the Connect screen, dropping the Library and its textures.
+    fn leave_server(&mut self) {
         self.api = None;
         self.library = None;
-        self.app_icons.clear();
-        self.session_thumbnails.clear();
+        self.media_generation += 1;
+        self.retired_images
+            .extend(self.app_icons.drain().map(|(_, image)| image));
+        self.retired_images
+            .extend(self.session_thumbnails.drain().map(|(_, image)| image));
         self.launch_dialog = None;
         self.pending_stop = None;
-        cx.notify();
     }
 
     fn open_launch_dialog(&mut self, app: RemoteApp, window: &mut Window, cx: &mut Context<Self>) {
@@ -457,6 +553,8 @@ impl Launcher {
             wayland: true,
             busy: false,
             show_copy_link: true,
+            show_organize: false,
+            link_copied: false,
         };
         let selects = LaunchDialogSelects::from_props(&props, window, cx);
         if let Some(storage) = &selects.storage {
@@ -490,6 +588,8 @@ impl Launcher {
             .detach();
         }
         self.launch_dialog = Some((app, props, selects));
+        // Take focus off the search field so Escape reaches the dialog.
+        window.focus(&self.focus_handle, cx);
         cx.notify();
     }
 
@@ -524,10 +624,10 @@ impl Launcher {
                 }
             }
             LaunchDialogAction::CopyLink => {
-                if let (Some(api), Some((app, _, _))) = (&self.api, &self.launch_dialog) {
+                if let (Some(api), Some((app, dialog, _))) = (&self.api, &mut self.launch_dialog) {
                     if let Some(link) = api.app_deep_link(&app.id) {
                         cx.write_to_clipboard(ClipboardItem::new_string(link));
-                        self.status = Some(format!("Copied link for {}.", app.name));
+                        dialog.link_copied = true;
                     }
                 }
             }
@@ -564,22 +664,28 @@ impl Launcher {
         let pending = self
             .rt
             .spawn(async move { api.launch_with_options(app, params).await });
-        cx.spawn_in(window, async move |this, cx| {
+        // Resolve the Launcher window by handle: gpui-pre's `update_in` uses the entity's
+        // *current* window, which is Session Controls whenever that panel last rendered the
+        // Launcher (ARCH-015).
+        let launcher_window = Window::window_handle(window);
+        cx.spawn(async move |this, cx| {
             let result = pending
                 .await
                 .unwrap_or_else(|_| Err("The launch was interrupted.".into()));
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.busy = None;
-                match result {
-                    Ok(session) => {
-                        if let Some(library) = &mut this.library {
-                            library.sessions.insert(0, session.clone());
+            let _ = launcher_window.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    this.busy = None;
+                    match result {
+                        Ok(session) => {
+                            if let Some(library) = &mut this.library {
+                                library.sessions.insert(0, session.clone());
+                            }
+                            this.open_session(session, window, cx);
                         }
-                        this.open_session(session, window, cx);
+                        Err(error) => this.status = Some(error),
                     }
-                    Err(error) => this.status = Some(error),
-                }
-                cx.notify();
+                    cx.notify();
+                })
             });
         })
         .detach();
@@ -610,7 +716,9 @@ impl Launcher {
                                 .sessions
                                 .retain(|s| s.session_id != session.session_id);
                         }
-                        this.session_thumbnails.remove(&session.session_id);
+                        if let Some(image) = this.session_thumbnails.remove(&session.session_id) {
+                            this.retired_images.push(image);
+                        }
                     }
                     Err(error) => this.status = Some(error),
                 }
@@ -675,52 +783,56 @@ impl Launcher {
                 stream.set_input_settings(self.preferences.input, window, cx);
                 self.current = Some((session, stream));
                 session_chrome(window, false);
-                self.stream_events = Some(cx.spawn_in(window, async move |this, cx| {
+                // Pin session events to this window (ARCH-015); see `launch_with_options`.
+                let session_window = Window::window_handle(window);
+                self.stream_events = Some(cx.spawn(async move |this, cx| {
                     while let Some(event) = incoming.recv().await {
-                        if this
-                            .update_in(cx, |this, window, cx| {
-                                match event {
-                                    SessionEvent::Audio(enabled) => this.audio = Some(enabled),
-                                    SessionEvent::AudioUnavailable(reason) => {
-                                        this.audio_unavailable = Some(reason)
-                                    }
-                                    SessionEvent::Video(enabled) => this.video = Some(enabled),
-                                    SessionEvent::Settings(settings) => {
-                                        this.settings = Some(settings)
-                                    }
-                                    SessionEvent::Stats(sample) => this.stats = Some(sample),
-                                    SessionEvent::FingerScroll(enabled) => {
-                                        if let Some((_, stream)) = &this.current {
-                                            stream.allow_finger_scroll(enabled, cx);
+                        if session_window
+                            .update(cx, |_, window, cx| {
+                                this.update(cx, |this, cx| {
+                                    match event {
+                                        SessionEvent::Audio(enabled) => this.audio = Some(enabled),
+                                        SessionEvent::AudioUnavailable(reason) => {
+                                            this.audio_unavailable = Some(reason)
                                         }
-                                    }
-                                    SessionEvent::Cursor(cursor) => {
-                                        if let Some((_, stream)) = &this.current {
-                                            stream.set_cursor(cursor, window, cx);
+                                        SessionEvent::Video(enabled) => this.video = Some(enabled),
+                                        SessionEvent::Settings(settings) => {
+                                            this.settings = Some(settings)
                                         }
-                                    }
-                                    SessionEvent::ScreenPolicy(policy) => {
-                                        this.screen_policy = policy;
-                                        this.resize_display(window, cx);
-                                    }
-                                    SessionEvent::ResizeAllowed(allowed) => {
-                                        if this.resize_allowed != allowed {
-                                            this.resize_allowed = allowed;
-                                            this.applied_resolution = None;
+                                        SessionEvent::Stats(sample) => this.stats = Some(sample),
+                                        SessionEvent::FingerScroll(enabled) => {
+                                            if let Some((_, stream)) = &this.current {
+                                                stream.allow_finger_scroll(enabled, cx);
+                                            }
+                                        }
+                                        SessionEvent::Cursor(cursor) => {
+                                            if let Some((_, stream)) = &this.current {
+                                                stream.set_cursor(cursor, window, cx);
+                                            }
+                                        }
+                                        SessionEvent::ScreenPolicy(policy) => {
+                                            this.screen_policy = policy;
                                             this.resize_display(window, cx);
                                         }
+                                        SessionEvent::ResizeAllowed(allowed) => {
+                                            if this.resize_allowed != allowed {
+                                                this.resize_allowed = allowed;
+                                                this.applied_resolution = None;
+                                                this.resize_display(window, cx);
+                                            }
+                                        }
+                                        SessionEvent::Error(error) => {
+                                            this.resize_allowed = false;
+                                            this.settings = None;
+                                            this.audio = None;
+                                            this.video = None;
+                                            this.status = Some(error);
+                                        }
                                     }
-                                    SessionEvent::Error(error) => {
-                                        this.resize_allowed = false;
-                                        this.settings = None;
-                                        this.audio = None;
-                                        this.video = None;
-                                        this.status = Some(error);
-                                    }
-                                }
-                                cx.notify();
+                                    cx.notify();
+                                })
                             })
-                            .is_err()
+                            .map_or(true, |updated| updated.is_err())
                         {
                             break;
                         }
@@ -735,7 +847,9 @@ impl Launcher {
     fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some((session, _)) = &self.current {
             let session = session.clone();
-            self.close_stream(window, cx);
+            // Keep Session Controls open across codec / HiDPI reconnects; it re-renders from
+            // the new stream's settings once they arrive.
+            self.end_stream(window, cx, false);
             self.open(session, window, cx);
         }
     }
@@ -919,6 +1033,10 @@ impl Launcher {
     }
 
     fn close_stream(&mut self, window: &mut Window, cx: &mut App) {
+        self.end_stream(window, cx, true);
+    }
+
+    fn end_stream(&mut self, window: &mut Window, cx: &mut App, close_controls: bool) {
         self.settings_task = None;
         if !self.pending_settings.is_empty() {
             self.apply_settings();
@@ -930,7 +1048,9 @@ impl Launcher {
         self.stats = None;
         self.resize_allowed = false;
         self.resize_task = None;
-        self.close_controls(window, cx);
+        if close_controls {
+            self.close_controls(window, cx);
+        }
         self.stream_events = None;
         if let Some((_, stream)) = self.current.take() {
             stream.release_focus(window, cx);
@@ -989,7 +1109,14 @@ fn dark_appearance(window: &Window) -> bool {
 }
 
 impl Render for Launcher {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for image in self.retired_images.drain(..) {
+            let _ = window.drop_image(image);
+        }
+        if std::mem::take(&mut self.clear_key_input) {
+            self.key_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
         let theme = cx.theme().clone();
         if let Some((_, stream)) = &self.current {
             return div()
@@ -1006,7 +1133,22 @@ impl Render for Launcher {
                 }))
                 .child(stream.view())
                 .when_some(self.status.clone(), |root, status| {
-                    root.child(session::status_banner(&theme, status))
+                    root.child(session::status_banner_with_actions(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| {
+                            this.status = None;
+                            this.reconnect(window, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|this, _, window, cx| {
+                            this.status = None;
+                            this.close_stream(window, cx);
+                            this.muted = false;
+                            this.refresh(cx);
+                            cx.notify();
+                        }),
+                    ))
                 });
         }
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
@@ -1048,7 +1190,13 @@ impl Render for Launcher {
                     app_name: session.app_name.clone(),
                     started_label: format_started_ago(session.created_at),
                     gpu: session.gpu,
-                    storage_label: (!session.home.is_empty()).then(|| session.home.clone()),
+                    // No home means a cleanroom session; label it so every card shows its
+                    // storage and the cards line up.
+                    storage_label: Some(if session.home.is_empty() {
+                        "Cleanroom".to_string()
+                    } else {
+                        session.home.clone()
+                    }),
                     thumbnail: self.session_thumbnails.get(&session.session_id).cloned(),
                     app_icon: self.app_icons.get(&session.app_id).cloned(),
                 })
@@ -1071,6 +1219,17 @@ impl Render for Launcher {
         div()
             .size_full()
             .relative()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && (this.launch_dialog.is_some() || this.pending_stop.is_some())
+                {
+                    this.launch_dialog = None;
+                    this.pending_stop = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
             .child(library::render(
                 &theme,
                 &props,
@@ -1094,7 +1253,7 @@ impl Render for Launcher {
                                 .update(cx, |this, cx| this.open_session(session, window, cx));
                         }
                     }),
-                    on_stop: Some(Rc::new(move |session_id, _, cx| {
+                    on_stop: Some(Rc::new(move |session_id, window, cx| {
                         if let Some(session) = sessions_for_stop
                             .iter()
                             .find(|s| s.session_id == session_id)
@@ -1102,6 +1261,7 @@ impl Render for Launcher {
                         {
                             launcher_for_stop.update(cx, |this, cx| {
                                 this.pending_stop = Some(session);
+                                window.focus(&this.focus_handle, cx);
                                 cx.notify();
                             });
                         }
@@ -1151,8 +1311,27 @@ fn storage_home_name(selected: &str) -> Option<String> {
     }
 }
 
-fn decode_image(bytes: &[u8]) -> Option<Arc<RenderImage>> {
-    let mut pixels = image::load_from_memory(bytes).ok()?.into_rgba8();
+/// Longest edge kept for app icons (shown at most ~80 pt @2x).
+const ICON_MAX_EDGE: u32 = 256;
+/// Longest edge kept for session thumbnails (card is ~470 pt wide @2x).
+const THUMBNAIL_MAX_EDGE: u32 = 960;
+
+/// Decodes server-supplied image bytes with hard size limits and downscales to `max_edge`,
+/// so a huge or hostile image can't exhaust memory or pin a full-size texture.
+fn decode_image(bytes: &[u8], max_edge: u32) -> Option<Arc<RenderImage>> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(256 * 1024 * 1024);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    reader.limits(limits);
+    let mut decoded = reader.decode().ok()?;
+    if decoded.width() > max_edge || decoded.height() > max_edge {
+        decoded = decoded.thumbnail(max_edge, max_edge);
+    }
+    let mut pixels = decoded.into_rgba8();
     for pixel in pixels.pixels_mut() {
         pixel.0.swap(0, 2); // RGBA -> BGRA for GPUI RenderImage
     }

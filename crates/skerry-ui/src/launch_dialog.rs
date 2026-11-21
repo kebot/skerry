@@ -49,6 +49,11 @@ pub struct LaunchDialogProps {
     pub wayland: bool,
     pub busy: bool,
     pub show_copy_link: bool,
+    /// Shows Favorite / Hide. Off until those choices are saved anywhere (ARCH-GAP-LS-04),
+    /// so the dialog never offers a control that does nothing.
+    pub show_organize: bool,
+    /// The deep link was just copied; the Copy button confirms it in place.
+    pub link_copied: bool,
 }
 
 /// Live `gpui-kit` `SelectState` entities backing the Launch Dialog's native dropdown popovers.
@@ -120,7 +125,13 @@ pub fn render_modal(
         .items_center()
         .justify_center()
         .p_6()
-        .on_click(move |_, window, cx| close_backdrop(LaunchDialogAction::Close, window, cx))
+        // Block hits to the Library underneath; otherwise a backdrop click also lands on
+        // whatever sits below it (e.g. Disconnect Server).
+        .occlude()
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            close_backdrop(LaunchDialogAction::Close, window, cx)
+        })
         .child(render_card(theme, props, selects, on_action))
 }
 
@@ -191,53 +202,57 @@ pub fn render_card(
                 .items_center()
                 .gap_2()
                 .flex_none()
-                .child({
-                    let mut btn = Button::new("launch-favorite")
-                        .small()
-                        .icon(if props.favorite {
-                            IconName::StarFill
+                .when(props.show_organize, |row| {
+                    row.child({
+                        let mut btn = Button::new("launch-favorite")
+                            .small()
+                            .icon(if props.favorite {
+                                IconName::StarFill
+                            } else {
+                                IconName::Star
+                            })
+                            .tooltip(if props.favorite {
+                                "Remove Favorite"
+                            } else {
+                                "Add Favorite"
+                            })
+                            .disabled(!enabled)
+                            .on_click(move |_, window, cx| {
+                                on_fav(LaunchDialogAction::ToggleFavorite, window, cx)
+                            });
+                        if props.favorite {
+                            btn = btn.primary();
                         } else {
-                            IconName::Star
-                        })
-                        .tooltip(if props.favorite {
-                            "Remove Favorite"
-                        } else {
-                            "Add Favorite"
-                        })
-                        .disabled(!enabled)
-                        .on_click(move |_, window, cx| {
-                            on_fav(LaunchDialogAction::ToggleFavorite, window, cx)
-                        });
-                    if props.favorite {
-                        btn = btn.primary();
-                    } else {
-                        btn = btn.outline();
-                    }
-                    btn
+                            btn = btn.outline();
+                        }
+                        btn
+                    })
                 })
-                .child({
-                    let mut btn = Button::new("launch-hide")
-                        .small()
-                        .icon(if props.hidden {
-                            IconName::Eye
+                .when(props.show_organize, |row| {
+                    row.child({
+                        let mut btn = Button::new("launch-hide")
+                            .small()
+                            .icon(if props.hidden {
+                                IconName::Eye
+                            } else {
+                                IconName::EyeOff
+                            })
+                            .tooltip(if props.hidden {
+                                "Show in Library"
+                            } else {
+                                "Hide from Library"
+                            })
+                            .disabled(!enabled)
+                            .on_click(move |_, window, cx| {
+                                on_hide(LaunchDialogAction::ToggleHidden, window, cx)
+                            });
+                        if props.hidden {
+                            btn = btn.primary();
                         } else {
-                            IconName::EyeOff
-                        })
-                        .tooltip(if props.hidden {
-                            "Show in Library"
-                        } else {
-                            "Hide from Library"
-                        })
-                        .disabled(!enabled)
-                        .on_click(move |_, window, cx| {
-                            on_hide(LaunchDialogAction::ToggleHidden, window, cx)
-                        });
-                    if props.hidden {
-                        btn = btn.primary();
-                    } else {
-                        btn = btn.outline();
-                    }
-                    btn
+                            btn = btn.outline();
+                        }
+                        btn
+                    })
                 })
                 .child(
                     Button::new("launch-close")
@@ -305,8 +320,16 @@ pub fn render_card(
             footer.child(
                 Button::new("launch-copy-link")
                     .outline()
-                    .icon(IconName::Copy)
-                    .label("Copy link")
+                    .icon(if props.link_copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    })
+                    .label(if props.link_copied {
+                        "Copied"
+                    } else {
+                        "Copy link"
+                    })
                     .disabled(!enabled)
                     .on_click(move |_, window, cx| {
                         on_copy(LaunchDialogAction::CopyLink, window, cx)

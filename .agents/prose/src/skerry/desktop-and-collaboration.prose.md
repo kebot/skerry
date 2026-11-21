@@ -15,6 +15,7 @@ id: 067NC4KG01SKERRY0000000004
 <!-- compose:unresolved id=ARCH-GAP-DC-06 concept="gaming-controls" question="Add relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-07 concept="session-sharing-and-rooms" question="Support Selkies view-only and player-slot roles and evaluate SealSkin collaboration rooms (room API, token handoff, control transfer)." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-08 concept="multitouch-trackpad" question="Keep raw multitouch contact forwarding deferred until gesture-to-display latency in Chrome matches native macOS pinch/pan and contact release on focus loss is proven." -->
+<!-- compose:unresolved id=ARCH-GAP-DC-09 concept="stray-super-key" question="QA 2026-11-21 saw the remote start menu open by itself during a codec switch while focus moved between apps, which suggests a Cmd/Super press reached the remote without its release. Reproduce, then check modifier release on blur and reconnect." -->
 
 ### Goal
 

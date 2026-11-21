@@ -256,6 +256,13 @@ impl ControlPanel {
                             if let Some((_, stream)) = &launcher.current {
                                 stream.set_screen(change);
                             }
+                            if matches!(change, ScreenChange::Alignment(_)) {
+                                // Selkies aligns whatever size it last stored, which may not be
+                                // the size this window wants; re-request ours so it is aligned
+                                // (or restored exactly when alignment is turned off).
+                                launcher.applied_resolution = None;
+                                launcher.resize_display(window, cx);
+                            }
                         }
                         Command::Codec(codec) => launcher.change_codec(codec, window, cx),
                         Command::Setting(key, value) => launcher.change_setting(key, value, cx),
