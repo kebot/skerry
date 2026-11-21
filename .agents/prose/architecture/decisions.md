@@ -160,7 +160,7 @@
 
 ## ARCH-017: Clipboard Sync Follows the Selkies Web Client, Triggered by Mac Focus
 
-- **Status:** settled 2026-11-21 — settles `ARCH-GAP-DC-01`; the ⌘C/⌘X/⌘V mapping is still open as `ARCH-GAP-DC-10`. Live: the person tested copy and paste in a session on 2026-11-21 and reported it works; the full QA list (`skerry.qa.test.prose.md` B1–B6) has not been run step by step.
+- **Status:** settled 2026-11-21 — settles `ARCH-GAP-DC-01` and `ARCH-GAP-DC-10`. Live: the person tested copy and paste in a session on 2026-11-21 and reported it works; the full QA list (`skerry.qa.test.prose.md` B1–B6) has not been run step by step.
 - **Reference:** Selkies `715df7c` server `crates/selkies/src/clipboard/{verbs,outbound,flavors}.rs`, web core `web/selkies-web-core/lib/clipboard-sync.ts`, and `docs/usage.md#clipboard`. Skerry speaks the same wire protocol as the web client. Skerry's behaviour differs only where a browser's limits forced the web client's design.
 - **Wire protocol (WebSocket text frames):**
   - *Mac → session:* text goes as `cw,<base64 UTF-8>`. A binary payload goes as `cb,<mime>,<base64>`. Payloads of 16383 raw bytes or more are split into multipart transfers: `cws,<id>,<size>` / `cwd,<id>,<base64>` / `cwe,<id>`, and `cbs,<id>,<mime>,<size>` / `cbd` / `cbe` for binary. Each transfer has its own id, and the server caps a transfer at 64 MiB. Rich text goes as the flavour envelope `application/x-selkies-clipboard-flavours`, a JSON object `{"text/html": …, "text/plain": …}`. The server accepts the envelope even when the binary clipboard is off. Images go as `image/png` and need `enable_binary_clipboard`.
@@ -178,7 +178,7 @@
   - `public.png` goes out as `image/png`, and TIFF-only images are converted to PNG first. An incoming `image/png` or `image/jpeg` is written under its own pasteboard type.
   - Finder file copies go out only as their plain-text names. Real files are `ARCH-GAP-DC-02`.
 - **Secrets:** an incoming secret is written together with `org.nspasteboard.ConcealedType` (the nspasteboard.org convention), so clipboard managers skip it. It is cleared after 60 s (the web core's `SECRET_CLIPBOARD_TTL_MS`), or as soon as an empty secret or any later payload arrives, but only while `changeCount` still shows Skerry's write. Clipboard contents are never logged.
-- **Open (`ARCH-GAP-DC-10`):** what ⌘C/⌘X/⌘V do while **Command sends Control** is off. Until that is decided, `ARCH-004` stands: ⌘ shortcuts stay on the Mac. Remote copy and paste use Control+C/V, or ⌘ with Command sends Control turned on.
+- **Shortcuts (decided 2026-11-21, was `ARCH-GAP-DC-10`):** ⌘C/⌘X/⌘V stay on the Mac while **Command sends Control** is off, as `ARCH-004` already had it (the user's choice, over mapping just those three to Ctrl or turning Command sends Control on by default). In a session, Control+C/X/V copy, cut, and paste. Control+V, Control+Shift+V, and Shift+Insert send the Mac clipboard first. ⌘ does the same once Command sends Control is on.
 - **Risk accepted:** newer macOS versions may show a paste-privacy prompt the first time Skerry reads the pasteboard without a paste gesture (the focus check). The `changeCount` check keeps such reads to copies the person actually made.
 - **Affected Contracts:** `src/skerry/desktop-and-collaboration.prose.md`, `src/skerry/index.prose.md`, `src/skerry/skerry.test.prose.md`, `src/skerry/skerry.qa.test.prose.md`
 - **Evidence:** `clipboard::tests::*` and `pasteboard::tests::*` (private pasteboard round-trip); `cargo test --workspace`, Clippy, and fmt pass.
@@ -215,4 +215,4 @@
 | `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | unresolved (todo) | Disconnect Server confirmation, wide-window Library density, Refresh/Copy feedback, live "Started … ago". |
 | `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | unresolved (todo) | No Bearer key on logo fetches, off-main-thread preference/key writes, fewer per-render clones. |
 | `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | unresolved (needs repro) | Remote start menu opened during a codec switch while focus moved; possible unreleased Cmd/Super. |
-| `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | unresolved (asked) | What ⌘C/⌘X/⌘V do in a session while Command sends Control is off: stay local (today), map just those to Ctrl, or default Command sends Control on. |
+| `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |

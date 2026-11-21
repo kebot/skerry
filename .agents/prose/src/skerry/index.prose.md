@@ -35,7 +35,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
 - `domain-readiness`:
   - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled (H.265/AV1 continuity on Selkies 2.3.0 in `ARCH-012`); second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
   - `launcher-and-sessions`: launch/resume, Library search/icons/filters, Launch Dialog (storage with named homes, GPU, VPN, language, timezone, Wayland, collaborative, remembered per-app options) matching the web launcher (`ARCH-016`), session thumbnails, and confirmed Stop settled (`ARCH-013`); startup progress, one-click launch, Send File, open links/files, favorites/hidden/recents, persistent storage, account recovery, cluster origins, multi-window sessions (`ARCH-010` / `ARCH-GAP-LS-08`), and native Mac app presence (`ARCH-GAP-LS-09`) open on the frontier.
-  - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME and clipboard sync (`ARCH-017`) settled; ⌘C/⌘X/⌘V mapping (`ARCH-GAP-DC-10`), file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
+  - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME and clipboard sync (`ARCH-017`) settled; file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
 
 Facets:
 - `architecture` — module boundaries and GPUI/Tokio/VideoToolbox invariants
