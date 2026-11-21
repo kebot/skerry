@@ -474,6 +474,15 @@ fn av1_format(obu: &[u8], size: (u16, u16)) -> Option<CFRetained<CMFormatDescrip
     unsafe { take_created(status, format.cast_mut()) }
 }
 
+/// Whether a non-key packet continues from the last decoded frame (`last`).
+fn follows(last: Option<u16>, id: u16, reference: u16) -> bool {
+    if reference == id {
+        last.is_some()
+    } else {
+        last == Some(reference)
+    }
+}
+
 #[derive(Default)]
 pub struct Decoder {
     session: Option<Session>,
@@ -486,7 +495,11 @@ impl Decoder {
             .session
             .as_ref()
             .is_some_and(|session| session.codec == packet.codec && session.size == packet.size);
-        if !packet.key && (!matches || self.last != Some(packet.reference)) {
+        // H.264 packets name the frame they predict from. Selkies 2.3.0's H.265 and AV1
+        // encoders send `reference == id` instead (no chain information), so for those the
+        // previous frame must simply have decoded; the WebSocket is ordered and lossless, and a
+        // failed decode clears `last` and waits for the next keyframe either way.
+        if !packet.key && (!matches || !follows(self.last, packet.id, packet.reference)) {
             self.last = None;
             return Ok(None);
         }
@@ -550,6 +563,17 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predicted_frames_follow_chained_or_unchained_references() {
+        // H.264: the reference names the previous decoded packet.
+        assert!(follows(Some(4), 6, 4));
+        assert!(!follows(Some(4), 6, 5));
+        // H.265 / AV1 on Selkies 2.3.0: reference == id, so only continuity is required.
+        assert!(follows(Some(10), 46, 46));
+        assert!(!follows(None, 46, 46));
+        assert!(!follows(None, 1, 0));
+    }
 
     #[test]
     fn finds_the_av1_sequence_obu_and_rejects_truncated_lengths() {

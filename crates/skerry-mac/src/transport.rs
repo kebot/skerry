@@ -383,15 +383,32 @@ pub async fn run(
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<(), &'static str> {
-    let request = socket_request(url).await?;
+    let template = socket_request(url).await?;
     let config = WebSocketConfig::default().max_message_size(Some(16 * 1024 * 1024));
-    let (mut socket, _) = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
-    )
-    .await
-    .map_err(|_| "The Selkies WebSocket did not respond.")?
-    .map_err(|_| "Couldn’t connect to the Selkies WebSocket.")?;
+    // A just-launched session answers 404/5xx or refuses connections until Selkies is up, so
+    // keep retrying transient failures for a while instead of failing the first attempt.
+    let give_up = Instant::now() + SOCKET_STARTUP_GRACE;
+    let mut socket = loop {
+        let mut request = template
+            .uri()
+            .clone()
+            .into_client_request()
+            .map_err(|_| "Couldn’t connect to the Selkies WebSocket.")?;
+        request.headers_mut().extend(template.headers().clone());
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+        )
+        .await
+        .map_err(|_| "The Selkies WebSocket did not respond.")?;
+        match attempt {
+            Ok((socket, _)) => break socket,
+            Err(error) if transient_socket_error(&error) && Instant::now() < give_up => {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            Err(_) => return Err("Couldn’t connect to the Selkies WebSocket."),
+        }
+    };
     let mut codec = if options.codec.supported() {
         options.codec
     } else {
@@ -824,6 +841,23 @@ fn dimension(value: &Value) -> Result<u16, &'static str> {
         .ok_or("Selkies returned an invalid display resolution.")
 }
 
+/// How long to keep retrying the WebSocket while a newly launched session starts.
+const SOCKET_STARTUP_GRACE: Duration = Duration::from_secs(45);
+
+fn transient_socket_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Io(_) => true,
+        Error::Http(response) => transient_status(response.status().as_u16()),
+        _ => false,
+    }
+}
+
+/// Statuses a session proxy returns while the container behind it is still starting.
+fn transient_status(status: u16) -> bool {
+    matches!(status, 404 | 502 | 503 | 504)
+}
+
 async fn socket_request(
     url: Url,
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, &'static str> {
@@ -1011,6 +1045,16 @@ mod tests {
         assert!(video.recover(start + Duration::from_secs(1)));
         assert!(!video.expired(start + Duration::from_secs(14)));
         assert!(video.expired(start + WAIT_FOR_VIDEO));
+    }
+
+    #[test]
+    fn only_startup_statuses_are_retried() {
+        for status in [404, 502, 503, 504] {
+            assert!(transient_status(status), "{status}");
+        }
+        for status in [200, 400, 401, 403, 500] {
+            assert!(!transient_status(status), "{status}");
+        }
     }
 
     #[test]

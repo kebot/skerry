@@ -198,6 +198,9 @@ struct Desktop {
     selection: Range<usize>,
     ime_click: Option<Point<Pixels>>,
     ime_bounds: Option<Bounds<Pixels>>,
+    /// The pointer is in the top-right hot corner, so the Session Controls trigger is shown
+    /// even when the picture fills the window and leaves no margin for it.
+    hot_corner: bool,
 }
 
 impl Desktop {
@@ -265,6 +268,7 @@ impl Desktop {
             selection: 0..0,
             ime_click: None,
             ime_bounds: None,
+            hot_corner: false,
         }
     }
 
@@ -531,7 +535,9 @@ impl Render for Desktop {
         let bounds = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
         let native_scale = (!self.scale_locally).then_some(window.scale_factor());
         let picture = picture_bounds(bounds, frame.width, frame.height, native_scale);
-        let menu = picture.and_then(|picture| menu_position(bounds, picture));
+        let menu = picture
+            .and_then(|picture| menu_position(bounds, picture))
+            .or_else(|| self.hot_corner.then(|| corner_position(bounds)));
         let painted = self.painted.clone();
         let focus = self.focus.clone();
         let mac_ime = self.settings.mac_ime;
@@ -599,8 +605,11 @@ impl Render for Desktop {
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble {
                         let hovered = hb.is_hovered(window);
+                        let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
+                        let hot = in_hot_corner(viewport, event.position);
                         v.update(cx, |desktop, cx| {
-                            if desktop.settings.remote_cursor {
+                            if desktop.settings.remote_cursor || desktop.hot_corner != hot {
+                                desktop.hot_corner = hot;
                                 cx.notify();
                             }
                             let dragging = desktop.buttons != 0;
@@ -820,6 +829,20 @@ fn picture_bounds(
     ))
 }
 
+fn corner_position(viewport: Bounds<Pixels>) -> Point<Pixels> {
+    point(
+        viewport.right() - MENU_MARGIN - MENU_SIZE,
+        viewport.top() + MENU_MARGIN,
+    )
+}
+
+/// Top-right square (trigger plus margin, doubled for easy targeting) that reveals the
+/// Session Controls trigger over the picture.
+fn in_hot_corner(viewport: Bounds<Pixels>, position: Point<Pixels>) -> bool {
+    let reach = (MENU_SIZE + MENU_MARGIN * 2.) * 2.;
+    position.x >= viewport.right() - reach && position.y <= viewport.top() + reach
+}
+
 fn menu_position(viewport: Bounds<Pixels>, picture: Bounds<Pixels>) -> Option<Point<Pixels>> {
     let needed = MENU_SIZE + MENU_MARGIN * 2.;
     let top_fits = picture.top() - viewport.top() >= needed;
@@ -952,6 +975,18 @@ mod tests {
         let exact = viewport(1280., 720.);
         let narrow_margin = viewport(1280., 740.);
         assert!(menu_position(exact, fit(exact)).is_none());
+        assert!(in_hot_corner(
+            exact,
+            point(exact.right() - px(10.), exact.top() + px(10.))
+        ));
+        assert!(!in_hot_corner(
+            exact,
+            point(exact.left() + px(10.), exact.top() + px(10.))
+        ));
+        assert!(!in_hot_corner(
+            exact,
+            point(exact.right() - px(10.), exact.bottom() - px(10.))
+        ));
         assert!(menu_position(narrow_margin, fit(narrow_margin)).is_none());
         let tall = viewport(1280., 860.);
         let wide = viewport(1500., 720.);
