@@ -12,14 +12,14 @@ cpal = "0.17.3"
 dotenvy = "0.15"
 futures-util = { version = "0.3", features = ["sink"] }
 gpui-kit = "0.10.0"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSEvent", "NSGraphics", "NSView", "NSWindow", "block2"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSEvent", "NSGraphics", "NSPasteboard", "NSView", "NSWindow", "block2"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "objc2", "objc2-io-surface"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSDictionary", "NSLocale", "NSString", "NSTimeZone", "NSUserDefaults", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSLocale", "NSString", "NSTimeZone", "NSUserDefaults", "NSValue"] }
 # Enable the CF type implementation required by Core Video's IOSurface getter.
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation"] }
 objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "objc2", "objc2-core-media", "objc2-core-video"] }

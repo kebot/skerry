@@ -22,6 +22,7 @@ pub enum Picker {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Input,
+    Clipboard,
     Screen,
     Video,
     Stats,
@@ -30,6 +31,7 @@ pub enum Section {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlsUiState {
     pub input_open: bool,
+    pub clipboard_open: bool,
     pub screen_open: bool,
     pub video_open: bool,
     pub stats_open: bool,
@@ -41,6 +43,7 @@ impl Default for ControlsUiState {
     fn default() -> Self {
         Self {
             input_open: false,
+            clipboard_open: false,
             screen_open: true,
             video_open: false,
             stats_open: false,
@@ -59,8 +62,18 @@ pub enum ControlsAction {
     ToggleFullScreen,
     Reconnect,
     Disconnect,
-    SetInput { id: String, enabled: bool },
+    SetInput {
+        id: String,
+        enabled: bool,
+    },
     SendChord(String),
+    SetClipboardSend(bool),
+    SetClipboardReceive(bool),
+    SetClipboardSeamless(bool),
+    /// Deliberate mode: send the Mac's clipboard to the session now.
+    SendClipboard,
+    /// Deliberate mode: fetch the session's clipboard onto the Mac now.
+    CopySessionClipboard,
     SetRetina(bool),
     SetAlignment(bool),
     SetUiScaling(Option<u16>),
@@ -70,7 +83,10 @@ pub enum ControlsAction {
     ResetToWindow,
     SetScaleLocally(bool),
     SelectCodec(String),
-    SetVideoSetting { id: String, value: u32 },
+    SetVideoSetting {
+        id: String,
+        value: u32,
+    },
     ResetVideo,
 }
 
@@ -85,6 +101,17 @@ pub struct SwitchItem {
 pub struct ChordItem {
     pub id: String,
     pub label: String,
+}
+
+/// The clipboard switches the server leaves to the person (`ARCH-017`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardProps {
+    /// Mac → session; `None` when the server refuses that direction.
+    pub send: Option<bool>,
+    /// Session → Mac; `None` when the server refuses that direction.
+    pub receive: Option<bool>,
+    pub seamless: bool,
+    pub seamless_locked: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +172,8 @@ pub struct ControlsProps {
     pub audio_unavailable: Option<String>,
     pub input_switches: Vec<SwitchItem>,
     pub chords: Vec<ChordItem>,
+    /// `None` until the server announces its settings.
+    pub clipboard: Option<ClipboardProps>,
     pub screen: ScreenProps,
     pub video_settings: Option<VideoProps>,
     pub diagnostics: Option<Vec<(String, String)>>,
@@ -238,6 +267,13 @@ pub fn render(
         ))
         .child(section(
             theme,
+            "Clipboard",
+            state.clipboard_open,
+            || render_clipboard(theme, props.clipboard.as_ref(), &on_action),
+            toggle(Section::Clipboard),
+        ))
+        .child(section(
+            theme,
             "Screen Settings",
             state.screen_open,
             || render_screen(theme, &props.screen, state, width, height, &on_action),
@@ -293,6 +329,87 @@ fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
                         })),
                 ),
         )
+}
+
+fn render_clipboard(
+    theme: &Theme,
+    clipboard: Option<&ClipboardProps>,
+    on_action: &ControlsHandler,
+) -> Div {
+    let note = |text: &'static str| div().text_color(theme.muted_foreground).child(text);
+    let Some(clipboard) = clipboard else {
+        return div().child(note("Waiting for the session…"));
+    };
+    if clipboard.send.is_none() && clipboard.receive.is_none() {
+        return div().child(note("Clipboard turned off by the server"));
+    }
+    let mut panel = div().v_flex().gap_3();
+    if let Some(send) = clipboard.send {
+        panel = panel.child(switch_row(
+            "Send to Session",
+            send,
+            ControlsAction::SetClipboardSend(!send),
+            on_action,
+        ));
+    }
+    if let Some(receive) = clipboard.receive {
+        panel = panel.child(switch_row(
+            "Receive from Session",
+            receive,
+            ControlsAction::SetClipboardReceive(!receive),
+            on_action,
+        ));
+    }
+    panel = panel.child(if clipboard.seamless_locked {
+        div()
+            .h_flex()
+            .justify_between()
+            .child("Seamless")
+            .child(if clipboard.seamless {
+                "On · Locked"
+            } else {
+                "Off · Locked"
+            })
+            .into_any_element()
+    } else {
+        switch_row(
+            "Seamless",
+            clipboard.seamless,
+            ControlsAction::SetClipboardSeamless(!clipboard.seamless),
+            on_action,
+        )
+    });
+    if clipboard.seamless {
+        return panel.child(note(
+            "A copy on either side is ready to paste on the other.",
+        ));
+    }
+    let send = clipboard.send == Some(true);
+    let receive = clipboard.receive == Some(true);
+    panel
+        .child(note("Nothing moves until you choose."))
+        .when(send || receive, |panel| {
+            panel.child(
+                div()
+                    .h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .when(send, |row| {
+                        row.child(action_button(
+                            "Send Mac Clipboard",
+                            ControlsAction::SendClipboard,
+                            on_action,
+                        ))
+                    })
+                    .when(receive, |row| {
+                        row.child(action_button(
+                            "Copy Session Clipboard",
+                            ControlsAction::CopySessionClipboard,
+                            on_action,
+                        ))
+                    }),
+            )
+        })
 }
 
 fn render_screen(
