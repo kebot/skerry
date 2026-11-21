@@ -2,11 +2,12 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{InputEvent, InputState},
     scroll::ScrollableElement as _,
+    select::SelectEvent,
     ActiveTheme as _, Sizable as _, StyledExt as _, Theme, ThemeMode,
 };
 use gpui_kit::{
     actions, div, point, prelude::*, px, rgb, size, App, Bounds, Context, Entity, FontWeight,
-    KeyBinding, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    KeyBinding, RenderImage, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use skerry_ui::{
     connect::{self, ConnectProps},
@@ -14,10 +15,14 @@ use skerry_ui::{
         self, ChordItem, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps,
         Section, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
+    launch_dialog::{
+        self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
+    },
     library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
     session,
 };
 use std::rc::Rc;
+use std::sync::Arc;
 
 actions!(skerry_preview, [Quit]);
 
@@ -27,6 +32,7 @@ enum Story {
     ConnectBusy,
     ConnectError,
     LibraryPopulated,
+    LibraryLaunchDialog,
     LibraryEmpty,
     LibraryBusy,
     ControlsHardware,
@@ -41,6 +47,7 @@ impl Story {
         Story::ConnectBusy,
         Story::ConnectError,
         Story::LibraryPopulated,
+        Story::LibraryLaunchDialog,
         Story::LibraryEmpty,
         Story::LibraryBusy,
         Story::ControlsHardware,
@@ -52,7 +59,10 @@ impl Story {
     fn group(self) -> &'static str {
         match self {
             Story::ConnectDefault | Story::ConnectBusy | Story::ConnectError => "Connect",
-            Story::LibraryPopulated | Story::LibraryEmpty | Story::LibraryBusy => "Library",
+            Story::LibraryPopulated
+            | Story::LibraryLaunchDialog
+            | Story::LibraryEmpty
+            | Story::LibraryBusy => "Library",
             Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked => {
                 "Session Controls"
             }
@@ -66,6 +76,7 @@ impl Story {
             Story::ConnectBusy => "Connecting",
             Story::ConnectError => "Error",
             Story::LibraryPopulated => "Populated",
+            Story::LibraryLaunchDialog => "Launch Dialog",
             Story::LibraryEmpty => "Empty",
             Story::LibraryBusy => "Busy + Status",
             Story::ControlsHardware => "Hardware H.265",
@@ -81,6 +92,7 @@ impl Story {
             Story::ConnectBusy => "story-connect-busy",
             Story::ConnectError => "story-connect-error",
             Story::LibraryPopulated => "story-library-populated",
+            Story::LibraryLaunchDialog => "story-library-launch-dialog",
             Story::LibraryEmpty => "story-library-empty",
             Story::LibraryBusy => "story-library-busy",
             Story::ControlsHardware => "story-controls-hardware",
@@ -98,11 +110,39 @@ enum Appearance {
     Dark,
 }
 
+struct PreviewAssets {
+    icon_zen: Arc<RenderImage>,
+    icon_lightcraft: Arc<RenderImage>,
+    icon_weixin: Arc<RenderImage>,
+    icon_vscode: Arc<RenderImage>,
+    icon_firefox: Arc<RenderImage>,
+    thumb_zen: Arc<RenderImage>,
+    thumb_lightcraft: Arc<RenderImage>,
+}
+
+impl PreviewAssets {
+    fn build() -> Self {
+        Self {
+            icon_zen: fixtures::zen_icon(),
+            icon_lightcraft: fixtures::lightcraft_icon(),
+            icon_weixin: fixtures::weixin_icon(),
+            icon_vscode: fixtures::vscode_icon(),
+            icon_firefox: fixtures::firefox_icon(),
+            thumb_zen: fixtures::zen_thumbnail(),
+            thumb_lightcraft: fixtures::lightcraft_thumbnail(),
+        }
+    }
+}
+
 struct PreviewApp {
     story: Story,
     appearance: Appearance,
     last_event: Option<String>,
+    assets: PreviewAssets,
     key_input: Entity<InputState>,
+    search_input: Entity<InputState>,
+    selected_filter: String,
+    launch_dialog: Option<(LaunchDialogProps, LaunchDialogSelects)>,
     controls_ui: ControlsUiState,
     controls_props: ControlsProps,
     width: Entity<InputState>,
@@ -123,6 +163,22 @@ impl PreviewApp {
                 this.record_event(preview, cx);
             }
         })
+        .detach();
+        let search_input = library::new_search_input(window, cx);
+        cx.subscribe_in(
+            &search_input,
+            window,
+            |this, _, event: &InputEvent, _, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } => {
+                    let query = this.search_input.read(cx).value().to_string();
+                    if !query.trim().is_empty() {
+                        this.record_event(format!("Omnibar: Submit `{}`", query.trim()), cx);
+                    }
+                }
+                _ => {}
+            },
+        )
         .detach();
         let digit_filter =
             |s: &str, _: &mut App| s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit());
@@ -153,11 +209,22 @@ impl PreviewApp {
         )
         .detach();
 
+        let assets = PreviewAssets::build();
+        let initial_dialog = Self::fixture_launch_dialog(
+            "lightcraft",
+            "LightCraft",
+            Some(Arc::clone(&assets.icon_lightcraft)),
+        );
+        let initial_selects = Self::bind_launch_selects(&initial_dialog, window, cx);
         Self {
-            story: Story::ConnectDefault,
+            story: Story::LibraryLaunchDialog,
             appearance: Appearance::System,
             last_event: None,
+            assets,
             key_input,
+            search_input,
+            selected_filter: "All".into(),
+            launch_dialog: Some((initial_dialog, initial_selects)),
             controls_ui: ControlsUiState {
                 input_open: false,
                 screen_open: true,
@@ -175,6 +242,17 @@ impl PreviewApp {
     fn select_story(&mut self, story: Story, window: &mut Window, cx: &mut Context<Self>) {
         self.story = story;
         self.last_event = None;
+        if story == Story::LibraryLaunchDialog {
+            let dialog = Self::fixture_launch_dialog(
+                "lightcraft",
+                "LightCraft",
+                Some(Arc::clone(&self.assets.icon_lightcraft)),
+            );
+            let selects = Self::bind_launch_selects(&dialog, window, cx);
+            self.launch_dialog = Some((dialog, selects));
+        } else if story == Story::LibraryPopulated {
+            self.launch_dialog = None;
+        }
         if matches!(
             story,
             Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked
@@ -190,6 +268,157 @@ impl PreviewApp {
             };
             self.width.update(cx, |s, cx| s.set_value("", window, cx));
             self.height.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    fn fixture_launch_dialog(
+        app_id: &str,
+        app_name: &str,
+        app_icon: Option<Arc<RenderImage>>,
+    ) -> LaunchDialogProps {
+        LaunchDialogProps {
+            app_id: app_id.into(),
+            app_name: app_name.into(),
+            app_icon,
+            favorite: false,
+            hidden: false,
+            storage_options: vec![
+                LaunchOption {
+                    id: "auto".into(),
+                    label: "Auto (per-app persistence)".into(),
+                },
+                LaunchOption {
+                    id: "cleanroom".into(),
+                    label: "Cleanroom (temporary)".into(),
+                },
+                LaunchOption {
+                    id: "work-home".into(),
+                    label: "Home · work-home".into(),
+                },
+            ],
+            selected_storage: "auto".into(),
+            gpu_options: vec![
+                LaunchOption {
+                    id: "phone-cpu".into(),
+                    label: "phone (cpu)".into(),
+                },
+                LaunchOption {
+                    id: "rtx-4090".into(),
+                    label: "desktop (RTX 4090)".into(),
+                },
+            ],
+            selected_gpu: "phone-cpu".into(),
+            language_options: vec![
+                LaunchOption {
+                    id: "en_US".into(),
+                    label: "Default (en_US)".into(),
+                },
+                LaunchOption {
+                    id: "zh_CN".into(),
+                    label: "简体中文 (zh_CN)".into(),
+                },
+                LaunchOption {
+                    id: "ja_JP".into(),
+                    label: "日本語 (ja_JP)".into(),
+                },
+            ],
+            selected_language: "en_US".into(),
+            collaborative: false,
+            wayland: true,
+            busy: false,
+            show_copy_link: true,
+        }
+    }
+
+    fn bind_launch_selects(
+        props: &LaunchDialogProps,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> LaunchDialogSelects {
+        let selects = LaunchDialogSelects::from_props(props, window, cx);
+        if let Some(storage) = &selects.storage {
+            cx.subscribe_in(
+                storage,
+                window,
+                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if let Some((dialog, _)) = this.launch_dialog.as_mut() {
+                            dialog.selected_storage = value.clone();
+                        }
+                        this.record_event(format!("LaunchDialog: Storage -> `{value}`"), cx);
+                    }
+                },
+            )
+            .detach();
+        }
+        if let Some(gpu) = &selects.gpu {
+            cx.subscribe_in(
+                gpu,
+                window,
+                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if let Some((dialog, _)) = this.launch_dialog.as_mut() {
+                            dialog.selected_gpu = value.clone();
+                        }
+                        this.record_event(format!("LaunchDialog: GPU -> `{value}`"), cx);
+                    }
+                },
+            )
+            .detach();
+        }
+        if let Some(language) = &selects.language {
+            cx.subscribe_in(
+                language,
+                window,
+                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
+                    if let SelectEvent::Confirm(Some(value)) = event {
+                        if let Some((dialog, _)) = this.launch_dialog.as_mut() {
+                            dialog.selected_language = value.clone();
+                        }
+                        this.record_event(format!("LaunchDialog: Language -> `{value}`"), cx);
+                    }
+                },
+            )
+            .detach();
+        }
+        selects
+    }
+
+    fn handle_launch_dialog_action(&mut self, action: LaunchDialogAction, cx: &mut Context<Self>) {
+        self.last_event = Some(format!("LaunchDialog: {action:?}"));
+        match action {
+            LaunchDialogAction::Close => {
+                if self.story == Story::LibraryPopulated {
+                    self.launch_dialog = None;
+                }
+            }
+            LaunchDialogAction::ToggleFavorite => {
+                if let Some((dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.favorite = !dialog.favorite;
+                }
+            }
+            LaunchDialogAction::ToggleHidden => {
+                if let Some((dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.hidden = !dialog.hidden;
+                }
+            }
+            LaunchDialogAction::SetCollaborative(enabled) => {
+                if let Some((dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.collaborative = enabled;
+                }
+            }
+            LaunchDialogAction::SetWayland(enabled) => {
+                if let Some((dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.wayland = enabled;
+                }
+            }
+            LaunchDialogAction::CopyLink => {}
+            LaunchDialogAction::Launch => {
+                if self.story == Story::LibraryPopulated {
+                    self.launch_dialog = None;
+                }
+            }
         }
         cx.notify();
     }
@@ -609,67 +838,126 @@ impl PreviewApp {
                     });
                 })
             }
-            Story::LibraryPopulated => {
+            Story::LibraryPopulated | Story::LibraryLaunchDialog => {
                 let props = LibraryProps {
                     app_name: "SealSkin Native".into(),
-                    server: "https://sealskin.example.internal".into(),
+                    server: "sealskin.example.internal".into(),
                     apps: vec![
                         AppItem {
+                            id: "lightcraft".into(),
+                            name: "LightCraft".into(),
+                            categories: vec!["app".into()],
+                            recent: true,
+                            icon: Some(Arc::clone(&self.assets.icon_lightcraft)),
+                        },
+                        AppItem {
+                            id: "weixin".into(),
+                            name: "Weixin".into(),
+                            categories: vec!["app".into()],
+                            recent: false,
+                            icon: Some(Arc::clone(&self.assets.icon_weixin)),
+                        },
+                        AppItem {
                             id: "zen".into(),
-                            name: "Zen Browser".into(),
+                            name: "Zen".into(),
+                            categories: vec!["browser".into()],
+                            recent: true,
+                            icon: Some(Arc::clone(&self.assets.icon_zen)),
                         },
                         AppItem {
                             id: "vscode".into(),
-                            name: "Visual Studio Code".into(),
+                            name: "VS Code".into(),
+                            categories: vec!["app".into()],
+                            recent: true,
+                            icon: Some(Arc::clone(&self.assets.icon_vscode)),
                         },
                         AppItem {
                             id: "firefox".into(),
-                            name: "Firefox Developer Edition".into(),
-                        },
-                        AppItem {
-                            id: "terminal".into(),
-                            name: "Linux Desktop Terminal".into(),
+                            name: "Firefox".into(),
+                            categories: vec!["browser".into()],
+                            recent: false,
+                            icon: Some(Arc::clone(&self.assets.icon_firefox)),
                         },
                     ],
                     sessions: vec![
                         SessionItem {
-                            id: "sess-01".into(),
-                            app_name: "Zen Browser (Cleanroom)".into(),
+                            id: "sess-zen".into(),
+                            app_name: "Zen".into(),
+                            started_label: Some("Started 2 days ago".into()),
+                            gpu: true,
+                            storage_label: Some("auto-zen".into()),
+                            thumbnail: Some(Arc::clone(&self.assets.thumb_zen)),
+                            app_icon: Some(Arc::clone(&self.assets.icon_zen)),
                         },
                         SessionItem {
-                            id: "sess-02".into(),
-                            app_name: "Visual Studio Code".into(),
+                            id: "sess-lightcraft".into(),
+                            app_name: "LightCraft".into(),
+                            started_label: Some("Started 2 days ago".into()),
+                            gpu: true,
+                            storage_label: Some("auto-lightcraft".into()),
+                            thumbnail: Some(Arc::clone(&self.assets.thumb_lightcraft)),
+                            app_icon: Some(Arc::clone(&self.assets.icon_lightcraft)),
                         },
                     ],
+                    search_query: self.search_input.read(cx).value().to_string(),
+                    selected_filter: self.selected_filter.clone(),
                     status: None,
                     busy: None,
                 };
-                library::render(theme, &props, self.library_handlers(cx))
+                let dialog_entity = entity.clone();
+                div()
+                    .size_full()
+                    .relative()
+                    .child(library::render(
+                        theme,
+                        &props,
+                        &self.search_input,
+                        self.library_handlers(cx),
+                    ))
+                    .when_some(self.launch_dialog.as_ref(), |view, (dialog, selects)| {
+                        let on_action = Rc::new(
+                            move |action: LaunchDialogAction, _: &mut Window, cx: &mut App| {
+                                dialog_entity.update(cx, |this, cx| {
+                                    this.handle_launch_dialog_action(action, cx);
+                                });
+                            },
+                        );
+                        view.child(launch_dialog::render_modal(
+                            theme, dialog, selects, on_action,
+                        ))
+                    })
             }
             Story::LibraryEmpty => {
                 let props = LibraryProps {
                     app_name: "SealSkin Native".into(),
-                    server: "https://sealskin.example.internal".into(),
+                    server: "sealskin.example.internal".into(),
                     apps: vec![],
                     sessions: vec![],
+                    search_query: self.search_input.read(cx).value().to_string(),
+                    selected_filter: self.selected_filter.clone(),
                     status: None,
                     busy: None,
                 };
-                library::render(theme, &props, self.library_handlers(cx))
+                library::render(theme, &props, &self.search_input, self.library_handlers(cx))
             }
             Story::LibraryBusy => {
                 let props = LibraryProps {
                     app_name: "SealSkin Native".into(),
-                    server: "https://sealskin.example.internal".into(),
+                    server: "sealskin.example.internal".into(),
                     apps: vec![AppItem {
                         id: "zen".into(),
-                        name: "Zen Browser".into(),
+                        name: "Zen".into(),
+                        categories: vec!["browser".into()],
+                        recent: true,
+                        icon: None,
                     }],
                     sessions: vec![],
+                    search_query: self.search_input.read(cx).value().to_string(),
+                    selected_filter: self.selected_filter.clone(),
                     status: Some("Previous launch timed out; retrying connection.".into()),
-                    busy: Some("Launching Zen Browser…".into()),
+                    busy: Some("Launching Zen…".into()),
                 };
-                library::render(theme, &props, self.library_handlers(cx))
+                library::render(theme, &props, &self.search_input, self.library_handlers(cx))
             }
             Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked => {
                 let handler = Rc::new(
@@ -739,6 +1027,8 @@ impl PreviewApp {
         let on_forget_entity = cx.entity().clone();
         let on_launch_entity = cx.entity().clone();
         let on_resume_entity = cx.entity().clone();
+        let on_stop_entity = cx.entity().clone();
+        let on_filter_entity = cx.entity().clone();
         LibraryHandlers {
             on_refresh: Box::new(move |_, _, cx| {
                 on_refresh_entity.update(cx, |this, cx| {
@@ -747,17 +1037,41 @@ impl PreviewApp {
             }),
             on_forget: Box::new(move |_, _, cx| {
                 on_forget_entity.update(cx, |this, cx| {
-                    this.record_event("Library: Remove Connection", cx);
+                    this.record_event("Library: Disconnect Server", cx);
                 });
             }),
-            on_launch: Rc::new(move |id, _, cx| {
+            on_launch: Rc::new(move |id, window, cx| {
                 on_launch_entity.update(cx, |this, cx| {
-                    this.record_event(format!("Library: Launch app `{id}`"), cx);
+                    let (name, icon) = match id.as_str() {
+                        "lightcraft" => {
+                            ("LightCraft", Some(Arc::clone(&this.assets.icon_lightcraft)))
+                        }
+                        "weixin" => ("Weixin", Some(Arc::clone(&this.assets.icon_weixin))),
+                        "zen" => ("Zen", Some(Arc::clone(&this.assets.icon_zen))),
+                        "vscode" => ("VS Code", Some(Arc::clone(&this.assets.icon_vscode))),
+                        "firefox" => ("Firefox", Some(Arc::clone(&this.assets.icon_firefox))),
+                        other => (other, None),
+                    };
+                    let dialog = Self::fixture_launch_dialog(&id, name, icon);
+                    let selects = Self::bind_launch_selects(&dialog, window, cx);
+                    this.launch_dialog = Some((dialog, selects));
+                    this.record_event(format!("Library: Open Launch Dialog for `{name}`"), cx);
                 });
             }),
             on_resume: Rc::new(move |id, _, cx| {
                 on_resume_entity.update(cx, |this, cx| {
-                    this.record_event(format!("Library: Resume session `{id}`"), cx);
+                    this.record_event(format!("Library: Open session `{id}`"), cx);
+                });
+            }),
+            on_stop: Some(Rc::new(move |id, _, cx| {
+                on_stop_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Library: Stop session `{id}`"), cx);
+                });
+            })),
+            on_select_filter: Rc::new(move |filter, _, cx| {
+                on_filter_entity.update(cx, |this, cx| {
+                    this.selected_filter = filter.clone();
+                    this.record_event(format!("Library: Filter `{filter}`"), cx);
                 });
             }),
         }
@@ -939,4 +1253,266 @@ fn main() {
             .expect("open Skerry UI preview window");
             cx.activate(true);
         });
+}
+
+mod fixtures {
+    use gpui_kit::RenderImage;
+    use image::{Frame, Rgba, RgbaImage};
+    use smallvec::smallvec;
+    use std::sync::Arc;
+
+    fn to_render_image(mut rgba: RgbaImage) -> Arc<RenderImage> {
+        for pixel in rgba.pixels_mut() {
+            pixel.0.swap(0, 2); // RGBA -> BGRA for GPUI RenderImage
+        }
+        Arc::new(RenderImage::new(smallvec![Frame::new(rgba)]))
+    }
+
+    fn blend(dst: &mut Rgba<u8>, src: [u8; 4]) {
+        let a = f32::from(src[3]) / 255.0;
+        let inv = 1.0 - a;
+        dst[0] = (f32::from(src[0]) * a + f32::from(dst[0]) * inv) as u8;
+        dst[1] = (f32::from(src[1]) * a + f32::from(dst[1]) * inv) as u8;
+        dst[2] = (f32::from(src[2]) * a + f32::from(dst[2]) * inv) as u8;
+        dst[3] = ((a + (f32::from(dst[3]) / 255.0) * inv).min(1.0) * 255.0) as u8;
+    }
+
+    fn fill_rounded_rect(
+        img: &mut RgbaImage,
+        x0: f32,
+        y0: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        color: [u8; 4],
+    ) {
+        let min_x = (x0.floor() as i32).max(0) as u32;
+        let min_y = (y0.floor() as i32).max(0) as u32;
+        let max_x = ((x0 + w).ceil() as u32).min(img.width());
+        let max_y = ((y0 + h).ceil() as u32).min(img.height());
+        let cx = x0 + w * 0.5;
+        let cy = y0 + h * 0.5;
+        let hx = (w * 0.5 - r).max(0.0);
+        let hy = (h * 0.5 - r).max(0.0);
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let dx = (x as f32 + 0.5 - cx).abs() - hx;
+                let dy = (y as f32 + 0.5 - cy).abs() - hy;
+                let dist = (dx.max(0.0).hypot(dy.max(0.0))) + dx.max(dy).min(0.0) - r;
+                let cov = (0.5 - dist).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let mut c = color;
+                    c[3] = (f32::from(c[3]) * cov) as u8;
+                    blend(img.get_pixel_mut(x, y), c);
+                }
+            }
+        }
+    }
+
+    fn fill_circle(img: &mut RgbaImage, cx: f32, cy: f32, r: f32, color: [u8; 4]) {
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let d = (x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy) - r;
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let mut c = color;
+                    c[3] = (f32::from(c[3]) * cov) as u8;
+                    blend(img.get_pixel_mut(x, y), c);
+                }
+            }
+        }
+    }
+
+    fn stroke_ring(img: &mut RgbaImage, cx: f32, cy: f32, r: f32, thickness: f32, color: [u8; 4]) {
+        let half = thickness * 0.5;
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let d = ((x as f32 + 0.5 - cx).hypot(y as f32 + 0.5 - cy) - r).abs() - half;
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let mut c = color;
+                    c[3] = (f32::from(c[3]) * cov) as u8;
+                    blend(img.get_pixel_mut(x, y), c);
+                }
+            }
+        }
+    }
+
+    fn draw_segment(
+        img: &mut RgbaImage,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        thickness: f32,
+        color: [u8; 4],
+    ) {
+        let half = thickness * 0.5;
+        let vx = x1 - x0;
+        let vy = y1 - y0;
+        let len2 = (vx * vx + vy * vy).max(1e-4);
+        for y in 0..img.height() {
+            for x in 0..img.width() {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let t = (((px - x0) * vx + (py - y0) * vy) / len2).clamp(0.0, 1.0);
+                let dx = px - (x0 + t * vx);
+                let dy = py - (y0 + t * vy);
+                let d = dx.hypot(dy) - half;
+                let cov = (0.5 - d).clamp(0.0, 1.0);
+                if cov > 0.0 {
+                    let mut c = color;
+                    c[3] = (f32::from(c[3]) * cov) as u8;
+                    blend(img.get_pixel_mut(x, y), c);
+                }
+            }
+        }
+    }
+
+    pub fn zen_icon() -> Arc<RenderImage> {
+        let mut img = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        let coral = [236, 108, 72, 255];
+        stroke_ring(&mut img, 64.0, 64.0, 50.0, 12.0, coral);
+        stroke_ring(&mut img, 64.0, 64.0, 32.0, 9.0, coral);
+        stroke_ring(&mut img, 64.0, 64.0, 16.0, 6.0, coral);
+        to_render_image(img)
+    }
+
+    pub fn lightcraft_icon() -> Arc<RenderImage> {
+        let mut img = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        let blue = [92, 114, 248, 255];
+        draw_segment(&mut img, 64.0, 20.0, 22.0, 106.0, 18.0, blue);
+        draw_segment(&mut img, 64.0, 20.0, 104.0, 106.0, 18.0, blue);
+        draw_segment(&mut img, 40.0, 76.0, 88.0, 76.0, 14.0, blue);
+        to_render_image(img)
+    }
+
+    pub fn weixin_icon() -> Arc<RenderImage> {
+        let mut img = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        fill_rounded_rect(&mut img, 8.0, 8.0, 112.0, 112.0, 26.0, [52, 199, 73, 255]);
+        fill_circle(&mut img, 50.0, 56.0, 26.0, [255, 255, 255, 255]);
+        fill_circle(&mut img, 80.0, 74.0, 21.0, [242, 252, 244, 255]);
+        fill_circle(&mut img, 42.0, 52.0, 3.5, [52, 199, 73, 255]);
+        fill_circle(&mut img, 58.0, 52.0, 3.5, [52, 199, 73, 255]);
+        fill_circle(&mut img, 73.0, 71.0, 3.0, [52, 199, 73, 255]);
+        fill_circle(&mut img, 87.0, 71.0, 3.0, [52, 199, 73, 255]);
+        to_render_image(img)
+    }
+
+    pub fn vscode_icon() -> Arc<RenderImage> {
+        let mut img = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        let light = [56, 178, 248, 255];
+        let mid = [0, 122, 204, 255];
+        draw_segment(&mut img, 96.0, 22.0, 96.0, 106.0, 20.0, light);
+        draw_segment(&mut img, 96.0, 22.0, 26.0, 88.0, 15.0, mid);
+        draw_segment(&mut img, 96.0, 106.0, 26.0, 40.0, 15.0, light);
+        to_render_image(img)
+    }
+
+    pub fn firefox_icon() -> Arc<RenderImage> {
+        let mut img = RgbaImage::from_pixel(128, 128, Rgba([0, 0, 0, 0]));
+        fill_circle(&mut img, 64.0, 64.0, 52.0, [118, 66, 214, 255]);
+        stroke_ring(&mut img, 66.0, 66.0, 38.0, 20.0, [249, 132, 44, 255]);
+        fill_circle(&mut img, 74.0, 52.0, 18.0, [255, 204, 72, 255]);
+        to_render_image(img)
+    }
+
+    pub fn zen_thumbnail() -> Arc<RenderImage> {
+        let (w, h) = (640, 360);
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([226, 228, 232, 255]));
+        // Subtle sidebar on the left
+        fill_rounded_rect(
+            &mut img,
+            0.0,
+            0.0,
+            156.0,
+            h as f32,
+            0.0,
+            [215, 218, 224, 255],
+        );
+        // Sidebar divider
+        fill_rounded_rect(
+            &mut img,
+            156.0,
+            0.0,
+            2.0,
+            h as f32,
+            0.0,
+            [196, 200, 208, 255],
+        );
+        // Floating white address bar
+        fill_rounded_rect(
+            &mut img,
+            34.0,
+            34.0,
+            572.0,
+            52.0,
+            12.0,
+            [255, 255, 255, 255],
+        );
+        // Search icon dot + placeholder bar inside address bar
+        stroke_ring(&mut img, 64.0, 60.0, 8.0, 2.5, [156, 163, 175, 255]);
+        fill_rounded_rect(&mut img, 84.0, 54.0, 190.0, 11.0, 5.0, [205, 210, 218, 255]);
+        to_render_image(img)
+    }
+
+    pub fn lightcraft_thumbnail() -> Arc<RenderImage> {
+        let (w, h) = (640, 360);
+        let mut img = RgbaImage::from_pixel(w, h, Rgba([24, 25, 28, 255]));
+        // Left catalog sidebar
+        fill_rounded_rect(&mut img, 0.0, 0.0, 128.0, h as f32, 0.0, [32, 33, 38, 255]);
+        for i in 0..8 {
+            let y = 26.0 + i as f32 * 26.0;
+            fill_rounded_rect(&mut img, 16.0, y, 86.0, 9.0, 4.0, [58, 61, 70, 255]);
+        }
+        // Right tool rail
+        fill_rounded_rect(
+            &mut img,
+            (w - 44) as f32,
+            0.0,
+            44.0,
+            h as f32,
+            0.0,
+            [32, 33, 38, 255],
+        );
+        for i in 0..6 {
+            fill_circle(
+                &mut img,
+                (w - 22) as f32,
+                36.0 + i as f32 * 38.0,
+                7.0,
+                [88, 92, 104, 255],
+            );
+        }
+        // Centered vertical photo preview (warm sky + silhouette towers)
+        let (px0, py0, pw, ph) = (210.0, 14.0, 224.0, 332.0);
+        for y in (py0 as u32)..((py0 + ph) as u32) {
+            let t = (y as f32 - py0) / ph;
+            let r = (232.0 - t * 90.0) as u8;
+            let g = (224.0 - t * 110.0) as u8;
+            let b = (214.0 - t * 125.0) as u8;
+            for x in (px0 as u32)..((px0 + pw) as u32) {
+                *img.get_pixel_mut(x, y) = Rgba([r, g, b, 255]);
+            }
+        }
+        // Architectural spires silhouette inside the photo
+        for (cx, top, base_w) in [
+            (256.0, 74.0, 38.0),
+            (296.0, 46.0, 44.0),
+            (340.0, 38.0, 46.0),
+            (384.0, 68.0, 38.0),
+        ] {
+            for y in (top as u32)..((py0 + ph) as u32) {
+                let progress = (y as f32 - top) / (py0 + ph - top);
+                let half_w = (base_w * 0.5) * (0.18 + 0.82 * progress);
+                let x_start = ((cx - half_w) as u32).max(px0 as u32);
+                let x_end = ((cx + half_w) as u32).min((px0 + pw) as u32);
+                for x in x_start..x_end {
+                    let shade = if (x + y) % 5 == 0 { 82 } else { 62 };
+                    *img.get_pixel_mut(x, y) = Rgba([shade, shade - 6, shade - 14, 255]);
+                }
+            }
+        }
+        to_render_image(img)
+    }
 }

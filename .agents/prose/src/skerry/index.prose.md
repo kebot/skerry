@@ -33,7 +33,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
   - `app.rs`, `app/controls.rs`, & `app/display.rs`: multi-threaded Tokio runtime beside `gpui_kit::application()`, Connect/Library/Session screens delegated to `skerry-ui` + `Theme::sync_system_appearance`, movable Session Controls child window (`cmd-shift-m`, opened via `cx.defer` with `Owner { window: AnyWindowHandle, launcher: Entity<Launcher> }`), and native display UI scale detection.
 - `domain-readiness`:
   - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled; second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
-  - `launcher-and-sessions`: simple launch/resume settled; launch options, session stop/previews, open links/files, library search/favorites, persistent storage, account recovery, and cluster origins open on the frontier.
+  - `launcher-and-sessions`: simple launch/resume settled; launch options, session stop/previews, open links/files, library search/favorites, persistent storage, account recovery, cluster origins, multi-window sessions (`ARCH-010` / `ARCH-GAP-LS-08`), and native Mac app presence (`ARCH-GAP-LS-09`) open on the frontier.
   - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME settled; clipboard, file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
 
 Facets:

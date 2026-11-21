@@ -169,6 +169,8 @@ struct Launcher {
     pending_settings: VideoSettings,
     settings_task: Option<Task<()>>,
     key_input: Entity<InputState>,
+    search_input: Entity<InputState>,
+    selected_filter: String,
     busy: Option<String>,
     status: Option<String>,
 }
@@ -185,6 +187,13 @@ impl Launcher {
                 }
             },
         )
+        .detach();
+        let search_input = library::new_search_input(window, cx);
+        cx.subscribe_in(&search_input, window, |_, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
         .detach();
         let mut launcher = Self {
             rt,
@@ -213,6 +222,8 @@ impl Launcher {
             pending_settings: VideoSettings::new(),
             settings_task: None,
             key_input,
+            search_input,
+            selected_filter: "All".into(),
             busy: None,
             status: None,
         };
@@ -763,6 +774,9 @@ impl Render for Launcher {
                 .map(|app| AppItem {
                     id: app.id.clone(),
                     name: app.name.clone(),
+                    categories: vec![],
+                    recent: false,
+                    icon: None,
                 })
                 .collect(),
             sessions: library
@@ -771,8 +785,15 @@ impl Render for Launcher {
                 .map(|session| SessionItem {
                     id: session.session_id.clone(),
                     app_name: session.app_name.clone(),
+                    started_label: None,
+                    gpu: false,
+                    storage_label: None,
+                    thumbnail: None,
+                    app_icon: None,
                 })
                 .collect(),
+            search_query: self.search_input.read(cx).value().to_string(),
+            selected_filter: self.selected_filter.clone(),
             status: self.status.clone(),
             busy: self.busy.clone(),
         };
@@ -781,10 +802,12 @@ impl Render for Launcher {
         let sessions_by_id = library.sessions.clone();
         let launcher_for_launch = cx.entity().clone();
         let launcher_for_resume = cx.entity().clone();
+        let launcher_for_filter = cx.entity().clone();
 
         library::render(
             &theme,
             &props,
+            &self.search_input,
             LibraryHandlers {
                 on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(cx))),
                 on_forget: Box::new(cx.listener(|this, _, _, cx| this.forget(cx))),
@@ -802,6 +825,13 @@ impl Render for Launcher {
                         launcher_for_resume
                             .update(cx, |this, cx| this.open_session(session, window, cx));
                     }
+                }),
+                on_stop: None,
+                on_select_filter: Rc::new(move |filter, _, cx| {
+                    launcher_for_filter.update(cx, |this, cx| {
+                        this.selected_filter = filter;
+                        cx.notify();
+                    });
                 }),
             },
         )

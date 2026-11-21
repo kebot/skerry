@@ -79,6 +79,15 @@
 - **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/skerry.test.prose.md`
 - **Affected Rust:** `crates/skerry-mac/src/api.rs` (`MINIMUM_SEALSKIN_VERSION`, `parse_version`, `Api::check_version`, `Api::library`)
 
+## ARCH-010: Multi-Window Session Architecture & Native Mac App Presence Scope
+
+- **Status:** settled (scope & multi-window model; implementation tracked in `ARCH-GAP-LS-08`, native Mac app presence mechanism deferred to `ARCH-GAP-LS-09`)
+- **Decision:**
+  - **Multi-window sessions (`ARCH-GAP-LS-08`):** Adopt an always-separate-windows model. The Launcher stays open in its own window, and every launched or resumed remote session opens in its own dedicated native macOS (`gpui-kit` `Root`-wrapped) window. Multiple concurrent sessions—including multiple sessions of the same remote application—can run side by side, each with independent stream/audio/controls lifecycle.
+  - **Native Mac app presence (`ARCH-GAP-LS-09`):** Add per-app native macOS identity (separate Dock icon, `Cmd+Tab` entry, and optionally Spotlight) to Skerry's scope. The delivery mechanism (on-demand generated `.app` shims vs. automatic per-app helper processes vs. both) and relaunch behavior when a session for that app is already running are intentionally left open for a future compose decision.
+  - **Protocol boundary:** Because Selkies streams a whole virtual framebuffer rather than rootless per-window surfaces, individual Linux windows opened inside a single remote application stay inside that session's virtual display (a second virtual monitor remains tracked in `ARCH-GAP-VS-01`).
+- **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -90,11 +99,13 @@
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
 | `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | unresolved (todo) | Storage mode (auto/cleanroom/named home), locale/timezone, Wayland/X11, GPU/VPN, startup progress stages, and remembered 1-click launch. |
 | `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | unresolved (todo) | Session thumbnail previews, Send File, and Stop (distinct from Disconnect, with cleanroom data loss confirmation). |
-| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs and dropped/chosen files in compatible remote apps via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url` (into a running session); only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
+| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
 | `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | unresolved (todo) | Search, app icons, recents, favorites, hidden apps, per-app launch preferences, and matching running-session reuse. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
+| `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | unresolved (todo) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
+| `ARCH-GAP-LS-09` | `launcher-and-sessions` | `native-mac-app-presence` | unresolved (backlog) | Per-app native macOS presence (Dock icon, `Cmd+Tab`, optionally Spotlight); mechanism (`.app` shims vs. helper processes vs. both) and existing-session relaunch behavior deferred to future compose decision. |
 | `ARCH-GAP-DC-01` | `desktop-and-collaboration` | `clipboard-sync` | unresolved (todo) | Bridge Selkies clipboard messages to `NSPasteboard` honoring server direction policy, Unicode, focus changes, and loop prevention. |
 | `ARCH-GAP-DC-02` | `desktop-and-collaboration` | `file-transfers` | unresolved (todo) | In-session Selkies file upload/download with native macOS Open/Save dialogs, progress, cancel, and folder/ZIP support. |
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | unresolved (todo) | Output device selection, sample-rate conversion, sleep/wake recovery, and server-allowed audio bitrate controls. |
