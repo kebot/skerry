@@ -19,6 +19,8 @@ subject: skerry
 - `api::tests::saved_key_round_trips_through_a_private_config_toml`, `saving_the_key_keeps_other_settings_and_comments`, and `malformed_saved_keys_are_reported_not_ignored` pass: the key is saved as `application_key` in `~/.config/skerry/config.toml` (`0600` file, `0700` folder), other settings and comments survive save and forget, and malformed values are reported (`ARCH-011`).
 - `video::tests::predicted_frames_follow_chained_or_unchained_references` passes: H.264 P-frames need `reference == last`, and H.265/AV1 P-frames with `reference == id` need only a previous decoded frame (`ARCH-012`).
 - `transport::tests::only_startup_statuses_are_retried` passes: only 404/502/503/504 (and I/O errors) are retried while a session starts (`ARCH-014`).
+- `launch_options::tests::*` pass: fields offer and hide what the web launcher does (storage, GPU by app support, VPN and endpoints), defaults then remembered options where they still hold, Auto names and creates `auto-<app>`, GPU/VPN are sent only when chosen, Copy link names only non-default options, and the default language is the locale nearest the Mac's (`ARCH-016`).
+- `api::tests::decodes_the_status_launch_rights_gpus_and_vpns`, `launch_body_carries_only_the_chosen_options`, and `deep_link_carries_the_launch_options` pass (`ARCH-016`).
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

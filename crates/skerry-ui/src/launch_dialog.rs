@@ -2,7 +2,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     label::Label,
-    select::{Select, SelectItem, SelectState},
+    select::{SearchableVec, Select, SelectItem, SelectState},
     Disableable as _, IconName, IndexPath, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
@@ -41,8 +41,16 @@ pub struct LaunchDialogProps {
     pub hidden: bool,
     pub storage_options: Vec<LaunchOption>,
     pub selected_storage: String,
+    /// "None" first, then the GPUs that fit the app; empty hides the field.
     pub gpu_options: Vec<LaunchOption>,
     pub selected_gpu: String,
+    /// "No VPN" first, then the VPN profiles open to the user; empty hides the field.
+    pub vpn_options: Vec<LaunchOption>,
+    pub selected_vpn: String,
+    /// The chosen VPN profile's endpoints; shown only when there are two or more to pick from.
+    pub vpn_endpoint_options: Vec<LaunchOption>,
+    pub selected_vpn_endpoint: String,
+    /// Every locale the server offers; the field is searchable.
     pub language_options: Vec<LaunchOption>,
     pub selected_language: String,
     pub collaborative: bool,
@@ -56,26 +64,59 @@ pub struct LaunchDialogProps {
     pub link_copied: bool,
 }
 
+/// The items behind one Launch Dialog dropdown; searchable so long lists (languages) filter as you type.
+pub type LaunchOptions = SearchableVec<LaunchOption>;
+pub type LaunchSelect = Entity<SelectState<LaunchOptions>>;
+
 /// Live `gpui-kit` `SelectState` entities backing the Launch Dialog's native dropdown popovers.
 #[derive(Clone)]
 pub struct LaunchDialogSelects {
-    pub storage: Option<Entity<SelectState<Vec<LaunchOption>>>>,
-    pub gpu: Option<Entity<SelectState<Vec<LaunchOption>>>>,
-    pub language: Option<Entity<SelectState<Vec<LaunchOption>>>>,
+    pub storage: Option<LaunchSelect>,
+    pub gpu: Option<LaunchSelect>,
+    pub vpn: Option<LaunchSelect>,
+    pub vpn_endpoint: Option<LaunchSelect>,
+    pub language: Option<LaunchSelect>,
 }
 
 impl LaunchDialogSelects {
     pub fn from_props(props: &LaunchDialogProps, window: &mut Window, cx: &mut App) -> Self {
         Self {
-            storage: build_select(&props.storage_options, &props.selected_storage, window, cx),
-            gpu: build_select(&props.gpu_options, &props.selected_gpu, window, cx),
+            storage: build_select(
+                &props.storage_options,
+                &props.selected_storage,
+                window,
+                cx,
+                false,
+            ),
+            gpu: build_select(&props.gpu_options, &props.selected_gpu, window, cx, false),
+            vpn: build_select(&props.vpn_options, &props.selected_vpn, window, cx, false),
+            vpn_endpoint: Self::build_vpn_endpoint(props, window, cx),
             language: build_select(
                 &props.language_options,
                 &props.selected_language,
                 window,
                 cx,
+                true,
             ),
         }
+    }
+
+    /// The endpoint field, which only shows when the chosen VPN has more than one endpoint.
+    pub fn build_vpn_endpoint(
+        props: &LaunchDialogProps,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<LaunchSelect> {
+        if props.vpn_endpoint_options.len() < 2 {
+            return None;
+        }
+        build_select(
+            &props.vpn_endpoint_options,
+            &props.selected_vpn_endpoint,
+            window,
+            cx,
+            false,
+        )
     }
 }
 
@@ -84,7 +125,8 @@ fn build_select(
     selected_id: &str,
     window: &mut Window,
     cx: &mut App,
-) -> Option<Entity<SelectState<Vec<LaunchOption>>>> {
+    searchable: bool,
+) -> Option<LaunchSelect> {
     if options.is_empty() {
         return None;
     }
@@ -93,8 +135,8 @@ fn build_select(
         .position(|opt| opt.id == selected_id)
         .or(Some(0))
         .map(IndexPath::new);
-    let items = options.to_vec();
-    Some(cx.new(|cx| SelectState::new(items, selected_index, window, cx)))
+    let items = SearchableVec::new(options.to_vec());
+    Some(cx.new(|cx| SelectState::new(items, selected_index, window, cx).searchable(searchable)))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -278,8 +320,24 @@ pub fn render_card(
         .when_some(selects.gpu.as_ref(), |body, state| {
             body.child(select_field(theme, "GPU", state, enabled))
         })
+        .when_some(selects.vpn.as_ref(), |body, state| {
+            body.child(select_field(theme, "VPN", state, enabled))
+        })
+        .when_some(selects.vpn_endpoint.as_ref(), |body, state| {
+            body.child(select_field(theme, "VPN endpoint", state, enabled))
+        })
         .when_some(selects.language.as_ref(), |body, state| {
-            body.child(select_field(theme, "Language", state, enabled))
+            body.child(
+                div()
+                    .v_flex()
+                    .gap_1p5()
+                    .child(field_label(theme, "Language"))
+                    .child(
+                        Select::new(state)
+                            .search_placeholder("Search languages")
+                            .disabled(!enabled),
+                    ),
+            )
         })
         .child(
             div()
@@ -366,20 +424,17 @@ pub fn render_card(
         .child(footer)
 }
 
-fn select_field(
-    theme: &Theme,
-    label: &'static str,
-    state: &Entity<SelectState<Vec<LaunchOption>>>,
-    enabled: bool,
-) -> Div {
+fn field_label(theme: &Theme, label: &'static str) -> Div {
+    div()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .child(Label::new(label))
+}
+
+fn select_field(theme: &Theme, label: &'static str, state: &LaunchSelect, enabled: bool) -> Div {
     div()
         .v_flex()
         .gap_1p5()
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(Label::new(label)),
-        )
+        .child(field_label(theme, label))
         .child(Select::new(state).disabled(!enabled))
 }

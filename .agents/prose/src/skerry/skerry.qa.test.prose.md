@@ -38,6 +38,9 @@ End-to-end QA of the current feature set (Connect, Library, Launch Dialog, Sessi
 - D2 The native Select popovers (storage/home and the other options) open, select, and close; their values persist while the dialog stays open.
 - D3 **Launch** shows progress, opens the session, and the new session appears under Running sessions after it returns to the Library.
 - D4 Favorite, Hide, and Copy controls either work or are clearly disabled; none of them is silently a no-op.
+- D5 The fields match SealSkin's web launcher for the same user and app (`ARCH-016`): Storage lists Auto, Cleanroom, and named homes; GPU lists "None" plus the GPUs that fit the app (e.g. `intel-gpu (i915)`); VPN and its endpoint appear only when the server offers them; Language filters as you type and shows Mac names ("German (Germany) · de_DE").
+- D6 An Auto launch keeps its data: the session card's storage pill reads `auto-<app>`, and a file saved in the session is there after Stop and a new Auto launch. A GPU launch shows the GPU pill.
+- D7 After a launch, opening the same app's dialog again shows the options last used; Copy link pasted into a browser opens the app with those options.
 
 #### S — Session streaming and controls
 - S1 **Open** on a session streams video within a few seconds, with a placeholder while waiting. Mouse, scroll, and keyboard reach the remote desktop.
@@ -53,7 +56,7 @@ End-to-end QA of the current feature set (Connect, Library, Launch Dialog, Sessi
 - K2 Confirming stops the session, and it leaves Running sessions after the Library refreshes.
 
 #### P — Preview workbench
-- P1 Every fixture (Connect default/busy/error, Library populated/empty/busy, Launch Dialog, Session Controls H.265/JPEG/server-locked, Session Overlays) renders in Light, Dark, and System themes, with event feedback when controls are clicked.
+- P1 Every fixture (Connect default/busy/error, Library populated/empty/busy, Launch Dialog full and minimal, Session Controls H.265/JPEG/server-locked, Session Overlays) renders in Light, Dark, and System themes, with event feedback when controls are clicked.
 
 #### U — Usability and design
 - U1 Consistent spacing, type scale, alignment, and button hierarchy; one clear primary action per screen; hover and focus states on everything clickable; icon-only buttons are recognisable (the Stop square in particular).

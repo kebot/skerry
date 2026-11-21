@@ -17,6 +17,7 @@ use skerry_ui::{
     },
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
+        LaunchOptions, LaunchSelect,
     },
     library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
     session,
@@ -26,6 +27,9 @@ use std::sync::Arc;
 
 actions!(skerry_preview, [Quit]);
 
+/// Writes one dropdown's confirmed choice into the Launch Dialog's props.
+type ApplyChoice = fn(&mut LaunchDialogProps, String);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Story {
     ConnectDefault,
@@ -33,6 +37,7 @@ enum Story {
     ConnectError,
     LibraryPopulated,
     LibraryLaunchDialog,
+    LibraryLaunchDialogMinimal,
     LibraryEmpty,
     LibraryBusy,
     ControlsHardware,
@@ -48,6 +53,7 @@ impl Story {
         Story::ConnectError,
         Story::LibraryPopulated,
         Story::LibraryLaunchDialog,
+        Story::LibraryLaunchDialogMinimal,
         Story::LibraryEmpty,
         Story::LibraryBusy,
         Story::ControlsHardware,
@@ -61,6 +67,7 @@ impl Story {
             Story::ConnectDefault | Story::ConnectBusy | Story::ConnectError => "Connect",
             Story::LibraryPopulated
             | Story::LibraryLaunchDialog
+            | Story::LibraryLaunchDialogMinimal
             | Story::LibraryEmpty
             | Story::LibraryBusy => "Library",
             Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked => {
@@ -77,6 +84,7 @@ impl Story {
             Story::ConnectError => "Error",
             Story::LibraryPopulated => "Populated",
             Story::LibraryLaunchDialog => "Launch Dialog",
+            Story::LibraryLaunchDialogMinimal => "Launch Dialog · Minimal",
             Story::LibraryEmpty => "Empty",
             Story::LibraryBusy => "Busy + Status",
             Story::ControlsHardware => "Hardware H.265",
@@ -93,6 +101,7 @@ impl Story {
             Story::ConnectError => "story-connect-error",
             Story::LibraryPopulated => "story-library-populated",
             Story::LibraryLaunchDialog => "story-library-launch-dialog",
+            Story::LibraryLaunchDialogMinimal => "story-library-launch-dialog-minimal",
             Story::LibraryEmpty => "story-library-empty",
             Story::LibraryBusy => "story-library-busy",
             Story::ControlsHardware => "story-controls-hardware",
@@ -219,21 +228,32 @@ impl PreviewApp {
         })
         .detach();
         let assets = PreviewAssets::build();
+        // `SKERRY_PREVIEW_STORY=<story id>` opens the workbench on that story (for screenshots).
+        let story = std::env::var("SKERRY_PREVIEW_STORY")
+            .ok()
+            .and_then(|id| Story::ALL.iter().copied().find(|story| story.id() == id))
+            .unwrap_or(Story::LibraryLaunchDialog);
         let initial_dialog = Self::fixture_launch_dialog(
-            "lightcraft",
-            "LightCraft",
-            Some(Arc::clone(&assets.icon_lightcraft)),
+            "zen",
+            "Zen",
+            Some(Arc::clone(&assets.icon_zen)),
+            story == Story::LibraryLaunchDialogMinimal,
         );
         let initial_selects = Self::bind_launch_selects(&initial_dialog, window, cx);
+        let initial_dialog = matches!(
+            story,
+            Story::LibraryLaunchDialog | Story::LibraryLaunchDialogMinimal
+        )
+        .then_some((initial_dialog, initial_selects));
         Self {
-            story: Story::LibraryLaunchDialog,
+            story,
             appearance: Appearance::System,
             last_event: None,
             assets,
             key_input,
             search_input,
             selected_filter: "All".into(),
-            launch_dialog: Some((initial_dialog, initial_selects)),
+            launch_dialog: initial_dialog,
             controls_ui: ControlsUiState {
                 input_open: false,
                 screen_open: true,
@@ -251,11 +271,15 @@ impl PreviewApp {
     fn select_story(&mut self, story: Story, window: &mut Window, cx: &mut Context<Self>) {
         self.story = story;
         self.last_event = None;
-        if story == Story::LibraryLaunchDialog {
+        if matches!(
+            story,
+            Story::LibraryLaunchDialog | Story::LibraryLaunchDialogMinimal
+        ) {
             let dialog = Self::fixture_launch_dialog(
-                "lightcraft",
-                "LightCraft",
-                Some(Arc::clone(&self.assets.icon_lightcraft)),
+                "zen",
+                "Zen",
+                Some(Arc::clone(&self.assets.icon_zen)),
+                story == Story::LibraryLaunchDialogMinimal,
             );
             let selects = Self::bind_launch_selects(&dialog, window, cx);
             self.launch_dialog = Some((dialog, selects));
@@ -281,58 +305,65 @@ impl PreviewApp {
         cx.notify();
     }
 
+    /// A Launch Dialog as a SealSkin server on Kubernetes fills it: named homes, an Intel GPU
+    /// PodTemplate, a VPN with two endpoints, and the full locale list. `minimal` is a user
+    /// without persistent storage, GPU, or VPN rights, where only Cleanroom and Language show.
     fn fixture_launch_dialog(
         app_id: &str,
         app_name: &str,
         app_icon: Option<Arc<RenderImage>>,
+        minimal: bool,
     ) -> LaunchDialogProps {
+        let option = |id: &str, label: &str| LaunchOption {
+            id: id.into(),
+            label: label.into(),
+        };
+        // Without persistent storage the web client hides Storage and launches in Cleanroom.
+        let storage_options = if minimal {
+            vec![]
+        } else {
+            vec![
+                option("auto", "Auto (per-app persistence)"),
+                option("cleanroom", "Cleanroom (temporary)"),
+                option("work", "work"),
+                option("research", "research"),
+            ]
+        };
+        let gpu_options = if minimal {
+            vec![]
+        } else {
+            vec![option("", "None"), option("intel-gpu", "intel-gpu (i915)")]
+        };
+        let vpn_options = if minimal {
+            vec![]
+        } else {
+            vec![
+                option("", "No VPN"),
+                option("mullvad", "Mullvad"),
+                option("office", "Office"),
+            ]
+        };
         LaunchDialogProps {
             app_id: app_id.into(),
             app_name: app_name.into(),
             app_icon,
             favorite: false,
             hidden: false,
-            storage_options: vec![
-                LaunchOption {
-                    id: "auto".into(),
-                    label: "Auto (per-app persistence)".into(),
-                },
-                LaunchOption {
-                    id: "cleanroom".into(),
-                    label: "Cleanroom (temporary)".into(),
-                },
-                LaunchOption {
-                    id: "work-home".into(),
-                    label: "Home · work-home".into(),
-                },
-            ],
-            selected_storage: "auto".into(),
-            gpu_options: vec![
-                LaunchOption {
-                    id: "phone-cpu".into(),
-                    label: "phone (cpu)".into(),
-                },
-                LaunchOption {
-                    id: "rtx-4090".into(),
-                    label: "desktop (RTX 4090)".into(),
-                },
-            ],
-            selected_gpu: "phone-cpu".into(),
-            language_options: vec![
-                LaunchOption {
-                    id: "en_US".into(),
-                    label: "Default (en_US)".into(),
-                },
-                LaunchOption {
-                    id: "zh_CN".into(),
-                    label: "简体中文 (zh_CN)".into(),
-                },
-                LaunchOption {
-                    id: "ja_JP".into(),
-                    label: "日本語 (ja_JP)".into(),
-                },
-            ],
-            selected_language: "en_US".into(),
+            selected_storage: if minimal { "cleanroom" } else { "auto" }.into(),
+            storage_options,
+            gpu_options,
+            // The last launch of this app used the GPU, so it is chosen again.
+            selected_gpu: "intel-gpu".into(),
+            vpn_options,
+            selected_vpn: if minimal {
+                String::new()
+            } else {
+                "mullvad".into()
+            },
+            vpn_endpoint_options: Self::fixture_vpn_endpoints(if minimal { "" } else { "mullvad" }),
+            selected_vpn_endpoint: "mullvad-de".into(),
+            language_options: fixture_languages(),
+            selected_language: "de_DE.UTF-8".into(),
             collaborative: false,
             wayland: true,
             busy: false,
@@ -342,56 +373,87 @@ impl PreviewApp {
         }
     }
 
+    fn fixture_vpn_endpoints(vpn: &str) -> Vec<LaunchOption> {
+        let option = |id: &str, label: &str| LaunchOption {
+            id: id.into(),
+            label: label.into(),
+        };
+        match vpn {
+            "mullvad" => vec![
+                option("mullvad-de", "de-fra-wg-001"),
+                option("mullvad-nl", "nl-ams-wg-004"),
+                option("mullvad-se", "se-sto-wg-012"),
+            ],
+            "office" => vec![option("office-1", "vpn.office.example")],
+            _ => vec![],
+        }
+    }
+
+    /// Writes a confirmed choice into the dialog's props and records it in the event log.
+    fn on_launch_select(
+        select: &LaunchSelect,
+        field: &'static str,
+        apply: ApplyChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(
+            select,
+            window,
+            move |this, _, event: &SelectEvent<LaunchOptions>, window, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event {
+                    if let Some((dialog, selects)) = this.launch_dialog.as_mut() {
+                        apply(dialog, value.clone());
+                        if field == "VPN" {
+                            // A different VPN has different endpoints; rebuild that field.
+                            dialog.vpn_endpoint_options = Self::fixture_vpn_endpoints(value);
+                            dialog.selected_vpn_endpoint = dialog
+                                .vpn_endpoint_options
+                                .first()
+                                .map(|endpoint| endpoint.id.clone())
+                                .unwrap_or_default();
+                            let dialog = dialog.clone();
+                            selects.vpn_endpoint =
+                                LaunchDialogSelects::build_vpn_endpoint(&dialog, window, cx);
+                            if let Some(endpoint) = selects.vpn_endpoint.clone() {
+                                Self::on_launch_select(
+                                    &endpoint,
+                                    "VPN endpoint",
+                                    |dialog, value| dialog.selected_vpn_endpoint = value,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                    }
+                    this.record_event(format!("LaunchDialog: {field} -> `{value}`"), cx);
+                }
+            },
+        )
+        .detach();
+    }
+
     fn bind_launch_selects(
         props: &LaunchDialogProps,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> LaunchDialogSelects {
         let selects = LaunchDialogSelects::from_props(props, window, cx);
-        if let Some(storage) = &selects.storage {
-            cx.subscribe_in(
-                storage,
-                window,
-                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
-                    if let SelectEvent::Confirm(Some(value)) = event {
-                        if let Some((dialog, _)) = this.launch_dialog.as_mut() {
-                            dialog.selected_storage = value.clone();
-                        }
-                        this.record_event(format!("LaunchDialog: Storage -> `{value}`"), cx);
-                    }
-                },
-            )
-            .detach();
-        }
-        if let Some(gpu) = &selects.gpu {
-            cx.subscribe_in(
-                gpu,
-                window,
-                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
-                    if let SelectEvent::Confirm(Some(value)) = event {
-                        if let Some((dialog, _)) = this.launch_dialog.as_mut() {
-                            dialog.selected_gpu = value.clone();
-                        }
-                        this.record_event(format!("LaunchDialog: GPU -> `{value}`"), cx);
-                    }
-                },
-            )
-            .detach();
-        }
-        if let Some(language) = &selects.language {
-            cx.subscribe_in(
-                language,
-                window,
-                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
-                    if let SelectEvent::Confirm(Some(value)) = event {
-                        if let Some((dialog, _)) = this.launch_dialog.as_mut() {
-                            dialog.selected_language = value.clone();
-                        }
-                        this.record_event(format!("LaunchDialog: Language -> `{value}`"), cx);
-                    }
-                },
-            )
-            .detach();
+        let fields: [(&Option<LaunchSelect>, &'static str, ApplyChoice); 5] = [
+            (&selects.storage, "Storage", |d, v| d.selected_storage = v),
+            (&selects.gpu, "GPU", |d, v| d.selected_gpu = v),
+            (&selects.vpn, "VPN", |d, v| d.selected_vpn = v),
+            (&selects.vpn_endpoint, "VPN endpoint", |d, v| {
+                d.selected_vpn_endpoint = v
+            }),
+            (&selects.language, "Language", |d, v| {
+                d.selected_language = v
+            }),
+        ];
+        for (select, field, apply) in fields {
+            if let Some(select) = select {
+                Self::on_launch_select(select, field, apply, window, cx);
+            }
         }
         selects
     }
@@ -849,7 +911,9 @@ impl PreviewApp {
                     });
                 })
             }
-            Story::LibraryPopulated | Story::LibraryLaunchDialog => {
+            Story::LibraryPopulated
+            | Story::LibraryLaunchDialog
+            | Story::LibraryLaunchDialogMinimal => {
                 let props = LibraryProps {
                     app_name: "SealSkin Native".into(),
                     server: "sealskin.example.internal".into(),
@@ -1063,7 +1127,7 @@ impl PreviewApp {
                         "firefox" => ("Firefox", Some(Arc::clone(&this.assets.icon_firefox))),
                         other => (other, None),
                     };
-                    let dialog = Self::fixture_launch_dialog(&id, name, icon);
+                    let dialog = Self::fixture_launch_dialog(&id, name, icon, false);
                     let selects = Self::bind_launch_selects(&dialog, window, cx);
                     this.launch_dialog = Some((dialog, selects));
                     this.record_event(format!("Library: Open Launch Dialog for `{name}`"), cx);
@@ -1232,6 +1296,50 @@ impl Render for PreviewApp {
             .child(gallery)
             .child(stage)
     }
+}
+
+/// A slice of the server's locale list, labelled as macOS names each locale.
+fn fixture_languages() -> Vec<LaunchOption> {
+    let mut options = vec![LaunchOption {
+        id: "en_US.UTF-8".into(),
+        label: "Default (en_US)".into(),
+    }];
+    for (id, name) in [
+        ("ar_EG", "Arabic (Egypt)"),
+        ("cs_CZ", "Czech (Czechia)"),
+        ("da_DK", "Danish (Denmark)"),
+        ("de_AT", "German (Austria)"),
+        ("de_CH", "German (Switzerland)"),
+        ("de_DE", "German (Germany)"),
+        ("el_GR", "Greek (Greece)"),
+        ("en_AU", "English (Australia)"),
+        ("en_GB", "English (United Kingdom)"),
+        ("es_ES", "Spanish (Spain)"),
+        ("es_MX", "Spanish (Mexico)"),
+        ("fi_FI", "Finnish (Finland)"),
+        ("fr_CA", "French (Canada)"),
+        ("fr_FR", "French (France)"),
+        ("he_IL", "Hebrew (Israel)"),
+        ("hi_IN", "Hindi (India)"),
+        ("it_IT", "Italian (Italy)"),
+        ("ja_JP", "Japanese (Japan)"),
+        ("ko_KR", "Korean (South Korea)"),
+        ("nl_NL", "Dutch (Netherlands)"),
+        ("pl_PL", "Polish (Poland)"),
+        ("pt_BR", "Portuguese (Brazil)"),
+        ("ru_RU", "Russian (Russia)"),
+        ("sv_SE", "Swedish (Sweden)"),
+        ("tr_TR", "Turkish (Türkiye)"),
+        ("uk_UA", "Ukrainian (Ukraine)"),
+        ("zh_CN", "Chinese (China mainland)"),
+        ("zh_TW", "Chinese (Taiwan)"),
+    ] {
+        options.push(LaunchOption {
+            id: format!("{id}.UTF-8"),
+            label: format!("{name} · {id}"),
+        });
+    }
+    options
 }
 
 fn main() {

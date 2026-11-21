@@ -203,6 +203,66 @@ pub struct RemoteApp {
     pub home_directories: bool,
     #[serde(default)]
     pub is_meta_app: bool,
+    /// The app runs on NVIDIA GPUs.
+    #[serde(default)]
+    pub nvidia_support: bool,
+    /// The app runs on Intel/AMD (Mesa, DRI3) GPUs.
+    #[serde(default)]
+    pub dri3_support: bool,
+}
+
+/// A GPU the server offers sessions: a render node on Docker (`/dev/dri/renderD128`), a
+/// PodTemplate or resource name on Kubernetes (`intel-gpu`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct GpuInfo {
+    pub device: String,
+    #[serde(default)]
+    pub driver: String,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct VpnEndpoint {
+    pub id: String,
+    pub label: String,
+}
+
+/// A VPN profile open to the user; its first endpoint is the default.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct VpnChoice {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub endpoints: Vec<VpnEndpoint>,
+}
+
+/// The launch rights in the user's effective settings.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct UserSettings {
+    #[serde(default)]
+    pub persistent_storage: bool,
+    #[serde(default)]
+    pub gpu: bool,
+    #[serde(default)]
+    pub vpn: bool,
+}
+
+/// What `POST /companion/api/admin/status` says about the user's launch choices.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ServerStatus {
+    #[serde(default)]
+    pub settings: UserSettings,
+    #[serde(default)]
+    pub gpus: Vec<GpuInfo>,
+    #[serde(default)]
+    pub vpns: Vec<VpnChoice>,
+}
+
+#[derive(Deserialize)]
+struct HomeDirectories {
+    #[serde(default)]
+    home_dirs: Vec<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -222,8 +282,15 @@ pub struct RemoteSession {
 
 #[derive(Clone, Debug)]
 pub struct LaunchParams {
+    /// A named home, `cleanroom`, or `None` (only a meta app's own Auto home).
     pub home_name: Option<String>,
+    /// Create `home_name` first when the server doesn't have it yet (the Auto home).
+    pub create_home: bool,
     pub language: Option<String>,
+    pub timezone: Option<String>,
+    pub selected_gpu: Option<String>,
+    pub vpn: Option<String>,
+    pub vpn_endpoint: Option<String>,
     pub wayland_mode: bool,
     pub launch_in_room_mode: bool,
 }
@@ -232,10 +299,44 @@ impl Default for LaunchParams {
     fn default() -> Self {
         Self {
             home_name: None,
+            create_home: false,
             language: None,
+            timezone: None,
+            selected_gpu: None,
+            vpn: None,
+            vpn_endpoint: None,
             wayland_mode: true,
             launch_in_room_mode: false,
         }
+    }
+}
+
+impl LaunchParams {
+    /// The `/launch/simple` body, as SealSkin's web launcher sends it.
+    fn body(&self, app_id: &str) -> serde_json::Value {
+        let mut body = serde_json::Map::new();
+        body.insert("application_id".into(), json!(app_id));
+        let optional = [
+            ("home_name", &self.home_name),
+            ("language", &self.language),
+            ("timezone", &self.timezone),
+            ("selected_gpu", &self.selected_gpu),
+            ("vpn", &self.vpn),
+        ];
+        for (name, value) in optional {
+            if let Some(value) = value {
+                body.insert(name.into(), json!(value));
+            }
+        }
+        if let (Some(_), Some(endpoint)) = (&self.vpn, &self.vpn_endpoint) {
+            body.insert("vpn_endpoint".into(), json!(endpoint));
+        }
+        body.insert("wayland_mode".into(), json!(self.wayland_mode));
+        body.insert(
+            "launch_in_room_mode".into(),
+            json!(self.launch_in_room_mode),
+        );
+        serde_json::Value::Object(body)
     }
 }
 
@@ -268,6 +369,10 @@ struct Failure {
 pub struct Library {
     pub apps: Vec<RemoteApp>,
     pub sessions: Vec<RemoteSession>,
+    /// The user's launch rights, GPUs, and VPNs; default (nothing offered) when unreadable.
+    pub status: ServerStatus,
+    /// The user's home directories, when they have persistent storage.
+    pub homes: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -353,8 +458,51 @@ impl Api {
                 .json(&json!({})),
         );
         let sessions = send(self.request(Method::GET, "/companion/api/sessions"));
-        let (apps, sessions) = tokio::try_join!(apps, sessions).map_err(LibraryError::Failed)?;
-        Ok(Library { apps, sessions })
+        let status = send::<ServerStatus>(
+            self.request(Method::POST, "/companion/api/admin/status")
+                .json(&json!({})),
+        );
+        let (apps, sessions, status) = tokio::join!(apps, sessions, status);
+        let (apps, sessions) = (
+            apps.map_err(LibraryError::Failed)?,
+            sessions.map_err(LibraryError::Failed)?,
+        );
+        // Launch choices are extras: without the status the dialog offers what it always did.
+        let status = status.unwrap_or_default();
+        let homes = if status.settings.persistent_storage {
+            self.home_directories().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        Ok(Library {
+            apps,
+            sessions,
+            status,
+            homes,
+        })
+    }
+
+    async fn home_directories(&self) -> Result<Vec<String>, String> {
+        let homes: HomeDirectories =
+            send(self.request(Method::GET, "/companion/api/homedirs")).await?;
+        Ok(homes.home_dirs)
+    }
+
+    async fn create_home_directory(&self, home_name: &str) -> Result<(), String> {
+        let response = self
+            .request(Method::POST, "/companion/api/homedirs")
+            .json(&json!({ "home_name": home_name }))
+            .send()
+            .await
+            .map_err(|_| "Couldn’t reach the SealSkin server to create the home.".to_string())?;
+        // 409: it exists already (made elsewhere since the Library loaded).
+        if response.status().is_success() || response.status() == StatusCode::CONFLICT {
+            return Ok(());
+        }
+        Err(format!(
+            "SealSkin returned HTTP {} while creating the home “{home_name}”.",
+            response.status().as_u16()
+        ))
     }
 
     pub async fn launch_with_options(
@@ -362,23 +510,13 @@ impl Api {
         app: RemoteApp,
         params: LaunchParams,
     ) -> Result<RemoteSession, String> {
-        let mut body = serde_json::Map::new();
-        body.insert("application_id".into(), json!(app.id));
-        if let Some(home_name) = params.home_name {
-            body.insert("home_name".into(), json!(home_name));
+        if let (true, Some(home_name)) = (params.create_home, &params.home_name) {
+            self.create_home_directory(home_name).await?;
         }
-        if let Some(language) = params.language {
-            body.insert("language".into(), json!(language));
-        }
-        body.insert("wayland_mode".into(), json!(params.wayland_mode));
-        body.insert(
-            "launch_in_room_mode".into(),
-            json!(params.launch_in_room_mode),
-        );
         let response: Launched = send(
             self.request(Method::POST, "/companion/api/launch/simple")
                 .timeout(Duration::from_secs(180))
-                .json(&serde_json::Value::Object(body)),
+                .json(&params.body(&app.id)),
         )
         .await?;
         Ok(RemoteSession {
@@ -387,8 +525,12 @@ impl Api {
             app_name: app.name,
             created_at: 0.0,
             session_url: response.session_url,
-            home: String::new(),
-            gpu: false,
+            // The server lists a cleanroom session with no home.
+            home: params
+                .home_name
+                .filter(|home| home != "cleanroom")
+                .unwrap_or_default(),
+            gpu: params.selected_gpu.is_some(),
         })
     }
 
@@ -450,12 +592,18 @@ impl Api {
         decode_data_uri(&resp.image)
     }
 
-    pub fn app_deep_link(&self, app_id: &str) -> Option<String> {
+    /// The app's address on the server, `/app/<id>/`, with `query` (the launch options, as
+    /// the web launcher's Copy link writes them).
+    pub fn app_deep_link(&self, app_id: &str, query: &[(&str, String)]) -> Option<String> {
         if !valid_path_segment(app_id) {
             return None;
         }
         let mut url = self.base.clone();
         url.set_path(&format!("/app/{app_id}/"));
+        if !query.is_empty() {
+            url.query_pairs_mut()
+                .extend_pairs(query.iter().map(|(k, v)| (*k, v.as_str())));
+        }
         Some(url.to_string())
     }
 
@@ -723,6 +871,7 @@ mod tests {
         .unwrap();
         assert_eq!(app.kind, "browser");
         assert!(app.home_directories);
+        assert!(app.nvidia_support && app.dri3_support);
 
         let session: RemoteSession = serde_json::from_value(json!({
             "session_id": "sess-1",
@@ -741,5 +890,88 @@ mod tests {
 
         let bytes = decode_data_uri("data:image/jpeg;base64,AQID").unwrap();
         assert_eq!(bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn decodes_the_status_launch_rights_gpus_and_vpns() {
+        let status: ServerStatus = serde_json::from_value(json!({
+            "is_admin": false,
+            "username": "kebot",
+            "via": "app_key",
+            "settings": {"persistent_storage": true, "gpu": true, "vpn": false, "group": "default"},
+            "gpus": [
+                {"device": "intel-gpu", "driver": "i915"},
+                {"device": "/dev/dri/renderD128", "driver": "nvidia", "model": "NVIDIA L40S"}
+            ],
+            "vpns": [{"id": "m", "name": "Mullvad", "kind": "wireguard",
+                      "endpoints": [{"id": "de", "label": "de-fra"}]}],
+            "cpu_model": "EPYC"
+        }))
+        .unwrap();
+        assert!(status.settings.persistent_storage && status.settings.gpu && !status.settings.vpn);
+        assert_eq!(status.gpus[0].device, "intel-gpu");
+        assert_eq!(status.gpus[1].model.as_deref(), Some("NVIDIA L40S"));
+        assert_eq!(status.vpns[0].endpoints[0].label, "de-fra");
+        let minimal: ServerStatus = serde_json::from_value(json!({"username": "x"})).unwrap();
+        assert!(minimal.gpus.is_empty() && !minimal.settings.gpu);
+    }
+
+    #[test]
+    fn launch_body_carries_only_the_chosen_options() {
+        let plain = LaunchParams::default().body("zen");
+        assert_eq!(
+            plain,
+            json!({"application_id": "zen", "wayland_mode": true, "launch_in_room_mode": false})
+        );
+        let params = LaunchParams {
+            home_name: Some("auto-zen".into()),
+            create_home: true,
+            language: Some("de_DE.UTF-8".into()),
+            timezone: Some("Europe/Berlin".into()),
+            selected_gpu: Some("intel-gpu".into()),
+            vpn: Some("mullvad".into()),
+            vpn_endpoint: Some("nl".into()),
+            wayland_mode: false,
+            launch_in_room_mode: true,
+        };
+        assert_eq!(
+            params.body("zen"),
+            json!({
+                "application_id": "zen",
+                "home_name": "auto-zen",
+                "language": "de_DE.UTF-8",
+                "timezone": "Europe/Berlin",
+                "selected_gpu": "intel-gpu",
+                "vpn": "mullvad",
+                "vpn_endpoint": "nl",
+                "wayland_mode": false,
+                "launch_in_room_mode": true
+            })
+        );
+        // An endpoint without a VPN is never sent.
+        let stray = LaunchParams {
+            vpn_endpoint: Some("nl".into()),
+            ..LaunchParams::default()
+        };
+        assert!(stray.body("zen").get("vpn_endpoint").is_none());
+    }
+
+    #[test]
+    fn deep_link_carries_the_launch_options() {
+        let credential = Credential::parse("ssk_id_secret@seal.example").unwrap();
+        let api = Api::new(&credential).unwrap();
+        assert_eq!(
+            api.app_deep_link("zen", &[]).as_deref(),
+            Some("https://seal.example/app/zen/")
+        );
+        assert_eq!(
+            api.app_deep_link(
+                "zen",
+                &[("gpu", "intel-gpu".into()), ("lang", "de_DE.UTF-8".into())]
+            )
+            .as_deref(),
+            Some("https://seal.example/app/zen/?gpu=intel-gpu&lang=de_DE.UTF-8")
+        );
+        assert!(api.app_deep_link("../x", &[]).is_none());
     }
 }

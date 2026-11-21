@@ -3,6 +3,7 @@ mod display;
 
 use crate::api::{Api, Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession};
 use crate::input::InputFeature;
+use crate::launch_options::{self, LaunchContext, LaunchSelection};
 use crate::settings::{
     self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
 };
@@ -27,6 +28,7 @@ use skerry_ui::{
     connect::{self, ConnectProps},
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
+        LaunchOptions, LaunchSelect,
     },
     library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
     session,
@@ -181,6 +183,8 @@ struct Launcher {
     app_icons: HashMap<String, Arc<RenderImage>>,
     session_thumbnails: HashMap<String, Arc<RenderImage>>,
     launch_dialog: Option<(RemoteApp, LaunchDialogProps, LaunchDialogSelects)>,
+    /// Every session locale with the Mac's name for it; built on the first Launch Dialog.
+    language_options: Option<Vec<LaunchOption>>,
     pending_stop: Option<RemoteSession>,
     /// Images replaced or removed since the last render; their GPU textures are freed with
     /// `window.drop_image` on the next render (GPUI never frees them on drop).
@@ -251,6 +255,7 @@ impl Launcher {
             app_icons: HashMap::new(),
             session_thumbnails: HashMap::new(),
             launch_dialog: None,
+            language_options: None,
             pending_stop: None,
             retired_images: Vec::new(),
             media_generation: 0,
@@ -375,6 +380,8 @@ impl Launcher {
                         }
                         this.startup_credential = None;
                         this.retry_api = None;
+                        // Launch options remembered per app live with the other preferences.
+                        this.preferences = settings::load(api.server());
                         this.api = Some(api.clone());
                         this.library = Some(library);
                         this.status = save.and_then(|credential| credential.save().err());
@@ -500,97 +507,126 @@ impl Launcher {
         self.pending_stop = None;
     }
 
+    /// What this server lets the user launch with, from the loaded Library.
+    fn launch_context(&self) -> LaunchContext {
+        self.library
+            .as_ref()
+            .map(|library| LaunchContext {
+                status: library.status.clone(),
+                homes: library.homes.clone(),
+            })
+            .unwrap_or_default()
+    }
+
     fn open_launch_dialog(&mut self, app: RemoteApp, window: &mut Window, cx: &mut Context<Self>) {
-        let storage_options = if app.home_directories {
-            vec![
-                LaunchOption {
-                    id: "auto".into(),
-                    label: "Auto (per-app persistence)".into(),
-                },
-                LaunchOption {
-                    id: "cleanroom".into(),
-                    label: "Cleanroom (temporary)".into(),
-                },
-            ]
-        } else {
-            vec![LaunchOption {
-                id: "cleanroom".into(),
-                label: "Cleanroom (temporary)".into(),
-            }]
-        };
-        let selected_storage = storage_options[0].id.clone();
-        let language_options = vec![
-            LaunchOption {
-                id: "".into(),
-                label: "Default (en_US)".into(),
-            },
-            LaunchOption {
-                id: "zh_CN.UTF-8".into(),
-                label: "简体中文 (zh_CN)".into(),
-            },
-            LaunchOption {
-                id: "ja_JP.UTF-8".into(),
-                label: "日本語 (ja_JP)".into(),
-            },
-            LaunchOption {
-                id: "de_DE.UTF-8".into(),
-                label: "Deutsch (de_DE)".into(),
-            },
-        ];
+        let context = self.launch_context();
+        let memory = self
+            .preferences
+            .launch
+            .get(&app.id)
+            .cloned()
+            .unwrap_or_default();
+        let default_language = launch_options::default_language(&launch_options::mac_locale());
+        let selection = context.selection(&app, &memory, &default_language);
+        let language_options = self
+            .language_options
+            .get_or_insert_with(|| {
+                launch_options::language_options(launch_options::mac_locale_name)
+            })
+            .clone();
         let props = LaunchDialogProps {
             app_id: app.id.clone(),
             app_name: app.name.clone(),
             app_icon: self.app_icons.get(&app.id).cloned(),
             favorite: false,
             hidden: false,
-            storage_options,
-            selected_storage,
-            gpu_options: vec![],
-            selected_gpu: String::new(),
+            storage_options: context.storage_options(&app),
+            selected_storage: selection.home_dir,
+            gpu_options: context.gpu_options(&app),
+            selected_gpu: selection.gpu,
+            vpn_options: context.vpn_options(),
+            vpn_endpoint_options: context.vpn_endpoints(&selection.vpn),
+            selected_vpn: selection.vpn,
+            selected_vpn_endpoint: selection.vpn_endpoint,
             language_options,
-            selected_language: String::new(),
-            collaborative: false,
-            wayland: true,
+            selected_language: selection.language,
+            collaborative: selection.room,
+            wayland: selection.wayland,
             busy: false,
             show_copy_link: true,
             show_organize: false,
             link_copied: false,
         };
         let selects = LaunchDialogSelects::from_props(&props, window, cx);
-        if let Some(storage) = &selects.storage {
-            cx.subscribe_in(
-                storage,
-                window,
-                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
-                    if let SelectEvent::Confirm(Some(value)) = event {
-                        if let Some((_, dialog, _)) = this.launch_dialog.as_mut() {
-                            dialog.selected_storage = value.clone();
-                        }
-                        cx.notify();
-                    }
-                },
-            )
-            .detach();
-        }
-        if let Some(language) = &selects.language {
-            cx.subscribe_in(
-                language,
-                window,
-                |this, _, event: &SelectEvent<Vec<LaunchOption>>, _, cx| {
-                    if let SelectEvent::Confirm(Some(value)) = event {
-                        if let Some((_, dialog, _)) = this.launch_dialog.as_mut() {
-                            dialog.selected_language = value.clone();
-                        }
-                        cx.notify();
-                    }
-                },
-            )
-            .detach();
+        let fields = [
+            (&selects.storage, LaunchField::Storage),
+            (&selects.gpu, LaunchField::Gpu),
+            (&selects.vpn, LaunchField::Vpn),
+            (&selects.vpn_endpoint, LaunchField::VpnEndpoint),
+            (&selects.language, LaunchField::Language),
+        ];
+        for (select, field) in fields {
+            if let Some(select) = select {
+                self.bind_launch_select(select, field, window, cx);
+            }
         }
         self.launch_dialog = Some((app, props, selects));
         // Take focus off the search field so Escape reaches the dialog.
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// Writes a confirmed dropdown choice into the dialog. A new VPN brings its own endpoints,
+    /// so that field is rebuilt with the first one chosen.
+    fn bind_launch_select(
+        &mut self,
+        select: &LaunchSelect,
+        field: LaunchField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.subscribe_in(
+            select,
+            window,
+            move |this, _, event: &SelectEvent<LaunchOptions>, window, cx| {
+                let SelectEvent::Confirm(Some(value)) = event else {
+                    return;
+                };
+                let context = this.launch_context();
+                let Some((_, dialog, selects)) = this.launch_dialog.as_mut() else {
+                    return;
+                };
+                dialog.link_copied = false;
+                match field {
+                    LaunchField::Storage => dialog.selected_storage = value.clone(),
+                    LaunchField::Gpu => dialog.selected_gpu = value.clone(),
+                    LaunchField::VpnEndpoint => dialog.selected_vpn_endpoint = value.clone(),
+                    LaunchField::Language => dialog.selected_language = value.clone(),
+                    LaunchField::Vpn => {
+                        dialog.selected_vpn = value.clone();
+                        dialog.vpn_endpoint_options = context.vpn_endpoints(value);
+                        dialog.selected_vpn_endpoint = dialog
+                            .vpn_endpoint_options
+                            .first()
+                            .map(|endpoint| endpoint.id.clone())
+                            .unwrap_or_default();
+                        let props = dialog.clone();
+                        selects.vpn_endpoint =
+                            LaunchDialogSelects::build_vpn_endpoint(&props, window, cx);
+                        if let Some(endpoint) = selects.vpn_endpoint.clone() {
+                            this.bind_launch_select(
+                                &endpoint,
+                                LaunchField::VpnEndpoint,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                }
+                cx.notify();
+            },
+        )
+        .detach();
     }
 
     fn handle_launch_dialog_action(
@@ -616,16 +652,22 @@ impl Launcher {
             LaunchDialogAction::SetCollaborative(enabled) => {
                 if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
                     dialog.collaborative = enabled;
+                    dialog.link_copied = false;
                 }
             }
             LaunchDialogAction::SetWayland(enabled) => {
                 if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
                     dialog.wayland = enabled;
+                    dialog.link_copied = false;
                 }
             }
             LaunchDialogAction::CopyLink => {
+                let context = self.launch_context();
                 if let (Some(api), Some((app, dialog, _))) = (&self.api, &mut self.launch_dialog) {
-                    if let Some(link) = api.app_deep_link(&app.id) {
+                    let default_language =
+                        launch_options::default_language(&launch_options::mac_locale());
+                    let query = context.link_query(app, &selection_of(dialog), &default_language);
+                    if let Some(link) = api.app_deep_link(&app.id, &query) {
                         cx.write_to_clipboard(ClipboardItem::new_string(link));
                         dialog.link_copied = true;
                     }
@@ -633,32 +675,32 @@ impl Launcher {
             }
             LaunchDialogAction::Launch => {
                 if let Some((app, dialog, _)) = self.launch_dialog.take() {
-                    let home_name = storage_home_name(&dialog.selected_storage);
-                    let language =
-                        (!dialog.selected_language.is_empty()).then_some(dialog.selected_language);
-                    let params = LaunchParams {
-                        home_name,
-                        language,
-                        wayland_mode: dialog.wayland,
-                        launch_in_room_mode: dialog.collaborative,
-                    };
-                    self.launch_with_options(app, params, window, cx);
+                    let selection = selection_of(&dialog);
+                    let params = self.launch_context().params(
+                        &app,
+                        &selection,
+                        launch_options::mac_timezone(),
+                    );
+                    self.launch_with_options(app, params, Some(selection), window, cx);
                 }
             }
         }
         cx.notify();
     }
 
+    /// Launches `app`; once it runs, `remember` becomes the app's remembered options.
     fn launch_with_options(
         &mut self,
         app: RemoteApp,
         params: LaunchParams,
+        remember: Option<LaunchSelection>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(api) = self.api.clone().filter(|_| self.busy.is_none()) else {
             return;
         };
+        let app_id = app.id.clone();
         self.status = None;
         self.busy = Some(format!("Launching {}…", app.name));
         let pending = self
@@ -679,6 +721,14 @@ impl Launcher {
                         Ok(session) => {
                             if let Some(library) = &mut this.library {
                                 library.sessions.insert(0, session.clone());
+                                if session.home.starts_with("auto-")
+                                    && !library.homes.contains(&session.home)
+                                {
+                                    library.homes.push(session.home.clone());
+                                }
+                            }
+                            if let Some(selection) = &remember {
+                                this.remember_launch(&app_id, selection);
                             }
                             this.open_session(session, window, cx);
                         }
@@ -690,6 +740,19 @@ impl Launcher {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Keeps `selection` as the options `app_id` opens with next time (saved per server).
+    fn remember_launch(&mut self, app_id: &str, selection: &LaunchSelection) {
+        let Some(api) = &self.api else {
+            return;
+        };
+        self.preferences
+            .launch
+            .insert(app_id.to_string(), selection.memory());
+        if settings::save(api.server(), &self.preferences).is_err() {
+            self.status = Some("Couldn’t save this app’s launch options.".into());
+        }
     }
 
     fn stop_session(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
@@ -1303,11 +1366,26 @@ impl Render for Launcher {
     }
 }
 
-fn storage_home_name(selected: &str) -> Option<String> {
-    match selected {
-        "auto" | "" => None,
-        "cleanroom" => Some("cleanroom".to_string()),
-        named => Some(named.to_string()),
+/// The Launch Dialog's dropdowns.
+#[derive(Clone, Copy)]
+enum LaunchField {
+    Storage,
+    Gpu,
+    Vpn,
+    VpnEndpoint,
+    Language,
+}
+
+/// The dialog's current choices.
+fn selection_of(dialog: &LaunchDialogProps) -> LaunchSelection {
+    LaunchSelection {
+        home_dir: dialog.selected_storage.clone(),
+        gpu: dialog.selected_gpu.clone(),
+        vpn: dialog.selected_vpn.clone(),
+        vpn_endpoint: dialog.selected_vpn_endpoint.clone(),
+        language: dialog.selected_language.clone(),
+        wayland: dialog.wayland,
+        room: dialog.collaborative,
     }
 }
 
@@ -1390,14 +1468,6 @@ mod tests {
         );
         let fixed = DisplayMode::Fixed(Resolution(1280, 720));
         assert_eq!(fixed.request(viewport, 2.), fixed.request(viewport, 1.));
-    }
-
-    #[test]
-    fn storage_home_name_maps_auto_cleanroom_and_named_homes() {
-        assert_eq!(storage_home_name("auto"), None);
-        assert_eq!(storage_home_name(""), None);
-        assert_eq!(storage_home_name("cleanroom").as_deref(), Some("cleanroom"));
-        assert_eq!(storage_home_name("work-home").as_deref(), Some("work-home"));
     }
 
     #[test]

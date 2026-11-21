@@ -1,4 +1,5 @@
 use crate::input::InputSettings;
+use crate::launch_options::LaunchMemory;
 use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -268,6 +269,9 @@ pub struct Preferences {
     pub codec: Codec,
     #[serde(default, skip_serializing_if = "InputSettings::is_default")]
     pub input: InputSettings,
+    /// The Launch Dialog options each app last launched with, by app id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub launch: BTreeMap<String, LaunchMemory>,
     #[serde(flatten)]
     pub video: VideoSettings,
 }
