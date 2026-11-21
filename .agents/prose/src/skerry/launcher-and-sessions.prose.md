@@ -9,7 +9,7 @@ id: 067NC4KG01SKERRY0000000003
 <!-- compose:status=provisional provenance=compose-managed -->
 <!-- compose:unresolved id=ARCH-GAP-LS-01 concept="launch-options-and-progress" question="Expose storage mode (automatic per-app, cleanroom, named home), language/timezone, Wayland/X11, and GPU/VPN options with stage progress and cold-pull timeout recovery while keeping one-click remembered launch." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-02 concept="session-management" question="Display server thumbnails for running sessions and add Send File and Stop (distinct from Disconnect, warning that Stop terminates remote process and cleanroom data)." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-03 concept="open-links-and-files" question="Accept pasted URLs and dropped/chosen files in the launcher, filter apps by declared URL/extension support, and launch with open-or-stage progress." -->
+<!-- compose:unresolved id=ARCH-GAP-LS-03 concept="open-links-and-files" question="Accept pasted URLs and dropped/chosen files in the launcher, filter apps by declared URL/extension support, and launch with open-or-stage progress via SealSkin 0.5.0 /api/launch/url|file|file_path, or hand a URL to a running session via POST /api/sessions/<id>/open_url; send only http, https, ftp, or space-free magnet addresses." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-04 concept="launcher-library" question="Add search, app icons, recents, favorites, hidden apps, per-app saved launch preferences, and running-session reuse matching app + storage." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-06 concept="account-and-key-recovery" question="Display signed-in account, effective capabilities, and usage limits; offer browser wake flow for dormant keys and replacement prompt for expired/revoked keys." -->
@@ -27,6 +27,7 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
 
 - `credential-and-connect` (settled baseline; recovery open in `ARCH-GAP-LS-06`):
   - Parses `ssk_<id>_<secret>@<host>[:port]`, enforces HTTPS with no path/query/userinfo, loads from `SEALSKIN_APPLICATION_KEY` -> `.env` -> macOS Keychain, and authenticates with `Authorization: Bearer <key>` and `x-sealskin-app: other`.
+  - Minimum server version (settled, `ARCH-009`): before loading the library on Connect or Refresh, `Api::check_version` reads `GET /companion/api/ui/version` and refuses any server older than `0.5.0` (`MINIMUM_SEALSKIN_VERSION`), a `0.5.0` pre-release, an unparseable version, or a missing route. A refused server leaves Skerry on the Connect screen with an error naming the minimum and found versions; the library is not loaded and the key is not saved to Keychain.
   - Unresolved frontier (`ARCH-GAP-LS-06`): show account limits/capabilities, dormant-key browser wake flow, and expired/revoked key replacement.
 - `application-library-and-launch` (baseline simple launch settled; options & library organization open in `ARCH-GAP-LS-01`, `ARCH-GAP-LS-03`, `ARCH-GAP-LS-04`):
   - Loads library via `POST /companion/api/applications` and launches via `POST /companion/api/launch/simple`.
@@ -50,6 +51,7 @@ Material: SealSkin companion API endpoints, credential/origin security policies,
 Immaterial: transient session timestamps and server polling intervals.
 
 Postconditions:
+- Skerry never loads a library from, launches on, or saves a key for a SealSkin server whose `GET /companion/api/ui/version` is older than `0.5.0` or cannot be read (`ARCH-009`).
 - Application keys never leave the SealSkin control-plane origin and are never sent to untrusted redirects.
 - Disconnecting never stops a remote session; stopping a session requires explicit user confirmation explaining cleanroom data loss.
 

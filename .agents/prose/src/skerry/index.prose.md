@@ -22,7 +22,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
 ### Maintains
 
 - `system-architecture`: verified module boundaries across `crates/skerry-mac/src/`:
-  - `api.rs`: `Credential::parse` (`ssk_<id>_<secret>@<host>[:port]`, HTTPS-only), `Credential::startup` (`SEALSKIN_APPLICATION_KEY` -> `.env` -> macOS Keychain `dev.kebot.sealskin`), and `Api` (`POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/launch/simple`, same-origin `session_url`).
+  - `api.rs`: `Credential::parse` (`ssk_<id>_<secret>@<host>[:port]`, HTTPS-only), `Credential::startup` (`SEALSKIN_APPLICATION_KEY` -> `.env` -> macOS Keychain `dev.kebot.sealskin`), and `Api` (`MINIMUM_SEALSKIN_VERSION = 0.5.0` gate via `GET /companion/api/ui/version` before any other call, `POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/launch/simple`, same-origin `session_url`).
   - `transport.rs`: `socket_request` (unredirected `GET` -> `303 See Other` cookie exchange -> `wss://.../api/websockets`), initial `SETTINGS` handshake, 33 ms frame publish + `CLIENT_FRAME_ACK`, 1 s stream stats/ping RTT, and `kh,<keys>` held-key keepalive.
   - `video.rs`: `Codec` (JPEG, H.264, H.265, AV1), `VTIsHardwareDecodeSupported`, Annex B / parameter-set / AV1 sequence-header parsing, and IOSurface-backed `CVPixelBuffer` (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`) painted via `window.paint_surface`.
   - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`.
@@ -61,6 +61,7 @@ input-driven
 - The multi-threaded Tokio `Runtime` is created in `main` before `Application::run` and kept alive for the lifetime of the app; all network I/O runs on Tokio and communicates with GPUI via `mpsc` / `watch` channels.
 - JPEG frames decoded off the main thread into `RenderImage` must retire previous frames via `window.drop_image(previous)` inside the paint closure to prevent texture leaks (~10 MB/s at 60 fps).
 - Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.
+- Skerry supports SealSkin `0.5.0` or newer (`ARCH-009`): it refuses to connect to a server whose `GET /companion/api/ui/version` reports an older or unparseable version, or that has no such route. Changing the minimum is a new superseding `ARCH-*` decision.
 
 ### Execution
 

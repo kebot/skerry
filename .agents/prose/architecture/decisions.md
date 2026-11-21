@@ -36,7 +36,7 @@
 
 ## ARCH-005: Product & Protocol Boundaries (SealSkin 0.4.2 & Selkies 715df7c)
 
-- **Status:** settled
+- **Status:** settled — SealSkin 0.4.2 version baseline superseded by `ARCH-008`, itself superseded by `ARCH-009` (the product/protocol boundaries below remain in force)
 - **Decision:**
   - **Operator vs. Client Settings:** Capture backends, GPU selection, TLS, TURN credentials, audit/recording policy, and server administration (users, groups, app stores, templates, cluster nodes, audit logs) remain operator/web-dashboard responsibilities. Skerry only requests session changes permitted by server policy.
   - **Control-Plane vs. In-Session:** SealSkin companion API owns application keys, catalog, launching, persistent homes/shares, and stopping sessions. Selkies WebSocket owns live stream settings, input, clipboard, in-session file transfer, printing, and media uplinks.
@@ -59,6 +59,26 @@
 - **Rationale:** Keeps Skerry on `gpui-kit 0.10.0` (avoiding `gpui-storybook 0.8.0`'s `gpui-kit 0.9.0` pin and `gpui-preview`'s incompatible `gpui 0.2.2` stack) while giving a fast, self-contained UI iteration loop with no Keychain auth, Tokio runtime, or SealSkin/Selkies connection required—and ensuring previewed changes are the exact code rendered by `skerry-mac`.
 - **Affected Contracts:** `src/skerry/index.prose.md`
 
+## ARCH-008: Pinned SealSkin Server Version (0.5.0 Only)
+
+- **Status:** superseded by `ARCH-009` — the user meant 0.5.0 as a minimum, not an exact version; kept for history
+- **Decision:** Skerry supports exactly one SealSkin server version: `0.5.0` (`api::SUPPORTED_SEALSKIN_VERSION`). Before any other companion API call, `Api::check_version` reads `GET /companion/api/ui/version` (`{"version", "bridge"}`, served by SealSkin's `ui.router`) and refuses to continue unless `version` is exactly `0.5.0`. On a mismatch, a missing route (servers before 0.5.0), or an unreadable reply, Skerry does not load the library, does not store the `Api`, does not save the key to Keychain, and stays on the Connect screen with an error naming the required and found versions. The same gate runs on every Refresh.
+- **Rationale:** SealSkin 0.5.0 changed security-relevant behaviour Skerry relies on or will build on: the per-origin `access_token` → `303` + `Set-Cookie` session exchange, collaboration room messages carrying only aliases (no room tokens), the `http`/`https`/`ftp`/`magnet` launch address rule, the new `POST /api/sessions/<id>/open_url`, Selkies 2.3.0 base images (`h264enc-striped` removed, congestion control on by default), and hardening switches that force file transfer, printing, and window-manager features off. Pinning one exact version keeps each contract verified against the one server it was written for, not a range nobody has tested.
+- **Changing the pin:** Moving to any other SealSkin version (including a patch release such as `0.5.1`) is a new `ARCH-*` decision that supersedes this one. It must re-read that release's notes against these contracts, update `SUPPORTED_SEALSKIN_VERSION` and its unit test, and re-run codec QA (`ARCH-003`) against the new server.
+- **Open verification:** The `ARCH-003` codec QA evidence was recorded on SealSkin 0.4.2. Re-run it on a 0.5.0 server (Selkies 2.3.0 congestion control now adapts the WebSocket video rate).
+- **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/api.rs` (`SUPPORTED_SEALSKIN_VERSION`, `Api::check_version`, `Api::library`)
+
+## ARCH-009: Minimum SealSkin Server Version (0.5.0 or Newer)
+
+- **Status:** settled (pinned minimum) — supersedes `ARCH-008`
+- **Decision:** Skerry supports SealSkin `0.5.0` and every newer version (`api::MINIMUM_SEALSKIN_VERSION = (0, 5, 0)`). Before any other companion API call, `Api::check_version` reads `GET /companion/api/ui/version` and parses `version` as SemVer `MAJOR.MINOR.PATCH[-pre][+build]`. Skerry refuses to continue when the version is older than `0.5.0`, is a pre-release of `0.5.0` (e.g. `0.5.0-rc1`, which SemVer orders before `0.5.0`), is not a plain three-part version (e.g. `0.5`, `v0.5.0`), the route is missing (servers before 0.5.0), or the reply is unreadable. A refused server leaves Skerry on the Connect screen with an error naming the minimum and the found version; the library is not loaded, the `Api` is not stored, and the key is not saved to Keychain. The same gate runs on every Refresh.
+- **Rationale:** 0.5.0 is the first release with the behaviour these contracts rely on (`ARCH-008` lists it: per-origin session cookie exchange, alias-only room messages, launch address scheme rule, `open_url`, Selkies 2.3.0 images, forced hardening). A minimum rather than an exact pin lets operators take SealSkin patch and feature releases without waiting for a Skerry update.
+- **Risk accepted:** Newer SealSkin releases are accepted without being verified. When a release changes a route or behaviour Skerry relies on, raising the minimum (or fixing Skerry) is a new decision that supersedes this one.
+- **Open verification:** Re-run `ARCH-003` codec QA on a 0.5.0 server; its recorded evidence is from SealSkin 0.4.2.
+- **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/skerry.test.prose.md`
+- **Affected Rust:** `crates/skerry-mac/src/api.rs` (`MINIMUM_SEALSKIN_VERSION`, `parse_version`, `Api::check_version`, `Api::library`)
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -70,7 +90,7 @@
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
 | `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | unresolved (todo) | Storage mode (auto/cleanroom/named home), locale/timezone, Wayland/X11, GPU/VPN, startup progress stages, and remembered 1-click launch. |
 | `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | unresolved (todo) | Session thumbnail previews, Send File, and Stop (distinct from Disconnect, with cleanroom data loss confirmation). |
-| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs and dropped/chosen files in compatible remote apps via SealSkin launch endpoints. |
+| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs and dropped/chosen files in compatible remote apps via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url` (into a running session); only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
 | `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | unresolved (todo) | Search, app icons, recents, favorites, hidden apps, per-app launch preferences, and matching running-session reuse. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
@@ -81,5 +101,5 @@
 | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | unresolved (todo) | Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference. |
 | `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
-| `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation. |
+| `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |

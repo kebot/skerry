@@ -9,6 +9,9 @@ const KEY_VARIABLE: &str = "SEALSKIN_APPLICATION_KEY";
 const KEYCHAIN_SERVICE: &str = "dev.kebot.sealskin";
 const KEYCHAIN_ACCOUNT: &str = "application-key";
 
+/// The oldest SealSkin server version Skerry supports (ARCH-009). Older servers are refused.
+pub const MINIMUM_SEALSKIN_VERSION: (u64, u64, u64) = (0, 5, 0);
+
 pub struct Credential {
     raw: String,
     base: Url,
@@ -117,6 +120,11 @@ struct Launched {
 }
 
 #[derive(Deserialize)]
+struct ServerVersion {
+    version: String,
+}
+
+#[derive(Deserialize)]
 struct Failure {
     detail: String,
 }
@@ -179,7 +187,29 @@ impl Api {
         self.client.request(method, url)
     }
 
+    /// Refuses any SealSkin server whose `GET /companion/api/ui/version` is older than
+    /// [`MINIMUM_SEALSKIN_VERSION`] or unreadable. Servers older than 0.5.0 have no such route.
+    pub async fn check_version(&self) -> Result<(), String> {
+        let response = self
+            .request(Method::GET, "/companion/api/ui/version")
+            .send()
+            .await
+            .map_err(|_| {
+                "Couldn’t reach the SealSkin server. Check the address, network, and HTTPS certificate."
+                    .to_string()
+            })?;
+        if !response.status().is_success() {
+            return Err(unsupported_version(None));
+        }
+        let server: ServerVersion = response
+            .json()
+            .await
+            .map_err(|_| unsupported_version(None))?;
+        supported_version(&server.version)
+    }
+
     pub async fn library(&self) -> Result<Library, String> {
+        self.check_version().await?;
         let apps = send(
             self.request(Method::POST, "/companion/api/applications")
                 .json(&json!({})),
@@ -201,6 +231,52 @@ impl Api {
             app_name: app.name,
             session_url: response.session_url,
         })
+    }
+}
+
+/// Parses `MAJOR.MINOR.PATCH[-pre][+build]` and reports whether a pre-release tag is present.
+fn parse_version(version: &str) -> Option<((u64, u64, u64), bool)> {
+    let version = version.trim();
+    let version = version.split_once('+').map_or(version, |(core, _)| core);
+    let (core, pre) = match version.split_once('-') {
+        Some((core, pre)) => (core, !pre.is_empty()),
+        None => (version, false),
+    };
+    let mut parts = core.split('.').map(|part| {
+        (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| part.parse::<u64>().ok())
+            .flatten()
+    });
+    let parsed = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some((parsed, pre))
+}
+
+fn supported_version(version: &str) -> Result<(), String> {
+    match parse_version(version) {
+        // A pre-release of the minimum (e.g. `0.5.0-rc1`) precedes it, per SemVer.
+        Some((core, pre))
+            if core > MINIMUM_SEALSKIN_VERSION || (core == MINIMUM_SEALSKIN_VERSION && !pre) =>
+        {
+            Ok(())
+        }
+        _ => Err(unsupported_version(Some(version.trim()))),
+    }
+}
+
+fn minimum_version() -> String {
+    let (major, minor, patch) = MINIMUM_SEALSKIN_VERSION;
+    format!("{major}.{minor}.{patch}")
+}
+
+fn unsupported_version(found: Option<&str>) -> String {
+    let minimum = minimum_version();
+    match found {
+        Some(found) => format!(
+            "Skerry requires SealSkin {minimum} or newer, but this server runs SealSkin {found}."
+        ),
+        None => format!(
+            "Skerry requires SealSkin {minimum} or newer. This server is older or isn’t SealSkin."
+        ),
     }
 }
 
@@ -259,6 +335,39 @@ mod tests {
             "ssk_id_secret@seal.example/path",
         ] {
             assert!(Credential::parse(input).is_err());
+        }
+    }
+
+    #[test]
+    fn sealskin_0_5_0_or_newer_is_supported() {
+        assert_eq!(minimum_version(), "0.5.0");
+        for version in [
+            "0.5.0",
+            " 0.5.0\n",
+            "0.5.1",
+            "0.6.0",
+            "1.0.0",
+            "0.10.0",
+            "0.5.1-rc1",
+            "0.5.0+build7",
+        ] {
+            assert!(supported_version(version).is_ok(), "{version}");
+        }
+        for version in [
+            "0.4.2",
+            "0.4.99",
+            "0.5.0-rc1",
+            "v0.5.0",
+            "0.5",
+            "0.5.0.1",
+            "",
+            "x.y.z",
+        ] {
+            let error = supported_version(version).unwrap_err();
+            assert!(
+                error.contains("requires SealSkin 0.5.0 or newer"),
+                "{error}"
+            );
         }
     }
 
