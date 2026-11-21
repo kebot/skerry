@@ -1,4 +1,5 @@
 use crate::audio::Playback;
+use crate::clipboard;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -257,6 +258,8 @@ pub enum SessionEvent {
     ScreenPolicy(ScreenPolicy),
     Cursor(RemoteCursor),
     FingerScroll(bool),
+    ClipboardPolicy(clipboard::Policy),
+    Clipboard(clipboard::Incoming),
     Error(String),
 }
 
@@ -308,6 +311,8 @@ pub enum Input {
     Resolution(DisplayRequest),
     Screen(ScreenChange),
     Appearance(bool),
+    /// Write this into the session's clipboard (`ARCH-017`).
+    Clipboard(clipboard::Content),
 }
 
 pub struct SessionOptions {
@@ -466,6 +471,8 @@ pub async fn run(
     present.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
+    let mut clipboard_in = clipboard::Receiver::default();
+    let mut clipboard_transfer = 0u64;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -533,6 +540,14 @@ pub async fn run(
                         }
                         continue;
                     }
+                    match clipboard_in.on_text(&text) {
+                        clipboard::Frame::NotClipboard => {}
+                        clipboard::Frame::Pending => continue,
+                        clipboard::Frame::Payload(payload) => {
+                            let _ = events.send(SessionEvent::Clipboard(payload));
+                            continue;
+                        }
+                    }
                     if text.starts_with("MODE ") && text != "MODE websockets" {
                         return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.");
                     }
@@ -563,6 +578,7 @@ pub async fn run(
                                     capabilities.live(&data["settings"]);
                                 } else {
                                     capabilities.announce(&data["settings"]);
+                                    let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -683,6 +699,13 @@ pub async fn run(
                         if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
                             socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
                             sent_scheme = Some(scheme);
+                        }
+                        continue;
+                    }
+                    Some(Input::Clipboard(content)) => {
+                        clipboard_transfer += 1;
+                        for frame in clipboard::encode(&content, clipboard_transfer) {
+                            socket.send(frame.into()).await.map_err(|_| disconnected)?;
                         }
                         continue;
                     }

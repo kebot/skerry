@@ -12,8 +12,9 @@ use gpui_kit::{
 use skerry_ui::{
     connect::{self, ConnectProps},
     controls::{
-        self, ChordItem, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps,
-        Section, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+        self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps,
+        ControlsUiState, ScreenProps, Section, SwitchItem, VideoProps, VideoSettingControl,
+        VideoSettingRow,
     },
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
@@ -256,6 +257,7 @@ impl PreviewApp {
             launch_dialog: initial_dialog,
             controls_ui: ControlsUiState {
                 input_open: false,
+                clipboard_open: false,
                 screen_open: true,
                 video_open: true,
                 stats_open: false,
@@ -293,6 +295,7 @@ impl PreviewApp {
             self.controls_props = Self::fixture_controls(story);
             self.controls_ui = ControlsUiState {
                 input_open: false,
+                clipboard_open: false,
                 screen_open: true,
                 video_open: true,
                 stats_open: matches!(story, Story::ControlsServerLocked),
@@ -526,6 +529,9 @@ impl PreviewApp {
         match action {
             ControlsAction::ToggleSection(section) => match section {
                 Section::Input => self.controls_ui.input_open = !self.controls_ui.input_open,
+                Section::Clipboard => {
+                    self.controls_ui.clipboard_open = !self.controls_ui.clipboard_open
+                }
                 Section::Screen => self.controls_ui.screen_open = !self.controls_ui.screen_open,
                 Section::Video => self.controls_ui.video_open = !self.controls_ui.video_open,
                 Section::Stats => self.controls_ui.stats_open = !self.controls_ui.stats_open,
@@ -547,6 +553,23 @@ impl PreviewApp {
                     .find(|item| item.id == id)
                 {
                     item.enabled = enabled;
+                }
+            }
+            ControlsAction::SetClipboardSend(on) => {
+                if let Some(clipboard) = self.controls_props.clipboard.as_mut() {
+                    clipboard.send = clipboard.send.map(|_| on);
+                }
+            }
+            ControlsAction::SetClipboardReceive(on) => {
+                if let Some(clipboard) = self.controls_props.clipboard.as_mut() {
+                    clipboard.receive = clipboard.receive.map(|_| on);
+                }
+            }
+            // The event line above shows them; the preview has no clipboard.
+            ControlsAction::SendClipboard | ControlsAction::CopySessionClipboard => {}
+            ControlsAction::SetClipboardSeamless(on) => {
+                if let Some(clipboard) = self.controls_props.clipboard.as_mut() {
+                    clipboard.seamless = on;
                 }
             }
             ControlsAction::SetRetina(enabled) => {
@@ -691,6 +714,12 @@ impl PreviewApp {
                 audio_unavailable: None,
                 input_switches: base_inputs,
                 chords,
+                clipboard: Some(ClipboardProps {
+                    send: Some(true),
+                    receive: Some(true),
+                    seamless: false,
+                    seamless_locked: false,
+                }),
                 screen: ScreenProps {
                     resize_allowed: true,
                     matching_retina: true,
@@ -778,6 +807,12 @@ impl PreviewApp {
                 audio_unavailable: Some("Audio is disabled by server policy.".into()),
                 input_switches: base_inputs,
                 chords,
+                clipboard: Some(ClipboardProps {
+                    send: None,
+                    receive: Some(true),
+                    seamless: false,
+                    seamless_locked: true,
+                }),
                 screen: ScreenProps {
                     resize_allowed: false,
                     matching_retina: false,
@@ -799,6 +834,12 @@ impl PreviewApp {
                 audio_unavailable: None,
                 input_switches: base_inputs,
                 chords,
+                clipboard: Some(ClipboardProps {
+                    send: Some(true),
+                    receive: Some(true),
+                    seamless: true,
+                    seamless_locked: false,
+                }),
                 screen: ScreenProps {
                     resize_allowed: true,
                     matching_retina: true,

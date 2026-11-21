@@ -5,9 +5,13 @@ mod app;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod clipboard;
+#[cfg(target_os = "macos")]
 mod input;
 #[cfg(target_os = "macos")]
 mod launch_options;
+#[cfg(target_os = "macos")]
+mod pasteboard;
 #[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]

@@ -44,12 +44,20 @@ End-to-end QA of the current feature set (Connect, Library, Launch Dialog, Sessi
 
 #### S — Session streaming and controls
 - S1 **Open** on a session streams video within a few seconds, with a placeholder while waiting. Mouse, scroll, and keyboard reach the remote desktop.
-- S2 `cmd-shift-m` toggles the Session Controls window; Escape and `cmd-w` close it. Its sections (Input, Screen, Video, Diagnostics) expand and collapse.
+- S2 `cmd-shift-m` toggles the Session Controls window; Escape and `cmd-w` close it. Its sections (Input, Clipboard, Screen, Video, Diagnostics) expand and collapse.
 - S3 Switching the codec (JPEG ↔ H.264 ↔ H.265 ↔ AV1, as the server allows) keeps the stream alive. Diagnostics show the active codec, FPS, bitrate, decode time, and RTT, refreshed every second.
 - S4 Display modes (**Match Window**, **Match Retina**, **Scale Locally**, fixed presets) change the remote resolution or scaling as labelled. Resizing the window re-negotiates the resolution when Match Window is on.
 - S5 `ctrl-cmd-f` toggles fullscreen and back without a stuck black frame.
 - S6 Disconnect / close returns to the Library. The remote session keeps running.
 - S7 Pause, mute, and Reset Video Settings behave as labelled.
+
+#### B — Clipboard (`ARCH-017`)
+- B1 Seamless (default): copy text in a Mac app, click into the session window, paste with Control+V (or ⌘V with **Command sends Control**). The text arrives, Unicode included (e.g. "日本語 — café"). Copy in the session, switch to a Mac app, ⌘V: it arrives.
+- B2 Rich text and images: copied formatted text from Safari pastes formatted into a remote rich editor and as plain text into a remote terminal. A Mac screenshot copied to the clipboard (⌃⇧⌘4) pastes as a picture in the session. A picture copied in the session pastes into Preview on the Mac.
+- B3 No echo: after a remote copy lands on the Mac, refocusing the session window sends nothing back (`clipboard.receive` is not followed by a `clipboard.send` of the same content in the server's debug log).
+- B4 Session Controls → **Clipboard**: turning off **Send to Session** or **Receive from Session** stops that direction alone. Turning off **Seamless** stops both, and **Send Mac Clipboard** / **Copy Session Clipboard** then move content on demand. The switches persist for that server across reconnects.
+- B5 Large text (≥ 1 MB) crosses in both directions intact.
+- B6 A password copied by a password manager in the session lands on the Mac marked concealed (a clipboard manager such as Maccy or Raycast does not record it), and it is gone from the Mac clipboard after 60 s if nothing replaced it.
 
 #### K — Stop Session
 - K1 Stop on a QA-launched session asks for confirmation that explains data loss. Cancel keeps the session.

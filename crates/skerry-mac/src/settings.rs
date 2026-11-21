@@ -1,3 +1,4 @@
+use crate::clipboard::ClipboardSettings;
 use crate::input::InputSettings;
 use crate::launch_options::LaunchMemory;
 use crate::video::Codec;
@@ -269,6 +270,8 @@ pub struct Preferences {
     pub codec: Codec,
     #[serde(default, skip_serializing_if = "InputSettings::is_default")]
     pub input: InputSettings,
+    #[serde(default, skip_serializing_if = "ClipboardSettings::is_default")]
+    pub clipboard: ClipboardSettings,
     /// The Launch Dialog options each app last launched with, by app id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launch: BTreeMap<String, LaunchMemory>,

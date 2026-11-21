@@ -7,7 +7,6 @@ id: 067NC4KG01SKERRY0000000004
 # Desktop Integration and Collaboration Domain
 
 <!-- compose:status=partially-settled provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-DC-01 concept="clipboard-sync" question="Bridge Selkies clipboard messages to NSPasteboard honoring inbound/outbound server policy, local direction switches, Unicode, focus changes, and loop-prevented follow-up rich-text/image sync." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-02 concept="file-transfers" question="Add in-session Selkies file upload/download with native macOS Open/Save dialogs, progress, cancel, and permission checks alongside a live stream." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-03 concept="audio-devices-and-quality" question="Handle macOS default output device changes, format resampling when 48 kHz f32 is unavailable, sleep/wake recovery, and server-allowed audio bitrate selection." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-04 concept="remote-printing" question="Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference while honoring read-only/disabled print policies." -->
@@ -31,8 +30,13 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
   - Forwards mouse, drag, wheel (`m,...` / `m2,...`), and X11 keysyms (`kd,<sym>` / `ku,<sym>`) with 1-second `kh,<keys>` keepalive and automatic release of held keys/modifiers/buttons on focus loss or session end.
   - Exposes per-server **Input** controls: **Command sends Control**, **Remote Cursor** (server cursor shape/visibility updates), **Smooth Trackpad Scrolling** (precise two-finger deltas with end-of-scroll event, enabled by default), **Use Mac Input Method** (local GPUI marked-text composition committed via `co,end,<text>`), and **Send Key Combination** (Alt+Tab, Ctrl+Alt+Delete).
   - Translates AppKit trackpad magnification (`view/pinch.rs`) into Control-wheel zoom steps over the remote picture.
-- `clipboard-integration` (unresolved: `ARCH-GAP-DC-01`):
-  - Deliberate and optional seamless text/rich-text/image copy and paste between `NSPasteboard` and Selkies clipboard messages within server inbound/outbound policy.
+- `clipboard-integration` (settled: `ARCH-017`):
+  - ⌘C/⌘X/⌘V stay on the Mac unless **Command sends Control** is on; in a session, Control+C/X/V copy, cut, and paste.
+  - Speaks the Selkies web client's clipboard protocol (`cw`/`cb` and multipart `cws`/`cbs` out; `clipboard*` with `clipboard_secret` / `clipboard_reply,cr` in) via `clipboard.rs`, and reads/writes the general `NSPasteboard` directly via `pasteboard.rs` (text, HTML + text as the flavour envelope, PNG; TIFF converted to PNG).
+  - **Seamless** (default, from `clipboard_seamless`): the Mac clipboard is sent when a session window becomes key, when the remote desktop gains focus, and just before a forwarded paste keystroke (Control+V, Shift+Insert), only when `NSPasteboard.changeCount` moved and the content differs from the last synced value. Session copies are written to the Mac at once. Nothing is read while Skerry is in the background.
+  - **Deliberate** (Seamless off): Session Controls → Clipboard's **Send Mac Clipboard** and **Copy Session Clipboard** (`cr`) move content on demand.
+  - Per-server **Send to Session**, **Receive from Session**, and **Seamless** switches (`Preferences.clipboard`) live within `clipboard_in_enabled`, `clipboard_out_enabled`, `enable_binary_clipboard`, and a locked `clipboard_seamless`.
+  - Session secrets are written with `org.nspasteboard.ConcealedType` and taken back after 60 s, or once the session's clipboard moves on, while the Mac pasteboard still holds them.
 - `in-session-file-transfers` (unresolved: `ARCH-GAP-DC-02`):
   - Native macOS Open/Save dialogs with transfer progress, cancellation, and folder/ZIP support over the Selkies session channel.
 - `audio-devices-and-media-uplinks` (baseline 48 kHz Opus output settled; device selection & mic/webcam open in `ARCH-GAP-DC-03`, `ARCH-GAP-DC-05`):
@@ -53,6 +57,7 @@ Postconditions:
 - Held keys, modifiers, and mouse buttons are always released on window focus loss or session disconnect.
 - Local macOS Command shortcuts remain local unless **Command sends Control** is enabled.
 - Clipboard, file transfer, print, and media capture strictly obey server inbound/outbound and read-only policies.
+- Clipboard content never crosses unchanged twice, never echoes back what Skerry itself wrote (`changeCount` and signature), and is never read from the Mac pasteboard while no session window is key, except by the deliberate button.
 
 ### Continuity
 

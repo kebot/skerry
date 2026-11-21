@@ -21,6 +21,8 @@ subject: skerry
 - `transport::tests::only_startup_statuses_are_retried` passes: only 404/502/503/504 (and I/O errors) are retried while a session starts (`ARCH-014`).
 - `launch_options::tests::*` pass: fields offer and hide what the web launcher does (storage, GPU by app support, VPN and endpoints), defaults then remembered options where they still hold, Auto names and creates `auto-<app>`, GPU/VPN are sent only when chosen, Copy link names only non-default options, and the default language is the locale nearest the Mac's (`ARCH-016`).
 - `api::tests::decodes_the_status_launch_rights_gpus_and_vpns`, `launch_body_carries_only_the_chosen_options`, and `deep_link_carries_the_launch_options` pass (`ARCH-016`).
+- `clipboard::tests::*` pass: text, Unicode, and LF line ends go as one `cw` frame; payloads of 16383 bytes or more go multipart (`cws`/`cwd`/`cwe`, `cbs`/`cbd`/`cbe`) with their declared size; rich text rides the `application/x-selkies-clipboard-flavours` envelope; `Receiver` reassembles `clipboard_start`/`data`/`finish`, carries `clipboard_secret` and `clipboard_reply,cr`, drops truncated or superseded payloads; and server policy bounds the person's switches, with a locked Seamless winning (`ARCH-017`).
+- `pasteboard::tests::contents_round_trip_and_secrets_are_concealed` passes on a private `NSPasteboard`: text, HTML with its text, and PNG round-trip, every write bumps the change count, and a secret carries `org.nspasteboard.ConcealedType` (`ARCH-017`).
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
@@ -29,4 +31,5 @@ subject: skerry
 
 - Separate non-Prose markdown ticket directories (`docs/` or `.agents/prose/specs/skerry-mac/tickets/`) acting as a parallel source of truth outside `.prose.md` contracts and `architecture/decisions.md`.
 - Storing session URLs or application keys inside per-server JSON preferences.
+- A test that reads or writes the person's general pasteboard (`ARCH-017`), or clipboard contents in any log line.
 - Any `security-framework` / macOS Keychain read or write in `crates/skerry-mac` (`ARCH-011`).

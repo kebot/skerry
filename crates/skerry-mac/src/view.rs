@@ -1,7 +1,9 @@
 mod pinch;
 
 use crate::app::ToggleSessionControls;
+use crate::clipboard::{ClipboardSettings, Content, Effective, Incoming, Policy};
 use crate::input::{commit_command, InputSettings, RemoteChord};
+use crate::pasteboard;
 use crate::settings::{Key, ScreenChange};
 use crate::transport::{
     self, DisplayRequest, Frame, Input, Picture, Pointer, RemoteCursor, Resolution, SessionEvent,
@@ -28,6 +30,11 @@ use tokio::{
 };
 
 const MENU_SIZE: Pixels = px(32.);
+/// How long a secret the session copied may stay on the Mac (the web core's
+/// `SECRET_CLIPBOARD_TTL_MS`).
+const SECRET_TTL: Duration = Duration::from_secs(60);
+const KEY_V: u32 = 0x76;
+const KEY_INSERT: u32 = 0xff63;
 const MENU_MARGIN: Pixels = px(8.);
 
 pub struct NativeSession {
@@ -157,6 +164,50 @@ impl NativeSession {
         let _ = self.input.send(Input::Audio(enabled));
     }
 
+    pub fn set_clipboard_policy(&self, policy: Policy, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            desktop.clipboard.policy = Some(policy);
+            if window.is_window_active() {
+                desktop.sync_to_session(false);
+            }
+        });
+    }
+
+    pub fn set_clipboard_settings(
+        &self,
+        settings: ClipboardSettings,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.view.update(cx, |desktop, _| {
+            desktop.clipboard.settings = settings;
+            if window.is_window_active() {
+                desktop.sync_to_session(false);
+            }
+        });
+    }
+
+    pub fn receive_clipboard(&self, incoming: Incoming, cx: &mut App) {
+        self.view
+            .update(cx, |desktop, cx| desktop.receive_clipboard(incoming, cx));
+    }
+
+    /// Deliberate mode's **Send Mac Clipboard**.
+    pub fn send_clipboard(&self, cx: &mut App) {
+        self.view
+            .update(cx, |desktop, _| desktop.sync_to_session(true));
+    }
+
+    /// Deliberate mode's **Copy Session Clipboard**: fetch with `cr`, write the tagged reply.
+    pub fn copy_session_clipboard(&self, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            if desktop.clipboard.effective().receive {
+                desktop.clipboard.fetch = true;
+                desktop.command("cr".into());
+            }
+        });
+    }
+
     pub fn release_focus(&self, window: &mut Window, cx: &mut App) {
         self.view.update(cx, |desktop, _| {
             desktop.release_input();
@@ -201,6 +252,38 @@ struct Desktop {
     /// The pointer is in the top-right hot corner, so the Session Controls trigger is shown
     /// even when the picture fills the window and leaves no margin for it.
     hot_corner: bool,
+    clipboard: ClipboardBridge,
+}
+
+/// The Mac side of clipboard sync (`ARCH-017`).
+#[derive(Default)]
+struct ClipboardBridge {
+    /// `None` until the server announces its settings.
+    policy: Option<Policy>,
+    settings: ClipboardSettings,
+    /// The pasteboard change count last read or written here.
+    seen: Option<isize>,
+    /// The latest value synced in either direction.
+    synced: Option<u64>,
+    /// A deliberate **Copy Session Clipboard** waits for its `cr` reply.
+    fetch: bool,
+    /// The change count of a secret written here, and the timer that takes it back.
+    secret: Option<(isize, Task<()>)>,
+}
+
+impl ClipboardBridge {
+    fn effective(&self) -> Effective {
+        self.policy
+            .map(|policy| Effective::new(policy, self.settings))
+            .unwrap_or_default()
+    }
+
+    /// Take a secret written here back off the pasteboard, if nothing replaced it.
+    fn retract_secret(&mut self) {
+        if let Some((count, _)) = self.secret.take() {
+            pasteboard::clear_if_unchanged(count);
+        }
+    }
 }
 
 impl Desktop {
@@ -213,13 +296,21 @@ impl Desktop {
     ) -> Self {
         let focus = cx.focus_handle();
         let pinch_target = pinch::Target::default();
+        cx.on_focus(&focus, window, |desktop, window, _| {
+            if window.is_window_active() {
+                desktop.sync_to_session(false);
+            }
+        })
+        .detach();
         cx.on_blur(&focus, window, |desktop, _, cx| {
             desktop.release_input();
             cx.notify();
         })
         .detach();
         cx.observe_window_activation(window, |desktop, window, cx| {
-            if !window.is_window_active() {
+            if window.is_window_active() {
+                desktop.sync_to_session(false);
+            } else {
                 desktop.release_input();
             }
             cx.notify();
@@ -269,6 +360,78 @@ impl Desktop {
             ime_click: None,
             ime_bounds: None,
             hot_corner: false,
+            clipboard: ClipboardBridge::default(),
+        }
+    }
+
+    /// Send the Mac's clipboard to the session when it changed since it was last seen, or,
+    /// `forced` by the deliberate button, whatever it holds.
+    fn sync_to_session(&mut self, forced: bool) {
+        let effective = self.clipboard.effective();
+        if !effective.send || !(forced || effective.seamless) {
+            return;
+        }
+        let count = pasteboard::change_count();
+        if !forced && self.clipboard.seen == Some(count) {
+            return;
+        }
+        self.clipboard.seen = Some(count);
+        let Some(content) = pasteboard::read().filter(|content| effective.sends(content)) else {
+            return;
+        };
+        let signature = content.signature();
+        if !forced && self.clipboard.synced == Some(signature) {
+            return;
+        }
+        self.clipboard.synced = Some(signature);
+        let _ = self.input.send(Input::Clipboard(content));
+    }
+
+    fn receive_clipboard(&mut self, incoming: Incoming, cx: &mut Context<Self>) {
+        let effective = self.clipboard.effective();
+        let wanted = if incoming.reply {
+            std::mem::take(&mut self.clipboard.fetch)
+        } else {
+            effective.seamless
+        };
+        if !effective.receive || !wanted {
+            return;
+        }
+        // Any newer payload means the session's clipboard moved on from a secret.
+        self.clipboard.retract_secret();
+        let Some(content) = incoming.content else {
+            return;
+        };
+        if matches!(content, Content::Image { .. }) && !effective.binary {
+            return;
+        }
+        let signature = content.signature();
+        if !incoming.reply
+            && !incoming.secret
+            && self.clipboard.synced == Some(signature)
+            && self.clipboard.seen == Some(pasteboard::change_count())
+        {
+            return;
+        }
+        let count = pasteboard::write(Some(&content), incoming.secret);
+        self.clipboard.seen = Some(count);
+        self.clipboard.synced = Some(signature);
+        if incoming.secret {
+            let timer = cx.background_executor().timer(SECRET_TTL);
+            let task = cx.spawn(async move |desktop, cx| {
+                timer.await;
+                let _ = desktop.update(cx, |desktop, _| {
+                    if desktop
+                        .clipboard
+                        .secret
+                        .as_ref()
+                        .is_some_and(|(secret, _)| *secret == count)
+                    {
+                        desktop.clipboard.retract_secret();
+                    }
+                });
+            });
+            self.clipboard.secret = Some((count, task));
         }
     }
 
@@ -736,6 +899,12 @@ impl Render for Desktop {
                 desktop.modifiers(stroke.modifiers);
                 let text = (!shortcut).then_some(stroke.key_char.as_deref()).flatten();
                 if let Some(key) = keysym(&stroke.key, text) {
+                    let paste = (key == KEY_V && desktop.modifiers.control)
+                        || (key == KEY_INSERT && desktop.modifiers.shift);
+                    if paste {
+                        // Ordered socket: the clipboard lands before the paste keystroke.
+                        desktop.sync_to_session(false);
+                    }
                     desktop.keys.insert(event.keystroke.key.clone(), key);
                     desktop.command(format!("kd,{key}"));
                     cx.stop_propagation();

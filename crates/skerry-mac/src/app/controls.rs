@@ -2,6 +2,7 @@ use super::{
     native_window, CloseSessionControls, DisplayMode, Launcher, ToggleFullScreen,
     ToggleSessionControls,
 };
+use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
 use crate::video::Codec;
 use crate::{
@@ -19,8 +20,8 @@ use gpui_kit::{
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
-    self, ChordItem, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps,
-    Section, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
+    ScreenProps, Section, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
 
@@ -58,6 +59,7 @@ enum Command {
     ResetVideo,
     Input(InputFeature, bool),
     Chord(RemoteChord),
+    Clipboard(ClipboardAction),
 }
 
 impl ControlPanel {
@@ -270,6 +272,7 @@ impl ControlPanel {
                         Command::Input(feature, enabled) => {
                             launcher.change_input(feature, enabled, window, cx)
                         }
+                        Command::Clipboard(action) => launcher.change_clipboard(action, window, cx),
                         Command::Chord(chord) => {
                             launcher.close_controls(window, cx);
                             if let Some((_, stream)) = &launcher.current {
@@ -313,6 +316,7 @@ impl ControlPanel {
             ControlsAction::ToggleSection(section) => {
                 match section {
                     Section::Input => self.ui.input_open = !self.ui.input_open,
+                    Section::Clipboard => self.ui.clipboard_open = !self.ui.clipboard_open,
                     Section::Screen => self.ui.screen_open = !self.ui.screen_open,
                     Section::Video => self.ui.video_open = !self.ui.video_open,
                     Section::Stats => self.ui.stats_open = !self.ui.stats_open,
@@ -342,6 +346,31 @@ impl ControlPanel {
                     Self::send(self.owner.clone(), Command::Input(feature, enabled), cx);
                 }
             }
+            ControlsAction::SetClipboardSend(on) => Self::send(
+                self.owner.clone(),
+                Command::Clipboard(ClipboardAction::SetSend(on)),
+                cx,
+            ),
+            ControlsAction::SetClipboardReceive(on) => Self::send(
+                self.owner.clone(),
+                Command::Clipboard(ClipboardAction::SetReceive(on)),
+                cx,
+            ),
+            ControlsAction::SetClipboardSeamless(on) => Self::send(
+                self.owner.clone(),
+                Command::Clipboard(ClipboardAction::SetSeamless(on)),
+                cx,
+            ),
+            ControlsAction::SendClipboard => Self::send(
+                self.owner.clone(),
+                Command::Clipboard(ClipboardAction::SendNow),
+                cx,
+            ),
+            ControlsAction::CopySessionClipboard => Self::send(
+                self.owner.clone(),
+                Command::Clipboard(ClipboardAction::CopyNow),
+                cx,
+            ),
             ControlsAction::SendChord(id) => {
                 let chord = match id.as_str() {
                     "alt-tab" => Some(RemoteChord::SwitchApp),
@@ -432,6 +461,16 @@ impl ControlPanel {
             },
         ];
 
+        let clipboard = launcher.clipboard_policy.map(|policy| {
+            let settings = launcher.preferences.clipboard;
+            ClipboardProps {
+                send: policy.inbound.then_some(settings.send),
+                receive: policy.outbound.then_some(settings.receive),
+                seamless: Effective::new(policy, settings).seamless,
+                seamless_locked: policy.seamless_locked,
+            }
+        });
+
         let preset_label = match launcher.display_mode {
             DisplayMode::Fixed(size) => format!("{} × {}", size.0, size.1),
             DisplayMode::Fit => "Keep Remote Size".into(),
@@ -496,6 +535,7 @@ impl ControlPanel {
             audio_unavailable: launcher.audio_unavailable.map(str::to_string),
             input_switches,
             chords,
+            clipboard,
             screen,
             video_settings,
             diagnostics,

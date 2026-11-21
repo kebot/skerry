@@ -168,6 +168,7 @@ struct Launcher {
     retina: bool,
     scale_locally: bool,
     screen_policy: ScreenPolicy,
+    clipboard_policy: Option<crate::clipboard::Policy>,
     dpi_override: Option<u16>,
     ui_scale: display::UiScale,
     applied_resolution: Option<DisplayRequest>,
@@ -240,6 +241,7 @@ impl Launcher {
             retina: true,
             scale_locally: true,
             screen_policy: ScreenPolicy::default(),
+            clipboard_policy: None,
             dpi_override: None,
             ui_scale: display::UiScale::default(),
             applied_resolution: None,
@@ -844,6 +846,7 @@ impl Launcher {
                     stream.scale_locally(false, cx);
                 }
                 stream.set_input_settings(self.preferences.input, window, cx);
+                stream.set_clipboard_settings(self.preferences.clipboard, window, cx);
                 self.current = Some((session, stream));
                 session_chrome(window, false);
                 // Pin session events to this window (ARCH-015); see `launch_with_options`.
@@ -882,6 +885,17 @@ impl Launcher {
                                                 this.resize_allowed = allowed;
                                                 this.applied_resolution = None;
                                                 this.resize_display(window, cx);
+                                            }
+                                        }
+                                        SessionEvent::ClipboardPolicy(policy) => {
+                                            this.clipboard_policy = Some(policy);
+                                            if let Some((_, stream)) = &this.current {
+                                                stream.set_clipboard_policy(policy, window, cx);
+                                            }
+                                        }
+                                        SessionEvent::Clipboard(incoming) => {
+                                            if let Some((_, stream)) = &this.current {
+                                                stream.receive_clipboard(incoming, cx);
                                             }
                                         }
                                         SessionEvent::Error(error) => {
@@ -951,6 +965,32 @@ impl Launcher {
         if let Some(api) = &self.api {
             if settings::save(api.server(), &self.preferences).is_err() {
                 self.status = Some("Couldn’t save input preferences.".into());
+            }
+        }
+        cx.notify();
+    }
+
+    fn change_clipboard(
+        &mut self,
+        action: crate::clipboard::ClipboardAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::clipboard::ClipboardAction;
+        let Some((_, stream)) = &self.current else {
+            return;
+        };
+        match action {
+            ClipboardAction::SendNow => stream.send_clipboard(cx),
+            ClipboardAction::CopyNow => stream.copy_session_clipboard(cx),
+            _ => {
+                self.preferences.clipboard.apply(action);
+                stream.set_clipboard_settings(self.preferences.clipboard, window, cx);
+                if let Some(api) = &self.api {
+                    if settings::save(api.server(), &self.preferences).is_err() {
+                        self.status = Some("Couldn’t save clipboard preferences.".into());
+                    }
+                }
             }
         }
         cx.notify();
@@ -1106,6 +1146,7 @@ impl Launcher {
         }
         self.settings = None;
         self.screen_policy = ScreenPolicy::default();
+        self.clipboard_policy = None;
         self.applied_resolution = None;
         self.applied_dpi = None;
         self.stats = None;

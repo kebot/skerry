@@ -26,6 +26,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
   - `transport.rs`: `socket_request` (unredirected `GET` -> `303 See Other` cookie exchange -> `wss://.../api/websockets`), initial `SETTINGS` handshake, 33 ms frame publish + `CLIENT_FRAME_ACK`, 1 s stream stats/ping RTT, and `kh,<keys>` held-key keepalive.
   - `video.rs`: `Codec` (JPEG, H.264, H.265, AV1), `VTIsHardwareDecodeSupported`, Annex B / parameter-set / AV1 sequence-header parsing, and IOSurface-backed `CVPixelBuffer` (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`) painted via `window.paint_surface`.
   - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`.
+  - `clipboard.rs` & `pasteboard.rs`: Selkies clipboard protocol (`encode`, `Receiver`, `Policy` / `ClipboardSettings` / `Effective`) and the general `NSPasteboard` bridge (`change_count`, `read`, `write`, concealed secrets) (`ARCH-017`).
   - `input.rs`: `InputSettings` (Command sends Control, Remote Cursor, Smooth Trackpad Scrolling, Use Mac Input Method) and `RemoteChord` (Alt+Tab, Ctrl+Alt+Delete).
   - `audio.rs`: 48 kHz stereo `f32` Opus `Playback` with bounded latency queue (`48000 * 2 / 8` samples).
   - `view.rs` & `view/pinch.rs`: `NativeSession`, `Desktop` canvas (`RenderImage` with `window.drop_image()` retirement for JPEG; `paint_surface` for hardware frames), mouse/wheel/keyboard/IME dispatch, and AppKit magnification monitor.
@@ -34,7 +35,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
 - `domain-readiness`:
   - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled (H.265/AV1 continuity on Selkies 2.3.0 in `ARCH-012`); second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
   - `launcher-and-sessions`: launch/resume, Library search/icons/filters, Launch Dialog (storage with named homes, GPU, VPN, language, timezone, Wayland, collaborative, remembered per-app options) matching the web launcher (`ARCH-016`), session thumbnails, and confirmed Stop settled (`ARCH-013`); startup progress, one-click launch, Send File, open links/files, favorites/hidden/recents, persistent storage, account recovery, cluster origins, multi-window sessions (`ARCH-010` / `ARCH-GAP-LS-08`), and native Mac app presence (`ARCH-GAP-LS-09`) open on the frontier.
-  - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME settled; clipboard, file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
+  - `desktop-and-collaboration`: keyboard/cursor/trackpad/IME and clipboard sync (`ARCH-017`) settled; file transfers, audio output device selection, printing, mic/webcam, gaming, and sharing open on the frontier.
 
 Facets:
 - `architecture` — module boundaries and GPUI/Tokio/VideoToolbox invariants
