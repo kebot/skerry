@@ -74,7 +74,7 @@ impl Credential {
     /// `~/.config/skerry/config.toml`. Skerry never reads or writes the macOS Keychain
     /// (ARCH-011).
     pub fn startup() -> Result<Option<Self>, String> {
-        let from = |raw: &str, source| Self::parse(raw).map(|key| Some(key.from_source(source)));
+        let from = |raw: &str, source| Self::parse(raw).map(|key| Some(key.with_source(source)));
         if let Ok(value) = std::env::var(KEY_VARIABLE) {
             return from(&value, KeySource::Environment);
         }
@@ -91,7 +91,7 @@ impl Credential {
         }
     }
 
-    fn from_source(mut self, source: KeySource) -> Self {
+    fn with_source(mut self, source: KeySource) -> Self {
         self.source = source;
         self
     }

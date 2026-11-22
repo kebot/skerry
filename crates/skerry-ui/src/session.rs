@@ -1,6 +1,6 @@
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
-    IconName, Sizable as _, StyledExt as _, Theme,
+    Icon, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
     div, prelude::*, px, rgb, rgba, App, ClickEvent, Div, FontWeight, Pixels, Point, SharedString,
@@ -119,10 +119,105 @@ pub fn stop_confirm_modal(
     on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui_kit::Stateful<Div> {
     let app_name = app_name.into();
+    confirm_modal(
+        theme,
+        ConfirmCopy {
+            id: "stop-session",
+            title: format!("Stop {app_name}?"),
+            body: vec!["Stopping this session terminates the remote application and permanently deletes any temporary cleanroom data.".into()],
+            confirm_label: "Stop Session",
+            confirm_icon: None,
+        },
+        on_cancel,
+        on_confirm,
+    )
+}
+
+/// Where the signed-in application key came from, which decides what Sign Out says it
+/// removes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySourceLabel {
+    /// Saved in `~/.config/skerry/config.toml` (read at startup, or a typed key saved there).
+    SavedFile,
+    Environment,
+    DotEnv,
+    /// A typed key Skerry couldn't save.
+    ThisRunOnly,
+}
+
+impl KeySourceLabel {
+    /// The first line of the Sign Out confirmation.
+    pub fn sign_out_text(self) -> &'static str {
+        match self {
+            Self::SavedFile => "Skerry will remove the application key saved in ~/.config/skerry/config.toml. To reconnect, you’ll need to paste the key again.",
+            Self::Environment => "This key comes from the SEALSKIN_APPLICATION_KEY environment variable. Skerry doesn’t store it, so it will be used again the next time Skerry starts.",
+            Self::DotEnv => "This key comes from the .env file in Skerry’s working folder. Skerry doesn’t store it, so it will be used again the next time Skerry starts.",
+            Self::ThisRunOnly => "Skerry hasn’t saved this key, so there’s nothing to remove. To reconnect, you’ll need to paste the key again.",
+        }
+    }
+}
+
+/// Confirmation dialog shown before signing out of a server. Escape and the backdrop cancel.
+pub fn sign_out_confirm_modal(
+    theme: &Theme,
+    server: &str,
+    source: KeySourceLabel,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    confirm_modal(
+        theme,
+        ConfirmCopy {
+            id: "sign-out",
+            title: format!("Sign out of {server}?"),
+            body: vec![
+                source.sign_out_text().into(),
+                "Open session windows stay connected, and running sessions keep running on the server."
+                    .into(),
+            ],
+            confirm_label: "Sign Out",
+            confirm_icon: Some(gpui_kit::assets::IconName::LogOut.into()),
+        },
+        on_cancel,
+        on_confirm,
+    )
+}
+
+struct ConfirmCopy {
+    id: &'static str,
+    title: String,
+    body: Vec<SharedString>,
+    confirm_label: &'static str,
+    confirm_icon: Option<Icon>,
+}
+
+/// The shared shell of destructive confirmations: dimmed backdrop (click cancels), centred
+/// card, Cancel and a danger button on the right. Enter does nothing.
+fn confirm_modal(
+    theme: &Theme,
+    copy: ConfirmCopy,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    let ConfirmCopy {
+        id,
+        title,
+        body,
+        confirm_label,
+        confirm_icon,
+    } = copy;
     let on_cancel = std::rc::Rc::new(on_cancel);
     let backdrop_cancel = std::rc::Rc::clone(&on_cancel);
+    let mut confirm = Button::new(SharedString::from(format!("{id}-confirm")))
+        .danger()
+        .small()
+        .label(confirm_label)
+        .on_click(on_confirm);
+    if let Some(icon) = confirm_icon {
+        confirm = confirm.icon(icon);
+    }
     div()
-        .id("stop-session-backdrop")
+        .id(SharedString::from(format!("{id}-backdrop")))
         .absolute()
         .inset_0()
         .bg(rgba(0x00000099))
@@ -137,7 +232,7 @@ pub fn stop_confirm_modal(
         })
         .child(
             div()
-                .id("stop-session-card")
+                .id(SharedString::from(format!("{id}-card")))
                 .w(px(420.))
                 .max_w_full()
                 .p_5()
@@ -153,13 +248,15 @@ pub fn stop_confirm_modal(
                     div()
                         .text_lg()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(format!("Stop {app_name}?")),
+                        .child(title),
                 )
                 .child(
                     div()
+                        .v_flex()
+                        .gap_2()
                         .text_sm()
                         .text_color(theme.muted_foreground)
-                        .child("Stopping this session terminates the remote application and permanently deletes any temporary cleanroom data."),
+                        .children(body.into_iter().map(|line| div().child(line))),
                 )
                 .child(
                     div()
@@ -167,19 +264,13 @@ pub fn stop_confirm_modal(
                         .justify_end()
                         .gap_2()
                         .child(
-                            Button::new("stop-cancel")
+                            Button::new(SharedString::from(format!("{id}-cancel")))
                                 .outline()
                                 .small()
                                 .label("Cancel")
                                 .on_click(move |event, window, cx| on_cancel(event, window, cx)),
                         )
-                        .child(
-                            Button::new("stop-confirm")
-                                .danger()
-                                .small()
-                                .label("Stop Session")
-                                .on_click(on_confirm),
-                        ),
+                        .child(confirm),
                 ),
         )
 }

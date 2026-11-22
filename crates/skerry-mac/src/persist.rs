@@ -201,8 +201,8 @@ mod tests {
         let rt = runtime();
         let dir = tempfile::tempdir().unwrap();
         let queue = start_at(rt.handle(), Root::Under(dir.path().into()));
-        let _ = queue.preferences("seal", |p| p.codec = Codec::Hevc);
-        let _ = queue.preferences("seal", |p| p.input.command_as_control = true);
+        drop(queue.preferences("seal", |p| p.codec = Codec::Hevc));
+        drop(queue.preferences("seal", |p| p.input.command_as_control = true));
         queue.flush_blocking(Duration::from_secs(5));
         let prefs = saved(dir.path(), "seal");
         assert_eq!(prefs.codec, Codec::Hevc);
@@ -215,9 +215,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let queue = start_at(rt.handle(), Root::Under(dir.path().into()));
         for fps in 1..=20 {
-            let _ = queue.preferences("seal", move |p| {
+            drop(queue.preferences("seal", move |p| {
                 p.video.insert(settings::Key::Fps, fps);
-            });
+            }));
         }
         queue.flush_blocking(Duration::from_secs(5));
         assert_eq!(

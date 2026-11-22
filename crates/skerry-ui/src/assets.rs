@@ -3,9 +3,10 @@
 use gpui_kit::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [Trash, FolderPlus]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [Trash, FolderPlus, LogOut]);
 
-/// gpui-kit's default icons, and the Files window's Trash and New Folder icons.
+/// gpui-kit's default icons, the Files window's Trash and New Folder icons, and Sign Out's
+/// LogOut icon.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SkerryAssets;
 
@@ -34,6 +35,7 @@ mod tests {
         for icon in [
             gpui_kit::assets::IconName::Trash,
             gpui_kit::assets::IconName::FolderPlus,
+            gpui_kit::assets::IconName::LogOut,
         ] {
             let path = icon.path();
             assert!(

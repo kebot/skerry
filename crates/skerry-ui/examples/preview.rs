@@ -1567,7 +1567,7 @@ impl PreviewApp {
 
     fn library_handlers(&self, cx: &mut Context<Self>) -> LibraryHandlers {
         let on_refresh_entity = cx.entity().clone();
-        let on_forget_entity = cx.entity().clone();
+        let on_sign_out_entity = cx.entity().clone();
         let on_launch_entity = cx.entity().clone();
         let on_resume_entity = cx.entity().clone();
         let on_stop_entity = cx.entity().clone();
@@ -1578,8 +1578,8 @@ impl PreviewApp {
                     this.record_event("Library: Refresh", cx);
                 });
             }),
-            on_forget: Box::new(move |_, _, cx| {
-                on_forget_entity.update(cx, |this, cx| {
+            on_sign_out: Box::new(move |_, _, cx| {
+                on_sign_out_entity.update(cx, |this, cx| {
                     this.record_event("Library: Disconnect Server", cx);
                 });
             }),

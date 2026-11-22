@@ -67,7 +67,7 @@ fn refresh_library(cx: &mut App) {
         .and_then(|windows| windows.library.as_ref())
         .map(|(_, launcher)| launcher.clone());
     if let Some(launcher) = library {
-        let _ = launcher.update(cx, |launcher, cx| launcher.refresh(cx));
+        let _ = launcher.update(cx, |launcher, cx| launcher.refresh(false, cx));
     }
 }
 
