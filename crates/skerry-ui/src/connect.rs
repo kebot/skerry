@@ -1,10 +1,15 @@
+use crate::selkies::{
+    self as direct, ConnectTab, SelkiesConnectHandlers, SelkiesConnectProps, SelkiesInputs,
+};
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     label::Label,
     Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
 };
-use gpui_kit::{div, prelude::*, px, App, ClickEvent, Div, Entity, FontWeight, Hsla, Window};
+use gpui_kit::{
+    div, prelude::*, px, AnyElement, App, ClickEvent, Div, Entity, FontWeight, Hsla, Window,
+};
 use std::rc::Rc;
 
 pub type ConnectHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -210,11 +215,16 @@ pub fn render(
     handlers: ConnectHandlers,
 ) -> Div {
     let card = match props.recovery {
-        Some(recovery) => recovery_panel(theme, props, recovery, &handlers),
-        None => key_card(theme, props, key_input, &handlers),
+        Some(recovery) => recovery_panel(theme, props, recovery, &handlers, None),
+        None => key_card(theme, props, key_input, &handlers, None),
     };
+    screen(theme, card)
+}
+
+fn screen(theme: &Theme, card: Div) -> Div {
     div()
         .size_full()
+        .relative()
         .bg(theme.background)
         .text_color(theme.foreground)
         .flex()
@@ -223,11 +233,52 @@ pub fn render(
         .child(card)
 }
 
+/// The Selkies tab's parts (`ARCH-036`).
+pub struct ConnectTabs<'a> {
+    pub tab: ConnectTab,
+    pub selkies: &'a SelkiesConnectProps,
+    pub inputs: &'a SelkiesInputs,
+    pub handlers: SelkiesConnectHandlers,
+}
+
+/// The Connect card with its SealSkin | Selkies control, and the certificate prompt over
+/// it when one is open.
+pub fn render_with_tabs(
+    theme: &Theme,
+    props: &ConnectProps,
+    key_input: &Entity<InputState>,
+    handlers: ConnectHandlers,
+    tabs: ConnectTabs<'_>,
+) -> Div {
+    let busy = props.busy.is_some() || tabs.selkies.busy.is_some();
+    let bar = || direct::tab_bar(tabs.tab, !busy, tabs.handlers.on_tab.clone()).into_any_element();
+    let card = match (tabs.tab, props.recovery) {
+        (ConnectTab::Selkies, _) => card(theme).child(bar()).child(direct::selkies_card(
+            theme,
+            tabs.selkies,
+            tabs.inputs,
+            &tabs.handlers,
+        )),
+        (ConnectTab::SealSkin, Some(recovery)) => {
+            recovery_panel(theme, props, recovery, &handlers, Some(bar()))
+        }
+        (ConnectTab::SealSkin, None) => key_card(theme, props, key_input, &handlers, Some(bar())),
+    };
+    screen(theme, card).when_some(
+        tabs.selkies
+            .certificate
+            .as_ref()
+            .filter(|_| tabs.tab == ConnectTab::Selkies),
+        |view, cert| view.child(direct::certificate_sheet(theme, cert, &tabs.handlers)),
+    )
+}
+
 fn key_card(
     theme: &Theme,
     props: &ConnectProps,
     key_input: &Entity<InputState>,
     handlers: &ConnectHandlers,
+    top: Option<AnyElement>,
 ) -> Div {
     let busy = props.busy.is_some();
     let on_connect = handlers.on_connect.clone();
@@ -242,6 +293,7 @@ fn key_card(
             .as_ref()
             .is_some_and(|problem| !problem.needs_new_key());
     card(theme)
+        .children(top)
         .child(
             div()
                 .text_2xl()
@@ -392,6 +444,7 @@ fn recovery_panel(
     props: &ConnectProps,
     recovery: RecoveryProps,
     handlers: &ConnectHandlers,
+    top: Option<AnyElement>,
 ) -> Div {
     let busy = props.busy.is_some();
     let (icon, tone, title, body) = match recovery.kind {
@@ -467,6 +520,7 @@ fn recovery_panel(
         (web.into_any_element(), try_again.into_any_element())
     };
     card(theme)
+        .children(top)
         .child(
             div()
                 .size(px(40.))

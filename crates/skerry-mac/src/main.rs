@@ -7,6 +7,10 @@ mod audio;
 #[cfg(target_os = "macos")]
 mod clipboard;
 #[cfg(target_os = "macos")]
+mod config_store;
+#[cfg(target_os = "macos")]
+mod direct;
+#[cfg(target_os = "macos")]
 mod gamepad;
 #[cfg(target_os = "macos")]
 mod input;
@@ -33,6 +37,8 @@ mod settings;
 #[cfg(target_os = "macos")]
 mod shortcuts;
 mod stats;
+#[cfg(target_os = "macos")]
+mod tls;
 #[cfg(target_os = "macos")]
 mod transport;
 #[cfg(target_os = "macos")]

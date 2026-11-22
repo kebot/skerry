@@ -22,7 +22,6 @@ use gpui_kit::{
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, SharedString, Task,
     UTF16Selection, Window,
 };
-use reqwest::Url;
 use skerry_ui::session;
 use std::cell::RefCell;
 use std::ops::Range;
@@ -55,7 +54,7 @@ pub struct NativeSession {
 
 impl NativeSession {
     pub fn open(
-        address: Url,
+        address: transport::SessionTarget,
         window: &mut Window,
         cx: &mut App,
         runtime: &Handle,
