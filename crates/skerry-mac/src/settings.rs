@@ -1,6 +1,7 @@
 use crate::clipboard::ClipboardSettings;
 use crate::input::InputSettings;
 use crate::launch_options::LaunchMemory;
+use crate::shortcuts::ShortcutPolicy;
 use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -90,6 +91,10 @@ pub struct Settings {
     pub codecs: Vec<Codec>,
     /// The server's audio bitrate choices; `None` when it doesn't expose them.
     pub audio_bitrate: Option<AudioBitrate>,
+    /// The server's `keyboard_shortcuts` (`ARCH-031`).
+    pub keyboard_shortcuts: ShortcutPolicy,
+    /// The server's gamepad settings (`ARCH-032`).
+    pub gamepad: crate::gamepad::GamepadPolicy,
 }
 
 impl Default for Settings {
@@ -101,6 +106,8 @@ impl Default for Settings {
                 .filter(|codec| codec.supported())
                 .collect(),
             audio_bitrate: None,
+            keyboard_shortcuts: ShortcutPolicy::default(),
+            gamepad: crate::gamepad::GamepadPolicy::default(),
         }
     }
 }
@@ -141,6 +148,8 @@ impl Settings {
             }
         }
         self.audio_bitrate = AudioBitrate::from_server(&payload[AudioBitrate::WIRE]);
+        self.keyboard_shortcuts = ShortcutPolicy::from_server(payload);
+        self.gamepad = crate::gamepad::GamepadPolicy::from_server(payload);
     }
 
     pub fn live(&mut self, payload: &Value) {
@@ -346,7 +355,10 @@ pub type VideoSettings = BTreeMap<Key, u32>;
 #[serde(default)]
 pub struct ControlsSections {
     pub input: bool,
+    pub shortcuts: bool,
+    pub gamepads: bool,
     pub clipboard: bool,
+    pub printing: bool,
     pub screen: bool,
     pub video: bool,
     pub audio: bool,
@@ -357,7 +369,10 @@ impl Default for ControlsSections {
     fn default() -> Self {
         Self {
             input: false,
+            shortcuts: false,
+            gamepads: false,
             clipboard: false,
+            printing: false,
             screen: true,
             video: false,
             audio: false,
@@ -371,11 +386,15 @@ impl ControlsSections {
         *self == Self::default()
     }
 
-    /// In Session Controls order: Input, Clipboard, Screen, Video, Audio, Stats.
-    pub fn to_array(self) -> [bool; 6] {
+    /// In Session Controls order: Input, Shortcuts, Gamepads, Clipboard, Printing, Screen,
+    /// Video, Audio, Stats.
+    pub fn to_array(self) -> [bool; 9] {
         [
             self.input,
+            self.shortcuts,
+            self.gamepads,
             self.clipboard,
+            self.printing,
             self.screen,
             self.video,
             self.audio,
@@ -383,10 +402,15 @@ impl ControlsSections {
         ]
     }
 
-    pub fn from_array([input, clipboard, screen, video, audio, stats]: [bool; 6]) -> Self {
+    pub fn from_array(
+        [input, shortcuts, gamepads, clipboard, printing, screen, video, audio, stats]: [bool; 9],
+    ) -> Self {
         Self {
             input,
+            shortcuts,
+            gamepads,
             clipboard,
+            printing,
             screen,
             video,
             audio,
@@ -528,6 +552,52 @@ impl AudioPreferences {
     }
 }
 
+/// The Gamepads card's switches, saved for a server (`ARCH-032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadPreferences {
+    /// **Gamepad input** as the person set it; `None` follows `gamepad_on_start`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<bool>,
+    /// **Rumble**; on by default.
+    pub rumble: bool,
+}
+
+impl Default for GamepadPreferences {
+    fn default() -> Self {
+        Self {
+            input: None,
+            rumble: true,
+        }
+    }
+}
+
+impl GamepadPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Remote printing choices for a server (`ARCH-033`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrintingPreferences {
+    /// **Open Print Dialog Automatically**: on, as the web client's `print_auto`.
+    pub auto_print: bool,
+}
+
+impl Default for PrintingPreferences {
+    fn default() -> Self {
+        Self { auto_print: true }
+    }
+}
+
+impl PrintingPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Preferences {
     #[serde(default)]
@@ -567,6 +637,26 @@ pub struct Preferences {
     pub library: LibraryOrganization,
     #[serde(default, skip_serializing_if = "AudioPreferences::is_default")]
     pub audio: AudioPreferences,
+    /// **Mac shortcuts active** as the person set it; `None` follows the server (`ARCH-031`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_shortcuts: Option<bool>,
+    /// **Show over the stream**: the stats strip (`ARCH-031`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stats_strip: bool,
+    /// The Gamepads card's switches (`ARCH-032`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "GamepadPreferences::is_default"
+    )]
+    pub gamepads: GamepadPreferences,
+    /// Remote printing (`ARCH-033`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "PrintingPreferences::is_default"
+    )]
+    pub printing: PrintingPreferences,
     #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
@@ -679,6 +769,10 @@ fn read_file(path: &Path) -> Loaded {
             "controls" => field(value, &mut prefs.controls),
             "library" => field(value, &mut prefs.library),
             "audio" => field(value, &mut prefs.audio),
+            "mac_shortcuts" => field(value, &mut prefs.mac_shortcuts),
+            "stats_strip" => field(value, &mut prefs.stats_strip),
+            "gamepads" => field(value, &mut prefs.gamepads),
+            "printing" => field(value, &mut prefs.printing),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
                     .map(|number| {
@@ -885,16 +979,128 @@ mod tests {
     #[test]
     fn controls_sections_round_trip_beside_video_settings() {
         let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
-        prefs.controls = ControlsSections::from_array([true, false, false, true, true, false]);
+        prefs.controls = ControlsSections::from_array([
+            true, false, false, false, false, false, true, true, false,
+        ]);
         let saved = serde_json::to_value(&prefs).unwrap();
         let restored: Preferences = serde_json::from_value(saved).unwrap();
         // `controls` is read as the struct, not swallowed by the flattened video map.
         assert_eq!(
             restored.controls.to_array(),
-            [true, false, false, true, true, false]
+            [true, false, false, false, false, false, true, true, false]
         );
         assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
         assert_eq!(restored.video.len(), 1);
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_shortcuts() {
+        for bits in 0..512u16 {
+            let open: [bool; 9] = std::array::from_fn(|i| bits & (1 << i) != 0);
+            assert_eq!(ControlsSections::from_array(open).to_array(), open);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"controls": {"stats": true}}"#).unwrap();
+        let old = load_at(&path).controls;
+        assert!(old.stats && !old.shortcuts && old.screen);
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_printing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // Files from before Shortcuts, before Printing, and with every key of today.
+        for old in [
+            r#"{"controls": {"input": true, "clipboard": true, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+            r#"{"controls": {"input": true, "shortcuts": true, "clipboard": true, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+            r#"{"controls": {"input": true, "shortcuts": true, "clipboard": true, "printing": false, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+        ] {
+            std::fs::write(&path, old).unwrap();
+            let loaded = load_at(&path).controls;
+            assert!(!loaded.printing, "{old}");
+            assert!(loaded.input && loaded.clipboard && !loaded.screen && loaded.stats);
+        }
+        let open = ControlsSections {
+            printing: true,
+            ..ControlsSections::default()
+        };
+        assert!(open.to_array()[4], "Printing follows Clipboard");
+        assert_eq!(ControlsSections::from_array(open.to_array()), open);
+    }
+
+    #[test]
+    fn printing_preferences_default_to_auto_print_and_round_trip() {
+        assert!(Preferences::default().printing.auto_print);
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("printing").is_none(), "{saved}");
+        let mut prefs = Preferences::default();
+        prefs.printing.auto_print = false;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(saved["printing"], json!({"auto_print": false}));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, saved.to_string()).unwrap();
+        assert!(!load_at(&path).printing.auto_print);
+        // A damaged value falls back to the default.
+        std::fs::write(&path, r#"{"printing": 3}"#).unwrap();
+        assert!(load_at(&path).printing.auto_print);
+    }
+
+    #[test]
+    fn a_preferences_file_without_printing_keeps_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        let old = json!({"codec": "jpeg", "jpeg": 45, "stats_strip": true, "future_key": [1]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.preferences.printing.auto_print);
+        assert!(loaded.preferences.stats_strip);
+        assert_eq!(loaded.preferences.video.get(&Key::Jpeg), Some(&45));
+        assert!(loaded.extra.contains_key("future_key"));
+        let written = serde_json::to_value(&loaded.preferences).unwrap();
+        assert!(written.get("printing").is_none(), "{written}");
+    }
+
+    #[test]
+    fn shortcut_and_strip_preferences_round_trip() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("mac_shortcuts").is_none(), "{saved}");
+        assert!(saved.get("stats_strip").is_none(), "{saved}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| {
+            p.mac_shortcuts = Some(false);
+            p.stats_strip = true;
+        })
+        .unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.mac_shortcuts, Some(false));
+        assert!(loaded.stats_strip);
+
+        // A value of the wrong shape loads as the default and the file is backed up.
+        std::fs::write(&path, r#"{"stats_strip": "yes", "mac_shortcuts": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.damaged);
+        assert!(!loaded.preferences.stats_strip);
+        assert_eq!(loaded.preferences.mac_shortcuts, Some(true));
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn announce_reads_keyboard_shortcuts() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.keyboard_shortcuts, ShortcutPolicy::default());
+        settings.announce(&json!({"keyboard_shortcuts": {"value": false, "locked": true}}));
+        assert_eq!(
+            settings.keyboard_shortcuts,
+            ShortcutPolicy {
+                value: false,
+                locked: true
+            }
+        );
     }
 
     #[test]
@@ -1213,8 +1419,67 @@ mod tests {
         let saved = load_at(&path);
         assert_eq!(
             saved.controls.to_array(),
-            [true, false, false, true, false, true]
+            [true, false, false, false, false, false, true, false, true]
         );
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_gamepads() {
+        let mut prefs = Preferences::default();
+        prefs.controls.gamepads = true;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(saved["controls"]["gamepads"], json!(true));
+        let restored: Preferences = serde_json::from_value(saved).unwrap();
+        assert!(restored.controls.gamepads);
+        assert_eq!(
+            restored.controls.to_array(),
+            [false, false, true, false, false, true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn gamepad_preferences_round_trip() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("gamepads").is_none(), "{saved}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| {
+            p.gamepads.input = Some(false);
+            p.gamepads.rumble = false;
+        })
+        .unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["gamepads"],
+            json!({"input": false, "rumble": false})
+        );
+        let loaded = load_at(&path).gamepads;
+        assert_eq!(loaded.input, Some(false));
+        assert!(!loaded.rumble);
+    }
+
+    #[test]
+    fn old_files_load_gamepad_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"jpeg": 45, "controls": {"stats": true}}"#).unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.gamepads, GamepadPreferences::default());
+        assert!(loaded.gamepads.rumble);
+        assert!(!loaded.controls.gamepads);
+        // Only one field written: the other keeps its default.
+        std::fs::write(&path, r#"{"gamepads": {"input": true}}"#).unwrap();
+        let partial = load_at(&path).gamepads;
+        assert_eq!(partial.input, Some(true));
+        assert!(partial.rumble);
+    }
+
+    #[test]
+    fn announce_reads_gamepad_policy() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"gamepad_enabled": {"value": false, "locked": true}}));
+        assert!(!settings.gamepad.enabled);
+        assert!(settings.gamepad.on_start);
     }
 
     #[test]

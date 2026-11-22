@@ -5,6 +5,8 @@ mod audio;
 #[cfg(target_os = "macos")]
 mod clipboard;
 #[cfg(target_os = "macos")]
+mod gamepad;
+#[cfg(target_os = "macos")]
 mod input;
 #[cfg(target_os = "macos")]
 mod launch_options;
@@ -17,11 +19,17 @@ mod pasteboard;
 #[cfg(target_os = "macos")]
 mod persist;
 #[cfg(target_os = "macos")]
+mod print_dialog;
+#[cfg(target_os = "macos")]
+mod print_jobs;
+#[cfg(target_os = "macos")]
 mod sealskin;
 #[cfg(target_os = "macos")]
 mod selkies;
 #[cfg(target_os = "macos")]
 mod settings;
+#[cfg(target_os = "macos")]
+mod shortcuts;
 mod stats;
 #[cfg(target_os = "macos")]
 mod transport;

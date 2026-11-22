@@ -5,7 +5,9 @@
 
 use crate::transport::{StreamInfo, StreamSample};
 use crate::video::Codec;
-use skerry_ui::stats::{Graph, Meter, Series, StatRow, StatsProps, Status, Tile};
+use skerry_ui::stats::{
+    Graph, Meter, Series, StatRow, StatsProps, Status, StripFigure, StripProps, Tile,
+};
 
 /// Seconds of history kept for the graphs (the web's `HISTORY_MAX`).
 pub const HISTORY_MAX: usize = 600;
@@ -499,6 +501,88 @@ pub fn props(info: Option<&StreamInfo>, history: &[StreamSample], framerate: u32
     }
 }
 
+/// Why the session subscribes to the server's `stream_stats` (`ARCH-031`, amending
+/// `ARCH-019`): while the Stats section is open **or** the strip is shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatsInterest {
+    section: bool,
+    strip: bool,
+}
+
+impl StatsInterest {
+    pub fn new(strip: bool) -> Self {
+        Self {
+            section: false,
+            strip,
+        }
+    }
+
+    pub fn wanted(&self) -> bool {
+        self.section || self.strip
+    }
+
+    /// The Stats section opened or shut. `Some(wanted)` only when the subscription starts
+    /// or stops: the caller then clears the history and tells the stream.
+    pub fn set_section(&mut self, open: bool) -> Option<bool> {
+        self.change(|interest| interest.section = open)
+    }
+
+    /// The strip was switched. As [`Self::set_section`].
+    pub fn set_strip(&mut self, on: bool) -> Option<bool> {
+        self.change(|interest| interest.strip = on)
+    }
+
+    fn change(&mut self, apply: impl FnOnce(&mut Self)) -> Option<bool> {
+        let before = self.wanted();
+        apply(self);
+        (self.wanted() != before).then_some(self.wanted())
+    }
+}
+
+/// Samples the strip reads: the latest, and enough before it for a held time.
+pub const STRIP_SAMPLES: usize = HOLD_SAMPLES + 1;
+
+/// A millisecond figure as the strip reads it: one decimal under 10, whole above.
+fn strip_ms(ms: f64) -> String {
+    if ms < 10. {
+        format!("{} ms", number((ms * 10.).round() / 10.))
+    } else {
+        format!("{} ms", ms.round())
+    }
+}
+
+/// The strip over the stream (the web's `streamStrip` for WebSockets): the four status
+/// marks, then FPS, Video rate, Capture to sent, and Latency. `history` needs only its last
+/// [`STRIP_SAMPLES`] samples.
+pub fn strip(info: Option<&StreamInfo>, history: &[StreamSample]) -> StripProps {
+    let latest = history.last();
+    let figure_of = |value: String, caption: &str, warn: bool| StripFigure {
+        value,
+        caption: caption.into(),
+        warn,
+    };
+    let fps = latest
+        .and_then(|sample| figure(sample, "fps"))
+        .map_or_else(|| "–".to_string(), |fps| format!("{fps} fps"));
+    let rate = tile(history, "video_mbps", "Video rate", "Mbps");
+    let send = tile(history, "send_ms", "Capture to sent", "ms");
+    let latency = latest
+        .and_then(|sample| figure(sample, "rtt_ms"))
+        .map_or_else(|| "–".to_string(), strip_ms);
+    StripProps {
+        marks: rows(info, latest)
+            .into_iter()
+            .map(|row| row.status)
+            .collect(),
+        figures: vec![
+            figure_of(fps, "FPS", false),
+            figure_of(rate.value, "Video rate", rate.warn),
+            figure_of(send.value, "Capture to sent", false),
+            figure_of(latency, "Latency", false),
+        ],
+    }
+}
+
 /// The session as plain text for an issue or a chat (the web's `streamReport`).
 pub fn report(info: Option<&StreamInfo>, history: &[StreamSample]) -> String {
     let latest = history.last();
@@ -716,6 +800,80 @@ mod tests {
         let graph = &graphs(&history, 60)[0];
         assert_eq!(graph.max, (239. * 1.1f32).ceil());
         assert_eq!(graph.series.len(), 1);
+    }
+
+    fn values(props: &StripProps) -> Vec<&str> {
+        props.figures.iter().map(|f| f.value.as_str()).collect()
+    }
+
+    #[test]
+    fn strip_reads_fps_rate_send_and_rtt() {
+        let mut latest = sample(
+            59.6,
+            &[("video_mbps", 7.8), ("target_mbps", 8.0), ("send_ms", 12.0)],
+        );
+        latest.rtt_ms = Some(24.3);
+        let props = strip(Some(&info()), &[latest]);
+        assert_eq!(values(&props), ["60 fps", "7.8 / 8 Mbps", "12 ms", "24 ms"]);
+        let captions: Vec<_> = props.figures.iter().map(|f| f.caption.as_str()).collect();
+        assert_eq!(
+            captions,
+            ["FPS", "Video rate", "Capture to sent", "Latency"]
+        );
+        assert_eq!(props.marks.len(), 4);
+        assert!(props.figures.iter().all(|f| !f.warn));
+        let mut quick = sample(60., &[]);
+        quick.rtt_ms = Some(4.25);
+        assert_eq!(strip(None, &[quick]).figures[3].value, "4.3 ms");
+    }
+
+    #[test]
+    fn strip_rate_warns_over_target() {
+        let over = [sample(60., &[("video_mbps", 9.0), ("target_mbps", 8.0)])];
+        assert!(strip(None, &over).figures[1].warn);
+        let under = [sample(60., &[("video_mbps", 8.8), ("target_mbps", 8.0)])];
+        assert!(!strip(None, &under).figures[1].warn);
+    }
+
+    #[test]
+    fn strip_send_holds_then_idles() {
+        let mut history = vec![sample(60., &[("send_ms", 12.0)])];
+        for _ in 0..3 {
+            history.push(sample(0., &[("encoded_fps", 0.)]));
+        }
+        assert_eq!(strip(None, &history).figures[2].value, "12 ms");
+        for _ in 0..3 {
+            history.push(sample(0., &[("encoded_fps", 0.)]));
+        }
+        let start = history.len() - STRIP_SAMPLES;
+        assert_eq!(strip(None, &history[start..]).figures[2].value, "idle");
+    }
+
+    #[test]
+    fn strip_without_server_figures_reads_dashes() {
+        let props = strip(None, &[sample(30., &[])]);
+        assert_eq!(values(&props), ["30 fps", "–", "–", "9 ms"]);
+        assert_eq!(values(&strip(None, &[]))[0], "–");
+    }
+
+    #[test]
+    fn strip_keeps_subscription_when_section_closes() {
+        let mut interest = StatsInterest::new(true);
+        assert!(interest.wanted());
+        assert_eq!(interest.set_section(true), None);
+        assert_eq!(interest.set_section(false), None);
+        assert_eq!(interest.set_strip(false), Some(false));
+        assert!(!interest.wanted());
+    }
+
+    #[test]
+    fn subscription_starts_once_for_section_then_strip() {
+        let mut interest = StatsInterest::default();
+        assert_eq!(interest.set_section(true), Some(true));
+        assert_eq!(interest.set_strip(true), None);
+        assert_eq!(interest.set_section(false), None);
+        assert_eq!(interest.set_strip(false), Some(false));
+        assert_eq!(interest.set_strip(false), None);
     }
 
     #[test]

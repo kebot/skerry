@@ -1,26 +1,31 @@
 use crate::components::elevated_shadow;
+use crate::session::PrintJobAction;
 use gpui_kit::component::{
-    button::Button,
+    button::{Button, ButtonVariants as _},
     collapsible::Collapsible,
     input::{Input, InputState},
     menu::{PopupMenu, PopupMenuItem},
     popover::Popover,
     slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
     div, prelude::*, px, Anchor, AnyElement, App, ClickEvent, DismissEvent, Div, Entity,
-    FocusHandle, Focusable as _, FontWeight, SharedString, Window,
+    FocusHandle, Focusable as _, FontFeatures, FontWeight, SharedString, Window,
 };
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub type ControlsHandler = Rc<dyn Fn(ControlsAction, &mut Window, &mut App)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Input,
+    Shortcuts,
+    Gamepads,
     Clipboard,
+    Printing,
     Screen,
     Video,
     Audio,
@@ -29,9 +34,12 @@ pub enum Section {
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 9] = [
         Self::Input,
+        Self::Shortcuts,
+        Self::Gamepads,
         Self::Clipboard,
+        Self::Printing,
         Self::Screen,
         Self::Video,
         Self::Audio,
@@ -42,7 +50,10 @@ impl Section {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlsUiState {
     pub input_open: bool,
+    pub shortcuts_open: bool,
+    pub gamepads_open: bool,
     pub clipboard_open: bool,
+    pub printing_open: bool,
     pub screen_open: bool,
     pub video_open: bool,
     pub audio_open: bool,
@@ -59,7 +70,10 @@ impl Default for ControlsUiState {
     fn default() -> Self {
         Self {
             input_open: false,
+            shortcuts_open: false,
+            gamepads_open: false,
             clipboard_open: false,
+            printing_open: false,
             screen_open: true,
             video_open: false,
             audio_open: false,
@@ -75,7 +89,10 @@ impl ControlsUiState {
     pub fn is_open(&self, section: Section) -> bool {
         match section {
             Section::Input => self.input_open,
+            Section::Shortcuts => self.shortcuts_open,
+            Section::Gamepads => self.gamepads_open,
             Section::Clipboard => self.clipboard_open,
+            Section::Printing => self.printing_open,
             Section::Screen => self.screen_open,
             Section::Video => self.video_open,
             Section::Audio => self.audio_open,
@@ -87,7 +104,10 @@ impl ControlsUiState {
     pub fn toggle(&mut self, section: Section) -> bool {
         let open = match section {
             Section::Input => &mut self.input_open,
+            Section::Shortcuts => &mut self.shortcuts_open,
+            Section::Gamepads => &mut self.gamepads_open,
             Section::Clipboard => &mut self.clipboard_open,
+            Section::Printing => &mut self.printing_open,
             Section::Screen => &mut self.screen_open,
             Section::Video => &mut self.video_open,
             Section::Audio => &mut self.audio_open,
@@ -98,12 +118,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 6] {
+    pub fn sections(&self) -> [bool; 9] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 6]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 9]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -160,6 +180,129 @@ pub enum ControlsAction {
     /// Ask the server for this audio bitrate (bps).
     SetAudioBitrate(u32),
     CopyStats,
+    /// **Show over the stream** (`ARCH-031`).
+    SetStatsStrip(bool),
+    /// **Mac shortcuts active** (`ARCH-031`).
+    SetMacShortcuts(bool),
+    /// Capture Pointer, or release it (`ARCH-032`).
+    CapturePointer,
+    /// **Gamepad input** (`ARCH-032`).
+    SetGamepadInput(bool),
+    /// **Rumble** (`ARCH-032`).
+    SetGamepadRumble(bool),
+    /// **Open Print Dialog Automatically** (`ARCH-033`).
+    SetAutoPrint(bool),
+    /// A Printing card row's button.
+    PrintJob(u64, PrintJobAction),
+}
+
+/// Whether a pad in a slot reaches the session (`ARCH-032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadStatus {
+    Sending,
+    /// Input is on but the session window isn't key.
+    Ready,
+    NotSent,
+}
+
+/// One connected pad in a Player slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PadRow {
+    pub name: String,
+    pub status: PadStatus,
+    /// The pad has haptics.
+    pub rumble: bool,
+}
+
+/// The Gamepads card (`ARCH-032`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadsProps {
+    pub input: bool,
+    /// The server's `gamepad_on_start` lock holds the input switch.
+    pub input_locked: bool,
+    pub rumble: bool,
+    pub server_off: bool,
+    /// The session window is key.
+    pub key: bool,
+    /// Players 1 to 4 (wire slots 0 to 3).
+    pub slots: [Option<PadRow>; 4],
+    /// Connected pads with no slot left.
+    pub overflow: usize,
+}
+
+/// The Input card's Capture Pointer button (`ARCH-032`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureProps {
+    /// A picture is painted and the session is ready.
+    pub available: bool,
+    /// The session window holds the pointer now.
+    pub captured: bool,
+    /// The chord in menu glyphs, from the Mac's chord table: "⌃⌥⇧" and "Z".
+    pub modifiers: String,
+    pub key: String,
+}
+
+/// A print job's state in the Printing card (`ARCH-033`).
+#[derive(Clone, Debug, PartialEq)]
+pub enum PrintRowKind {
+    Receiving { fraction: Option<f32> },
+    Ready,
+    Unreadable,
+    Failed,
+    TooLarge,
+    Missing,
+}
+
+/// One row of the Printing card.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrintJobRow {
+    pub id: u64,
+    pub name: String,
+    /// `size · age[ · state]`.
+    pub meta: String,
+    pub kind: PrintRowKind,
+    /// "Saved to Downloads", shown as a link that reveals the copy.
+    pub saved_to: Option<String>,
+    /// Open in another app: Remove keeps the file.
+    pub opened: bool,
+}
+
+/// The Printing card; `None` in `ControlsProps` hides it (printing off or unknown).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrintingProps {
+    pub auto_print: bool,
+    /// Newest first.
+    pub jobs: Vec<PrintJobRow>,
+    /// The list holds as many jobs as it keeps.
+    pub at_cap: bool,
+}
+
+/// Whether the Printing card shows: only while the server allows printing.
+pub fn printing_card_shown(printing: Option<&PrintingProps>) -> bool {
+    printing.is_some()
+}
+
+/// One row of the Shortcuts card, its chord in macOS menu glyphs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutRow {
+    pub label: String,
+    /// "⇧⌘", in ⌃⌥⇧⌘ order.
+    pub modifiers: String,
+    /// "M".
+    pub key: String,
+    /// "Sent as Ctrl+Shift+M" while the chord goes to the session.
+    pub remote: Option<String>,
+    /// Quit: "Always on the Mac", never dimmed.
+    pub always_local: bool,
+}
+
+/// The Shortcuts card (`ARCH-031`, `ARCH-GAP-DC-12`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutsProps {
+    /// The effective value: the server's when locked.
+    pub mac_active: bool,
+    pub locked: bool,
+    pub rows: Vec<ShortcutRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,6 +459,14 @@ pub struct ControlsProps {
     pub stats: Option<crate::stats::StatsProps>,
     /// Shows the copy button's check for a moment after a copy.
     pub stats_copied: bool,
+    /// The stats strip is shown over the stream.
+    pub stats_strip: bool,
+    pub shortcuts: ShortcutsProps,
+    pub capture: CaptureProps,
+    /// The Gamepads card; `None` hides it (`ui_sidebar_show_gamepads`, or no settings yet).
+    pub gamepads: Option<GamepadsProps>,
+    /// The Printing card (`ARCH-033`); `None` hides it.
+    pub printing: Option<PrintingProps>,
 }
 
 pub fn dpi_label(dpi: u16) -> String {
@@ -430,9 +581,25 @@ pub fn render(
                     theme,
                     "Input",
                     state.input_open,
-                    || render_input(props, &on_action),
+                    || render_input(theme, props, &on_action),
                     toggle(Section::Input),
                 ))
+                .child(section(
+                    theme,
+                    "Shortcuts",
+                    state.shortcuts_open,
+                    || render_shortcuts(theme, &props.shortcuts, &on_action),
+                    toggle(Section::Shortcuts),
+                ))
+                .when_some(props.gamepads.as_ref(), |cards, gamepads| {
+                    cards.child(section(
+                        theme,
+                        "Gamepads",
+                        state.gamepads_open,
+                        || render_gamepads(theme, gamepads, &on_action),
+                        toggle(Section::Gamepads),
+                    ))
+                })
                 .child(section(
                     theme,
                     "Clipboard",
@@ -440,6 +607,21 @@ pub fn render(
                     || render_clipboard(theme, props.clipboard.as_ref(), &on_action),
                     toggle(Section::Clipboard),
                 ))
+                .when_some(
+                    props
+                        .printing
+                        .as_ref()
+                        .filter(|printing| printing_card_shown(Some(printing))),
+                    |list, printing| {
+                        list.child(section(
+                            theme,
+                            "Printing",
+                            state.printing_open,
+                            || render_printing(theme, printing, &on_action),
+                            toggle(Section::Printing),
+                        ))
+                    },
+                )
                 .child(section(
                     theme,
                     "Screen Settings",
@@ -497,7 +679,7 @@ const FIELD_GAP: f32 = 6.;
 const CONTROL_H: f32 = 40.;
 const CONTROL_RADIUS: f32 = 8.;
 
-fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
+fn render_input(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
     div()
         .v_flex()
         .gap(px(STACK_GAP))
@@ -527,6 +709,86 @@ fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
                     ))
                 })),
         ))
+        .child(render_capture(theme, &props.capture, on_action))
+}
+
+/// Capture Pointer: the label with its crosshair, the chord's glyphs on the right, and a
+/// note on how to get out (`ARCH-032`).
+fn render_capture(theme: &Theme, capture: &CaptureProps, on_action: &ControlsHandler) -> Div {
+    let chord = format!("{}{}", capture.modifiers, capture.key);
+    let (label, note) = if capture.captured {
+        ("Pointer Captured", format!("Press {chord} to release it."))
+    } else if capture.available {
+        (
+            "Capture Pointer",
+            format!("{chord}, ⌘-Tab, or leaving the window releases it."),
+        )
+    } else {
+        (
+            "Capture Pointer",
+            "Available once the picture appears.".to_string(),
+        )
+    };
+    let on_action = Rc::clone(on_action);
+    let button = Button::new("input-capture-pointer")
+        .w_full()
+        .h(px(CONTROL_H))
+        .rounded(px(CONTROL_RADIUS))
+        .disabled(!capture.available && !capture.captured)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .child(Icon::new(gpui_kit::assets::IconName::Crosshair).with_size(px(16.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .text_left()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .w(px(56.))
+                        .flex_none()
+                        .h_flex()
+                        .text_size(px(13.))
+                        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_right()
+                                .whitespace_nowrap()
+                                .when(!capture.captured, |glyphs| {
+                                    glyphs.text_color(theme.muted_foreground)
+                                })
+                                .child(capture.modifiers.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .child(capture.key.clone()),
+                        ),
+                ),
+        )
+        .on_click(move |_, window, cx| on_action(ControlsAction::CapturePointer, window, cx));
+    let button = if capture.captured {
+        button.primary()
+    } else {
+        button.outline()
+    };
+    div().v_flex().gap(px(FIELD_GAP)).child(button).child(
+        div()
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .child(note),
+    )
 }
 
 fn render_clipboard(
@@ -926,16 +1188,474 @@ fn render_audio(
     )
 }
 
-fn render_stats(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
-    let Some(stats) = props.stats.as_ref() else {
-        return div()
+/// The Printing card (`ARCH-033`): the auto-open switch, then this window's jobs.
+fn render_printing(theme: &Theme, printing: &PrintingProps, on_action: &ControlsHandler) -> Div {
+    let list = if printing.jobs.is_empty() {
+        div()
+            .text_size(px(13.))
             .text_color(theme.muted_foreground)
-            .child("Waiting for stream stats…");
+            .child("Nothing printed yet. Print from an app in the session to get the PDF here.")
+    } else {
+        div()
+            .v_flex()
+            .gap(px(6.))
+            .children(
+                printing
+                    .jobs
+                    .iter()
+                    .map(|row| print_row(theme, row, on_action)),
+            )
+            .when(printing.at_cap, |list| {
+                list.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child("Keeps the 20 most recent."),
+                )
+            })
+    };
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_row_with_detail(
+            theme,
+            "Open Print Dialog Automatically",
+            Some("When the session prints, the macOS print dialog opens here.".into()),
+            printing.auto_print,
+            false,
+            ControlsAction::SetAutoPrint(!printing.auto_print),
+            on_action,
+        ))
+        .child(div().h(px(1.)).bg(theme.border))
+        .child(list)
+}
+
+fn print_row(theme: &Theme, row: &PrintJobRow, on_action: &ControlsHandler) -> Div {
+    let file_x: Icon = gpui_kit::assets::IconName::FileX.into();
+    let (glyph, tint) = match row.kind {
+        PrintRowKind::Unreadable => (Icon::from(IconName::FileText), theme.warning),
+        PrintRowKind::Failed => (file_x, theme.danger),
+        PrintRowKind::TooLarge => (Icon::from(IconName::TriangleAlert), theme.warning),
+        PrintRowKind::Missing => (file_x, theme.muted_foreground),
+        _ => (Icon::from(IconName::FileText), theme.muted_foreground),
+    };
+    let receiving = matches!(row.kind, PrintRowKind::Receiving { .. });
+    let has_file = matches!(
+        row.kind,
+        PrintRowKind::Ready | PrintRowKind::Unreadable | PrintRowKind::Receiving { .. }
+    );
+    let id = row.id;
+    let button = |name: &'static str,
+                  icon: Icon,
+                  tooltip: &'static str,
+                  action: PrintJobAction,
+                  shown: bool,
+                  enabled: bool| {
+        let on_action = Rc::clone(on_action);
+        div().when(!shown, |slot| slot.invisible()).child(
+            Button::new(SharedString::from(format!("print-row-{name}-{id}")))
+                .ghost()
+                .xsmall()
+                .icon(icon)
+                .tooltip(tooltip)
+                .tab_stop(false)
+                .disabled(!enabled || !shown)
+                .on_click(move |_, window, cx| {
+                    on_action(ControlsAction::PrintJob(id, action), window, cx)
+                }),
+        )
+    };
+    let print_tooltip = if row.kind == PrintRowKind::Unreadable {
+        "Open it in Preview to print"
+    } else {
+        "Print…"
+    };
+    let remove_tooltip = if row.opened {
+        "Remove from this list"
+    } else {
+        "Remove from this list and delete the file"
+    };
+    let (stem, ext) = row
+        .name
+        .rfind('.')
+        .filter(|dot| *dot > 0)
+        .map_or((row.name.as_str(), ""), |dot| row.name.split_at(dot));
+    let fraction = match row.kind {
+        PrintRowKind::Receiving { fraction } => Some(fraction),
+        _ => None,
+    };
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(10.))
+        .min_h(px(44.))
+        .child(glyph.with_size(px(20.)).text_color(tint))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .v_flex()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .h_flex()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(div().min_w_0().truncate().child(stem.to_string()))
+                        .child(div().flex_none().child(ext.to_string())),
+                )
+                .child(
+                    div()
+                        .h_flex()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(div().min_w_0().truncate().child(row.meta.clone()))
+                        .when_some(row.saved_to.clone(), |meta, saved| {
+                            let on_action = Rc::clone(on_action);
+                            meta.child(div().flex_none().child(" · ")).child(
+                                div()
+                                    .id(SharedString::from(format!("print-row-saved-{id}")))
+                                    .flex_none()
+                                    .cursor_pointer()
+                                    .text_color(theme.link)
+                                    .child(saved)
+                                    .on_click(move |_, window, cx| {
+                                        on_action(
+                                            ControlsAction::PrintJob(id, PrintJobAction::Reveal),
+                                            window,
+                                            cx,
+                                        )
+                                    }),
+                            )
+                        }),
+                )
+                .when_some(fraction, |text, fraction| {
+                    text.child(
+                        div()
+                            .h(px(2.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(theme.muted)
+                            .relative()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .left_0()
+                                    .bg(theme.accent)
+                                    .w(gpui_kit::relative(fraction.unwrap_or(0.3))),
+                            ),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .flex_none()
+                .h_flex()
+                .gap(px(2.))
+                .child(button(
+                    "print",
+                    gpui_kit::assets::IconName::Printer.into(),
+                    print_tooltip,
+                    PrintJobAction::Print,
+                    has_file,
+                    !receiving && row.kind != PrintRowKind::Unreadable,
+                ))
+                .child(button(
+                    "open",
+                    IconName::ExternalLink.into(),
+                    "Open in Preview",
+                    PrintJobAction::Open,
+                    has_file,
+                    !receiving,
+                ))
+                .child(button(
+                    "save",
+                    gpui_kit::assets::IconName::Download.into(),
+                    "Save a copy…",
+                    PrintJobAction::Save,
+                    has_file,
+                    !receiving,
+                ))
+                .child(button(
+                    "remove",
+                    IconName::Close.into(),
+                    remove_tooltip,
+                    PrintJobAction::Remove,
+                    !receiving,
+                    true,
+                )),
+        )
+}
+
+fn render_stats(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
+    let strip = switch_row_with_detail(
+        theme,
+        "Show over the stream",
+        Some("Frame rate, video rate and latency at the top of the window.".into()),
+        props.stats_strip,
+        false,
+        ControlsAction::SetStatsStrip(!props.stats_strip),
+        on_action,
+    );
+    let panel = div().v_flex().gap(px(STACK_GAP)).child(strip);
+    let Some(stats) = props.stats.as_ref() else {
+        return panel.child(
+            div()
+                .text_color(theme.muted_foreground)
+                .child("Waiting for stream stats…"),
+        );
     };
     let on_action = Rc::clone(on_action);
-    crate::stats::render(theme, stats, props.stats_copied, move |window, cx| {
-        on_action(ControlsAction::CopyStats, window, cx)
-    })
+    panel.child(crate::stats::render(
+        theme,
+        stats,
+        props.stats_copied,
+        move |window, cx| on_action(ControlsAction::CopyStats, window, cx),
+    ))
+}
+
+/// The Shortcuts card: the switch, Skerry's chords as macOS menus write them, and, while
+/// they go to the session, where Session Controls still is (`ARCH-031`).
+fn render_shortcuts(theme: &Theme, shortcuts: &ShortcutsProps, on_action: &ControlsHandler) -> Div {
+    let detail = if shortcuts.locked {
+        "Set by the server."
+    } else {
+        "Let these chords act on the Mac. Off, they go to the remote session instead."
+    };
+    let rows = shortcuts.rows.iter().map(|row| {
+        let note = if row.always_local {
+            Some("Always on the Mac".to_string())
+        } else if shortcuts.mac_active {
+            None
+        } else {
+            row.remote.clone()
+        };
+        let dimmed = !shortcuts.mac_active && !row.always_local;
+        div()
+            .h_flex()
+            .items_start()
+            .justify_between()
+            .gap(px(10.))
+            .child(
+                div()
+                    .min_w_0()
+                    .v_flex()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
+                            .text_color(theme.foreground)
+                            .child(row.label.clone()),
+                    )
+                    .when_some(note, |label, note| {
+                        label.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .child(note),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w(px(56.))
+                    .flex_none()
+                    .h_flex()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .text_color(theme.muted_foreground)
+                    .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                    .when(dimmed, |glyphs| glyphs.opacity(0.45))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_right()
+                            .whitespace_nowrap()
+                            .child(row.modifiers.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .child(row.key.clone()),
+                    ),
+            )
+    });
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_row_with_detail(
+            theme,
+            "Mac shortcuts active",
+            Some(detail.into()),
+            shortcuts.mac_active,
+            shortcuts.locked,
+            ControlsAction::SetMacShortcuts(!shortcuts.mac_active),
+            on_action,
+        ))
+        .child(div().v_flex().gap(px(8.)).children(rows))
+        .when(!shortcuts.mac_active, |panel| {
+            panel.child(
+                div()
+                    .h_flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        div()
+                            .pt(px(2.))
+                            .child(Icon::new(IconName::Info).with_size(px(12.))),
+                    )
+                    .child(div().flex_1().min_w_0().child(
+                        "Session Controls is still in the View menu and behind the ⋯ button \
+                         at the top-right.",
+                    )),
+            )
+        })
+}
+
+/// Gamepads: the two switches, one note at most, then four Player rows (`ARCH-032`).
+fn render_gamepads(theme: &Theme, gamepads: &GamepadsProps, on_action: &ControlsHandler) -> Div {
+    let muted_line = |icon: Option<IconName>, text: String| {
+        div()
+            .h_flex()
+            .items_start()
+            .gap(px(6.))
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .when_some(icon, |line, icon| {
+                line.child(div().pt(px(2.)).child(Icon::new(icon).with_size(px(12.))))
+            })
+            .child(div().flex_1().min_w_0().child(text))
+    };
+    let note = if gamepads.server_off {
+        Some("Turned off by the server.")
+    } else if gamepads.input && !gamepads.key {
+        Some(
+            "Paused while another window is in front, including this one. Click the session \
+             to play.",
+        )
+    } else {
+        None
+    };
+    let rows = gamepads.slots.iter().enumerate().map(|(index, slot)| {
+        let number = index + 1;
+        let badge = div()
+            .size(px(22.))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+            .child(number.to_string());
+        let badge = match slot.as_ref().map(|pad| pad.status) {
+            Some(PadStatus::Sending) => badge.bg(theme.accent).text_color(gpui_kit::white()),
+            Some(PadStatus::Ready) => badge
+                .border_1()
+                .border_color(theme.accent)
+                .text_color(theme.accent),
+            _ => badge
+                .border_1()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground),
+        };
+        let middle = match slot {
+            Some(pad) => {
+                let status = match pad.status {
+                    PadStatus::Sending => "Sending",
+                    PadStatus::Ready => "Ready",
+                    PadStatus::NotSent => "Not sent",
+                };
+                let status = if pad.rumble {
+                    status.to_string()
+                } else {
+                    format!("{status} · No rumble")
+                };
+                div()
+                    .v_flex()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(pad.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(status),
+                    )
+            }
+            None => div()
+                .text_size(px(13.))
+                .text_color(theme.muted_foreground)
+                .child("No controller"),
+        };
+        div()
+            .h(px(44.))
+            .px(px(4.))
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .child(badge)
+            .child(div().flex_1().min_w_0().child(middle))
+    });
+    let empty = gamepads.slots.iter().all(Option::is_none);
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_row_with_detail(
+            theme,
+            "Gamepad input",
+            Some("Send controllers to this session while its window is in front.".into()),
+            gamepads.input,
+            gamepads.server_off || gamepads.input_locked,
+            ControlsAction::SetGamepadInput(!gamepads.input),
+            on_action,
+        ))
+        .child(switch_row_with_detail(
+            theme,
+            "Rumble",
+            Some("Let the session's games vibrate your controllers.".into()),
+            gamepads.rumble && gamepads.input,
+            gamepads.server_off || !gamepads.input,
+            ControlsAction::SetGamepadRumble(!gamepads.rumble),
+            on_action,
+        ))
+        .when_some(note, |panel, note| {
+            panel.child(muted_line(Some(IconName::Info), note.to_string()))
+        })
+        .child(field("Players", div().v_flex().gap(px(4.)).children(rows)))
+        .when(empty, |panel| {
+            panel.child(muted_line(
+                None,
+                "Pair a controller in System Settings › Bluetooth.".into(),
+            ))
+        })
+        .when(gamepads.overflow > 0, |panel| {
+            let text = if gamepads.overflow == 1 {
+                "1 more controller isn't sent: all four players are in use.".to_string()
+            } else {
+                format!(
+                    "{} more controllers aren't sent: all four players are in use.",
+                    gamepads.overflow
+                )
+            };
+            panel.child(muted_line(Some(IconName::TriangleAlert), text))
+        })
 }
 
 fn action_button(
@@ -1335,6 +2055,48 @@ fn switch_row(
         .into_any_element()
 }
 
+/// A switch row with a muted 12 pt line under its label.
+fn switch_row_with_detail(
+    theme: &Theme,
+    label: impl Into<String>,
+    detail: Option<String>,
+    enabled: bool,
+    locked: bool,
+    action: ControlsAction,
+    on_action: &ControlsHandler,
+) -> AnyElement {
+    let Some(detail) = detail else {
+        return switch_row(label, enabled, locked, action, on_action);
+    };
+    let label = label.into();
+    let on_action = Rc::clone(on_action);
+    div()
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            div()
+                .min_w_0()
+                .v_flex()
+                .gap(px(2.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(label.clone()))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(detail),
+                ),
+        )
+        .child(
+            Switch::new(SharedString::from(label))
+                .checked(enabled)
+                .disabled(locked)
+                .on_click(move |_, window, cx| on_action(action.clone(), window, cx)),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,14 +2154,38 @@ mod tests {
 
     #[test]
     fn sections_round_trip_in_section_order() {
-        // Input, Video and Audio open, Screen closed.
-        let open = [true, false, false, true, true, false];
+        // Input, Shortcuts, Gamepads, Printing, Video and Audio open, Screen closed.
+        let open = [true, true, true, false, true, false, true, true, false];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
         assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
+        assert!(state.shortcuts_open && state.gamepads_open && state.printing_open);
+        assert_eq!(Section::ALL[1], Section::Shortcuts);
+        assert_eq!(Section::ALL[2], Section::Gamepads);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, true, false, false, false]
+            [false, false, false, false, false, true, false, false, false]
         );
+    }
+
+    #[test]
+    fn the_printing_card_shows_only_while_printing_is_on() {
+        assert!(!printing_card_shown(None));
+        let printing = PrintingProps {
+            auto_print: true,
+            jobs: Vec::new(),
+            at_cap: false,
+        };
+        assert!(printing_card_shown(Some(&printing)));
+    }
+
+    #[test]
+    fn printing_follows_clipboard_in_section_order() {
+        let clipboard = Section::ALL.iter().position(|s| *s == Section::Clipboard);
+        let printing = Section::ALL.iter().position(|s| *s == Section::Printing);
+        assert_eq!(printing, clipboard.map(|index| index + 1));
+        let state = ControlsUiState::default()
+            .with_sections([false, false, false, false, true, false, false, false, false]);
+        assert!(state.printing_open && !state.screen_open);
     }
 }

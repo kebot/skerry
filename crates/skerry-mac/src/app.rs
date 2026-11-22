@@ -3,6 +3,7 @@ mod controls;
 mod display;
 mod files_model;
 mod files_window;
+mod gamepads;
 mod promise;
 mod session_window;
 
@@ -73,6 +74,19 @@ pub fn run() {
         .build()
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
+    // Print jobs a crash, an orphaned download, or an Opened file left behind (`ARCH-033`).
+    handle.spawn_blocking(|| {
+        if let Some(root) = crate::print_jobs::cache_root() {
+            let swept = crate::print_jobs::sweep(
+                &root,
+                std::time::SystemTime::now(),
+                crate::print_jobs::SWEEP_AGE,
+            );
+            if let Err(error) = swept {
+                eprintln!("Couldn’t sweep the print cache: {error}");
+            }
+        }
+    });
     let reopen_handle = handle.clone();
     let application = gpui_kit::application().with_assets(skerry_ui::assets::SkerryAssets);
     // A Dock-icon click brings the Library back (ARCH-022).
@@ -87,6 +101,8 @@ pub fn run() {
     application.run(move |cx: &mut App| {
         gpui_kit::init(cx);
         cx.set_global(OpenWindows::default());
+        // Connected controllers and their Player slots, app-wide (`ARCH-032`).
+        gamepads::init(cx);
         // Every preference and key write goes through this one queue (`persist`).
         cx.set_global(persist::start(&handle));
         // GPUI gives quit futures 200 ms; wait for queued writes (at most 1 s) before
@@ -94,20 +110,11 @@ pub fn run() {
         cx.on_app_quit(|cx| {
             cx.global::<WriteQueue>()
                 .flush_blocking(Duration::from_secs(1));
+            quit_print_cleanup(cx);
             async {}
         })
         .detach();
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-0", ShowLibrary, None),
-            KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
-            KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
-            KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
-            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-            KeyBinding::new("cmd-shift-f", ToggleFiles, None),
-        ]);
-        cx.bind_keys(files_window::key_bindings());
-        cx.bind_keys(library_key_bindings());
+        cx.bind_keys(key_bindings());
         // Quitting disconnects every session window; no remote session is stopped.
         cx.on_action(|_: &Quit, cx| cx.quit());
         let library_handle = handle.clone();
@@ -192,6 +199,10 @@ pub fn run() {
                     MenuItem::action("Session Controls", ToggleSessionControls),
                     MenuItem::action("Files", ToggleFiles),
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+                    // No checkmark: menus are set once, and the strip is per window.
+                    MenuItem::action("Toggle Stats Over Stream", ToggleStatsStrip),
+                    // No checkmark either; while captured the menu bar is out of reach.
+                    MenuItem::action("Capture Pointer", TogglePointerCapture),
                 ],
                 disabled: false,
             },
@@ -262,9 +273,46 @@ actions!(
         ToggleFullScreen,
         ToggleFiles,
         OpenFile,
-        OpenLocation
+        OpenLocation,
+        ToggleStatsStrip,
+        TogglePointerCapture
     ]
 );
+
+/// Every key binding, in the order GPUI needs: the session-wide chords from
+/// `shortcuts::CHORDS`, then the context-scoped ones, then the `NoAction` suppressions,
+/// which must come last to outrank the chords they hand to the session (`ARCH-031`). `run`
+/// binds exactly this list, and the keymap tests read it.
+pub(crate) fn key_bindings() -> Vec<KeyBinding> {
+    let mut bindings = global_bindings();
+    bindings.extend(files_window::key_bindings());
+    bindings.extend(library_key_bindings());
+    bindings.extend(crate::shortcuts::suppress_bindings());
+    bindings
+}
+
+fn global_bindings() -> Vec<KeyBinding> {
+    use crate::shortcuts::{ChordId, CHORDS};
+    let mut bindings: Vec<KeyBinding> = CHORDS
+        .iter()
+        .map(|chord| {
+            let keys = chord.keystroke;
+            match chord.id {
+                ChordId::SessionControls => KeyBinding::new(keys, ToggleSessionControls, None),
+                ChordId::FullScreen => KeyBinding::new(keys, ToggleFullScreen, None),
+                ChordId::Files => KeyBinding::new(keys, ToggleFiles, None),
+                ChordId::Library => KeyBinding::new(keys, ShowLibrary, None),
+                ChordId::CapturePointer => KeyBinding::new(keys, TogglePointerCapture, None),
+                ChordId::Quit => KeyBinding::new(keys, Quit, None),
+            }
+        })
+        .collect();
+    bindings.extend([
+        KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
+        KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
+    ]);
+    bindings
+}
 
 /// The Library window's key context.
 const LIBRARY_CONTEXT: &str = "Library";
@@ -2604,6 +2652,36 @@ impl Launcher {
     }
 }
 
+/// Quit skips the windows' close handlers (`cx.quit()`), so every session window's print
+/// jobs are cleaned up here, synchronously with `std::fs`: the runtime is going away. Then
+/// the cache is swept, so Opened files don't wait for a launch a day later (`ARCH-033`).
+fn quit_print_cleanup(cx: &mut App) {
+    let sessions: Vec<_> = cx
+        .try_global::<OpenWindows>()
+        .map(|windows| {
+            windows
+                .sessions
+                .iter()
+                .map(|open| open.entity.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut doomed = Vec::new();
+    for session in sessions.iter().filter_map(|session| session.upgrade()) {
+        doomed.extend(session.update(cx, |session, _| {
+            crate::print_jobs::quit_cleanup([&mut session.print_jobs])
+        }));
+    }
+    crate::print_jobs::remove_now(&doomed);
+    if let Some(root) = crate::print_jobs::cache_root() {
+        let _ = crate::print_jobs::sweep(
+            &root,
+            std::time::SystemTime::now(),
+            crate::print_jobs::SWEEP_AGE,
+        );
+    }
+}
+
 pub(crate) fn native_window(window: &Window) -> Option<objc2::rc::Retained<NSWindow>> {
     let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
@@ -3634,6 +3712,154 @@ mod tests {
         let (_, rebuilt) = cache.get(build);
         assert!(!Rc::ptr_eq(&first, &rebuilt));
         assert_eq!(rebuilt[0].started_label.as_deref(), Some("Just started"));
+    }
+
+    use gpui_kit::Keystroke;
+    const MAC: [&str; 2] = ["Root", crate::view::DESKTOP_CONTEXT];
+    const REMOTE: [&str; 2] = ["Root", crate::shortcuts::REMOTE_DESKTOP_CONTEXT];
+
+    /// The action names `keys` resolves to under `contexts`, `NoAction` left out, in the
+    /// order GPUI would try them.
+    fn resolve_in(keymap: &gpui_kit::Keymap, keys: &Keystroke, contexts: &[&str]) -> Vec<String> {
+        use gpui_kit::KeyContext;
+        let stack: Vec<KeyContext> = contexts
+            .iter()
+            .map(|context| KeyContext::parse(context).unwrap())
+            .collect();
+        let (bindings, _) = keymap.bindings_for_input(std::slice::from_ref(keys), &stack);
+        bindings
+            .iter()
+            .filter(|binding| !gpui_kit::is_no_action(binding.action()))
+            .map(|binding| binding.action().name().to_string())
+            .collect()
+    }
+
+    fn chord_action(id: crate::shortcuts::ChordId) -> &'static str {
+        use crate::shortcuts::ChordId;
+        match id {
+            ChordId::SessionControls => "sealskin::ToggleSessionControls",
+            ChordId::FullScreen => "sealskin::ToggleFullScreen",
+            ChordId::Files => "sealskin::ToggleFiles",
+            ChordId::Library => "sealskin::ShowLibrary",
+            ChordId::CapturePointer => "sealskin::TogglePointerCapture",
+            ChordId::Quit => "sealskin::Quit",
+        }
+    }
+
+    #[test]
+    fn capture_chord_matches_option_shift_z() {
+        let keymap = gpui_kit::Keymap::new(key_bindings());
+        // Option turns z into "¸" on a US layout; GPUI matches the key, not the character.
+        let typed = Keystroke {
+            key_char: Some("¸".into()),
+            ..Keystroke::parse("ctrl-alt-shift-z").unwrap()
+        };
+        for contexts in [&MAC, &REMOTE] {
+            assert_eq!(
+                resolve_in(&keymap, &typed, contexts),
+                ["sealskin::TogglePointerCapture"]
+            );
+        }
+    }
+
+    /// The keystroke macOS delivers for a binding: Shift arrives as the lowercase key with
+    /// the shifted character in `key_char`; Control leaves no printable `key_char`.
+    fn delivered(source: &'static str) -> Keystroke {
+        let mut keys = Keystroke::parse(source).unwrap();
+        keys.key_char = (!keys.modifiers.control).then(|| {
+            if keys.modifiers.shift {
+                keys.key.to_uppercase()
+            } else {
+                keys.key.clone()
+            }
+        });
+        keys
+    }
+
+    #[test]
+    fn every_chord_that_acts_in_a_session_is_listed() {
+        use crate::shortcuts::CHORDS;
+        let keymap = gpui_kit::Keymap::new(key_bindings());
+        let listed: Vec<&str> = CHORDS.iter().map(|chord| chord_action(chord.id)).collect();
+        for binding in keymap.bindings() {
+            for keys in binding.keystrokes() {
+                let keys = Keystroke {
+                    modifiers: *keys.modifiers(),
+                    key: keys.key().to_string(),
+                    key_char: None,
+                };
+                // Only the winner acts.
+                if let Some(action) = resolve_in(&keymap, &keys, &MAC).first() {
+                    assert!(
+                        listed.contains(&action.as_str()),
+                        "{action} acts in a session window but isn't in shortcuts::CHORDS"
+                    );
+                }
+            }
+        }
+        for chord in CHORDS {
+            let keys = Keystroke::parse(chord.keystroke).unwrap();
+            assert_eq!(
+                resolve_in(&keymap, &keys, &MAC),
+                [chord_action(chord.id)],
+                "{}",
+                chord.keystroke
+            );
+        }
+        // The Library's ⌘O / ⌘L act there, and only there: not chords of a session window.
+        for source in ["cmd-o", "cmd-l"] {
+            let keys = Keystroke::parse(source).unwrap();
+            let actions = resolve_in(&keymap, &keys, &["Root", LIBRARY_CONTEXT]);
+            assert_eq!(actions.len(), 1, "{source}");
+            assert!(!listed.contains(&actions[0].as_str()), "{source}");
+            assert!(resolve_in(&keymap, &keys, &MAC).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn the_remote_context_hands_every_passable_chord_to_the_session() {
+        use crate::shortcuts::CHORDS;
+        let keymap = gpui_kit::Keymap::new(key_bindings());
+        for chord in CHORDS {
+            let actions = resolve_in(&keymap, &delivered(chord.keystroke), &REMOTE);
+            if chord.always_local {
+                assert_eq!(actions, [chord_action(chord.id)], "{}", chord.keystroke);
+            } else {
+                assert!(actions.is_empty(), "{}: {actions:?}", chord.keystroke);
+            }
+        }
+    }
+
+    #[test]
+    fn forwarding_matches_suppression() {
+        use crate::shortcuts::{passes_to_session, CHORDS};
+        let keymap = gpui_kit::Keymap::new(key_bindings());
+        let others = [
+            "cmd-c",
+            "cmd-shift-n",
+            "ctrl-shift-m",
+            "cmd-w",
+            "escape",
+            "m",
+        ];
+        for source in CHORDS.iter().map(|chord| chord.keystroke).chain(others) {
+            let keys = delivered(source);
+            let global = !resolve_in(&keymap, &keys, &MAC).is_empty();
+            let suppressed = global && resolve_in(&keymap, &keys, &REMOTE).is_empty();
+            assert_eq!(passes_to_session(&keys, false), suppressed, "{source}");
+            assert!(!passes_to_session(&keys, true), "{source}");
+        }
+    }
+
+    #[test]
+    fn suppression_must_come_last() {
+        let mut bindings = crate::shortcuts::suppress_bindings();
+        bindings.extend(global_bindings());
+        let keymap = gpui_kit::Keymap::new(bindings);
+        assert_eq!(
+            resolve_in(&keymap, &delivered("cmd-shift-m"), &REMOTE),
+            ["sealskin::ToggleSessionControls"]
+        );
     }
 
     #[test]

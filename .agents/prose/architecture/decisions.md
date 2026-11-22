@@ -205,6 +205,8 @@
 
 ## ARCH-019: Stats Section Follows the Selkies Web Sidebar's Stats
 
+- **Amended by `ARCH-031`:** the subscription is held while Stats is open or the stream strip is on, and history resets only when a subscription starts.
+
 - **Status:** settled — design approved in the preview workbench on 2026-11-21; amends the 1-second Stream Diagnostics of `ARCH-003` (`playback-and-diagnostics`)
 - **Finding (2026-11-21):** Selkies' web sidebar Stats (`selkies-dashboard/src/panels/stats.tsx` `StatsSection`, `stats-data.ts`, `selkies-web-core/lib/stream-stats{,-view}.ts`) shows four status rows, three history graphs, figure tiles, and host meters, and copies a plain-text report. Its numbers come from the server only while the stats are on screen: the page sends `_stats,1`, and the server answers once a second with `stream_stats` (`encode_ms`, `encoded_fps`, `pipeline_ms` with `pipeline_min_ms`/`pipeline_max_ms`, `send_ms` with its range, `video_mbps`, `peak_mbps`, `target_mbps` under CBR, `rtt_ms`, `throttled`, and the host's `cpu_percent`, `mem_used`/`mem_total`, `gpu_percent`, `gpu_mem_used`/`gpu_mem_total`). `stream_info` describes the encoder and capture path. Skerry showed nine label/value lines from its own counters and read only `stream_info.encoder`.
 - **Decision:** The Session Controls section is titled **Stats** and draws, in order, what the web sidebar draws for a WebSockets session:
@@ -237,11 +239,11 @@
 | **Stats** | "Show over the stream" switch; status rows, graphs, tiles, meters, copy (`StatsSection`) | Rows, graphs, tiles, meters, copy (`ARCH-019`) | Strip and floating gauges: `ARCH-GAP-VS-06` |
 | **Clipboard** | The server clipboard's text, editable (sent on blur, `clipboardUpdateFromUI`); image upload when binary clipboard is on (`enable_binary_clipboard`); masked-secret copy button | Clipboard section: Send to Session, Receive from Session, Seamless; Send Mac Clipboard / Copy Session Clipboard when Seamless is off; `NSPasteboard` sync on focus (`ARCH-017`). No editable text box: the Mac's own pasteboard is the clipboard | Settled: `ARCH-017` (`ARCH-GAP-DC-01`) |
 | **Files** | Opens the file manager: browse the session's directories, upload and download (shown when the server allows either transfer) | A native **Files** window per session (⌘⇧F, Session Controls → Files): browse, transfers, Finder copy/paste and drag both ways, Delete via SealSkin storage (`ARCH-023`, `ARCH-024`) | Settled (`ARCH-GAP-DC-02`); mount `ARCH-GAP-DC-14`, rename/move `ARCH-GAP-DC-15` |
-| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` |
+| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
-| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
-| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` |
+| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
+| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
 | **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
 | Footer | "Cite our paper academically" link | — | Excluded |
 
@@ -505,6 +507,115 @@
 - **Known:** the TLD list includes `app` and `ai`, so "Zen.app" followed by Return opens `https://zen.app`. A key refusal clears the chooser.
 - **Affected Rust:** `open_target.rs` (new), `sealskin.rs`, `transport.rs`, `selkies.rs`, `launch_progress.rs`, `app.rs`, `app/files_window.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,files.rs,assets.rs}`, `scripts/bundle.sh`, `examples/preview.rs`.
 
+## ARCH-031: Stats Strip over the Stream and a Shortcuts Card (Task F)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-06` and `ARCH-GAP-DC-12`. Amends `ARCH-019`: Stats history now resets only when a subscription starts.
+- **Process:** plan → design → review (7 required changes) → build → QA (4 trivial) → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-f-overlay-shortcuts`.
+- **Stats strip (`VS-06`):**
+  - A **Show over the stream** switch sits at the top of the Stats card, and View → **Toggle Stats Over Stream** does the same.
+  - The strip copies the Selkies web client's "over the stream" strip:
+    - four status marks (encoder, capture, decoder, connection), then fps, video Mbps against the target (amber above 1.1×), capture-to-sent ms, and RTT
+    - a 55 % black pill centred 8 pt from the top, in every theme
+    - tabular digits and fixed minimum widths so it doesn't jump
+    - it wraps whole figures in narrow windows
+  - It has no hitbox, so clicks pass through, including to the ⋯ button it draws over.
+  - It is saved per server through `persist.rs`.
+  - Only the strip was built. Moonlight, Parsec and Steam all use text overlays, and Selkies draws its gauges only in layouts Skerry doesn't follow.
+  - `_stats,1` is sent while the Stats card is open or the strip is on (`StatsInterest`), and sent again after a reconnect.
+  - `stats::strip_bottom` tells later overlays where to start below the strip.
+- **Shortcuts (`DC-12`):**
+  - A Shortcuts card after Input lists Skerry's own chords from one table (`shortcuts::CHORDS`): ⇧⌘M Session Controls, ⌃⌘F full screen, ⇧⌘F, ⌘0 Library, and ⌘Q "Always on the Mac". The glyphs are macOS menu glyphs in Apple's modifier order.
+  - **Mac shortcuts active** follows the server's `keyboard_shortcuts` until the user changes it, then the saved per-server value. A server lock wins, shows as a disabled switch, and survives reconnects.
+  - When it is off, those chords go to the session with ⌘ sent as Control. The key is sent as a down-up tap while Control stays held, so holding ⌘ never auto-repeats it. There is no escape chord: the View menu, the ⋯ button and ⌘Q always work, as in Jump Desktop and Windows App.
+  - One ordered `app::key_bindings()` puts the global chords first, then Files, then the Library's ⌘O/⌘L (`ARCH-028`), then a `NoAction` suppression layer under the `SessionDesktop` key context last. gpui-pre 0.3.12 lets the last binding win at equal depth.
+  - `passes_to_session` reuses the suppression bindings and always calls `stop_propagation`, so neither the menu nor AppKit's own ⌃⌘F item fires.
+- **Key release (amends `ARCH-026`):**
+  - AppKit sends no key-up while ⌘ is held. When ⌘ lifts, every key the ledger still holds is checked against the real HID key state (`CGEventSourceKeyState`) and released if it's up; keys still physically down stay held.
+- **QA:**
+  - A GPUI test window with the shipped key bindings, plus the real transport against a fake WebSocket server, showed:
+    - chords skip their actions and arrive as Ctrl
+    - ⌘Q stays local, and ⌘O/⌘L still work in the Library
+    - the letter's `ku` comes before Control's
+    - `_stats` ref-counting holds across 41 rapid flips and a reconnect
+  - Not verified (screen locked): the strip's look, clicking through it, full screen, and AppKit's ⌃⌘F item live.
+- **Affected Rust:** `shortcuts.rs` (new), `view/keys.rs`, `view.rs`, `stats.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{stats.rs,controls.rs,session.rs}`, `examples/preview.rs`.
+
+## ARCH-033: Remote Printing Through the macOS Print Dialog (Task H)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-04`.
+- **Process:** plan → design → review (12 required changes) → build → QA (1 medium) → code review (3 medium; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-h-printing`.
+- **Server facts (Selkies 715df7c):**
+  - The server sends text JSON `{"type":"print_document","name","size_bytes"}` to the primary controller, and sends it again after `server_settings`.
+  - `GET /api/print/{name}` deletes the file on a 200 before the body is sent (`transfer.rs:297`), so the fetch is one-shot.
+  - Gated by `printing_enabled` (default on). SealSkin's `harden_container` turns it off.
+- **Decision:**
+  - **Fetch:** each job downloads immediately on Tokio through `SelkiesClient::print_document`.
+    - The local file is created before the GET.
+    - Never `Range`.
+    - 30 s timeouts on the headers and on each chunk.
+    - A 1 GiB cap, checked before the request, on Content-Length, and while streaming. An over-cap announcement shows **Too large** and is never fetched.
+    - A `%PDF-` check as the bytes arrive.
+    - Failures before a 200, including a SealSkin cookie 403, say "Reconnect to receive", because the document is still on the server.
+    - No fetch starts once the window has closed.
+  - **Print…:** the PDFKit print operation runs as a sheet on the session window, from a `cx.spawn` task with no `cx.update` around the AppKit call. It takes the `NSWindow` and checks again before opening that the window is visible, has no sheet, and is key. A damaged or locked PDF shows **Unreadable**, with Open as the main button. `objc2-pdf-kit` 0.3.2 was added; it is the only new crate.
+  - **Notices:** stacked at top right, 340 pt wide, below the ⋯ button or below `ARCH-031`'s strip (`stats::strip_bottom`), with at most three shown. A Ready notice (Print… / Open / Save…) hides after 15 s. A name that failed and is announced again replaces the earlier failed job.
+  - **Printing card:** placed after Clipboard and shown only while `printing_enabled` is on. It holds **Open Print Dialog Automatically** (default on, like the web client's `print_auto`, saved per server through `persist.rs`) and the session's jobs, with Print…, Open, Save… and Remove per row.
+  - **Auto-open:** only when the session window or its sheet is key; otherwise the job waits for the window to become active (up to 5 min) and the notice says so.
+    - PM decision: documents already waiting at connect (announced within 3 s of `server_settings`, aged by `Last-Modified`) each get a notice. Only the newest auto-opens, and only if it is less than 5 minutes old, so a reconnect never brings up a burst of print dialogs.
+  - **Cache** (`~/Library/Caches/SealSkin Native/Print/`):
+    - Remove and window close delete unopened files. A job under an open sheet survives.
+    - Cmd-Q cleans every window's jobs synchronously in `on_app_quit`.
+    - A startup sweep removes anything older than 24 h.
+    - Closing with a sheet up ends the sheet and then removes the window, in one task.
+- **Prior art:** Parallels RAS and Windows App on the Mac open the native print dialog without an extra step.
+- **QA (live, real server):**
+  - `lp` printed through Selkies came back as a PDF. A second fetch got 404.
+  - A file over 1 GiB was listed as Too large and never fetched.
+  - A reconnect with 6 waiting documents auto-opened only the newest fresh one.
+  - The cleanup sweeps work in the real binary, and PDFKit rejects damaged, locked and no-print PDFs.
+  - Not verified (screen locked): the notices, the card, and the print sheet on screen.
+- **Affected Rust:** `print_jobs.rs` (new), `print_dialog.rs` (new), `selkies.rs`, `transport.rs`, `settings.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{session.rs,controls.rs}`, `examples/preview.rs`.
+
+## ARCH-032: Pointer Capture and Gamepads (Task G)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-06`. Custom chords were dropped, following `ARCH-031`.
+- **Process:** plan → design → review (13 required changes) → build (G1 pointer capture, G2 gamepads) → QA (2 medium, 3 low) → code review (4 rounds; one high found in rounds 2 and 3, fixed) by subagents (`ARCH-025`). Branch `task-g-gaming`, merged after Task H.
+- **Protocol (Selkies 715df7c):**
+  - Relative motion is `m2,<dx>,<dy>,<mask>,<magnitude>,<seq>`, integers only, so Skerry carries fractions forward.
+  - Pointer lock is `p,0|1` plus `SET_NATIVE_CURSOR_RENDERING,0|1`.
+  - Gamepads use `js,c,<idx>,<b64 name>,<axes>,<buttons>`, `js,d`, `js,b`/`js,a`, and a `js,h` heartbeat. Mapping follows the W3C standard layout.
+  - Rumble comes back as the system frame `rumble,<slot>,<strong>,<weak>,<ms>`.
+  - Everything is gated by `gamepad_enabled`, read as `{value, locked}`.
+- **Pointer capture (G1):**
+  - **Capture Pointer** lives in the Input card and in the View menu. ⌃⌥⇧Z (Moonlight's chord) captures and releases. It joins `shortcuts::CHORDS` as always-local, and a held chord toggles only once. VMware's ⌃⌘ clashes with ⌃⌘F, and Parallels' ⌃⌥ is a common Linux chord.
+  - **Capturing:**
+    - An app-wide AppKit monitor (`view/capture.rs`, built like `pinch.rs`) sends raw deltas to the input channel as scaled `m2` with carry.
+    - Skerry sends `p,1`, warps the cursor to the picture centre (primary-display flip), drops the first motion after the warp, dissociates the mouse from the cursor, and hides the cursor.
+  - **Releasing:** on the chord, on blur or deactivation, on child windows (including a print sheet, `ARCH-033`), on full screen, on disconnect, and on drop.
+    - Release shows "Pointer released". Errors release with no hint.
+    - Modifiers are lifted before they are muted.
+    - The transport sends `p,0`, `SET_NATIVE_CURSOR_RENDERING,0`, and `js,d` on close, because the server's cursor setting outlives the connection.
+  - Server pointer-lock requests are not honoured: Selkies sends none.
+  - Hint pill: "Pointer captured · ⌃⌥⇧Z releases it" at the bottom centre for 3 s.
+- **Gamepads (G2):**
+  - Apple's GameController framework (`objc2-game-controller` 0.3.2) and CoreHaptics (`objc2-core-haptics` 0.3.2; `createEngineWithLocality` is called through `msg_send!` because the crate gates it to iOS).
+  - **Slots:** an app-wide table gives each pad the lowest free slot 0–3. Drivers are keyed by session (host + session id), because each Selkies session has its own slot table.
+  - **Sending:** only changes are sent, plus `js,h` every 100 ms from the transport.
+    - Pads send only while the session window is key, as in Moonlight. When the window loses key, its slots return to rest.
+    - A window sends `js,d` only for the slots it drove.
+  - **Rumble:** each message starts a fresh haptics player, capped at 5 s. Engines stop with their players, and a start that races a stop is retried once.
+  - **Gamepads card:** four fixed slot rows, each with a numbered badge (Sending / Ready / Not sent), the name, and "· No rumble" when the pad has none. Battery display was cut.
+  - Skerry drives up to four slots; the web client drives one.
+- **Risks recorded:**
+  - Every `p` change makes the server reconfigure its displays.
+  - If the main thread hangs while the pointer is captured, the cursor stays frozen until ⌥⌘Esc.
+  - In collaboration rooms (master token set), the server drops Skerry's `js,` messages (`ARCH-GAP-DC-07`).
+- **QA:**
+  - The app launched with GameController and CoreHaptics loaded and didn't crash.
+  - A fake-server harness confirmed every message, the 100 ms heartbeat, and rumble reaching the haptics path.
+  - Not verified (screen locked, no controller): capture and warp on screen, `kill -9` while captured, real pads and haptics, and the server's display restart.
+- **Affected Rust:** `view/capture.rs` (new), `gamepad/` (new, `native.rs`), `view.rs`, `view/keys.rs`, `transport.rs`, `settings.rs`, `shortcuts.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{controls.rs,session.rs,assets.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -528,9 +639,9 @@
 | `ARCH-GAP-DC-14` | `desktop-and-collaboration` | `session-file-mount` | future scope | Mount session files in Finder via a File Provider extension, a local WebDAV server, or a local NFS server. |
 | `ARCH-GAP-DC-15` | `desktop-and-collaboration` | `remote-rename-move` | blocked (server) | Delete settled via SealSkin storage (`ARCH-024`); no server offers rename or move, and Cleanroom/direct-Selkies sessions cannot delete. |
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
-| `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | unresolved (todo) | Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference. |
+| `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
-| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
+| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
 | `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
@@ -540,7 +651,7 @@
 | `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | settled (`ARCH-026`) | Key only on `/companion/api/`, single FIFO write queue off the main thread, cached Library items. |
 | `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | settled client-side (`ARCH-026`) | Key releases are sent before the socket closes; no `kr`; `KeyLedger`. A live input trace is still to be taken. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
-| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | unresolved (backlog) | The web's "Show over the stream" strip (status marks, fps, video rate vs target, capture-to-sent, RTT over the picture, no pointer input) and its compact/detailed floating gauges (FPS, Mbps, RTT, CPU, GPU, MEM, VRAM half-circles) (`ARCH-020`). |
+| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | settled (`ARCH-031`) | The web's over-the-stream strip, with no hitbox and saved per server; the floating gauges were not built. |
 | `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | unresolved (backlog) | The web's Apps panel: proot-apps catalog by category with search, install/remove/update/launch and job consoles, gated by the server's `command_enabled` (`ARCH-020`). |
-| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | unresolved (backlog) | A Shortcuts panel listing Skerry's own chords (`cmd-shift-m`, full screen, and any gaming-mode / pointer-lock chord from `ARCH-GAP-DC-06`) with a switch that hands them to the remote session instead, as the web's "Shortcuts active" (`ARCH-020`). |
+| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
 | `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | unresolved (backlog) | The web's Pelorus panel: a prompt against the server's `/pelorus/api`, which describes the desktop as text for a caller without vision; evaluate whether Skerry should surface it (`ARCH-020`). |
