@@ -15,9 +15,7 @@ id: 067NC4KG01SKERRY0000000003
 <!-- compose:unresolved id=ARCH-GAP-LS-06 concept="account-and-key-recovery" question="Display signed-in account, effective capabilities, and usage limits; offer browser wake flow for dormant keys and replacement prompt for expired/revoked keys." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-09 concept="native-mac-app-presence" question="Give remote applications first-class native macOS app presence (separate Dock icon, Cmd+Tab entry, and optionally Spotlight); decide in a future compose turn between generated .app shims, automatic per-app helper processes, or both, and how relaunch behaves when a session is already running." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-10 concept="launcher-polish" question="Disconnect Server forgets the saved key with no confirmation; at wide windows (~2540 pt) about 75 % of the Library is empty; Refresh and Copy link give little lasting feedback; 'Started … ago' only updates on render. Add a confirm (or rename to Sign Out), a max content width or denser grid, and transient success toasts?" -->
 <!-- compose:unresolved id=ARCH-GAP-LS-13 concept="direct-selkies-sessions" question="Connect to a standalone Selkies server with no SealSkin in front (its own Basic or secure-mode token login), through `SelkiesClient` alone: what the Library shows for it, and how the credential is kept. The Files window already needs only `SelkiesClient` (`ARCH-024`); Delete stays SealSkin-only." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-11 concept="control-plane-hardening" question="Icon fetches send the Bearer application key to any same-origin `logo` path, which shares an origin with container-served session paths (matters once per-session origins land, ARCH-GAP-LS-07); preference and key writes fsync on the main thread; Library render clones the app list once and the session list twice per frame. Use an unauthenticated client (or an allow-listed prefix) for logos, move writes to the Tokio runtime, and borrow instead of cloning?" -->
 
 ### Goal
 
@@ -46,7 +44,11 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - **Stop** (labelled button) asks for confirmation that explains the remote app ends and cleanroom data is deleted, then calls the session stop API; Escape or Cancel keeps the session.
   - A just-launched session's WebSocket is retried for up to 45 s while it answers 404/502/503/504 or refuses connections (`ARCH-014`).
   - Unresolved frontier (`ARCH-GAP-LS-02`): Send File from the launcher.
-- `launcher-polish` (unresolved: `ARCH-GAP-LS-10`) and `control-plane-hardening` (unresolved: `ARCH-GAP-LS-11`): open findings from QA 2026-11-21.
+- `launcher-polish-and-hardening` (settled: `ARCH-026`):
+  - **Sign Out…** (was Disconnect Server) asks for confirmation. The wording names where the key came from (`config.toml`, environment, `.env`) and says open session windows stay connected. `application_key` is removed only when `config.toml` holds the active key.
+  - The Library content is a centred column capped at 1200 pt. Success toasts ("Library refreshed", "Link copied") show for 3 s at the bottom centre. "Started … ago" updates every 30 s while the Library is visible.
+  - The application key is attached only to requests under `/companion/api/`. Logos and icons use a client with no key.
+  - Preference and key writes go through the single first-in-first-out write queue in `persist.rs` on Tokio. Its in-memory copy serves every read, it flushes within 1 s on quit, and an unreadable file is backed up before it is overwritten.
 - `persistent-storage-and-shares` (unresolved: `ARCH-GAP-LS-05`):
   - Manage SealSkin homes, shared files, direct remote file opening without re-upload, and public share links (password, expiry, revocation).
 - `cluster-and-session-origins` (unresolved: `ARCH-GAP-LS-07`):

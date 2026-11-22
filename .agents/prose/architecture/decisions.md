@@ -325,6 +325,42 @@
 - **Deferred by the PM (not built in this plan):** `ARCH-GAP-VS-02` WebRTC (a second transport stack, needs a prototype before it can be designed); `ARCH-GAP-VS-03` VP8/VP9 software decode, 10-bit, and 4:4:4 (VideoToolbox has no hardware path; the hardware codecs already cover the need); `ARCH-GAP-DC-07` rooms and viewer roles (SealSkin 0.5.0 room messages carry only the sender alias, so control handoff can't be built cleanly); `ARCH-GAP-DC-08` raw multitouch (kept deferred on its own condition); `ARCH-GAP-DC-14` Finder mount (needs a signed File Provider extension); `ARCH-GAP-DC-15` rename and move (blocked: no server route); `ARCH-GAP-LS-07` cluster placement and per-session origins (no test cluster to verify against); `ARCH-GAP-LS-09` native per-app Dock presence (needs code-signing and a helper-process design of its own).
 - **Rationale:** the order puts small, low-risk, client-only work first, then the launcher features people use every day, then in-session media and input. Tasks that need a second protocol stack, signing infrastructure, or a server we can't test against are deferred, so that what ships can be verified.
 
+## ARCH-026: Launcher Polish, Control-Plane Hardening, Session Controls Memory, and Key Release Before Close (Task A)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-10`, `ARCH-GAP-LS-11`, and `ARCH-GAP-DC-09` (client side). `ARCH-GAP-VS-05` is now settled except the web's stream-toggle tile row (`ARCH-020`).
+- **Process:** plan → design → review (14 required changes) → build → QA (1 major, 5 minor) → code review (2 rounds, MERGE), all done by subagents (`ARCH-025`). Branch `task-a-polish`, merged into `frontier-2026-11-22`.
+- **Launcher (`LS-10`):**
+  - **Sign Out…** replaces **Disconnect Server** and asks for confirmation in a modal built like Stop Session (Cancel, then **Sign Out** in danger).
+    - The wording depends on where the key came from. With `config.toml` it says the saved key is removed. With `SEALSKIN_APPLICATION_KEY` or `.env` it says Skerry doesn't store that key and will use it again next launch.
+    - It says open session windows stay connected (`ARCH-022`).
+    - It removes `application_key` whenever `config.toml` holds the active key, and ignores a Refresh or launch still in flight.
+  - The Library content column is capped at 1200 pt and centred. Tiles and cards keep their sizes.
+  - Toasts are a `skerry-ui` component: bottom centre, 3 s, a new one replaces the old, successes only. They read "Library refreshed" (manual Refresh) and "Link copied".
+  - "Started … ago" updates every 30 s, only while the Library is visible and has sessions.
+- **Hardening (`LS-11`):**
+  - The application key is attached only to requests whose resolved path is under `/companion/api/`. Logos and `/app/<id>/icon.png` go through a second HTTP client that has no key. This is chosen on the resolved path in release builds too, and tested over raw TCP.
+  - Preference and key writes go through one first-in-first-out write queue on Tokio (`persist.rs`). It is the only writer, with an in-memory copy that every reader uses, so reads always see queued writes. On quit it flushes within 1 s (`block_on` in `on_app_quit`).
+  - Preferences load field by field. Unknown top-level keys from newer builds are written back. An unreadable file is copied to `<file>.bak-<timestamp>` before it is overwritten.
+  - Library items are cached as `Rc` slices and rebuilt only when marked dirty. Every image retirement (`ARCH-014`) marks them dirty.
+- **Session Controls (`VS-05`):**
+  - Which sections are open is saved per server. Restoring Stats open subscribes as a click would.
+  - Scroll position is kept per session window across closing the panel and reconnecting; it is not saved to disk.
+  - Preset was already a dropdown (`ARCH-018`), so no picker changed.
+  - Session Controls dropdowns use a `skerry-ui` `menu_dropdown` with a stronger, theme-aware shadow. Light: 0 8 24 at 16 % plus 0 2 6 at 8 %. Dark: 0 12 32 at 60 % plus a 1 px white 12 % ring, with GPUI blur at half the CSS value. Launch Dialog `Select` popups keep gpui-kit's own shadow.
+- **Stray Super key (`DC-09`):**
+  - Root cause in Skerry: `NativeSession::drop` aborted the transport task before the queued key releases were sent, so a key held during a codec switch stayed down on the remote.
+  - Now the transport sends `ku` for every held key, then a WebSocket close frame. A 1 s abort watchdog is the fallback, and a cancel flag stops a stream that is dropped while still connecting from ever sending `SETTINGS`.
+  - **No `kr` is sent anywhere.** Selkies' `reset_keyboard` releases Super/Meta/Control/Escape even when they aren't down, which could itself open a menu.
+  - Key bookkeeping lives in a pure `KeyLedger` (`view/keys.rs`):
+    - Command never maps to Super or Meta.
+    - A keysym that Shift changes while held is released.
+    - Keys are released on blur and before Session Controls, Files, or full screen.
+  - `SKERRY_INPUT_TRACE=1` prints each input message, with printable keys redacted.
+- **Corrections from review:** Selkies `disconnect()`/`connect()` reset only at server start and stop. An aborted socket (1006) leaves keys held until the server's roughly 2 s stale sweep, and a clean close runs `reset_keyboard`. Ctrl+Esc is a likelier trigger than Super.
+- **Not verified live:** the screen was locked during QA, so nothing was checked visually (Light/Dark shots, dropdown shadow, toasts). The Sign Out run and the codec-switch input trace were checked in code and unit tests only. The Library loading, keyless logo fetches (a proxy saw no Authorization), and resilience to a corrupt preferences file were verified live.
+- **Known, not fixed:** quitting still ends streams abruptly (1006), so the server holds keys for its grace period. The in-memory preferences stay ahead of disk after a failed write.
+- **Affected Rust:** `persist.rs` (new), `view/keys.rs` (new), `sealskin.rs`, `settings.rs`, `app.rs`, `view.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{library.rs,controls.rs,components.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -354,11 +390,11 @@
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
 | `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
-| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | partially settled (`ARCH-018`) | Settled: web-sidebar cards, dropdowns, sliders, switches. Open: Session Controls forgets section state/scroll; popovers lack shadow; the web's stream-toggle tile row (`ARCH-020`). |
-| `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | unresolved (todo) | Disconnect Server confirmation, wide-window Library density, Refresh/Copy feedback, live "Started … ago". |
+| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | mostly settled (`ARCH-018`, `ARCH-026`) | Settled: web-sidebar cards, section memory per server, scroll per window, theme-aware dropdown shadow. Open: the web's stream-toggle tile row (`ARCH-020`). |
+| `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | settled (`ARCH-026`) | Sign Out… with confirmation, 1200 pt Library column, success toasts, live "Started … ago". |
 | `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | unresolved (goal) | Connect to a standalone Selkies server with no SealSkin, through `SelkiesClient` alone (`ARCH-024`). |
-| `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | unresolved (todo) | No Bearer key on logo fetches, off-main-thread preference/key writes, fewer per-render clones. |
-| `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | unresolved (needs repro) | Remote start menu opened during a codec switch while focus moved; possible unreleased Cmd/Super. |
+| `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | settled (`ARCH-026`) | Key only on `/companion/api/`, single FIFO write queue off the main thread, cached Library items. |
+| `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | settled client-side (`ARCH-026`) | Key releases are sent before the socket closes; no `kr`; `KeyLedger`. A live input trace is still to be taken. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
 | `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | unresolved (backlog) | The web's "Show over the stream" strip (status marks, fps, video rate vs target, capture-to-sent, RTT over the picture, no pointer input) and its compact/detailed floating gauges (FPS, Mbps, RTT, CPU, GPU, MEM, VRAM half-circles) (`ARCH-020`). |
 | `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | unresolved (backlog) | The web's Apps panel: proot-apps catalog by category with search, install/remove/update/launch and job consoles, gated by the server's `command_enabled` (`ARCH-020`). |
