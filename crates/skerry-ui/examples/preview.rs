@@ -18,21 +18,22 @@ use skerry_ui::{
         SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
-        self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, SortColumn,
+        self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
         TransferRow, TransferStatus,
     },
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
-        LaunchOptions, LaunchSelect, RunningMatch,
+        LaunchOptions, LaunchSelect, OpeningLabel, RunningMatch,
     },
     library::{
-        self, AppItem, Filter, LaunchNotice, LaunchingItem, LibraryHandlers, LibraryProps,
-        SessionItem, StageRow, StageState,
+        self, AppItem, DropPreview, Filter, LaunchNotice, LaunchingItem, LibraryHandlers,
+        LibraryProps, OmnibarIcon, OpenHandlers, OpeningAppRow, OpeningKind, OpeningProps,
+        OpeningSessionRow, SessionItem, StageRow, StageState, UploadProgress,
     },
     session::{self, KeySourceLabel},
     stats,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -51,6 +52,20 @@ enum Story {
     LibraryLaunchDialogMinimal,
     LibraryEmpty,
     LibraryBusy,
+    LibraryOpenLink,
+    LibraryOpenLinkPending,
+    LibraryOpenLinkNotice,
+    LibraryOpenLinkNone,
+    LibraryOpenLinkRejected,
+    LibraryOpenFile,
+    LibraryOpenFileFallback,
+    LibraryDropTarget,
+    LibraryDropOnSession,
+    LibraryDropFolders,
+    LibraryUploading,
+    LibraryUploadFailed,
+    LaunchDialogOpenFile,
+    LaunchDialogOpenLink,
     LibrarySignOut,
     LibrarySignOutEnv,
     LibrarySignOutDotEnv,
@@ -99,6 +114,20 @@ impl Story {
         Story::LibraryLaunchDialogMinimal,
         Story::LibraryEmpty,
         Story::LibraryBusy,
+        Story::LibraryOpenLink,
+        Story::LibraryOpenLinkPending,
+        Story::LibraryOpenLinkNotice,
+        Story::LibraryOpenLinkNone,
+        Story::LibraryOpenLinkRejected,
+        Story::LibraryOpenFile,
+        Story::LibraryOpenFileFallback,
+        Story::LibraryDropTarget,
+        Story::LibraryDropOnSession,
+        Story::LibraryDropFolders,
+        Story::LibraryUploading,
+        Story::LibraryUploadFailed,
+        Story::LaunchDialogOpenFile,
+        Story::LaunchDialogOpenLink,
         Story::LibrarySignOut,
         Story::LibrarySignOutEnv,
         Story::LibrarySignOutDotEnv,
@@ -145,6 +174,20 @@ impl Story {
             | Story::LibraryLaunchDialogMinimal
             | Story::LibraryEmpty
             | Story::LibraryBusy
+            | Story::LibraryOpenLink
+            | Story::LibraryOpenLinkPending
+            | Story::LibraryOpenLinkNotice
+            | Story::LibraryOpenLinkNone
+            | Story::LibraryOpenLinkRejected
+            | Story::LibraryOpenFile
+            | Story::LibraryOpenFileFallback
+            | Story::LibraryDropTarget
+            | Story::LibraryDropOnSession
+            | Story::LibraryDropFolders
+            | Story::LibraryUploading
+            | Story::LibraryUploadFailed
+            | Story::LaunchDialogOpenFile
+            | Story::LaunchDialogOpenLink
             | Story::LibrarySignOut
             | Story::LibrarySignOutEnv
             | Story::LibrarySignOutDotEnv
@@ -192,6 +235,20 @@ impl Story {
             Story::LibraryLaunchDialogMinimal => "Launch Dialog · Minimal",
             Story::LibraryEmpty => "Empty",
             Story::LibraryBusy => "Busy + Status",
+            Story::LibraryOpenLink => "Open Link",
+            Story::LibraryOpenLinkPending => "Open Link · Opening",
+            Story::LibraryOpenLinkNotice => "Open Link · Not Taken",
+            Story::LibraryOpenLinkNone => "Open Link · No Apps",
+            Story::LibraryOpenLinkRejected => "Open Link · Rejected",
+            Story::LibraryOpenFile => "Open File",
+            Story::LibraryOpenFileFallback => "Open File · Unknown Type",
+            Story::LibraryDropTarget => "Drop Target",
+            Story::LibraryDropOnSession => "Drop on Session",
+            Story::LibraryDropFolders => "Drop · Folders Only",
+            Story::LibraryUploading => "Uploading + Files",
+            Story::LibraryUploadFailed => "Upload Failed",
+            Story::LaunchDialogOpenFile => "Launch Dialog · Open File",
+            Story::LaunchDialogOpenLink => "Launch Dialog · Open Link",
             Story::LibrarySignOut => "Sign Out · Saved key",
             Story::LibrarySignOutEnv => "Sign Out · Environment key",
             Story::LibrarySignOutDotEnv => "Sign Out · .env key",
@@ -241,6 +298,20 @@ impl Story {
             Story::LibraryLaunchDialogMinimal => "story-library-launch-dialog-minimal",
             Story::LibraryEmpty => "story-library-empty",
             Story::LibraryBusy => "story-library-busy",
+            Story::LibraryOpenLink => "story-library-open-link",
+            Story::LibraryOpenLinkPending => "story-library-open-link-pending",
+            Story::LibraryOpenLinkNotice => "story-library-open-link-notice",
+            Story::LibraryOpenLinkNone => "story-library-open-link-none",
+            Story::LibraryOpenLinkRejected => "story-library-open-link-rejected",
+            Story::LibraryOpenFile => "story-library-open-file",
+            Story::LibraryOpenFileFallback => "story-library-open-file-fallback",
+            Story::LibraryDropTarget => "story-library-drop-target",
+            Story::LibraryDropOnSession => "story-library-drop-session",
+            Story::LibraryDropFolders => "story-library-drop-folders",
+            Story::LibraryUploading => "story-library-uploading",
+            Story::LibraryUploadFailed => "story-library-upload-failed",
+            Story::LaunchDialogOpenFile => "story-library-launch-dialog-open-file",
+            Story::LaunchDialogOpenLink => "story-library-launch-dialog-open-link",
             Story::LibrarySignOut => "story-library-sign-out",
             Story::LibrarySignOutEnv => "story-library-sign-out-env",
             Story::LibrarySignOutDotEnv => "story-library-sign-out-dotenv",
@@ -289,6 +360,8 @@ impl Story {
                 | Story::LibraryLaunchDialogCopied
                 | Story::LibraryLaunchDialogRunning
                 | Story::LibraryLaunchDialogHidden
+                | Story::LaunchDialogOpenFile
+                | Story::LaunchDialogOpenLink
         )
     }
 
@@ -303,10 +376,14 @@ impl Story {
 
     /// The search a story opens with.
     fn query(self) -> &'static str {
-        if self == Story::LibrarySearchHidden {
-            "o"
-        } else {
-            ""
+        match self {
+            Story::LibrarySearchHidden => "o",
+            Story::LibraryOpenLink
+            | Story::LibraryOpenLinkPending
+            | Story::LibraryOpenLinkNotice => "wiki.lan/page",
+            Story::LibraryOpenLinkNone => "https://wiki.lan/page",
+            Story::LibraryOpenLinkRejected => "vnc://desk.lan",
+            _ => "",
         }
     }
 
@@ -727,6 +804,26 @@ impl PreviewApp {
             )
         };
         dialog.link_copied = story == Story::LibraryLaunchDialogCopied;
+        match story {
+            Story::LaunchDialogOpenFile => {
+                dialog = Self::fixture_launch_dialog("libreoffice", "LibreOffice", None, false);
+                dialog.opening = Some(OpeningLabel {
+                    kind: OpeningKind::File,
+                    label: "report.pdf".into(),
+                    detail: Some("PDF · 2.4 MB".into()),
+                    tooltip: Some("/Users/kim/Documents/report.pdf".into()),
+                });
+            }
+            Story::LaunchDialogOpenLink => {
+                dialog.opening = Some(OpeningLabel {
+                    kind: OpeningKind::Link,
+                    label: "wiki.lan/very/long/path/…/page".into(),
+                    detail: None,
+                    tooltip: Some("https://wiki.lan/very/long/path/to/the/page".into()),
+                });
+            }
+            _ => {}
+        }
         if story == Story::LibraryLaunchDialogRunning {
             dialog.favorite = true;
             dialog.running_match = Some(RunningMatch {
@@ -802,6 +899,7 @@ impl PreviewApp {
             show_organize: !minimal,
             link_copied: false,
             running_match: None,
+            opening: None,
         }
     }
 
@@ -1012,11 +1110,14 @@ impl PreviewApp {
                 storage_label: Some(storage.into()),
                 thumbnail: Some(Arc::clone(thumb)),
                 app_icon: Some(Arc::clone(icon)),
+                files: true,
+                accepts_drop: true,
             };
-        let sessions: Vec<SessionItem> = match story {
-            Story::LibraryLaunching | Story::LibraryLaunchingPull | Story::LibraryLaunchFailed => {
-                Vec::new()
-            }
+        let mut sessions: Vec<SessionItem> = match story {
+            Story::LibraryLaunching
+            | Story::LibraryLaunchingPull
+            | Story::LibraryLaunchFailed
+            | Story::LibraryUploadFailed => Vec::new(),
             Story::LibraryLaunchStalled => vec![session(
                 "sess-zen",
                 "Zen",
@@ -1041,7 +1142,35 @@ impl PreviewApp {
                 ),
             ],
         };
+        if story == Story::LibraryUploading {
+            // A collaboration room: no Files button, not a drop target.
+            sessions.push(SessionItem {
+                id: "sess-room".into(),
+                app_name: "Firefox (room)".into(),
+                started_label: Some("Started 4m ago".into()),
+                gpu: false,
+                storage_label: Some("Cleanroom".into()),
+                thumbnail: None,
+                app_icon: Some(Arc::clone(&self.assets.icon_firefox)),
+                files: false,
+                accepts_drop: false,
+            });
+        }
+        if matches!(story, Story::LibraryOpenFile) {
+            for (id, name) in [
+                ("libreoffice", "LibreOffice"),
+                ("evince", "Evince"),
+                ("gimp", "GIMP"),
+                ("okular", "Okular"),
+                ("calibre", "Calibre"),
+                ("xournal", "Xournal++"),
+                ("scribus", "Scribus"),
+            ] {
+                apps.push(self.app_item(id, name, "office"));
+            }
+        }
         let (launching, launching_apps) = self.fixture_launching();
+        let opening = self.fixture_opening();
         LibraryProps {
             app_name: "SealSkin Native".into(),
             server: server.into(),
@@ -1053,8 +1182,178 @@ impl PreviewApp {
             launching_apps,
             search_query: self.search_input.read(cx).value().to_string(),
             selected_filter: self.selected_filter.clone(),
-            status: None,
+            status: (story == Story::LibraryDropFolders).then(|| {
+                "Open one file at a time. To copy a folder, use Files on a running session.".into()
+            }),
             busy: None,
+            omnibar: match story {
+                Story::LibraryOpenLink
+                | Story::LibraryOpenLinkPending
+                | Story::LibraryOpenLinkNotice
+                | Story::LibraryOpenLinkNone => OmnibarIcon::Link,
+                Story::LibraryOpenLinkRejected => OmnibarIcon::Rejected,
+                _ => OmnibarIcon::Search,
+            },
+            opening,
+            files_pending: HashSet::new(),
+            accepts_drops: true,
+            drop_preview: match story {
+                Story::LibraryDropTarget => Some(DropPreview::Library),
+                Story::LibraryDropOnSession => Some(DropPreview::Session("sess-zen".into())),
+                Story::LibraryDropFolders => Some(DropPreview::FoldersOnly),
+                _ => None,
+            },
+        }
+    }
+
+    /// The open chooser of the Open Link and Open File stories.
+    fn fixture_opening(&self) -> Option<OpeningProps> {
+        let story = self.story;
+        let zen = Some(Arc::clone(&self.assets.icon_zen));
+        let lightcraft = Some(Arc::clone(&self.assets.icon_lightcraft));
+        let session = |id: &str, name: &str, detail: &str, icon: Option<Arc<RenderImage>>| {
+            OpeningSessionRow {
+                id: id.into(),
+                app_name: name.into(),
+                detail: detail.into(),
+                icon,
+            }
+        };
+        let app = |id: &str, name: &str, icon: Option<Arc<RenderImage>>| OpeningAppRow {
+            id: id.into(),
+            name: name.into(),
+            icon,
+            launching: false,
+        };
+        let base = OpeningProps {
+            kind: OpeningKind::Link,
+            label: "wiki.lan/page".into(),
+            tooltip: Some("https://wiki.lan/page".into()),
+            detail: None,
+            rejected: false,
+            sessions: Vec::new(),
+            apps: Vec::new(),
+            apps_expanded: false,
+            queue_more: false,
+            pending_session: None,
+            note: None,
+            enter_hint: false,
+            generation: 1,
+        };
+        let link_rows = |mut props: OpeningProps| {
+            props.sessions = vec![
+                session("sess-zen", "Zen", "Started 5m ago · auto-zen", zen.clone()),
+                session("sess-chromium", "Chromium", "Started 2 days ago", None),
+            ];
+            props.apps = vec![
+                app("zen", "Zen", zen.clone()),
+                app("chromium", "Chromium", None),
+                app(
+                    "firefox",
+                    "Firefox ESR",
+                    Some(Arc::clone(&self.assets.icon_firefox)),
+                ),
+            ];
+            props.enter_hint = true;
+            props
+        };
+        let note = |text: &str, error: bool| {
+            Some(Notice {
+                text: text.into(),
+                error,
+            })
+        };
+        match story {
+            Story::LibraryOpenLink => Some(link_rows(base)),
+            Story::LibraryOpenLinkPending => Some(OpeningProps {
+                pending_session: Some("sess-zen".into()),
+                ..link_rows(base)
+            }),
+            Story::LibraryOpenLinkNotice => Some(OpeningProps {
+                note: note(
+                    "Zen couldn’t take the link. Choose another session or launch a new one.",
+                    true,
+                ),
+                ..link_rows(base)
+            }),
+            Story::LibraryOpenLinkNone => Some(OpeningProps {
+                note: note("No app on this server opens links.", false),
+                ..base
+            }),
+            Story::LibraryOpenLinkRejected => Some(OpeningProps {
+                label: "vnc://desk.lan".into(),
+                tooltip: None,
+                rejected: true,
+                note: note(
+                    "Skerry opens web (http, https), ftp and magnet links.",
+                    false,
+                ),
+                ..base
+            }),
+            Story::LibraryOpenFile => {
+                let mut apps = vec![
+                    app("libreoffice", "LibreOffice", None),
+                    app("evince", "Evince", None),
+                    app("zen", "Zen", zen.clone()),
+                ];
+                for (id, name) in [
+                    ("gimp", "GIMP"),
+                    ("okular", "Okular"),
+                    ("calibre", "Calibre"),
+                    ("xournal", "Xournal++"),
+                    ("scribus", "Scribus"),
+                    ("inkscape", "Inkscape"),
+                    ("krita", "Krita"),
+                ] {
+                    apps.push(app(id, name, None));
+                }
+                Some(OpeningProps {
+                    kind: OpeningKind::File,
+                    label: "report.pdf".into(),
+                    tooltip: Some("/Users/kim/Documents/report.pdf".into()),
+                    detail: Some("PDF · 2.4 MB · 1 of 3".into()),
+                    sessions: vec![
+                        session("sess-zen", "Zen", "Started 5m ago · auto-zen", zen.clone()),
+                        session(
+                            "sess-lightcraft",
+                            "LightCraft",
+                            "Started 2 days ago",
+                            lightcraft,
+                        ),
+                    ],
+                    apps,
+                    queue_more: true,
+                    ..base
+                })
+            }
+            Story::LibraryOpenFileFallback => Some(OpeningProps {
+                kind: OpeningKind::File,
+                label: "data.xyz".into(),
+                tooltip: Some("/Users/kim/Downloads/data.xyz".into()),
+                detail: Some("XYZ · 120 KB".into()),
+                apps: vec![
+                    app("lightcraft", "LightCraft", lightcraft),
+                    app(
+                        "weixin",
+                        "Weixin",
+                        Some(Arc::clone(&self.assets.icon_weixin)),
+                    ),
+                    app("zen", "Zen", zen),
+                    app(
+                        "vscode",
+                        "VS Code",
+                        Some(Arc::clone(&self.assets.icon_vscode)),
+                    ),
+                    app(
+                        "firefox",
+                        "Firefox",
+                        Some(Arc::clone(&self.assets.icon_firefox)),
+                    ),
+                ],
+                note: note("No app lists .xyz files, so all apps are shown.", false),
+                ..base
+            }),
+            _ => None,
         }
     }
 
@@ -1077,6 +1376,9 @@ impl PreviewApp {
                     detail: detail.map(Into::into),
                     status: status.into(),
                     notice,
+                    upload: None,
+                    subject: None,
+                    cancellable: false,
                 }
             };
         let (cards, tiles): (Vec<LaunchingItem>, Vec<(&str, &str)>) = match self.story {
@@ -1165,6 +1467,67 @@ impl PreviewApp {
                         body: "No GPU is free on any node.".into(),
                     }),
                 )],
+                Vec::new(),
+            ),
+            Story::LibraryUploading => (
+                vec![
+                    LaunchingItem {
+                        upload: Some(UploadProgress {
+                            fraction: 0.3,
+                            label: "Uploading 12 MB of 40 MB".into(),
+                        }),
+                        subject: Some((
+                            OpeningKind::File,
+                            "quarterly-report-final.xlsx".into(),
+                        )),
+                        cancellable: true,
+                        detail: None,
+                        ..card(
+                            "l3",
+                            "LibreOffice",
+                            None,
+                            Vec::new(),
+                            None,
+                            "Launching · 0:09",
+                            None,
+                        )
+                    },
+                    LaunchingItem {
+                        subject: Some((OpeningKind::Link, "wiki.lan/page".into())),
+                        ..card(
+                            "l4",
+                            "Zen",
+                            Some(Arc::clone(&self.assets.icon_zen)),
+                            vec![
+                                row("Requesting", Some("1 s"), StageState::Done),
+                                row("Starting", Some("3 s"), StageState::Current),
+                                row("Connecting", None, StageState::Pending),
+                            ],
+                            Some("Creating the container"),
+                            "Launching · 0:04",
+                            None,
+                        )
+                    },
+                ],
+                vec![("zen", "Starting…")],
+            ),
+            Story::LibraryUploadFailed => (
+                vec![LaunchingItem {
+                    subject: Some((OpeningKind::File, "report.pdf".into())),
+                    ..card(
+                        "l5",
+                        "LibreOffice",
+                        None,
+                        vec![row("Requesting", Some("0 s"), StageState::Failed)],
+                        None,
+                        "Launch failed",
+                        Some(LaunchNotice::Failed {
+                            headline: "Couldn’t launch LibreOffice".into(),
+                            body: "Your SealSkin storage is full. Free space in Files, then try again."
+                                .into(),
+                        }),
+                    )
+                }],
                 Vec::new(),
             ),
             _ => (Vec::new(), Vec::new()),
@@ -1978,6 +2341,7 @@ impl PreviewApp {
                 let props = ConnectProps {
                     busy: Some("Connecting to sealskin.example.internal…".into()),
                     status: None,
+                    pending_open: Some("Connect to a server to open “report.pdf”.".into()),
                 };
                 connect::render(theme, &props, &self.key_input, |_, _, _| {})
             }
@@ -1987,6 +2351,7 @@ impl PreviewApp {
                         "Invalid application key format. Expected ssk_<id>_<secret>@<host>.".into(),
                     ),
                     busy: None,
+                    pending_open: None,
                 };
                 let entity = entity.clone();
                 connect::render(theme, &props, &self.key_input, move |_, _, cx| {
@@ -2015,7 +2380,21 @@ impl PreviewApp {
             | Story::LibraryLaunchStalled
             | Story::LibraryLaunchFailed
             | Story::LibraryLaunchDialogRunning
-            | Story::LibraryLaunchDialogHidden => {
+            | Story::LibraryLaunchDialogHidden
+            | Story::LibraryOpenLink
+            | Story::LibraryOpenLinkPending
+            | Story::LibraryOpenLinkNotice
+            | Story::LibraryOpenLinkNone
+            | Story::LibraryOpenLinkRejected
+            | Story::LibraryOpenFile
+            | Story::LibraryOpenFileFallback
+            | Story::LibraryDropTarget
+            | Story::LibraryDropOnSession
+            | Story::LibraryDropFolders
+            | Story::LibraryUploading
+            | Story::LibraryUploadFailed
+            | Story::LaunchDialogOpenFile
+            | Story::LaunchDialogOpenLink => {
                 let server = if self.story == Story::LibraryLongServer {
                     "analytics-gpu-cluster-07.eu-central.sealskin.example.internal"
                 } else {
@@ -2346,6 +2725,49 @@ impl PreviewApp {
                     this.selected_filter = filter;
                 });
             }),
+            open: self.open_handlers(cx),
+        }
+    }
+
+    /// The chooser, drop and Files handlers only record what they would do.
+    fn open_handlers(&self, cx: &mut Context<Self>) -> OpenHandlers {
+        let entity = cx.entity();
+        let record = |label: &'static str| {
+            let entity = entity.clone();
+            Rc::new(move |id: String, _: u64, _: &mut Window, cx: &mut App| {
+                entity.update(cx, |this, cx| {
+                    this.record_event(format!("{label}: {id}"), cx)
+                });
+            }) as library::OpeningHandler
+        };
+        let action = |label: &'static str| {
+            let entity = entity.clone();
+            Rc::new(move |_: &mut Window, cx: &mut App| {
+                entity.update(cx, |this, cx| this.record_event(label, cx));
+            }) as library::ActionHandler
+        };
+        let files_entity = entity.clone();
+        let drop_entity = entity.clone();
+        let session_drop_entity = entity.clone();
+        OpenHandlers {
+            on_open_in_session: Some(record("Chooser: Running row")),
+            on_open_with_app: Some(record("Chooser: Launch & Open")),
+            on_clear_opening: Some(action("Chooser: Cancel")),
+            on_skip_opening: Some(action("Chooser: Skip")),
+            on_toggle_opening_apps: Some(action("Chooser: Show All")),
+            on_files: Some(Rc::new(move |id, _, cx| {
+                files_entity.update(cx, |this, cx| this.record_event(format!("Files: {id}"), cx));
+            })),
+            on_drop: Some(Rc::new(move |paths, _, cx| {
+                drop_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Drop on Library: {} items", paths.len()), cx)
+                });
+            })),
+            on_drop_to_session: Some(Rc::new(move |id, paths, _, cx| {
+                session_drop_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Drop on {id}: {} items", paths.len()), cx)
+                });
+            })),
         }
     }
 }
