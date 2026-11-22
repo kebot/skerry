@@ -453,7 +453,12 @@ fn redact_key_command(text: &str) -> Option<String> {
     let keys: Vec<String> = keys
         .split(',')
         .map(|key| match key.parse::<u32>() {
-            Ok(keysym) if (0xff00..=0xffff).contains(&keysym) => keysym.to_string(),
+            // Keypad digits and operators (0xff80 to 0xffbd) are typed text too.
+            Ok(keysym)
+                if (0xff00..=0xffff).contains(&keysym) && !(0xff80..=0xffbd).contains(&keysym) =>
+            {
+                keysym.to_string()
+            }
             _ => "<char>".into(),
         })
         .collect();
@@ -1283,6 +1288,7 @@ mod tests {
             redact_key_command("kh,97,65505,32").as_deref(),
             Some("kh,<char>,65505,<char>")
         );
+        assert_eq!(redact_key_command("kd,65457").as_deref(), Some("kd,<char>"));
         assert_eq!(redact_key_command("kr").as_deref(), Some("kr"));
         assert_eq!(redact_key_command("m2,0,0,1,0"), None);
         assert_eq!(redact_key_command("SETTINGS,{}"), None);

@@ -897,6 +897,21 @@ fn dropdown(
 #[derive(Default)]
 struct MenuState {
     menu: Option<Entity<PopupMenu>>,
+    /// The labels and checks the menu was built with.
+    built_for: Vec<(String, bool)>,
+}
+
+/// Whether a menu built for `built_for` still shows `items`. A menu can close without a
+/// `DismissEvent` (the popover's own Escape or trigger click), so the cache is checked
+/// against the current items instead of trusting the dismissal to clear it.
+fn menu_is_current(built_for: &[(String, bool)], items: &[(String, bool, ControlsAction)]) -> bool {
+    built_for.len() == items.len()
+        && built_for
+            .iter()
+            .zip(items)
+            .all(|((label, checked), (item, item_checked, _))| {
+                label == item && checked == item_checked
+            })
 }
 
 /// gpui-kit's `dropdown_menu`, rebuilt so the popup gets `elevated_shadow` (gpui-kit's own
@@ -904,6 +919,11 @@ struct MenuState {
 /// dismiss subscription holding only Weak handles (a strong one would leak the menu), and
 /// no overlay close. gpui-kit's trigger-focus hook is private, so focus goes back to
 /// `menus.return_focus` instead.
+///
+/// A click on the trigger while the menu is open closes it and doesn't reopen it: the menu's
+/// mouse-down-out runs in the capture phase and dismisses the popover first, and the
+/// popover's trigger handler toggles only when the open state is still the one it rendered
+/// with (gpui-base `Popover`).
 fn menu_dropdown(
     id: SharedString,
     trigger: Button,
@@ -926,25 +946,39 @@ fn menu_dropdown(
             // The wrapper takes the menu's own radius, so the shadow's corners match.
             let radius = cx.theme().radius;
             let shadow = elevated_shadow(cx.theme());
-            let menu = match menu_state.read(cx).menu.clone() {
+            let cached = menu_state
+                .read(cx)
+                .menu
+                .clone()
+                .filter(|_| menu_is_current(&menu_state.read(cx).built_for, &items));
+            let menu = match cached {
                 Some(menu) => menu,
                 None => {
-                    let items = Rc::clone(&items);
+                    let menu_items = Rc::clone(&items);
                     let on_action = Rc::clone(&on_action);
                     let menu = PopupMenu::build(window, cx, move |menu, _, _| {
-                        items.iter().fold(menu, |menu, (label, checked, action)| {
-                            let on_action = Rc::clone(&on_action);
-                            let action = action.clone();
-                            menu.item(
-                                PopupMenuItem::new(label.clone())
-                                    .checked(*checked)
-                                    .on_click(move |_, window, cx| {
-                                        on_action(action.clone(), window, cx)
-                                    }),
-                            )
-                        })
+                        menu_items
+                            .iter()
+                            .fold(menu, |menu, (label, checked, action)| {
+                                let on_action = Rc::clone(&on_action);
+                                let action = action.clone();
+                                menu.item(
+                                    PopupMenuItem::new(label.clone())
+                                        .checked(*checked)
+                                        .on_click(move |_, window, cx| {
+                                            on_action(action.clone(), window, cx)
+                                        }),
+                                )
+                            })
                     });
-                    menu_state.update(cx, |state, _| state.menu = Some(menu.clone()));
+                    let built_for = items
+                        .iter()
+                        .map(|(label, checked, _)| (label.clone(), *checked))
+                        .collect();
+                    menu_state.update(cx, |state, _| {
+                        state.menu = Some(menu.clone());
+                        state.built_for = built_for;
+                    });
                     menu.focus_handle(cx).focus(window, cx);
                     let popover_state = cx.entity().downgrade();
                     let weak_state = menu_state.downgrade();
@@ -1138,6 +1172,21 @@ fn switch_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_menu_is_rebuilt_when_its_items_change() {
+        let item = |label: &str, checked| (label.to_string(), checked, ControlsAction::SetFitMode);
+        let built = vec![
+            ("1280 × 720".to_string(), true),
+            ("1920 × 1080".to_string(), false),
+        ];
+        let same = [item("1280 × 720", true), item("1920 × 1080", false)];
+        let moved_check = [item("1280 × 720", false), item("1920 × 1080", true)];
+        assert!(menu_is_current(&built, &same));
+        assert!(!menu_is_current(&built, &moved_check));
+        assert!(!menu_is_current(&built, &same[..1]));
+        assert!(!menu_is_current(&[], &same));
+    }
 
     #[test]
     fn toggle_flips_only_that_section() {
