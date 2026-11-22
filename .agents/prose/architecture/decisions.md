@@ -435,6 +435,36 @@
 - **Known:** a progress run that the server pruned after 900 s can still offer a fresh Retry.
 - **Affected Rust:** `launch_progress.rs` (new), `sealskin.rs`, `settings.rs`, `launch_options.rs`, `transport.rs`, `app.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,session.rs,components.rs}`, `examples/preview.rs`.
 
+## ARCH-029: Account Menu and Key Recovery (Task D)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-06`.
+- **Process:** plan → design → review (10 required changes) → build → QA (2 medium, fixed) → code review (1 high, 1 medium, fixed; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-d-account`.
+- **What SealSkin 0.5.0 gives a key:**
+  - `POST /companion/api/admin/status` (`routers/admin.py:116`) is open to every user. It returns name, admin flag, groups, rights (storage, GPU, VPN), limits (sessions, session length, idle, CPUs, memory, storage), the hours allowance, `held`, and storage used (with `?storage=1`).
+  - Key refusals are `401` with `detail` = `unknown` / `expired` / `dormant` / `disabled` / `client` (`security.py:489-513`).
+  - A key's own expiry, name and last use are not available to the key (`/api/keys` answers web sign-ins only), so they are left out.
+  - Only the built-in `admin` user never goes dormant.
+- **Account menu:**
+  - The Library header's right edge holds an account button (user icon, name, caret). It takes the place of Task A's header Sign Out (macOS convention and SealSkin's own profile card).
+  - Its 300 pt popover shows: name with an Admin tag, server, groups; Storage/GPU/VPN chips; and limit rows in the web profile's order with 4 pt meters (warning at 80 %, danger at 100 %, with a caption). Storage uses binary GB, as `quota.py` does, and is measured only when the menu opens; only a failed measure is retried. The key's source and its sleep time come next.
+  - The footer has **Open SealSkin in Browser** and **Sign Out…** (in red), which closes the popover and then opens Task A's confirmation (`ARCH-026`).
+  - Admins see "Administrators have every capability and no limits." The key id appears only in a tooltip.
+- **Recovery:**
+  - **Dormant:** a panel with **Sign In on the Web** (opens `<origin>/?wake=1`, never with the key in the URL), Try Again, and Use a Different Key. Skerry checks again every 5 s for up to 3 minutes and when the window becomes active. The poll is a GPUI task the Launcher owns, cancelled on every exit; `WakeState` clears its in-flight mark whenever a poll starts or stops.
+  - **Revoked or expired:** back to Connect with a red alert. The field is relabelled "New Application Key", empty and focused. The saved key stays in `config.toml` until a replacement connects. An empty Connect says "Paste a new application key." and sends nothing.
+  - **Disabled, client not allowed, or inactive:** a yellow alert, and an empty field retries the current key. Use a Different Key keeps the current key as the retry target, and a network failure on retry doesn't lose it.
+  - **Held:** read from `held: true` before any text match. It shows a panel with Open SealSkin in Browser and Try Again.
+  - Any unrecognised 403 shows the server's own sentence under "SealSkin refused the request" and allows a retry. Quota or permission 403s show the server's sentence alone.
+  - A key from the environment or `.env` gets a note: a pasted key is saved, but the environment key wins at the next launch.
+  - A pasted key that is refused at first and connects later (wake poll, Try Again, empty Connect) is kept as a pending credential and saved on that success. Environment and `.env` keys are never saved.
+  - Refusals on Refresh, Launch (including home creation and Task B's progress 401) and Stop all reach this flow. Session windows keep streaming; their Files window's Storage pane shows the refusal; a new key reaches a session window only after it is reopened.
+- **Evidence:** SealSkin 0.5.0 `routers/admin.py`, `security.py:489-513`, `api.md:42`, `shell/host.js:253`, `ui/app.js:122-165`. Prior art: gh and Tailscale re-authenticate in the browser and keep the old credential until the new one works.
+- **QA:**
+  - Live and read-only: the real `admin/status` for the admin user gives the expected menu.
+  - A fake HTTPS server with the real binary: every refusal code mapped to the right recovery state with one Library round, `config.toml` stayed byte-identical, and the key went only to the control-plane host.
+  - Not verified: anything on screen (screen locked) and the wake flow in a real browser.
+- **Affected Rust:** `app/account.rs` (new), `crates/skerry-ui/src/account.rs` (new), `sealskin.rs`, `app.rs`, `launch_progress.rs`, `app/files_window.rs`, `crates/skerry-ui/src/{library.rs,connect.rs,assets.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -449,7 +479,7 @@
 | `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
 | `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Search, icons, categories, favorites, hidden apps, recents (saved per server), and reuse of a matching running session. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
-| `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
+| `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | settled (`ARCH-029`) | Account menu with limits and meters, plus dormant / revoked / expired / disabled / held key recovery that keeps the old key until a new one connects. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
 | `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | settled (`ARCH-022`) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
 | `ARCH-GAP-LS-09` | `launcher-and-sessions` | `native-mac-app-presence` | unresolved (backlog) | Per-app native macOS presence (Dock icon, `Cmd+Tab`, optionally Spotlight); mechanism (`.app` shims vs. helper processes vs. both) and existing-session relaunch behavior deferred to future compose decision. |
