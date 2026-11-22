@@ -6,15 +6,34 @@ use std::borrow::Cow;
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
-        Trash, FolderPlus, LogOut, Circle, Hourglass, Link, FileUp, FolderUp, Ban, Info, Printer,
-        Download, FileX, Crosshair
+        Trash,
+        FolderPlus,
+        LogOut,
+        Circle,
+        Hourglass,
+        Link,
+        FileUp,
+        FolderUp,
+        Ban,
+        Info,
+        Printer,
+        Download,
+        FileX,
+        Crosshair,
+        Lock,
+        LockOpen,
+        KeyRound,
+        ShieldAlert,
+        Monitor,
+        Server
     ]
 );
 
 /// gpui-kit's default icons, the Files window's Trash and New Folder icons, and Sign Out's
 /// LogOut icon, the launch checklist’s Circle, the Held panel’s Hourglass, and the open
 /// chooser’s Link, FileUp, FolderUp, Ban and Info (`ARCH-028`), and printing’s Printer,
-/// Download and FileX (`ARCH-033`).
+/// Download and FileX (`ARCH-033`), and direct Selkies' Lock, LockOpen, KeyRound, ShieldAlert,
+/// Monitor and Server (`ARCH-036`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SkerryAssets;
 
@@ -55,6 +74,12 @@ mod tests {
             gpui_kit::assets::IconName::Printer,
             gpui_kit::assets::IconName::Download,
             gpui_kit::assets::IconName::FileX,
+            gpui_kit::assets::IconName::Lock,
+            gpui_kit::assets::IconName::LockOpen,
+            gpui_kit::assets::IconName::KeyRound,
+            gpui_kit::assets::IconName::ShieldAlert,
+            gpui_kit::assets::IconName::Monitor,
+            gpui_kit::assets::IconName::Server,
         ] {
             let path = icon.path();
             assert!(

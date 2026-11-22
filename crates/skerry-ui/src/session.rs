@@ -697,6 +697,30 @@ pub fn sign_out_confirm_modal(
     )
 }
 
+/// Confirmation before forgetting a direct Selkies server (`ARCH-036`).
+pub fn forget_server_confirm_modal(
+    theme: &Theme,
+    display_name: &str,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    confirm_modal(
+        theme,
+        ConfirmCopy {
+            id: "forget-server",
+            title: format!("Forget {display_name}?"),
+            body: vec![
+                "Skerry removes its address, login and trusted certificate from ~/.config/skerry/config.toml.".into(),
+                "Open session windows stay connected.".into(),
+            ],
+            confirm_label: "Forget",
+            confirm_icon: Some(gpui_kit::assets::IconName::Trash.into()),
+        },
+        on_cancel,
+        on_confirm,
+    )
+}
+
 struct ConfirmCopy {
     id: &'static str,
     title: String,
