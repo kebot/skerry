@@ -647,15 +647,19 @@ fn render_input(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandle
 /// Capture Pointer: the label with its crosshair, the chord's glyphs on the right, and a
 /// note on how to get out (`ARCH-032`).
 fn render_capture(theme: &Theme, capture: &CaptureProps, on_action: &ControlsHandler) -> Div {
+    let chord = format!("{}{}", capture.modifiers, capture.key);
     let (label, note) = if capture.captured {
-        ("Pointer Captured", "Press ⌃⌥⇧Z to release it.")
+        ("Pointer Captured", format!("Press {chord} to release it."))
     } else if capture.available {
         (
             "Capture Pointer",
-            "⌃⌥⇧Z, ⌘-Tab, or leaving the window releases it.",
+            format!("{chord}, ⌘-Tab, or leaving the window releases it."),
         )
     } else {
-        ("Capture Pointer", "Available once the picture appears.")
+        (
+            "Capture Pointer",
+            "Available once the picture appears.".to_string(),
+        )
     };
     let on_action = Rc::clone(on_action);
     let button = Button::new("input-capture-pointer")
@@ -1360,13 +1364,7 @@ fn render_gamepads(theme: &Theme, gamepads: &GamepadsProps, on_action: &Controls
         .when_some(note, |panel, note| {
             panel.child(muted_line(Some(IconName::Info), note.to_string()))
         })
-        .child(
-            div()
-                .v_flex()
-                .gap(px(FIELD_GAP))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Players"))
-                .child(div().v_flex().gap(px(4.)).children(rows)),
-        )
+        .child(field("Players", div().v_flex().gap(px(4.)).children(rows)))
         .when(empty, |panel| {
             panel.child(muted_line(
                 None,

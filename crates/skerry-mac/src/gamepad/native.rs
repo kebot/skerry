@@ -393,10 +393,16 @@ impl Haptics {
         }
     }
 
+    /// Stops every player, then the engines, so nothing keeps the controller awake; the
+    /// next rumble starts them again.
     fn stop(&mut self) {
         let motors: Vec<Motor> = self.players.keys().copied().collect();
         for motor in motors {
             self.stop_motor(motor);
+        }
+        for (_, engine) in &self.engines {
+            // No completion handler; the engine stops asynchronously.
+            unsafe { engine.stopWithCompletionHandler(std::ptr::null_mut()) };
         }
     }
 }

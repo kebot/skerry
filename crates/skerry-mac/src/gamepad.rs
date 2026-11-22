@@ -283,6 +283,28 @@ impl Link {
     pub fn reset(&mut self) {
         self.announced.clear();
     }
+
+    /// The slots this stream has announced.
+    pub fn announced_slots(&self) -> Vec<u8> {
+        self.announced.keys().copied().collect()
+    }
+
+    /// Forgets, without a word to the server, every announced slot another window now
+    /// drives: Selkies' `js,d` isn't checked against the connection, so sending it would
+    /// drop that window's Player. Returns the forgotten slots, for the transport to forget
+    /// too.
+    pub fn yield_to(&mut self, drives: &dyn Fn(u8) -> bool) -> Vec<u8> {
+        let gone: Vec<u8> = self
+            .announced
+            .keys()
+            .copied()
+            .filter(|&slot| !drives(slot))
+            .collect();
+        for slot in &gone {
+            self.announced.remove(slot);
+        }
+        gone
+    }
 }
 
 /// The transport's view of the slots it announced, from the `js,…` it sends: which are off
@@ -328,6 +350,11 @@ impl JsTracker {
             }
             _ => {}
         }
+    }
+
+    /// Another window drives this slot now: no heartbeat, and no `js,d` at close.
+    pub fn forget(&mut self, slot: u8) {
+        self.slots.remove(&slot);
     }
 
     /// Whether any slot holds a control off rest: the heartbeat runs only then.
@@ -480,7 +507,7 @@ impl GamepadPolicy {
 }
 
 /// Whether Gamepad input is on: the saved choice, else the server's `gamepad_on_start`. A
-/// locked `gamepad_on_start` with no saved choice holds.
+/// locked `gamepad_on_start` always holds, over a saved choice too.
 pub fn input_on(policy: GamepadPolicy, saved: Option<bool>) -> bool {
     match saved {
         Some(_) if policy.on_start_locked => policy.on_start,
@@ -762,6 +789,28 @@ mod tests {
         };
         assert_eq!(link.sync(&pads, off), ["js,d,0", "js,d,1"]);
         assert!(link.sync(&pads, off).is_empty());
+    }
+
+    #[test]
+    fn a_slot_another_window_drives_is_forgotten_without_js_d() {
+        let mut link = Link::default();
+        link.sync(
+            &[
+                pad(7, Some(0), PadState::REST),
+                pad(8, Some(1), PadState::REST),
+            ],
+            KEY,
+        );
+        // The other window took Player 1 (slot 0) while this one was not key.
+        assert_eq!(link.yield_to(&|slot| slot != 0), [0]);
+        assert_eq!(link.announced_slots(), [1]);
+        assert_eq!(link.close(), ["js,d,1"]);
+        let mut tracker = JsTracker::default();
+        tracker.observe(&connect_command(0, "A"));
+        tracker.observe("js,b,0,0,1");
+        tracker.forget(0);
+        assert!(!tracker.active());
+        assert!(tracker.closing().is_empty());
     }
 
     #[test]

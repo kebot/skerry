@@ -262,6 +262,9 @@ impl SessionWindow {
             session_chrome(window, false);
             if this.fullscreen != window.is_fullscreen() {
                 this.fullscreen = window.is_fullscreen();
+                if let Some(stream) = &this.current {
+                    stream.release_capture_for_full_screen(cx);
+                }
                 this.release_keys(cx);
             }
             this.resize_display(window, cx)
@@ -830,9 +833,9 @@ impl SessionWindow {
     /// Brings the server up to date with the pads (`ARCH-032`): only while the server
     /// allows it, input is on, and this window is key; at rest otherwise.
     pub(super) fn sync_gamepads(&mut self, cx: &mut Context<Self>) {
-        let Some(stream) = &self.current else {
+        if self.current.is_none() {
             return;
-        };
+        }
         let gate = crate::gamepad::Gate {
             ready_and_enabled: self
                 .settings
@@ -841,11 +844,31 @@ impl SessionWindow {
             input_on: self.gamepad_input(),
             key: self.window_active,
         };
+        // Slots another window took while this one wasn't key are forgotten, not dropped.
+        let yielded = self.yield_gamepad_slots(cx);
         let commands = match cx.try_global::<Gamepads>() {
             Some(gamepads) => self.gamepad_link.sync(gamepads.pads(), gate),
             None => self.gamepad_link.sync(&[], gate),
         };
-        stream.send_commands(commands);
+        if let Some(stream) = &self.current {
+            stream.forget_pads(yielded);
+            stream.send_commands(commands);
+        }
+        if gate.key && cx.has_global::<Gamepads>() {
+            let (window, slots) = (self.window, self.gamepad_link.announced_slots());
+            cx.update_global::<Gamepads, _>(|gamepads, _| gamepads.drive(window, &slots));
+        }
+    }
+
+    /// Forgets the announced slots another window drives now (`ARCH-032`).
+    fn yield_gamepad_slots(&mut self, cx: &App) -> Vec<u8> {
+        let window = self.window;
+        match cx.try_global::<Gamepads>() {
+            Some(gamepads) => self
+                .gamepad_link
+                .yield_to(&|slot| gamepads.drives(window, slot)),
+            None => Vec::new(),
+        }
     }
 
     /// **Gamepad input** switched; saved for this server.
@@ -1139,8 +1162,13 @@ impl SessionWindow {
         self.hint_task = None;
         self.stream_events = None;
         // Announced pads leave before the key releases and the close frame (`ARCH-032`).
-        if let Some(stream) = &self.current {
-            stream.send_commands(self.gamepad_link.close());
+        if self.current.is_some() {
+            // Only the slots this window still drives; another window's stay its own.
+            let yielded = self.yield_gamepad_slots(cx);
+            if let Some(stream) = &self.current {
+                stream.forget_pads(yielded);
+                stream.send_commands(self.gamepad_link.close());
+            }
             if self.window_active {
                 if let Some(gamepads) = cx.try_global::<Gamepads>() {
                     gamepads.stop_rumble();
@@ -1223,6 +1251,9 @@ impl Render for SessionWindow {
                 cx.listener(|this, _: &DisconnectSession, window, cx| this.disconnect(window, cx)),
             )
             .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
+                if let Some(stream) = &this.current {
+                    stream.release_capture_for_full_screen(cx);
+                }
                 this.close_controls(window, cx);
                 this.release_keys(cx);
                 window.toggle_fullscreen();

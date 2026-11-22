@@ -427,6 +427,8 @@ pub enum Input {
     Clipboard(clipboard::Content),
     /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
     Stats(bool),
+    /// Gamepad slots another window drives now: forgotten here, nothing sent (`ARCH-032`).
+    ForgetPads(Vec<u8>),
     /// End the stream: release every held key, then send a close frame (`ARCH-GAP-DC-09`).
     Close,
 }
@@ -439,16 +441,48 @@ pub enum Input {
 /// releases.
 fn closing_commands(
     held: &BTreeSet<u32>,
-    pointer_locked: bool,
+    pointer: PointerLock,
     pads: &mut crate::gamepad::JsTracker,
 ) -> Vec<String> {
     // Every announced gamepad slot first (`ARCH-032`).
     let mut commands: Vec<String> = pads.closing();
-    if pointer_locked {
+    if pointer.locked {
         commands.extend(["p,0".into(), "SET_NATIVE_CURSOR_RENDERING,0".into()]);
+        if pointer.buttons != 0 {
+            commands.push("m2,0,0,0,0".into());
+        }
     }
     commands.extend(held.iter().map(|key| format!("ku,{key}")));
     commands
+}
+
+/// The capture as the server was last told it: `p,1` and the buttons the last relative
+/// `m2` held (`ARCH-032`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PointerLock {
+    locked: bool,
+    buttons: u8,
+}
+
+impl PointerLock {
+    fn observe(&mut self, text: &str) {
+        if let Some(locked) = pointer_lock_command(text) {
+            *self = Self { locked, buttons: 0 };
+        } else if self.locked {
+            if let Some(buttons) = m2_buttons(text) {
+                self.buttons = buttons;
+            }
+        }
+    }
+}
+
+/// The buttons an `m2,dx,dy,mask,0` holds; wheel pulses (a magnitude) leave them alone.
+fn m2_buttons(text: &str) -> Option<u8> {
+    let mut parts = text.strip_prefix("m2,")?.split(',');
+    let (_, _, mask, magnitude) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (magnitude == "0")
+        .then(|| mask.parse::<u8>().ok())
+        .flatten()
 }
 
 /// The pointer lock the server was last told: `Some(true)` for `p,1`, `Some(false)` for
@@ -791,7 +825,7 @@ pub async fn run(
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
     // The last `p,N` sent: a close while captured restores the server's cursor (`ARCH-032`).
-    let mut pointer_locked = false;
+    let mut pointer_lock = PointerLock::default();
     // Gamepad slots announced on this stream, and `js,h` while any is off rest.
     let mut pads = crate::gamepad::JsTracker::default();
     let mut pad_heartbeat = tokio::time::interval(crate::gamepad::HEARTBEAT);
@@ -1080,6 +1114,12 @@ pub async fn run(
                         }
                         continue;
                     }
+                    Some(Input::ForgetPads(slots)) => {
+                        for slot in slots {
+                            pads.forget(slot);
+                        }
+                        continue;
+                    }
                     Some(Input::Stats(on)) => {
                         if on == diagnostics.stats_on { continue; }
                         diagnostics.set_stats(on);
@@ -1089,7 +1129,7 @@ pub async fn run(
                     // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
                     // an explicit close: release held keys, then close cleanly.
                     Some(Input::Close) | None => {
-                        for command in closing_commands(&held, pointer_locked, &mut pads) {
+                        for command in closing_commands(&held, pointer_lock, &mut pads) {
                             trace_input(&command);
                             let _ = socket.send(command.into()).await;
                         }
@@ -1098,9 +1138,7 @@ pub async fn run(
                         return Ok(());
                     }
                 };
-                if let Some(locked) = pointer_lock_command(&text) {
-                    pointer_locked = locked;
-                }
+                pointer_lock.observe(&text);
                 pads.observe(&text);
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
                     held.insert(key);
@@ -1594,7 +1632,14 @@ mod tests {
     fn closing_restores_native_cursor_rendering() {
         let held = BTreeSet::from([0x61]);
         assert_eq!(
-            closing_commands(&held, true, &mut Default::default()),
+            closing_commands(
+                &held,
+                PointerLock {
+                    locked: true,
+                    buttons: 0
+                },
+                &mut Default::default()
+            ),
             ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "ku,97"]
         );
         assert_eq!(pointer_lock_command("p,1"), Some(true));
@@ -1611,14 +1656,41 @@ mod tests {
     fn closing_releases_every_held_key_then_closes() {
         let held = BTreeSet::from([0x61, 0xffe3]);
         assert_eq!(
-            closing_commands(&held, false, &mut Default::default()),
+            closing_commands(&held, PointerLock::default(), &mut Default::default()),
             ["ku,97", "ku,65507"]
         );
     }
 
     #[test]
     fn closing_with_nothing_held_sends_nothing() {
-        assert!(closing_commands(&BTreeSet::new(), false, &mut Default::default()).is_empty());
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            PointerLock::default(),
+            &mut Default::default()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn closing_while_captured_lifts_held_buttons() {
+        let mut lock = PointerLock::default();
+        // Buttons before a capture are the absolute path's, not tracked here.
+        lock.observe("m2,0,0,1,0");
+        assert_eq!(lock.buttons, 0);
+        lock.observe("p,1");
+        lock.observe("m2,0,0,4,0");
+        lock.observe("m2,3,-1,4,0");
+        // A wheel pulse carries the wheel bit and a magnitude: buttons unchanged.
+        lock.observe("m2,0,0,20,1");
+        assert_eq!(lock.buttons, 4);
+        assert_eq!(
+            closing_commands(&BTreeSet::new(), lock, &mut Default::default()),
+            ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "m2,0,0,0,0"]
+        );
+        // Released by the view first: nothing more at close.
+        lock.observe("m2,0,0,0,0");
+        lock.observe("p,0");
+        assert!(closing_commands(&BTreeSet::new(), lock, &mut Default::default()).is_empty());
     }
 
     #[test]
@@ -1658,10 +1730,10 @@ mod tests {
         pads.observe("js,c,2,UGFk,4,17");
         pads.observe("js,d,0");
         assert_eq!(
-            closing_commands(&BTreeSet::from([0x61]), false, &mut pads),
+            closing_commands(&BTreeSet::from([0x61]), PointerLock::default(), &mut pads),
             ["js,d,2", "ku,97"]
         );
-        assert!(closing_commands(&BTreeSet::new(), false, &mut pads).is_empty());
+        assert!(closing_commands(&BTreeSet::new(), PointerLock::default(), &mut pads).is_empty());
     }
 
     #[test]

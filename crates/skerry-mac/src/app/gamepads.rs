@@ -6,7 +6,7 @@
 
 use super::session_window::{OpenWindows, SessionWindow};
 use crate::gamepad::native::{Controllers, PadEvent};
-use crate::gamepad::{Pad, PadState, Rumble, SlotTable};
+use crate::gamepad::{Pad, PadState, Rumble, SlotTable, SLOTS};
 use gpui_kit::{AnyWindowHandle, App, BorrowAppContext as _, Global, WeakEntity};
 
 type SessionHandle = (AnyWindowHandle, WeakEntity<SessionWindow>);
@@ -18,6 +18,9 @@ pub(crate) struct Gamepads {
     pads: Vec<Pad>,
     /// The key session window, if any: only it sends pads.
     active: Option<SessionHandle>,
+    /// The window that last drove each slot while key. Only it may send that slot's
+    /// `js,d` (`ARCH-032`).
+    drivers: [Option<AnyWindowHandle>; SLOTS],
 }
 
 impl Global for Gamepads {}
@@ -30,13 +33,27 @@ pub(super) fn init(cx: &mut App) {
         slots: SlotTable::default(),
         pads: Vec::new(),
         active: None,
+        drivers: [None; SLOTS],
     });
     cx.spawn(async move |cx| {
-        while let Some(event) = incoming.recv().await {
-            let roster = !matches!(event, PadEvent::Changed(..));
+        while let Some(first) = incoming.recv().await {
+            // Everything queued since, with each pad's readings folded to its latest: one
+            // global update and one sync per batch, however fast a stick moves.
+            let mut batch = vec![first];
+            while let Ok(event) = incoming.try_recv() {
+                batch.push(event);
+            }
+            let batch = coalesce(batch);
+            let roster = batch
+                .iter()
+                .any(|event| !matches!(event, PadEvent::Changed(..)));
             // The global first, then (outside its lease) the sessions that must hear of it.
             let targets = cx.update(|cx| {
-                cx.update_global::<Gamepads, _>(|gamepads, _| gamepads.apply(event));
+                cx.update_global::<Gamepads, _>(|gamepads, _| {
+                    for event in batch {
+                        gamepads.apply(event);
+                    }
+                });
                 if roster {
                     cx.try_global::<OpenWindows>()
                         .map(|windows| {
@@ -72,7 +89,64 @@ pub(super) fn init(cx: &mut App) {
     .detach();
 }
 
+/// Folds each pad's readings to its latest, keeping connects and disconnects in order (a
+/// reading never moves across its own pad's connect or disconnect).
+fn coalesce(events: Vec<PadEvent>) -> Vec<PadEvent> {
+    let mut out: Vec<PadEvent> = Vec::with_capacity(events.len());
+    for event in events {
+        if let PadEvent::Changed(id, _) = &event {
+            let earlier = out.iter().rposition(|seen| match seen {
+                PadEvent::Changed(other, _) => other == id,
+                PadEvent::Connected(other, ..) | PadEvent::Gone(other) => other == id,
+            });
+            if let Some(index) = earlier.filter(|&i| matches!(out[i], PadEvent::Changed(..))) {
+                out[index] = event;
+                continue;
+            }
+        }
+        out.push(event);
+    }
+    out
+}
+
+/// The key window after `next` becomes key (`active`) or resigns, and the one that lost
+/// key, if another.
+fn hand_over<T>(
+    current: &mut Option<T>,
+    next: T,
+    active: bool,
+    same: impl Fn(&T, &T) -> bool,
+) -> Option<T> {
+    if active {
+        let lost = current.take().filter(|previous| !same(previous, &next));
+        *current = Some(next);
+        lost
+    } else {
+        if current.as_ref().is_some_and(|current| same(current, &next)) {
+            *current = None;
+        }
+        None
+    }
+}
+
 impl Gamepads {
+    /// The key window drives the slots it announced.
+    pub(super) fn drive(&mut self, window: AnyWindowHandle, slots: &[u8]) {
+        for &slot in slots {
+            if let Some(driver) = self.drivers.get_mut(usize::from(slot)) {
+                *driver = Some(window);
+            }
+        }
+    }
+
+    /// Whether `window` still drives `slot` (no other window has since).
+    pub(super) fn drives(&self, window: AnyWindowHandle, slot: u8) -> bool {
+        self.drivers
+            .get(usize::from(slot))
+            .and_then(|driver| *driver)
+            .is_none_or(|driver| driver == window)
+    }
+
     fn apply(&mut self, event: PadEvent) {
         match event {
             PadEvent::Connected(id, name, rumble) => {
@@ -119,20 +193,9 @@ impl Gamepads {
         entity: WeakEntity<SessionWindow>,
         active: bool,
     ) -> Option<SessionHandle> {
-        let lost = if active {
-            self.active
-                .replace((window, entity))
-                .filter(|(previous, _)| *previous != window)
-        } else {
-            if self
-                .active
-                .as_ref()
-                .is_some_and(|(current, _)| *current == window)
-            {
-                self.active = None;
-            }
-            None
-        };
+        let lost = hand_over(&mut self.active, (window, entity), active, |a, b| {
+            a.0 == b.0
+        });
         // Whatever played belonged to the window that was key.
         self.stop_rumble();
         self.route_home();
@@ -175,6 +238,7 @@ impl Gamepads {
             slots: SlotTable::default(),
             pads: Vec::new(),
             active: None,
+            drivers: [None; SLOTS],
         }
     }
 }
@@ -188,6 +252,49 @@ fn slots_of(gamepads: &Gamepads) -> Vec<(crate::gamepad::PadId, Option<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_active_reports_the_window_that_lost_key() {
+        let same = |a: &u8, b: &u8| a == b;
+        let mut key = None;
+        assert_eq!(hand_over(&mut key, 1, true, same), None);
+        assert_eq!(hand_over(&mut key, 1, true, same), None);
+        // Window 2 takes key: window 1 lost it.
+        assert_eq!(hand_over(&mut key, 2, true, same), Some(1));
+        // Window 1 resigning (late) changes nothing.
+        assert_eq!(hand_over(&mut key, 1, false, same), None);
+        assert_eq!(key, Some(2));
+        assert_eq!(hand_over(&mut key, 2, false, same), None);
+        assert_eq!(key, None);
+    }
+
+    #[test]
+    fn readings_coalesce_per_pad_around_roster_events() {
+        use crate::gamepad::RawPad;
+        let reading = |a: f32| RawPad {
+            a,
+            ..RawPad::default()
+        };
+        let events = vec![
+            PadEvent::Changed(1, reading(0.)),
+            PadEvent::Changed(2, reading(0.)),
+            PadEvent::Changed(1, reading(1.)),
+            PadEvent::Gone(2),
+            PadEvent::Connected(2, "Pad".into(), false),
+            PadEvent::Changed(2, reading(1.)),
+            PadEvent::Changed(1, reading(0.5)),
+        ];
+        assert_eq!(
+            coalesce(events),
+            [
+                PadEvent::Changed(1, reading(0.5)),
+                PadEvent::Changed(2, reading(0.)),
+                PadEvent::Gone(2),
+                PadEvent::Connected(2, "Pad".into(), false),
+                PadEvent::Changed(2, reading(1.)),
+            ]
+        );
+    }
 
     #[test]
     fn a_waiting_pad_takes_a_freed_slot() {

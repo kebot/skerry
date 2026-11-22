@@ -262,6 +262,13 @@ impl NativeSession {
         });
     }
 
+    /// Gamepad slots another window drives now: the transport forgets them.
+    pub fn forget_pads(&self, slots: Vec<u8>) {
+        if !slots.is_empty() {
+            let _ = self.input.send(Input::ForgetPads(slots));
+        }
+    }
+
     /// Sends each command in order (the gamepads' `js,…`).
     pub fn send_commands(&self, commands: Vec<String>) {
         for command in commands {
@@ -284,10 +291,21 @@ impl NativeSession {
     /// Controls or the menu, once the window has activated).
     pub fn engage_capture(&self, window: &mut Window, cx: &mut App) {
         self.view.update(cx, |desktop, cx| {
-            // The chord may have been pressed in another window: its modifiers, still held,
-            // never reach the session.
-            desktop.keys.mute_mods_until_clear(window.modifiers());
+            // The chord may have been pressed in another window: modifiers the ledger
+            // recorded are lifted, the ones still held never reach the session, and the
+            // chord's auto-repeats here don't release what this engages.
+            let mac = window.modifiers();
+            let commands = desktop.keys.mute_mods_until_clear(mac);
+            desktop.commands(commands);
+            desktop.chord.hold(capture::modifiers_held(mac));
             desktop.engage_capture(window, cx)
+        });
+    }
+
+    /// Entering or leaving full screen: the capture ends with the "Pointer released" hint.
+    pub fn release_capture_for_full_screen(&self, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            desktop.release_capture(capture::Release::FullScreen)
         });
     }
 
@@ -376,6 +394,8 @@ struct Desktop {
     capture: Rc<RefCell<capture::Capture>>,
     capture_monitor: Option<capture::Monitor>,
     cursor_lock: Option<capture::CursorLock>,
+    /// One toggle per press of ⌃⌥⇧Z, whatever its auto-repeats.
+    chord: capture::ChordGuard,
     /// Session events this view raises itself (the capture's state and hints).
     events: mpsc::UnboundedSender<SessionEvent>,
 }
@@ -503,6 +523,7 @@ impl Desktop {
             capture: Rc::default(),
             capture_monitor: None,
             cursor_lock: None,
+            chord: capture::ChordGuard::default(),
             events,
         }
     }
@@ -514,9 +535,13 @@ impl Desktop {
     /// The chord (or the menu) in the key session window. The chord's modifiers already
     /// reached the session, so they are lifted and muted until they come up (`ARCH-032`).
     fn toggle_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let commands = self.keys.release_all();
+        let mac = window.modifiers();
+        if !self.chord.press(capture::modifiers_held(mac)) {
+            return;
+        }
+        let mut commands = self.keys.release_all();
+        commands.extend(self.keys.mute_mods_until_clear(mac));
         self.commands(commands);
-        self.keys.mute_mods_until_clear(window.modifiers());
         if self.captured() {
             self.release_capture(capture::Release::Chord);
         } else {
@@ -1158,6 +1183,7 @@ impl Render for Desktop {
                 }
             }))
             .on_key_up(cx.listener(|desktop, event: &KeyUpEvent, _, cx| {
+                desktop.chord.key_up(&event.keystroke.key);
                 let commands = desktop.keys.release(&event.keystroke.key);
                 if !commands.is_empty() {
                     desktop.commands(commands);
@@ -1165,6 +1191,9 @@ impl Render for Desktop {
                 }
             }))
             .on_modifiers_changed(cx.listener(|desktop, event: &ModifiersChangedEvent, _, _| {
+                desktop
+                    .chord
+                    .modifiers(capture::modifiers_held(event.modifiers));
                 desktop.modifiers(event.modifiers);
             }))
             .child(surface)

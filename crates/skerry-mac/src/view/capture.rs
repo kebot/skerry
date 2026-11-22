@@ -131,7 +131,9 @@ impl Capture {
         if !self.on {
             return None;
         }
-        if std::mem::take(&mut self.first_motion) || timestamp < self.locked_at {
+        // Queued before the lock: stale, and it must not use up the first-motion drop,
+        // which is for the first event after the warp (it can carry the warp's jump).
+        if timestamp < self.locked_at || std::mem::take(&mut self.first_motion) {
             return None;
         }
         let (sx, sy) = self.scale?;
@@ -295,13 +297,58 @@ impl CaptureHint {
     }
 }
 
+/// One press of the capture chord, so a held ⌃⌥⇧Z toggles once: GPUI matches the binding
+/// on every auto-repeat. Re-armed when Z comes up or the chord's modifiers clear.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ChordGuard {
+    down: bool,
+}
+
+impl ChordGuard {
+    /// The chord fired: `true` for a fresh press, `false` for a repeat while held.
+    /// `held` says whether the Mac holds any modifier (a menu click holds none).
+    pub(super) fn press(&mut self, held: bool) -> bool {
+        if self.down {
+            return false;
+        }
+        self.down = held;
+        true
+    }
+
+    /// The chord is down already (pressed in another window before this one activated).
+    pub(super) fn hold(&mut self, held: bool) {
+        self.down |= held;
+    }
+
+    pub(super) fn key_up(&mut self, key: &str) {
+        if key == "z" {
+            self.down = false;
+        }
+    }
+
+    pub(super) fn modifiers(&mut self, held: bool) {
+        if !held {
+            self.down = false;
+        }
+    }
+}
+
+/// Whether the Mac holds a modifier.
+pub(super) fn modifiers_held(mac: gpui_kit::Modifiers) -> bool {
+    mac.shift || mac.control || mac.alt || mac.platform
+}
+
 /// Why a capture ended. Only the person's own releases (and a deactivation that leaves the
 /// window on screen) show the "Pointer released" hint; the status banner explains the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Release {
     Chord,
+    /// Entering or leaving full screen: deliberate, so it shows the hint.
+    FullScreen,
     FocusLost,
-    Window { visible: bool },
+    Window {
+        visible: bool,
+    },
     Disconnected,
     Closed,
 }
@@ -309,9 +356,10 @@ pub(super) enum Release {
 impl Release {
     pub(super) fn hint(self) -> Option<CaptureHint> {
         match self {
-            Release::Chord | Release::FocusLost | Release::Window { visible: true } => {
-                Some(CaptureHint::Released)
-            }
+            Release::Chord
+            | Release::FullScreen
+            | Release::FocusLost
+            | Release::Window { visible: true } => Some(CaptureHint::Released),
             Release::Window { visible: false } | Release::Disconnected | Release::Closed => None,
         }
     }
@@ -598,6 +646,42 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_motion_does_not_use_up_the_first_motion_drop() {
+        let mut capture = Capture::default();
+        capture.engage(Some((1.5, 1.5)), 100.);
+        // Queued while the chord was pressed: dropped, and the guard stays armed.
+        assert_eq!(capture.motion(50., 50., 99.), None);
+        // The first real motion carries the warp's jump: dropped too.
+        assert_eq!(capture.motion(40., 0., 100.01), None);
+        assert_eq!(
+            capture.motion(2., 0., 100.02).as_deref(),
+            Some("m2,3,0,0,0")
+        );
+    }
+
+    #[test]
+    fn a_held_chord_toggles_once() {
+        let mut guard = ChordGuard::default();
+        assert!(guard.press(true));
+        // Auto-repeats while held.
+        assert!(!guard.press(true));
+        assert!(!guard.press(true));
+        guard.key_up("z");
+        assert!(guard.press(true));
+        // Letting go of the modifiers re-arms it too.
+        guard.modifiers(false);
+        assert!(guard.press(true));
+        // A menu click holds nothing, so it never blocks the next one.
+        let mut menu = ChordGuard::default();
+        assert!(menu.press(false));
+        assert!(menu.press(false));
+        // Pressed in another window, then this one activated: its repeats are ignored.
+        let mut pending = ChordGuard::default();
+        pending.hold(true);
+        assert!(!pending.press(true));
+    }
+
+    #[test]
     fn motion_without_a_painted_picture_sends_nothing() {
         let mut capture = captured();
         capture.set_scale(None);
@@ -685,6 +769,7 @@ mod tests {
     #[test]
     fn hint_text_for_capture_and_release() {
         assert_eq!(Release::Chord.hint(), Some(CaptureHint::Released));
+        assert_eq!(Release::FullScreen.hint(), Some(CaptureHint::Released));
         assert_eq!(Release::FocusLost.hint(), Some(CaptureHint::Released));
         assert_eq!(
             Release::Window { visible: true }.hint(),

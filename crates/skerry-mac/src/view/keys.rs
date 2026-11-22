@@ -218,10 +218,16 @@ impl KeyLedger {
     /// [`Self::release_all`] has lifted them, its modifiers going up must not send `kd`
     /// again on the way (`ARCH-032`). A no-op when `mac` holds no modifier (the menu or
     /// the panel's button). Keys pressed meanwhile are still sent, without modifiers.
-    pub fn mute_mods_until_clear(&mut self, mac: Modifiers) {
-        if mac.shift || mac.control || mac.alt || mac.platform {
-            self.muted = true;
+    /// Returns the `ku` for modifiers the ledger still records, lifted before the mute so
+    /// none stays held on the session.
+    #[must_use]
+    pub fn mute_mods_until_clear(&mut self, mac: Modifiers) -> Vec<String> {
+        if !(mac.shift || mac.control || mac.alt || mac.platform) {
+            return Vec::new();
         }
+        let commands = self.move_mods(Mods::default());
+        self.muted = true;
+        commands
     }
 
     #[cfg(test)]
@@ -618,7 +624,7 @@ mod tests {
         );
         // ⌃⌥⇧Z resolves locally: lift everything, then mute.
         assert_eq!(ledger.release_all(), ["ku,65505", "ku,65507", "ku,65513"]);
-        ledger.mute_mods_until_clear(chord);
+        let _ = ledger.mute_mods_until_clear(chord);
         assert!(ledger.is_muted());
         // Shift lifts first: Control and Alt are not sent down again.
         assert!(ledger
@@ -635,7 +641,7 @@ mod tests {
         let mut ledger = KeyLedger::default();
         ledger.mac_modifiers(mac(true, true, true, false), false);
         ledger.release_all();
-        ledger.mute_mods_until_clear(mac(true, true, true, false));
+        let _ = ledger.mute_mods_until_clear(mac(true, true, true, false));
         assert!(ledger
             .mac_modifiers(mac(false, false, false, false), false)
             .is_empty());
@@ -646,15 +652,31 @@ mod tests {
         );
         // A release during a mute keeps the mute.
         ledger.release_all();
-        ledger.mute_mods_until_clear(mac(true, false, false, false));
+        let _ = ledger.mute_mods_until_clear(mac(true, false, false, false));
         assert!(ledger.release_all().is_empty());
         assert!(ledger.is_muted());
     }
 
     #[test]
+    fn muting_lifts_recorded_modifiers_first() {
+        // The pending-capture path: modifiers reached the session, no release_all ran.
+        let mut ledger = KeyLedger::default();
+        ledger.mac_modifiers(mac(true, true, false, false), false);
+        assert_eq!(
+            ledger.mute_mods_until_clear(mac(true, true, false, false)),
+            ["ku,65505", "ku,65507"]
+        );
+        assert!(ledger.is_muted());
+        assert!(ledger
+            .mac_modifiers(mac(false, false, false, false), false)
+            .is_empty());
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
     fn muting_with_no_modifiers_held_does_nothing() {
         let mut ledger = KeyLedger::default();
-        ledger.mute_mods_until_clear(Modifiers::default());
+        let _ = ledger.mute_mods_until_clear(Modifiers::default());
         assert!(!ledger.is_muted());
         assert_eq!(
             ledger.mac_modifiers(mac(true, false, false, false), false),
@@ -667,7 +689,7 @@ mod tests {
         let mut ledger = KeyLedger::default();
         ledger.mac_modifiers(mac(true, true, true, false), false);
         ledger.release_all();
-        ledger.mute_mods_until_clear(mac(true, true, true, false));
+        let _ = ledger.mute_mods_until_clear(mac(true, true, true, false));
         assert!(ledger
             .mac_modifiers(mac(true, true, true, false), false)
             .is_empty());
