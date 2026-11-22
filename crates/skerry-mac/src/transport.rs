@@ -2147,32 +2147,55 @@ mod tests {
         canvas.clone()
     }
 
+    /// Real stripes from `SKERRY_JPEG_BENCH_STRIPES`: 1492-wide files named `*_<y>_<h>.jpg`.
+    fn bench_stripes_from_disk() -> Option<Vec<(u16, Vec<u8>)>> {
+        let dir = std::env::var_os("SKERRY_JPEG_BENCH_STRIPES")?;
+        let mut stripes: Vec<(u16, Vec<u8>)> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let name = path.file_stem()?.to_str()?.to_owned();
+                let y = name.rsplit('_').nth(1)?.parse().ok()?;
+                Some((y, std::fs::read(path).ok()?))
+            })
+            .collect();
+        stripes.sort_by_key(|(y, _)| *y);
+        Some(stripes)
+    }
+
     /// `cargo test --release -p skerry-mac jpeg_stripe_decode_cost -- --ignored --nocapture`
+    /// Prints CPU ms per frame for every stripe changing (motion) and for one (typing).
     #[test]
     #[ignore = "benchmark"]
     fn jpeg_stripe_decode_cost() {
         let (width, height, count) = (1492u16, 1868u16, 8u16);
         let rows = height / count;
-        let stripes: Vec<(u16, Vec<u8>)> = (0..count)
-            .map(|i| {
-                let y = i * rows;
-                let h = if i == count - 1 { height - y } else { rows };
-                let jpeg = jpeg_sized(width, h, 75, |x, row| {
-                    let y = u32::from(y) + row;
-                    let noise = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 27;
-                    [
-                        (x / 6) as u8,
-                        (y / 8) as u8,
-                        ((x ^ y) as u8 & 0xf0) | noise as u8,
-                    ]
-                });
-                (y, jpeg)
-            })
-            .collect();
+        let synthetic = || -> Vec<(u16, Vec<u8>)> {
+            (0..count)
+                .map(|i| {
+                    let y = i * rows;
+                    let h = if i == count - 1 { height - y } else { rows };
+                    let jpeg = jpeg_sized(width, h, 75, |x, row| {
+                        let y = u32::from(y) + row;
+                        let noise = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 27;
+                        [
+                            (x / 6) as u8,
+                            (y / 8) as u8,
+                            ((x ^ y) as u8 & 0xf0) | noise as u8,
+                        ]
+                    });
+                    (y, jpeg)
+                })
+                .collect()
+        };
+        let (source, stripes) = match bench_stripes_from_disk() {
+            Some(stripes) => ("disk", stripes),
+            None => ("synthetic", synthetic()),
+        };
         let mut canvas = Canvas::default();
         canvas.resize(width, height).unwrap();
         let mut full = image::RgbaImage::new(width.into(), height.into());
-        let frames = 60;
+        let frames = 120;
         let time = |f: &mut dyn FnMut()| {
             f();
             let started = Instant::now();
@@ -2181,16 +2204,21 @@ mod tests {
             }
             started.elapsed().as_secs_f64() * 1000.0 / f64::from(frames)
         };
-        let old = time(&mut || {
-            std::hint::black_box(old_decode(&stripes, &mut full));
-        });
-        let new = time(&mut || {
-            for (y, jpeg) in &stripes {
-                canvas.insert(canvas.decode(*y, jpeg).unwrap());
-            }
-            std::hint::black_box(canvas.snapshot());
-        });
-        println!("jpeg stripes {width}x{height} in {count}: old {old:.2} ms/frame, new {new:.2} ms/frame");
+        for (workload, changed) in [("motion", &stripes[..]), ("typing", &stripes[3..4])] {
+            let old = time(&mut || {
+                std::hint::black_box(old_decode(changed, &mut full));
+            });
+            let new = time(&mut || {
+                for (y, jpeg) in changed {
+                    canvas.insert(canvas.decode(*y, jpeg).unwrap());
+                }
+                std::hint::black_box(canvas.snapshot());
+            });
+            println!(
+                "jpeg {source} {workload}: old {old:.3} ms/frame, new {new:.3} ms/frame ({:.0}% less)",
+                (1.0 - new / old) * 100.0
+            );
+        }
     }
 
     // ---- Session access without a stream (ARCH-028) --------------------------------------
