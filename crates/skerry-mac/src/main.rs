@@ -46,6 +46,8 @@ mod selkies;
 mod settings;
 #[cfg(target_os = "macos")]
 mod shortcuts;
+#[cfg(target_os = "macos")]
+mod socket_writer;
 mod stats;
 #[cfg(target_os = "macos")]
 mod tls;
