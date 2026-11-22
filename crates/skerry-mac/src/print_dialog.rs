@@ -6,9 +6,6 @@
 //! `App` borrow held around it: AppKit may re-enter the run loop while it sets the panel up,
 //! as `prompt_for_paths` does in GPUI itself.
 
-// Wired into the session window in the next step.
-#![allow(dead_code)]
-
 use objc2::{AnyThread as _, MainThreadMarker};
 use objc2_app_kit::NSWindow;
 use objc2_foundation::{NSString, NSURL};

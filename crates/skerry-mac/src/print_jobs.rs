@@ -10,9 +10,6 @@
 //!
 //! This module holds no GPUI or AppKit: the window (`app/session_window.rs`) drives it.
 
-// Wired into the session window in the next step.
-#![allow(dead_code)]
-
 use crate::selkies::{Progress, SelkiesClient};
 use serde_json::Value;
 use std::io;
@@ -29,8 +26,6 @@ pub const JOBS_CAP: usize = 20;
 pub const READY_NOTICE: Duration = Duration::from_secs(15);
 /// The startup (and quit) sweep removes cache entries older than this.
 pub const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-/// The most notices shown at once.
-pub const NOTICES_SHOWN: usize = 3;
 /// A job older than this never opens the print dialog on its own.
 pub const AUTO_STALE: Duration = Duration::from_secs(5 * 60);
 /// Announcements this soon after `server_settings` are documents that were already waiting
@@ -119,6 +114,16 @@ pub fn local_file_name(name: &str) -> String {
         end -= 1;
     }
     format!("{}.pdf", &stem[..end])
+}
+
+/// How long ago, as the Printing card reads it: "Just now", "1 min ago", "3 hr ago".
+pub fn age_label(age: Duration) -> String {
+    let minutes = age.as_secs() / 60;
+    match minutes {
+        0 => "Just now".into(),
+        1..60 => format!("{minutes} min ago"),
+        _ => format!("{} hr ago", minutes / 60),
+    }
 }
 
 /// `%PDF-` within the first kilobyte.
@@ -363,7 +368,7 @@ pub enum Announced {
         progress: Progress,
     },
     /// Listed as too large; nothing is fetched.
-    Listed(JobId),
+    Listed,
     /// The same name is already receiving or listed as too large.
     Ignored,
 }
@@ -436,6 +441,7 @@ impl PrintJobs {
         }
     }
 
+    #[cfg(test)]
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -505,7 +511,7 @@ impl PrintJobs {
         });
         self.enforce_cap();
         if announcement.too_large {
-            Announced::Listed(id)
+            Announced::Listed
         } else {
             Announced::Fetch {
                 id,
@@ -800,6 +806,7 @@ impl PrintJobs {
             || self.sheet_job.is_some()
             || self.jobs.iter().any(|job| {
                 job.state == JobState::Receiving
+                    || job.busy
                     || matches!(job.notice, Notice::Shown { until: Some(_) })
             })
     }
@@ -1008,10 +1015,10 @@ mod tests {
             too_large: true,
             ..announcement("big.pdf")
         };
-        let Announced::Listed(id) = jobs.announce(big.clone(), false, now, wall) else {
+        let Announced::Listed = jobs.announce(big.clone(), false, now, wall) else {
             panic!("listed");
         };
-        assert_eq!(jobs.get(id).unwrap().state, JobState::TooLarge);
+        assert_eq!(jobs.jobs()[0].state, JobState::TooLarge);
         // The reconnect's repeat doesn't stack another warning.
         assert!(matches!(
             jobs.announce(big, true, now, wall),
@@ -1267,11 +1274,7 @@ mod tests {
         }
         let notices = jobs.notices();
         assert_eq!(notices.len(), 5);
-        let shown: Vec<_> = notices
-            .iter()
-            .take(NOTICES_SHOWN)
-            .map(|job| job.id)
-            .collect();
+        let shown: Vec<_> = notices.iter().take(3).map(|job| job.id).collect();
         assert_eq!(shown, [5, 4, 3], "newest first");
         assert_eq!(notices.len() - shown.len(), 2);
     }
@@ -1466,6 +1469,15 @@ mod tests {
         assert!(short.ends_with(".pdf"));
         assert!(long.starts_with(&short[..short.len() - 4]));
         assert_eq!(local_file_name("a.pdf"), "a.pdf");
+    }
+
+    #[test]
+    fn ages_read_in_minutes_then_hours() {
+        assert_eq!(age_label(Duration::from_secs(59)), "Just now");
+        assert_eq!(age_label(Duration::from_secs(60)), "1 min ago");
+        assert_eq!(age_label(Duration::from_secs(12 * 60 + 5)), "12 min ago");
+        assert_eq!(age_label(Duration::from_secs(3600)), "1 hr ago");
+        assert_eq!(age_label(Duration::from_secs(3 * 3600 + 59)), "3 hr ago");
     }
 
     #[test]
