@@ -11,7 +11,7 @@ id: 067NC4KG01SKERRY0000000002
 <!-- compose:unresolved id=ARCH-GAP-VS-02 concept="webrtc-transport" question="Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, data-channel input, and SealSkin session handoff before adding a transport selector alongside WebSockets." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-03 concept="extended-codecs-and-tuning" question="Evaluate VP8/VP9 decode paths where VideoToolbox lacks hardware decode, plus 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder tuning." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-04 concept="jpeg-cpu-cost" question="JPEG streaming costs 36–65 % CPU at 1492×1868 (H.264 8–15 %): stripes are decoded in software and the whole canvas is copied every 33 ms (transport.rs present loop). Decide between dirty-rect upload, hardware JPEG decode (VTDecompression / ImageIO), or keeping JPEG as a fallback only." -->
-<!-- compose:unresolved id=ARCH-GAP-VS-05 concept="session-controls-ux" question="Session Controls forgets which sections are open and its scroll position on every open and reconnect, Preset is an inline button list unlike the other pickers, and Select popovers have no shadow. Persist section state per server and unify the pickers?" -->
+<!-- compose:unresolved id=ARCH-GAP-VS-05 concept="session-controls-ux" question="Section memory, scroll position, and dropdown shadow are settled (ARCH-026). Still open: the web sidebar's stream-toggle tile row (ARCH-020)." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-06 concept="stats-overlay" question="Add the web's \"Show over the stream\" stats strip (status marks, fps, video rate vs target, capture-to-sent, RTT over the picture) and/or its floating gauges, and where would a native window put them (ARCH-020)?" -->
 
 ### Goal
@@ -40,7 +40,7 @@ Deliver low-latency hardware-accelerated or JPEG-fallback remote desktop video, 
   - Web-sidebar Stats (settled: `ARCH-019`): the Stats section shows Encoder/Capture/Decoder/Connection status rows, FPS/Bandwidth/Latency history graphs, figure tiles, and host CPU/GPU/memory meters from the server's `stream_stats`, subscribed with `_stats,1` only while the section is open; a copy button copies a plain-text report.
 - `second-display-window` (unresolved: `ARCH-GAP-VS-01`): open a second remote display in its own GPUI window following the server's display placement model, coordinate boundaries, and fullscreen lifecycle while primary session owns audio.
 - `jpeg-cpu-cost` (unresolved: `ARCH-GAP-VS-04`): JPEG mode is CPU-heavy (QA 2026-11-21); hardware codecs are the default.
-- `session-controls-ux` (unresolved: `ARCH-GAP-VS-05`): remember section state, unify pickers.
+- `session-controls-ux` (mostly settled: `ARCH-026`; tile row open in `ARCH-GAP-VS-05`): which sections are open is saved per server, scroll position is kept per session window across closing the panel and reconnecting, and Session Controls dropdowns use `menu_dropdown` with a theme-aware shadow.
   - Web-sidebar look (settled: `ARCH-018`): sections are separate rounded cards 10px apart; settings are a label above a full-width dropdown, slider (value in the label, requested on release), switch, or button, as in the Selkies web sidebar.
 - `stats-overlay` (unresolved: `ARCH-GAP-VS-06`): the web's over-the-stream stats strip and floating gauges (`ARCH-020`).
 - `webrtc-transport-evaluation` (unresolved: `ARCH-GAP-VS-02`): evaluate WebRTC signaling, ICE/STUN/TURN, negotiated codecs, and data-channel input against the direct WebSocket transport.

@@ -30,6 +30,16 @@ subject: skerry
 - Two sessions (the same app twice included) stream in separate windows at once. Closing one leaves the other streaming and the Library open. Session Controls and resizing act only on their own window. Resuming an open session focuses its window (`ARCH-022`).
 - `selkies::tests::*` pass: a file at or under 64 MiB uploads as one POST with only `X-Upload-Path` (URL-encoded); a larger file goes as sequential 64 MiB slices whose `X-Upload-Id` is constant, `X-Upload-Offset` advances by the bytes sent, `X-Upload-Total` is the file size, and only the last carries `X-Upload-Final: 1`; browse JSON decodes into entries; a resumed download asks for `Range: bytes=<have>-`; no request carries an `Origin` header; upload/download availability follows `file_transfers`; `selkies::tests::end_to_end::*` round-trip a plain upload, a ~131 MiB sliced upload, browse, mkdir, a download, and a resumed download (206, and 416 restarting from 0) against an in-process fake Selkies; and the list's keys never fire while typing in the New Folder field (`ARCH-023`).
 - `files_window::tests::deletes_map_into_the_home_desktop_only_when_the_folders_match` passes: a Selkies path maps to `/Desktop/<path>` in the home, and Delete is offered only when the Selkies root and the home's `Desktop` list the same names, staging files aside (`ARCH-024`). `pasteboard::tests::file_urls_round_trip` resolves Finder's `file:///.file/id=…` reference URLs to real paths.
+- Task A tests pass (`ARCH-026`):
+  - `KeyLedger` tests: releases on blur and close, never Super or Meta for Command, and a Shift-changed keysym is released.
+  - A stream dropped while connecting sends no `SETTINGS`, and key releases go out before the close frame.
+  - The raw-TCP tests: logo and icon fetches carry no `Authorization`, and only `/companion/api/` requests do.
+  - The write queue is the only writer (a test fails if another module calls the file writers), runs jobs in order, and backs up an unreadable preferences file.
+  - Unknown preference keys survive a rewrite.
+- Task E tests pass (`ARCH-030`):
+  - `audio::tests::*` use the fake `Backend`: following the default, chosen-missing fallback and return, the stall heartbeat (no false stall while muted), backoff and strikes, the probe keeping the fallback playing, and one failed listing keeping a healthy stream.
+  - The `AudioBitrate` parsing accepts strings or numbers, and the `SETTINGS` audio_bitrate message is the exact text.
+  - A preferences file without audio settings loads.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

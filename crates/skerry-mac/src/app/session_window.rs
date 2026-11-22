@@ -10,6 +10,7 @@ use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
     ToggleFiles, ToggleFullScreen, ToggleSessionControls, APP_NAME,
 };
+use crate::audio::OutputStatus;
 use crate::input::InputFeature;
 use crate::persist::WriteQueue;
 use crate::sealskin::{RemoteSession, SealSkinClient};
@@ -83,6 +84,8 @@ pub(super) struct SessionWindow {
     stream_events: Option<Task<()>>,
     pub(super) audio: Option<bool>,
     pub(super) audio_unavailable: Option<&'static str>,
+    /// The output devices and where sound plays, from the audio thread.
+    pub(super) audio_output: Option<OutputStatus>,
     pub(super) muted: bool,
     pub(super) video: Option<bool>,
     pub(super) settings: Option<Settings>,
@@ -147,6 +150,7 @@ impl SessionWindow {
             stream_events: None,
             audio: None,
             audio_unavailable: None,
+            audio_output: None,
             muted: false,
             video: None,
             settings: None,
@@ -238,6 +242,8 @@ impl SessionWindow {
                     } else {
                         format!("Connecting to {}…", self.remote.app_name)
                     },
+                    audio_output: self.preferences.audio.output_device.clone(),
+                    audio_bitrate: self.preferences.audio.bitrate,
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -248,6 +254,7 @@ impl SessionWindow {
         match stream {
             Ok(stream) => {
                 self.audio = None;
+                self.audio_output = None;
                 self.status = None;
                 // A new stream replaces whatever the start-up banner was about.
                 self.startup_stalled = None;
@@ -285,6 +292,13 @@ impl SessionWindow {
         match event {
             SessionEvent::Audio(enabled) => self.audio = Some(enabled),
             SessionEvent::AudioUnavailable(reason) => self.audio_unavailable = Some(reason),
+            // Audio starts only after the settings arrive, so a status while they are
+            // unknown is a late one from a stream that already ended (an error).
+            SessionEvent::AudioOutput(status) if self.settings.is_some() => {
+                self.remember_output_name(&status, cx);
+                self.audio_output = Some(status);
+            }
+            SessionEvent::AudioOutput(_) => {}
             SessionEvent::Video(enabled) => self.video = Some(enabled),
             SessionEvent::Settings(settings) => {
                 // The session answered: later reconnects get the normal 45 s grace.
@@ -351,6 +365,7 @@ impl SessionWindow {
                 self.resize_allowed = false;
                 self.settings = None;
                 self.audio = None;
+                self.audio_output = None;
                 self.video = None;
                 self.status = Some(error);
             }
@@ -461,6 +476,78 @@ impl SessionWindow {
             }
         }
         cx.notify();
+    }
+
+    /// Plays through `uid` (`None` follows the Mac) and saves the choice with the device's
+    /// name, to label it while it isn't connected.
+    pub(super) fn change_audio_output(&mut self, uid: Option<String>, cx: &mut Context<Self>) {
+        let name = uid.as_deref().and_then(|uid| {
+            self.audio_output
+                .as_ref()
+                .and_then(|status| status.device(uid))
+                .map(|device| device.name.clone())
+        });
+        let audio = &mut self.preferences.audio;
+        audio.output_device = uid.clone();
+        audio.output_device_name = name;
+        let (device, name) = (
+            audio.output_device.clone(),
+            audio.output_device_name.clone(),
+        );
+        self.save(
+            "the output device",
+            move |p| {
+                p.audio.output_device = device.clone();
+                p.audio.output_device_name = name.clone();
+            },
+            cx,
+        );
+        if let Some(stream) = &self.current {
+            stream.set_audio_output(uid);
+        }
+        cx.notify();
+    }
+
+    /// Asks the server for `bps` and saves it for the next session on this server.
+    pub(super) fn change_audio_bitrate(&mut self, bps: u32, cx: &mut Context<Self>) {
+        if self
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.audio_bitrate.as_ref())
+            .and_then(|bitrate| bitrate.request(bps))
+            .is_none()
+        {
+            return;
+        }
+        self.preferences.audio.bitrate = Some(bps);
+        self.save(
+            "the audio bitrate",
+            move |p| p.audio.bitrate = Some(bps),
+            cx,
+        );
+        if let Some(stream) = &self.current {
+            stream.set_audio_bitrate(bps);
+        }
+        cx.notify();
+    }
+
+    /// Keeps the chosen device's latest name, saving only when it changed so status churn
+    /// never queues writes.
+    fn remember_output_name(&mut self, status: &OutputStatus, cx: &mut Context<Self>) {
+        let audio = &self.preferences.audio;
+        let Some(name) = output_name_to_save(
+            audio.output_device.as_deref(),
+            audio.output_device_name.as_deref(),
+            status,
+        ) else {
+            return;
+        };
+        self.preferences.audio.output_device_name = Some(name.clone());
+        self.save(
+            "the output device",
+            move |p| p.audio.output_device_name = Some(name.clone()),
+            cx,
+        );
     }
 
     pub(super) fn change_setting(&mut self, key: Key, value: u32, cx: &mut Context<Self>) {
@@ -730,6 +817,7 @@ impl SessionWindow {
         }
         self.audio = None;
         self.audio_unavailable = None;
+        self.audio_output = None;
         self.video = None;
     }
 
@@ -750,6 +838,21 @@ impl SessionWindow {
         self.teardown(window, cx);
         window.remove_window();
     }
+}
+
+/// The chosen device's name to save: when the status answers that choice, lists the device,
+/// and its name differs from the saved one.
+fn output_name_to_save(
+    chosen: Option<&str>,
+    saved: Option<&str>,
+    status: &OutputStatus,
+) -> Option<String> {
+    let chosen = chosen?;
+    if status.chosen.as_deref() != Some(chosen) {
+        return None;
+    }
+    let name = &status.device(chosen)?.name;
+    (saved != Some(name.as_str())).then(|| name.clone())
 }
 
 impl Render for SessionWindow {
@@ -808,5 +911,43 @@ impl Render for SessionWindow {
                     ))
                 },
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::OutputDevice;
+
+    #[test]
+    fn the_chosen_name_is_saved_only_when_it_changes() {
+        let status = OutputStatus {
+            devices: vec![OutputDevice {
+                uid: "AirPods".into(),
+                name: "Office AirPods".into(),
+            }],
+            chosen: Some("AirPods".into()),
+            ..OutputStatus::default()
+        };
+        assert_eq!(
+            output_name_to_save(Some("AirPods"), Some("AirPods Pro"), &status).as_deref(),
+            Some("Office AirPods")
+        );
+        assert_eq!(
+            output_name_to_save(Some("AirPods"), Some("Office AirPods"), &status),
+            None
+        );
+        assert_eq!(output_name_to_save(None, None, &status), None);
+        // Not connected: keep the last-seen name.
+        assert_eq!(
+            output_name_to_save(Some("USB"), Some("USB DAC"), &status),
+            None
+        );
+        // A status for an older choice says nothing about this one.
+        let stale = OutputStatus {
+            chosen: None,
+            ..status
+        };
+        assert_eq!(output_name_to_save(Some("AirPods"), None, &stale), None);
     }
 }
