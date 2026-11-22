@@ -13,6 +13,8 @@ cpal = "0.17.3"
 dotenvy = "0.15"
 futures-util = { version = "0.3", features = ["sink"] }
 gpui-kit = "0.10.0"
+# setrlimit for the SVG icon worker (`ARCH-035`).
+libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSView", "NSWindow", "NSWorkspace", "block2", "objc2-uniform-type-identifiers"] }

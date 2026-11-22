@@ -385,10 +385,11 @@ fn system_action(text: &str) -> Option<String> {
 fn system_event(action: &str) -> Option<SessionEvent> {
     match action.split_once(',').map_or(action, |(kind, _)| kind) {
         "rumble" => crate::gamepad::Rumble::parse(action).map(SessionEvent::Rumble),
-        "apps_state" | "apps_job" | "command_error" => Some(SessionEvent::Apps(
+        "apps_state" | "apps_job" => Some(SessionEvent::Apps(
             // Unreadable JSON still shows the server speaks the apps protocol.
             crate::apps::parse_action(action).unwrap_or(crate::apps::Event::Unreadable),
         )),
+        "command_error" => crate::apps::parse_action(action).map(SessionEvent::Apps),
         _ => None,
     }
 }

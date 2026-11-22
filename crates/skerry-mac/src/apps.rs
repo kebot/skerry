@@ -36,9 +36,10 @@ pub const ICON_EDGE: u32 = 128;
 pub const ICON_FETCHES: usize = 6;
 /// Icon decodes running at once, per window: separate from the fetches.
 pub const ICON_DECODES: usize = 2;
-/// An SVG decode that takes longer than this marks the icon failed and stops SVG decoding
-/// for the window (`spawn_blocking` can't be cancelled).
-pub const SVG_WATCHDOG: Duration = Duration::from_secs(2);
+/// A second line behind the worker's own limits ([`SVG_WORKER_FLAG`], killed after 3 s): an
+/// SVG decode still unanswered after this (a worker slot wait included) marks the icon
+/// failed and stops SVG decoding for the window.
+pub const SVG_WATCHDOG: Duration = Duration::from_secs(10);
 /// A request with no `apps_job` for its app after this gives up ("Requested…" ends).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// A `command_error` this soon after a launch belongs to it (Selkies `LAUNCH_FAILURE_WINDOW`).
@@ -1102,19 +1103,42 @@ fn svg_elements_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
         .any(|n| n.is_element() && SVG_REFUSED.contains(&n.tag_name().name()))
 }
 
-/// The `#id`s `url(...)` references in `text` name.
+/// The `#id`s `url(...)` references in `text` name, read as svgtypes reads a FuncIRI:
+/// whitespace (`' ' \t \n \r`) after `url(`, an optional quote, whitespace again, `#`, then the
+/// id up to the closing quote (trimmed) or, unquoted, up to `)` or whitespace. A `url(` that
+/// can't be read this way yields `""`, which [`names_server`] treats as a reference: fail
+/// closed.
 fn url_ids(text: &str) -> Vec<&str> {
+    const WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
     let mut ids = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find("url(") {
         rest = &rest[at + 4..];
-        let inner = rest.trim_start_matches([' ', '"', '\'', '\t', '\n']);
-        if let Some(id) = inner.strip_prefix('#') {
-            let end = id.find([')', '"', '\'', ' ']).unwrap_or(id.len());
-            ids.push(&id[..end]);
+        let inner = rest.trim_start_matches(WHITESPACE);
+        let (quote, inner) = match inner.chars().next() {
+            Some(quote @ ('"' | '\'')) => (Some(quote), &inner[1..]),
+            _ => (None, inner),
+        };
+        let inner = inner.trim_start_matches(WHITESPACE);
+        let Some(id) = inner.strip_prefix('#') else {
+            ids.push("");
+            continue;
+        };
+        let end = match quote {
+            Some(quote) => id.find(quote),
+            None => id.find(|c: char| c == ')' || c.is_ascii_whitespace()),
+        };
+        match end {
+            Some(end) => ids.push(id[..end].trim_matches(|c: char| c.is_ascii_whitespace())),
+            None => ids.push(""),
         }
     }
     ids
+}
+
+/// Whether a `url(...)` id from [`url_ids`] names one of `servers` (or couldn't be read).
+fn names_server(id: &str, servers: &HashMap<&str, ()>) -> bool {
+    id.is_empty() || servers.contains_key(id)
 }
 
 /// The classes whose stylesheet rules reference one of `servers`, and whether a rule without a
@@ -1126,7 +1150,7 @@ fn css_server_classes(stylesheet: &str, servers: &HashMap<&str, ()>) -> (HashSet
         let Some((selectors, body)) = rule.split_once('{') else {
             continue;
         };
-        if !url_ids(body).iter().any(|id| servers.contains_key(id)) {
+        if !url_ids(body).iter().any(|id| names_server(id, servers)) {
             continue;
         }
         for selector in selectors.split(',') {
@@ -1192,6 +1216,21 @@ fn svg_nesting_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
     if roots.is_empty() {
         return true;
     }
+    // Uses by attribute (the worker's tree check also counts stylesheet uses).
+    let uses: usize = doc
+        .descendants()
+        .filter(|n| n.is_element())
+        .flat_map(|n| n.attributes())
+        .map(|a| {
+            url_ids(a.value())
+                .iter()
+                .filter(|id| names_server(id, &servers))
+                .count()
+        })
+        .sum();
+    if uses > SVG_MAX_PAINT_REFS {
+        return false;
+    }
     let (classes, every) = css_server_classes(&stylesheet, &servers);
     let href = |node: Node| -> Option<NodeId> {
         let target = node
@@ -1202,9 +1241,11 @@ fn svg_nesting_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
     };
     let reaches = |node: Node| -> bool {
         every
-            || node
-                .attributes()
-                .any(|a| url_ids(a.value()).iter().any(|id| servers.contains_key(id)))
+            || node.attributes().any(|a| {
+                url_ids(a.value())
+                    .iter()
+                    .any(|id| names_server(id, &servers))
+            })
             || node
                 .attribute("class")
                 .is_some_and(|names| names.split_whitespace().any(|n| classes.contains(n)))
@@ -1440,7 +1481,19 @@ fn without_filters(text: &str, doc: &resvg::usvg::roxmltree::Document) -> Option
 /// Rasterizes an SVG icon into a box [`ICON_EDGE`] pixels on the long edge, with no external
 /// resources ([`svg_options`]), after [`svg_cost_ok`], [`svg_elements_ok`] and [`svg_tree_ok`]. Gzip (SVGZ) and any
 /// DTD are refused: their expansion would escape the byte cap.
+///
+/// The cheap checks run here; usvg and resvg run only in a short-lived worker process
+/// ([`SVG_WORKER_FLAG`]) under CPU and memory limits and a wall timeout, so a bypass of the
+/// checks costs at most one killed child, never the app.
 pub fn decode_svg(bytes: &[u8]) -> Option<IconPixels> {
+    svg_checked_text(bytes)?;
+    rasterize_in_worker(bytes, false)
+}
+
+/// The icon's text once it passes every check before usvg: the byte cap, no gzip, UTF-8, no
+/// entities ([`svg_parsing`]), [`svg_cost_ok`], filters removed ([`without_filters`]), and
+/// then on the rewritten text [`svg_cost_ok`], [`svg_elements_ok`] and [`svg_nesting_ok`].
+fn svg_checked_text(bytes: &[u8]) -> Option<String> {
     use resvg::usvg::roxmltree;
     if bytes.len() > ICON_CAP || bytes.starts_with(&[0x1f, 0x8b]) {
         return None;
@@ -1454,18 +1507,21 @@ pub fn decode_svg(bytes: &[u8]) -> Option<IconPixels> {
         // Filters are removed, not refused: the icon renders without its drop shadow.
         without_filters(text, &doc)?
     };
-    render_svg(stripped.as_deref().unwrap_or(text))
+    let text = stripped.unwrap_or_else(|| text.to_owned());
+    let doc = roxmltree::Document::parse_with_options(&text, svg_parsing(&text)?).ok()?;
+    if !svg_cost_ok(&doc) || !svg_elements_ok(&doc) || !svg_nesting_ok(&doc) {
+        return None;
+    }
+    drop(doc);
+    Some(text)
 }
 
-/// Checks and renders an icon's text that has no filters left.
+/// Converts and renders checked icon text (in the worker process).
 fn render_svg(text: &str) -> Option<IconPixels> {
     use resvg::tiny_skia::{Pixmap, Transform};
     use resvg::usvg::roxmltree;
     let doc = roxmltree::Document::parse_with_options(text, svg_parsing(text)?).ok()?;
     let doc = &doc;
-    if !svg_cost_ok(doc) || !svg_elements_ok(doc) || !svg_nesting_ok(doc) {
-        return None;
-    }
     let tree = resvg::usvg::Tree::from_xmltree(doc, &svg_options()).ok()?;
     if !svg_tree_ok(&tree) {
         return None;
@@ -1500,6 +1556,208 @@ fn render_svg(text: &str) -> Option<IconPixels> {
     Some(IconPixels {
         width: pixel_width,
         height: pixel_height,
+        bgra,
+    })
+}
+
+// ---- SVG worker process -----------------------------------------------------------------
+
+/// The hidden argument that makes the app binary an SVG worker: read SVG bytes on stdin,
+/// write the icon's pixels on stdout, exit. `main` checks it before GPUI or Tokio start.
+pub const SVG_WORKER_FLAG: &str = "--skerry-svg-worker";
+/// What precedes the pixels on the worker's stdout.
+const WORKER_MAGIC: &[u8; 6] = b"SKSVG1";
+/// The parent kills a worker still running after this.
+const WORKER_WALL: Duration = Duration::from_secs(3);
+/// The worker's own limits, set before it parses anything.
+const WORKER_CPU_SECONDS: u64 = 2;
+const WORKER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// Workers running at once, app-wide.
+const WORKER_SLOTS: usize = 2;
+
+static WORKERS: (std::sync::Mutex<usize>, std::sync::Condvar) =
+    (std::sync::Mutex::new(0), std::sync::Condvar::new());
+
+/// One of the [`WORKER_SLOTS`], released on drop.
+struct WorkerSlot;
+
+impl WorkerSlot {
+    fn acquire() -> Self {
+        let (lock, freed) = &WORKERS;
+        let mut running = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *running >= WORKER_SLOTS {
+            running = freed
+                .wait(running)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *running += 1;
+        WorkerSlot
+    }
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        let (lock, freed) = &WORKERS;
+        let mut running = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *running = running.saturating_sub(1);
+        freed.notify_one();
+    }
+}
+
+/// The worker's body. It touches no file and no network: stdin in, stdout out. Returns the
+/// process exit code.
+pub fn svg_worker_main() -> i32 {
+    use std::io::{Read as _, Write as _};
+    limit_worker();
+    let mut input = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(ICON_CAP as u64 + 1)
+        .read_to_end(&mut input)
+        .is_err()
+    {
+        return 2;
+    }
+    let Some(pixels) = rasterize_svg(&input, !worker_unchecked()) else {
+        return 1;
+    };
+    let mut out = Vec::with_capacity(WORKER_MAGIC.len() + 8 + pixels.bgra.len());
+    out.extend_from_slice(WORKER_MAGIC);
+    out.extend_from_slice(&pixels.width.to_le_bytes());
+    out.extend_from_slice(&pixels.height.to_le_bytes());
+    out.extend_from_slice(&pixels.bgra);
+    let mut stdout = std::io::stdout().lock();
+    if stdout.write_all(&out).and_then(|_| stdout.flush()).is_err() {
+        return 3;
+    }
+    0
+}
+
+/// The worker in tests may skip the checks, to prove the limits alone stop a bomb.
+fn worker_unchecked() -> bool {
+    cfg!(test) && std::env::var_os("SKERRY_SVG_UNCHECKED").is_some()
+}
+
+/// CPU seconds (SIGXCPU, then SIGKILL a second later) and address space, best effort: macOS
+/// may not enforce every memory limit, and the parent's wall timeout backs both up.
+fn limit_worker() {
+    let set = |resource: libc::c_int, soft: u64, hard: u64| {
+        let limit = libc::rlimit {
+            rlim_cur: soft as libc::rlim_t,
+            rlim_max: hard as libc::rlim_t,
+        };
+        // SAFETY: a plain syscall on a valid, initialised struct.
+        unsafe { libc::setrlimit(resource, &limit) };
+    };
+    set(libc::RLIMIT_CPU, WORKER_CPU_SECONDS, WORKER_CPU_SECONDS + 1);
+    set(libc::RLIMIT_AS, WORKER_MEMORY_BYTES, WORKER_MEMORY_BYTES);
+    set(libc::RLIMIT_DATA, WORKER_MEMORY_BYTES, WORKER_MEMORY_BYTES);
+}
+
+/// Rasterizes in this process: the worker's job.
+fn rasterize_svg(bytes: &[u8], checked: bool) -> Option<IconPixels> {
+    if checked {
+        render_svg(&svg_checked_text(bytes)?)
+    } else {
+        render_svg(std::str::from_utf8(bytes).ok()?)
+    }
+}
+
+/// The command that starts a worker: this same binary with [`SVG_WORKER_FLAG`] (inside the
+/// `.app` too: `current_exe` is `Contents/MacOS/<name>`), with an empty environment.
+#[cfg(not(test))]
+fn worker_command() -> Option<std::process::Command> {
+    let mut command = std::process::Command::new(std::env::current_exe().ok()?);
+    command.arg(SVG_WORKER_FLAG).env_clear();
+    Some(command)
+}
+
+/// Under `cargo test` the binary is the test harness: it runs the one test that turns into a
+/// worker.
+#[cfg(test)]
+fn worker_command() -> Option<std::process::Command> {
+    let mut command = std::process::Command::new(std::env::current_exe().ok()?);
+    command
+        .args([
+            "--exact",
+            "apps::tests::svg_worker_entry",
+            "--nocapture",
+            "--test-threads=1",
+            "-q",
+        ])
+        .env_clear()
+        .env("SKERRY_SVG_WORKER", "1");
+    Some(command)
+}
+
+/// Runs one worker on `bytes`: at most [`WORKER_SLOTS`] at once, killed after
+/// [`WORKER_WALL`]. A crash, kill, timeout or bad answer is `None` (the initial tile).
+fn rasterize_in_worker(bytes: &[u8], unchecked: bool) -> Option<IconPixels> {
+    use std::io::{Read as _, Write as _};
+    use std::process::Stdio;
+    let _slot = WorkerSlot::acquire();
+    let mut command = worker_command()?;
+    if unchecked && cfg!(test) {
+        command.env("SKERRY_SVG_UNCHECKED", "1");
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    let input = bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let stdout = child.stdout.take()?;
+    // The pixels, plus room for the test harness's own banner.
+    let most = (WORKER_MAGIC.len() + 8 + (ICON_EDGE * ICON_EDGE * 4) as usize + 4096) as u64;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.take(most).read_to_end(&mut out);
+        out
+    });
+    let deadline = Instant::now() + WORKER_WALL;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let _ = writer.join();
+    let out = reader.join().ok()?;
+    if !status?.success() {
+        return None;
+    }
+    worker_pixels(&out)
+}
+
+/// The pixels in a worker's stdout, checked against the icon box.
+fn worker_pixels(out: &[u8]) -> Option<IconPixels> {
+    let at = out
+        .windows(WORKER_MAGIC.len())
+        .position(|window| window == WORKER_MAGIC)?;
+    let body = &out[at + WORKER_MAGIC.len()..];
+    let width = u32::from_le_bytes(body.get(0..4)?.try_into().ok()?);
+    let height = u32::from_le_bytes(body.get(4..8)?.try_into().ok()?);
+    if width == 0 || height == 0 || width > ICON_EDGE || height > ICON_EDGE {
+        return None;
+    }
+    let bgra = body.get(8..8 + (width * height * 4) as usize)?.to_vec();
+    Some(IconPixels {
+        width,
+        height,
         bgra,
     })
 }
@@ -2507,13 +2765,16 @@ include:
         let chain = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><filter id="f">{blurs}</filter><rect width="9" height="9" filter="url(#f)"/></svg>"#
         );
+        // The checks and the stripping, all in this process, take under 50 ms; the drawing is
+        // the worker's (a process start included).
         let started = Instant::now();
-        let icon = decode_svg(chain.as_bytes()).expect("drawn without its filter");
+        assert!(svg_checked_text(chain.as_bytes()).is_some());
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "{:?}",
             started.elapsed()
         );
+        let icon = decode_svg(chain.as_bytes()).expect("drawn without its filter");
         assert!(icon.bgra.chunks(4).all(|p| p[3] == 255));
         refused_fast(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><marker id="m"><rect width="1" height="1"/></marker><path d="M0 0L9 9" marker-mid="url(#m)"/></svg>"##,
@@ -2533,8 +2794,9 @@ include:
                 if path.to_string_lossy().contains("blur") {
                     // Filter chains: stripped, not refused, and just as fast.
                     let started = Instant::now();
-                    assert!(decode_svg(svg.as_bytes()).is_some(), "{path:?}");
+                    assert!(svg_checked_text(svg.as_bytes()).is_some(), "{path:?}");
                     assert!(started.elapsed() < Duration::from_millis(50), "{path:?}");
+                    assert!(decode_svg(svg.as_bytes()).is_some(), "{path:?}");
                 } else {
                     refused_fast(&svg);
                 }
@@ -2605,6 +2867,116 @@ include:
         refused_fast(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><pattern id="a0" width="2" height="2"><rect width="1" height="1"/></pattern><pattern id="b" width="3" height="3"><rect style="fill:url(#a\30)" width="1" height="1"/></pattern><rect width="9" height="9" fill="url(#b)"/></svg>"##,
         );
+    }
+
+    /// Turns this test binary into an SVG worker when the parent asks (`worker_command`).
+    #[test]
+    fn svg_worker_entry() {
+        if std::env::var_os("SKERRY_SVG_WORKER").is_some() {
+            std::process::exit(svg_worker_main());
+        }
+    }
+
+    #[test]
+    fn a_bomb_past_the_checks_is_killed_and_the_parent_stays_healthy() {
+        // The R3 shape: objectBoundingBox patterns, 7 levels, each filling with the one below.
+        let mut svg = String::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><defs><pattern id="n0" width="0.5" height="0.5"><rect width="1" height="1"/></pattern>"#,
+        );
+        for k in 1..7 {
+            svg.push_str(&format!(
+                r#"<pattern id="n{k}" width="0.1" height="0.1">{}</pattern>"#,
+                format!(r#"<rect width="1" height="1" fill="url(#n{})"/>"#, k - 1).repeat(10)
+            ));
+        }
+        svg.push_str(r#"</defs><rect width="64" height="64" fill="url(#n6)"/></svg>"#);
+        assert!(
+            svg_checked_text(svg.as_bytes()).is_none(),
+            "the checks catch it"
+        );
+        // Skip the checks in the worker: its limits alone must stop it.
+        let started = Instant::now();
+        assert!(rasterize_in_worker(svg.as_bytes(), true).is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(3_500),
+            "{:?}",
+            started.elapsed()
+        );
+        // The parent carries on.
+        assert!(decode_svg(SQUARE_SVG.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn worker_answers_are_checked() {
+        let mut good = WORKER_MAGIC.to_vec();
+        good.extend_from_slice(&1u32.to_le_bytes());
+        good.extend_from_slice(&1u32.to_le_bytes());
+        good.extend_from_slice(&[1, 2, 3, 4]);
+        let mut noisy = b"running 1 test\n".to_vec();
+        noisy.extend_from_slice(&good);
+        assert_eq!(
+            worker_pixels(&noisy).map(|p| p.bgra),
+            Some(vec![1, 2, 3, 4])
+        );
+        assert!(worker_pixels(&good[..good.len() - 1]).is_none(), "short");
+        let mut huge = WORKER_MAGIC.to_vec();
+        huge.extend_from_slice(&1000u32.to_le_bytes());
+        huge.extend_from_slice(&1u32.to_le_bytes());
+        assert!(worker_pixels(&huge).is_none(), "outside the icon box");
+        assert!(worker_pixels(b"nothing").is_none());
+    }
+
+    #[test]
+    fn url_references_are_read_as_svgtypes_reads_them() {
+        let servers: HashMap<&str, ()> = [("n0", ())].into();
+        let hits = |text: &str| url_ids(text).iter().any(|id| names_server(id, &servers));
+        for text in [
+            "fill:url(\"#n0\t\")",
+            "fill:url('#n0\n')",
+            "fill:url(\r#n0)",
+            "url(\r#n0)",
+            "url('#n0\t')",
+            "fill:url( \t\r\n ' \r#n0 ' )",
+            "url(#n0)",
+            "url(x.svg#n0)",
+            "url('#n0",
+        ] {
+            assert!(hits(text), "{text:?}");
+        }
+        assert!(!hits("fill:url(#other) stroke:none"));
+        assert_eq!(url_ids("url( '#a b ' )"), ["a b"]);
+    }
+
+    #[test]
+    fn whitespace_inside_url_never_hides_nesting() {
+        // The reviewer's six variants (R3-H1), as XML would carry them.
+        let pattern = |fill_ref: &str, style: &str| {
+            format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9">{style}<pattern id="n0" width="2" height="2"><rect width="1" height="1"/></pattern><pattern id="n1" width="3" height="3"><rect class="c" width="1" height="1" {fill_ref}/></pattern><rect width="9" height="9" fill="url(#n1)"/></svg>"##
+            )
+        };
+        refused_fast(&pattern("", "<style>.c{fill:url(\"#n0\t\")}</style>"));
+        refused_fast(&pattern("", "<style>.c{fill:url('#n0\n')}</style>"));
+        refused_fast(&pattern("", "<style>.c{fill:url(&#13;#n0)}</style>"));
+        refused_fast(&pattern(r#"fill="url(&#13;#n0)""#, ""));
+        refused_fast(&pattern(r#"fill="url('#n0&#9;')""#, ""));
+        refused_fast(&pattern(r#"style="fill:url(&#13;#n0)""#, ""));
+        // And the 6-level objectBoundingBox timing case through an attribute.
+        let mut svg = String::from(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><defs><pattern id="n0" width="0.5" height="0.5"><rect width="1" height="1"/></pattern>"#,
+        );
+        for k in 1..6 {
+            svg.push_str(&format!(
+                r#"<pattern id="n{k}" width="0.1" height="0.1">{}</pattern>"#,
+                format!(
+                    r#"<rect width="1" height="1" fill="url(&#13;#n{})"/>"#,
+                    k - 1
+                )
+                .repeat(10)
+            ));
+        }
+        svg.push_str(r#"</defs><rect width="64" height="64" fill="url(#n5)"/></svg>"#);
+        refused_fast(&svg);
     }
 
     #[test]

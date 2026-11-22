@@ -42,6 +42,10 @@ mod view;
 
 #[cfg(target_os = "macos")]
 fn main() {
+    // The SVG icon worker (`ARCH-035`): before GPUI, Tokio, or anything else starts.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(apps::SVG_WORKER_FLAG)) {
+        std::process::exit(apps::svg_worker_main());
+    }
     app::run();
 }
 
