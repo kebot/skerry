@@ -6160,6 +6160,7 @@ dependencies = [
  "opus-decoder",
  "percent-encoding",
  "raw-window-handle",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
