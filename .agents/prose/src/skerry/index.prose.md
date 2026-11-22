@@ -26,7 +26,9 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
   - `selkies.rs` (`SelkiesClient`, one Selkies session's HTTP file routes, `ARCH-023`/`ARCH-024`; was `files.rs`/`Access`) and `app/{files_window,files_model,promise}.rs` (the per-session Files window, its browsing model, and `NSFilePromiseProvider` drags).
   - `transport.rs`: `socket_request` (unredirected `GET` -> `303 See Other` cookie exchange -> `wss://.../api/websockets`), initial `SETTINGS` handshake, 33 ms frame publish + `CLIENT_FRAME_ACK`, 1 s stream stats/ping RTT, and `kh,<keys>` held-key keepalive.
   - `video.rs`: `Codec` (JPEG, H.264, H.265, AV1), `VTIsHardwareDecodeSupported`, Annex B / parameter-set / AV1 sequence-header parsing, and IOSurface-backed `CVPixelBuffer` (`kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`) painted via `window.paint_surface`.
-  - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`.
+  - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`, loaded field by field so a newer build's keys survive (`ARCH-026`).
+  - `persist.rs`: the single FIFO write queue on Tokio for preferences and the key. Its in-memory copy serves every read, and it flushes within 1 s on quit (`ARCH-026`).
+  - `view/keys.rs`: `KeyLedger`, the pure held-key bookkeeping that releases keys before close, on blur, and before child windows (`ARCH-026`).
   - `clipboard.rs` & `pasteboard.rs`: Selkies clipboard protocol (`encode`, `Receiver`, `Policy` / `ClipboardSettings` / `Effective`) and the general `NSPasteboard` bridge (`change_count`, `read`, `write`, concealed secrets) (`ARCH-017`).
   - `input.rs`: `InputSettings` (Command sends Control, Remote Cursor, Smooth Trackpad Scrolling, Use Mac Input Method) and `RemoteChord` (Alt+Tab, Ctrl+Alt+Delete).
   - `audio.rs`: 48 kHz stereo `f32` Opus `Playback` with bounded latency queue (`48000 * 2 / 8` samples).
@@ -65,6 +67,8 @@ input-driven
 - Async or long-lived work on an entity that another window also renders (a `SessionWindow` is rendered by its Session Controls) captures `Window::window_handle(window)` and updates through that handle. `gpui-pre`'s `update_in` resolves the entity's *current* window instead (`ARCH-015`).
 - Library images (app icons, session thumbnails) are GPU textures too: every replaced, removed, or stale image is retired with `window.drop_image` on the next Launcher render, and server images are decoded with size limits and downscaled before upload (`ARCH-014`).
 - Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.
+- The application key is attached only to requests whose resolved path is under `/companion/api/`; every other fetch (logos, icons) uses a client with no key (`ARCH-026`).
+- Preference and key files are written only by the `persist.rs` queue, never from the GPUI main thread (`ARCH-026`).
 - Skerry supports SealSkin `0.5.0` or newer (`ARCH-009`): it refuses to connect to a server whose `GET /companion/api/ui/version` reports an older or unparseable version, or that has no such route. Changing the minimum is a new superseding `ARCH-*` decision.
 
 ### Execution
