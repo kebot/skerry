@@ -97,6 +97,11 @@ subject: skerry
   - Late permission answers are ignored, and the start policy runs only once.
   - Reconnects don't stack threads while permission is undetermined.
   - The 10 s no-traffic timeout fires.
+- Task L1 tests pass (`ARCH-037`):
+  - Shared Files and Cleanroom never get a DELETE (case-insensitive, zero requests sent).
+  - Delete Home rechecks sessions after the confirm, and the storage pane is not in the Files registry.
+  - A body cut off mid-download resumes, but a partial whose tag doesn't match restarts from 0, and a truncated folder walk fails.
+  - Upload retries carry the upload_id key, and Open in… filters apps.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
