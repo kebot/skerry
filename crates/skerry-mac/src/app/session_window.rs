@@ -22,7 +22,8 @@ use crate::video::Codec;
 use crate::view::NativeSession;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
-    div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, Task, WeakEntity, Window,
+    div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, ScrollHandle, Task,
+    WeakEntity, Window,
 };
 use skerry_ui::session;
 use std::collections::VecDeque;
@@ -85,6 +86,9 @@ pub(super) struct SessionWindow {
     pub(super) video: Option<bool>,
     pub(super) settings: Option<Settings>,
     controls: Option<AnyWindowHandle>,
+    /// Session Controls' scroll position, kept here so it survives closing and reopening
+    /// the panel while this window stays open.
+    pub(super) controls_scroll: ScrollHandle,
     pub(super) stats: Option<StreamSample>,
     /// Whether the Stats section is open in Session Controls, which is what
     /// subscribes the session to the server's `stream_stats` (`ARCH-019`).
@@ -140,6 +144,7 @@ impl SessionWindow {
             video: None,
             settings: None,
             controls: None,
+            controls_scroll: ScrollHandle::new(),
             stats: None,
             stats_open: false,
             stats_history: VecDeque::new(),
@@ -510,6 +515,16 @@ impl SessionWindow {
                 }
             });
         }));
+    }
+
+    /// The server this session runs on.
+    pub(super) fn server(&self) -> &str {
+        self.api.server()
+    }
+
+    /// Shows `status` in this window's banner.
+    pub(super) fn set_status(&mut self, status: String) {
+        self.status = Some(status);
     }
 
     /// Lifts every key the session holds, before something else takes the keyboard.

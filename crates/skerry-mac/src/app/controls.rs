@@ -4,6 +4,8 @@ use super::{
 };
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
+use crate::persist::WriteQueue;
+use crate::settings::ControlsSections;
 use crate::stats;
 use crate::video::Codec;
 use crate::{
@@ -17,14 +19,24 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context, Entity,
-    FocusHandle, Task, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
+    FocusHandle, Global, Pixels, Point, Task, TitlebarOptions, Window, WindowBounds, WindowKind,
+    WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
     self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
     ScreenProps, Section, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
+use std::collections::HashMap;
 use std::rc::Rc;
+
+/// Which Session Controls sections were open last, per server. The read cache of the saved
+/// preference: filled from a session window's preferences on a miss, and updated on every
+/// toggle before the write is queued.
+#[derive(Default)]
+struct SectionMemory(HashMap<String, ControlsSections>);
+
+impl Global for SectionMemory {}
 
 #[derive(Clone)]
 struct Owner {
@@ -41,6 +53,9 @@ pub(super) struct ControlPanel {
     height: Entity<InputState>,
     /// Shows the Stats copy button's check, and clears it after a moment.
     copied: Option<Task<()>>,
+    /// The scroll offset kept while the panel's content is incomplete (a reconnect), to
+    /// restore once it has refilled.
+    scroll_saved: Option<Point<Pixels>>,
 }
 
 #[derive(Clone, Copy)]
@@ -80,6 +95,16 @@ impl ControlPanel {
         };
         let parent = native_window(window);
         let fullscreen = window.is_fullscreen();
+        let sections = {
+            let session = session.read(cx);
+            let server = session.server().to_string();
+            let saved = session.preferences.controls;
+            *cx.default_global::<SectionMemory>()
+                .0
+                .entry(server)
+                .or_insert(saved)
+        };
+        let ui = ControlsUiState::default().with_sections(sections.to_array());
         let bounds = window.bounds();
         let panel_size = size(px(388.), px(680.));
         let display = window.display(cx);
@@ -176,16 +201,25 @@ impl ControlPanel {
                         },
                     )
                     .detach();
+                    let focus = cx.focus_handle();
                     Self {
                         owner: panel_owner,
-                        focus: cx.focus_handle(),
+                        ui: ControlsUiState {
+                            return_focus: Some(focus.clone()),
+                            ..ui
+                        },
+                        focus,
                         fullscreen,
-                        ui: ControlsUiState::default(),
                         width,
                         height,
                         copied: None,
+                        scroll_saved: None,
                     }
                 });
+                if sections.stats {
+                    // A restored open Stats section subscribes, as a click on it would.
+                    Self::send(owner.clone(), Command::Stats(true), cx);
+                }
                 window.on_window_should_close(cx, move |_, cx| {
                     Self::send(owner.clone(), Command::Close, cx);
                     false
@@ -317,16 +351,11 @@ impl ControlPanel {
     ) {
         match action {
             ControlsAction::ToggleSection(section) => {
-                match section {
-                    Section::Input => self.ui.input_open = !self.ui.input_open,
-                    Section::Clipboard => self.ui.clipboard_open = !self.ui.clipboard_open,
-                    Section::Screen => self.ui.screen_open = !self.ui.screen_open,
-                    Section::Video => self.ui.video_open = !self.ui.video_open,
-                    Section::Stats => {
-                        self.ui.stats_open = !self.ui.stats_open;
-                        Self::send(self.owner.clone(), Command::Stats(self.ui.stats_open), cx);
-                    }
+                let open = self.ui.toggle(section);
+                if section == Section::Stats {
+                    Self::send(self.owner.clone(), Command::Stats(open), cx);
                 }
+                self.remember_sections(cx);
                 cx.notify();
             }
             ControlsAction::SetAudio(enabled) => {
@@ -452,6 +481,32 @@ impl ControlPanel {
                 cx.notify();
             }
         }
+    }
+
+    /// Keeps the open sections for this server: in memory now, on disk through the write
+    /// queue. A failed save shows in the session window's banner.
+    fn remember_sections(&self, cx: &mut Context<Self>) {
+        let sections = ControlsSections::from_array(self.ui.sections());
+        let server = self.owner.session.read(cx).server().to_string();
+        cx.default_global::<SectionMemory>()
+            .0
+            .insert(server.clone(), sections);
+        let done = cx
+            .global::<WriteQueue>()
+            .preferences(&server, move |p| p.controls = sections);
+        let owner = self.owner.clone();
+        cx.spawn(async move |_, cx| {
+            if !matches!(done.await, Ok(Ok(()))) {
+                let _ = owner.window.update(cx, |_, _, cx| {
+                    owner.session.update(cx, |session, cx| {
+                        session
+                            .set_status("Couldn’t save the open Session Controls sections.".into());
+                        cx.notify();
+                    })
+                });
+            }
+        })
+        .detach();
     }
 
     fn build_props(&self, session: &SessionWindow, app_name: String) -> ControlsProps {
@@ -661,10 +716,13 @@ impl Render for ControlPanel {
         let close_owner = owner.clone();
         let toggle_owner = owner.clone();
         let fullscreen_owner = owner.clone();
+        let scroll = owner.session.read(cx).controls_scroll.clone();
         let root = div()
             .id("session-controls")
             .size_full()
-            .overflow_y_scrollbar()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .vertical_scrollbar(&scroll)
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
@@ -681,6 +739,20 @@ impl Render for ControlPanel {
             });
 
         let session = owner.session.read(cx);
+        // A reconnect empties the panel for a moment (no stream, then no settings), and GPUI
+        // would clamp the offset to the short content. Keep it, and put it back as the
+        // content refills (`next_scroll`).
+        let complete = session.current.is_some() && session.settings.is_some();
+        let (saved, apply) = next_scroll(
+            self.scroll_saved,
+            complete,
+            scroll.offset(),
+            scroll.max_offset().y,
+        );
+        self.scroll_saved = saved;
+        if let Some(offset) = apply {
+            scroll.set_offset(offset);
+        }
         if session.current.is_none() {
             return root;
         }
@@ -701,5 +773,69 @@ impl Render for ControlPanel {
             window,
             cx,
         ))
+    }
+}
+
+/// One frame of the scroll keeper: `(offset to keep, offset to apply)`. While the content is
+/// incomplete the current offset is kept (once, before GPUI clamps it). Once complete, the
+/// kept offset is applied each frame until the content is tall enough for it, or until the
+/// person scrolls (the offset is no longer what applying it left). GPUI offsets are
+/// negative; `max_y` is the largest scroll distance the last layout allowed.
+fn next_scroll(
+    saved: Option<Point<Pixels>>,
+    complete: bool,
+    current: Point<Pixels>,
+    max_y: Pixels,
+) -> (Option<Point<Pixels>>, Option<Point<Pixels>>) {
+    if !complete {
+        return (saved.or(Some(current)), None);
+    }
+    let Some(saved) = saved else {
+        return (None, None);
+    };
+    let left = saved.y.max(-max_y);
+    if (f32::from(current.y) - f32::from(left)).abs() > 0.5 {
+        return (None, None);
+    }
+    if max_y >= -saved.y {
+        (None, Some(saved))
+    } else {
+        (Some(saved), Some(saved))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::px;
+
+    fn at(y: f32) -> Point<Pixels> {
+        point(px(0.), px(y))
+    }
+
+    #[test]
+    fn scroll_offset_survives_an_empty_frame() {
+        // Scrolled 600 down, then a reconnect empties the panel.
+        let (saved, apply) = next_scroll(None, false, at(-600.), px(900.));
+        assert_eq!((saved, apply), (Some(at(-600.)), None));
+        // GPUI clamps the empty panel to 0; the kept offset stays.
+        let (saved, apply) = next_scroll(saved, false, at(0.), px(0.));
+        assert_eq!((saved, apply), (Some(at(-600.)), None));
+        // Settings arrive: the content is 300 tall so far. Apply, and keep waiting.
+        let (saved, apply) = next_scroll(saved, true, at(0.), px(0.));
+        assert_eq!((saved, apply), (Some(at(-600.)), Some(at(-600.))));
+        let (saved, apply) = next_scroll(saved, true, at(-300.), px(300.));
+        assert_eq!((saved, apply), (Some(at(-600.)), Some(at(-600.))));
+        // The policies refill the rest: the offset fits, applied one last time.
+        let (saved, apply) = next_scroll(saved, true, at(-600.), px(900.));
+        assert_eq!((saved, apply), (None, Some(at(-600.))));
+        assert_eq!(next_scroll(saved, true, at(-600.), px(900.)), (None, None));
+    }
+
+    #[test]
+    fn scrolling_during_the_refill_wins() {
+        let saved = Some(at(-600.));
+        // Content can scroll 300 but the person moved to 100.
+        assert_eq!(next_scroll(saved, true, at(-100.), px(300.)), (None, None));
     }
 }

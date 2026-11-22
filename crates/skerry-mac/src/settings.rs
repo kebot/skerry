@@ -268,6 +268,57 @@ impl ScreenPolicy {
 
 pub type VideoSettings = BTreeMap<Key, u32>;
 
+/// Which Session Controls sections are open. The default matches a fresh panel: Screen open,
+/// the rest closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlsSections {
+    pub input: bool,
+    pub clipboard: bool,
+    pub screen: bool,
+    pub video: bool,
+    pub stats: bool,
+}
+
+impl Default for ControlsSections {
+    fn default() -> Self {
+        Self {
+            input: false,
+            clipboard: false,
+            screen: true,
+            video: false,
+            stats: false,
+        }
+    }
+}
+
+impl ControlsSections {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// In Session Controls order: Input, Clipboard, Screen, Video, Stats.
+    pub fn to_array(self) -> [bool; 5] {
+        [
+            self.input,
+            self.clipboard,
+            self.screen,
+            self.video,
+            self.stats,
+        ]
+    }
+
+    pub fn from_array([input, clipboard, screen, video, stats]: [bool; 5]) -> Self {
+        Self {
+            input,
+            clipboard,
+            screen,
+            video,
+            stats,
+        }
+    }
+}
+
 #[derive(Default, Deserialize, Serialize)]
 pub struct Preferences {
     #[serde(default)]
@@ -279,6 +330,9 @@ pub struct Preferences {
     /// The Launch Dialog options each app last launched with, by app id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launch: BTreeMap<String, LaunchMemory>,
+    /// Which Session Controls sections were open last on this server.
+    #[serde(default, skip_serializing_if = "ControlsSections::is_default")]
+    pub controls: ControlsSections,
     #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
@@ -344,6 +398,37 @@ fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn controls_sections_default_is_not_written() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("controls").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn controls_sections_round_trip_beside_video_settings() {
+        let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
+        prefs.controls = ControlsSections::from_array([true, false, false, true, false]);
+        let saved = serde_json::to_value(&prefs).unwrap();
+        let restored: Preferences = serde_json::from_value(saved).unwrap();
+        // `controls` is read as the struct, not swallowed by the flattened video map.
+        assert_eq!(
+            restored.controls.to_array(),
+            [true, false, false, true, false]
+        );
+        assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(restored.video.len(), 1);
+    }
+
+    #[test]
+    fn unknown_preferences_from_a_newer_build_dont_wipe_the_file() {
+        let prefs: Preferences = serde_json::from_value(
+            json!({"codec": "hevc", "jpeg": 45, "library": {"favorites": ["zen"]}}),
+        )
+        .unwrap();
+        assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(prefs.video.len(), 1);
+    }
 
     #[test]
     fn updates_keep_what_other_windows_saved() {
