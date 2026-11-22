@@ -1,25 +1,32 @@
-use crate::audio::Playback;
+use crate::audio::{OutputStatus, Playback};
+use crate::capture;
 use crate::clipboard;
+use crate::print_jobs;
 use crate::selkies;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt as _;
 use gpui_kit::RenderImage;
-use image::{ImageDecoder, ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader};
 use reqwest::Url;
 use serde_json::{json, Value};
 use smallvec::smallvec;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Cursor,
-};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, protocol::WebSocketConfig, Message,
 };
+
+mod role;
+
+#[cfg(test)]
+pub use role::LayoutRect;
+use role::Wire;
+pub use role::{DisplayConfig, Kill, Side, StreamRole};
 
 const MAX_WIDTH: u16 = 4096;
 const MAX_HEIGHT: u16 = 2160;
@@ -71,68 +78,313 @@ pub struct Frame {
 
 #[derive(Clone)]
 pub enum Picture {
-    Jpeg(Arc<RenderImage>),
+    Jpeg(JpegPicture),
     Video(video::Surface),
+}
+
+/// The JPEG stripes on screen, top to bottom (`ARCH-034`). Each stripe is its own
+/// `RenderImage`, so a changed stripe uploads only its own rows, and nothing copies the
+/// whole canvas. The view retires a replaced stripe with `drop_image` four paints after it
+/// leaves the screen.
+#[derive(Clone)]
+pub struct JpegPicture {
+    pub stripes: Arc<[JpegStripe]>,
+}
+
+#[derive(Clone)]
+pub struct JpegStripe {
+    pub y: u16,
+    pub height: u16,
+    /// BGRA, `height + 2` rows: the first and last rows repeat, so linear sampling at a
+    /// non-1:1 scale never reads a neighbouring atlas tile.
+    pub image: Arc<RenderImage>,
+}
+
+/// Decodes one stripe to BGRA in a buffer padded by one repeated row at the top and
+/// bottom. Reads the headers before allocating: the width must be `width`, and the height
+/// not 0 and at most `rows_left`. The decoder is not strict (as in `image`), so scan data
+/// cut short decodes with filler; a stripe cut inside its headers is rejected. Grayscale
+/// and any chroma subsampling are accepted.
+///
+/// zune converts YCbCr to RGB with NEON (its BGRA output falls back to scalar code that
+/// costs as much as the entropy decode) into `scratch`, which is reused across stripes.
+/// One NEON pass then expands it to BGRA straight into the image's buffer, which is never
+/// zero-filled.
+fn decode_stripe(
+    jpeg: &[u8],
+    width: u16,
+    rows_left: u16,
+    scratch: &mut Vec<u8>,
+) -> Option<(u16, Vec<u8>)> {
+    use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
+        .set_max_width(usize::from(width))
+        .set_max_height(usize::from(rows_left));
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg), options);
+    decoder.decode_headers().ok()?;
+    let (stripe_width, height) = decoder.dimensions()?;
+    let height = u16::try_from(height).ok()?;
+    if stripe_width != usize::from(width) || height == 0 || height > rows_left {
+        return None;
+    }
+    let rows = usize::from(height);
+    let rgb_row = usize::from(width) * 3;
+    if decoder.output_buffer_size()? != rgb_row * rows {
+        return None;
+    }
+    scratch.resize(rgb_row * rows, 0);
+    let rgb = &mut scratch[..rgb_row * rows];
+    decoder.decode_into(rgb).ok()?;
+    let row = usize::from(width) * 4;
+    let mut bgra = Vec::with_capacity(row * (rows + 2));
+    let out = &mut bgra.spare_capacity_mut()[..row * (rows + 2)];
+    let (top, rest) = out.split_at_mut(row);
+    let (body, bottom) = rest.split_at_mut(row * rows);
+    rgb_to_bgra(&rgb[..rgb_row], top);
+    rgb_to_bgra(rgb, body);
+    rgb_to_bgra(&rgb[rgb_row * (rows - 1)..], bottom);
+    // SAFETY: the three calls above wrote every byte of the first `row * (rows + 2)`.
+    unsafe { bgra.set_len(row * (rows + 2)) };
+    Some((height, bgra))
+}
+
+/// Expands RGB to BGRA with opaque alpha, writing every byte of `out`, which must hold
+/// `rgb.len() / 3 * 4` bytes.
+fn rgb_to_bgra(rgb: &[u8], out: &mut [std::mem::MaybeUninit<u8>]) {
+    let count = rgb.len() / 3;
+    assert_eq!(out.len(), count * 4);
+    #[cfg(target_arch = "aarch64")]
+    let done = {
+        use std::arch::aarch64::{uint8x16x4_t, vdupq_n_u8, vld3q_u8, vst4q_u8};
+        let blocks = count / 16;
+        // SAFETY: NEON is part of the aarch64 baseline. Block `i` reads bytes 48i..48i+48
+        // of `rgb` and writes bytes 64i..64i+64 of `out`, in bounds since i < count / 16.
+        unsafe {
+            let opaque = vdupq_n_u8(255);
+            for i in 0..blocks {
+                let px = vld3q_u8(rgb.as_ptr().add(i * 48));
+                vst4q_u8(
+                    out.as_mut_ptr().add(i * 64).cast::<u8>(),
+                    uint8x16x4_t(px.2, px.1, px.0, opaque),
+                );
+            }
+        }
+        blocks * 16
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let done = 0;
+    for (px, dst) in rgb[done * 3..count * 3]
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out[done * 4..].as_chunks_mut::<4>().0)
+    {
+        dst[0].write(px[2]);
+        dst[1].write(px[1]);
+        dst[2].write(px[0]);
+        dst[3].write(255);
+    }
 }
 
 #[derive(Default)]
 struct Canvas {
     width: u16,
     height: u16,
-    pixels: image::RgbaImage,
-    received_image: bool,
+    /// Keyed by top row; stored stripes never overlap.
+    stripes: BTreeMap<u16, JpegStripe>,
+    /// The RGB decode of the last stripe, reused so no stripe allocates for it.
+    scratch: Vec<u8>,
 }
 
 impl Canvas {
-    fn resize(&mut self, width: u16, height: u16) -> Result<(), &'static str> {
+    /// Sets the remote size; a new size clears every stripe. Returns whether it changed.
+    fn resize(&mut self, width: u16, height: u16) -> Result<bool, &'static str> {
         if !valid_resolution(width, height) {
             return Err("The remote display resolution is outside the supported range.");
         }
-        if (self.width, self.height) != (width, height) {
-            *self = Self {
-                width,
-                height,
-                pixels: image::RgbaImage::new(width.into(), height.into()),
-                received_image: false,
-            };
+        let changed = (self.width, self.height) != (width, height);
+        if changed {
+            self.width = width;
+            self.height = height;
+            self.stripes.clear();
         }
-        Ok(())
+        Ok(changed)
     }
 
-    fn stripe(&mut self, y: u16, jpeg: &[u8]) -> Option<()> {
-        let decoder = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg)
-            .into_decoder()
-            .ok()?;
-        let (width, height) = decoder.dimensions();
-        let height = u16::try_from(height).ok()?;
-        let end = y.checked_add(height)?;
-        if width != u32::from(self.width) || height == 0 || end > self.height {
-            return None;
+    /// Decodes a stripe for row `y` without touching the canvas.
+    fn decode(&mut self, y: u16, jpeg: &[u8]) -> Option<JpegStripe> {
+        let rows_left = self.height.checked_sub(y).filter(|rows| *rows > 0)?;
+        let (height, pixels) = decode_stripe(jpeg, self.width, rows_left, &mut self.scratch)?;
+        let buffer = image::RgbaImage::from_raw(self.width.into(), u32::from(height) + 2, pixels)?;
+        Some(JpegStripe {
+            y,
+            height,
+            image: Arc::new(RenderImage::new(smallvec![image::Frame::new(buffer)])),
+        })
+    }
+
+    /// Whether `stripe` ends at the canvas's last row. Selkies sends a frame's changed
+    /// stripes top to bottom, so the bottom stripe completes its frame and presents at once.
+    fn is_bottom(&self, stripe: &JpegStripe) -> bool {
+        stripe.y + stripe.height == self.height
+    }
+
+    /// Stores a stripe after removing every stored stripe it overlaps, so a change in the
+    /// server's stripe count or geometry leaves nothing stale.
+    fn insert(&mut self, stripe: JpegStripe) {
+        let (top, bottom) = (stripe.y, stripe.y + stripe.height);
+        if let Some((&y, above)) = self.stripes.range(..top).next_back() {
+            if y + above.height > top {
+                self.stripes.remove(&y);
+            }
         }
-        let mut stripe = image::DynamicImage::from_decoder(decoder)
-            .ok()?
-            .into_rgba8();
-        for pixel in stripe.pixels_mut() {
-            pixel.0.swap(0, 2);
-        } // GPUI expects BGRA.
-        let row = usize::from(self.width) * 4;
-        let pixels: &mut [u8] = &mut self.pixels;
-        pixels[usize::from(y) * row..usize::from(end) * row].copy_from_slice(&stripe);
-        self.received_image = true;
-        Some(())
+        let covered: Vec<u16> = self.stripes.range(top..bottom).map(|(y, _)| *y).collect();
+        for y in covered {
+            self.stripes.remove(&y);
+        }
+        self.stripes.insert(top, stripe);
     }
 
     fn snapshot(&self) -> Frame {
         Frame {
             width: self.width,
             height: self.height,
-            picture: self.received_image.then(|| {
-                Picture::Jpeg(Arc::new(RenderImage::new(smallvec![image::Frame::new(
-                    self.pixels.clone()
-                )])))
+            picture: (!self.stripes.is_empty()).then(|| {
+                Picture::Jpeg(JpegPicture {
+                    stripes: self.stripes.values().cloned().collect(),
+                })
             }),
         }
     }
+}
+
+/// How long the stream must be quiet before the stripes gathered so far are shown.
+/// A frame's stripes arrive back to back, so this is only for a frame whose last stripe is
+/// not the bottom one (typing changes one stripe).
+const SETTLE: Duration = Duration::from_millis(2);
+/// How late a tokio `Sleep` wakes: it rounds its deadline up to the next 1 ms tick, and the
+/// driver's park adds about another. QA measured 4 ms sleeps waking after 6.3 ms (p50).
+const TIMER_LATENESS: Duration = Duration::from_millis(2);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentReason {
+    /// A stripe of a new frame id arrived, so the previous frame is complete.
+    Boundary,
+    /// The bottom stripe arrived: Selkies sends a frame's stripes top to bottom, so the
+    /// frame is complete.
+    Bottom,
+    /// No stripe arrived for `SETTLE`.
+    Settle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Present {
+    reason: PresentReason,
+    /// Whether this shows a frame id not shown before (`ARCH-021` counts frames per id).
+    new_frame: bool,
+    /// From the last gathered stripe's arrival (before its decode) to this present.
+    delay: Duration,
+}
+
+/// Presents JPEG stripes once a frame is complete (`ARCH-034`): when its bottom stripe
+/// arrives, when a stripe of a new frame id arrives (like the Selkies web client), or after a
+/// `SETTLE` deadline that each stripe pushes back, for a frame that doesn't reach the bottom.
+#[derive(Default)]
+struct JpegPacer {
+    /// The frame id gathered and not yet shown.
+    pending: Option<u16>,
+    last_stripe: Option<Instant>,
+    shown: Option<u16>,
+    /// The pending frame's stripe rows in arrival order, kept only while tracing.
+    rows: Vec<u16>,
+}
+
+impl JpegPacer {
+    /// Records a decoded stripe of frame `id` at row `y` that arrived at `now`. When it
+    /// starts a new frame, returns the present of the previous one, due *before* this stripe
+    /// is applied.
+    fn stripe(&mut self, id: u16, y: u16, now: Instant) -> Option<Present> {
+        let boundary = if self.pending.is_some_and(|pending| pending != id) {
+            self.present(PresentReason::Boundary, now)
+        } else {
+            None
+        };
+        self.pending = Some(id);
+        self.last_stripe = Some(now);
+        if present_trace_enabled() {
+            self.rows.push(y);
+        }
+        boundary
+    }
+
+    /// When the settle present is due; `None` while nothing is pending.
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.and(self.last_stripe).map(|last| last + SETTLE)
+    }
+
+    /// When to arm the timer so it wakes near `deadline()`, given `TIMER_LATENESS`.
+    fn timer(&self) -> Option<Instant> {
+        let last = self.last_stripe?;
+        self.deadline().map(|deadline| {
+            deadline
+                .checked_sub(TIMER_LATENESS)
+                .unwrap_or(last)
+                .max(last)
+        })
+    }
+
+    /// Takes the pending frame for a present.
+    fn present(&mut self, reason: PresentReason, now: Instant) -> Option<Present> {
+        let id = self.pending.take()?;
+        let new_frame = self.shown != Some(id);
+        self.shown = Some(id);
+        let present = Present {
+            reason,
+            new_frame,
+            delay: self
+                .last_stripe
+                .map_or(Duration::ZERO, |last| now.saturating_duration_since(last)),
+        };
+        if present_trace_enabled() {
+            let rows: Vec<String> = self.rows.drain(..).map(|y| y.to_string()).collect();
+            eprintln!(
+                "skerry present: {:?} delay_ms={:.3} id={id} rows={}",
+                present.reason,
+                present.delay.as_secs_f64() * 1000.0,
+                rows.join(",")
+            );
+        }
+        Some(present)
+    }
+
+    /// Forgets everything: the stream left JPEG (a hardware frame or codec switch) or
+    /// resized, so a pending settle can never show a stale picture.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Whether `SKERRY_PRESENT_TRACE=1` asks for one stderr line per JPEG present: its reason,
+/// delay from the last stripe, frame id, and the frame's stripe rows in arrival order (so
+/// QA can confirm Selkies sends them top to bottom). Read once.
+fn present_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SKERRY_PRESENT_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Shows the gathered stripes; a snapshot is only a list of `Arc`s.
+fn present_jpeg(
+    frames: &watch::Sender<Frame>,
+    canvas: &Canvas,
+    diagnostics: &mut Diagnostics,
+    present: Present,
+) {
+    let picture = canvas.snapshot();
+    if picture.picture.is_some() && present.new_frame {
+        diagnostics.frames += 1;
+    }
+    frames.send_replace(picture);
 }
 
 #[derive(Clone, Debug)]
@@ -337,7 +589,10 @@ impl RemoteCursor {
 
 pub enum SessionEvent {
     Audio(bool),
+    /// No audio this session: the server turned it off, or it couldn't start on this Mac.
     AudioUnavailable(&'static str),
+    /// The output devices and where sound plays (`ARCH-GAP-DC-03`).
+    AudioOutput(OutputStatus),
     Video(bool),
     Settings(Settings),
     Stats(StreamSample),
@@ -351,7 +606,118 @@ pub enum SessionEvent {
     /// The session's file routes, once the session cookie is in hand (`ARCH-023`).
     Files(selkies::SelkiesClient),
     FilePolicy(selkies::Policy),
+    /// `server_settings.printing_enabled` (`ARCH-033`).
+    PrintPolicy(bool),
+    /// A document the session printed, ready to fetch once (`ARCH-033`).
+    PrintDocument(print_jobs::Announcement),
     Error(String),
+    /// The start-up grace ran out with the session still answering like one starting.
+    StartupTimeout,
+    /// Capture Pointer started or ended, or couldn't start, and the hint to show if any
+    /// (`ARCH-032`). Raised by the session's view, not the server.
+    PointerCapture(Option<crate::view::CaptureHint>),
+    /// The server asked the pad in this slot to rumble (`ARCH-032`).
+    Rumble(crate::gamepad::Rumble),
+    /// The capture part of a primary `server_settings` (`ARCH-038`).
+    CapturePolicy(capture::CapturePolicy),
+    /// `MICROPHONE_DISABLED`, `WEBCAM_DISABLED`, `WEBCAM_KEYFRAME` or `CAPTURE_DEMAND`
+    /// (`ARCH-038`).
+    Capture(capture::Reply),
+    /// A status from the window's `skerry-mic` thread, tagged with that thread's id so a
+    /// late one from a thread already stopped is ignored. Raised by the window, not the
+    /// server.
+    MicStatus(u64, crate::microphone::MicStatus),
+    /// The card's input list, from plain CoreAudio properties, tagged with its stream.
+    /// Raised by the window.
+    MicInputs(u64, crate::input_devices::InputList),
+    /// A status from the window's `skerry-camera` thread, tagged like `MicStatus`.
+    CamStatus(u64, crate::camera::CamStatus),
+    /// The card's camera list (only once macOS granted the camera), tagged with its stream.
+    CamInputs(u64, crate::input_devices::InputList),
+    /// An Apps window event: `apps_state`, `apps_job`, `command_error` (`ARCH-035`).
+    Apps(crate::apps::Event),
+    /// What `server_settings` allows the Apps window (`ARCH-035`).
+    AppsPolicy(crate::apps::Policy),
+    /// The server ended the stream with `KILL <reason>` (`ARCH-039`).
+    Killed(Kill),
+    /// The server's display arrangement, from `DISPLAY_CONFIG_UPDATE` (`ARCH-039`).
+    DisplayLayout(DisplayConfig),
+}
+
+/// No message from the server for this long, while pings go out every second: the peer is
+/// gone (a dead network keeps TCP up for minutes).
+const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+const SILENT: &str = "The Selkies stream stopped answering. Choose Reconnect to resume.";
+
+fn peer_silent(last_inbound: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_inbound) >= PEER_TIMEOUT
+}
+
+/// The socket's next message, noting when anything arrived.
+async fn inbound<S, T, E>(socket: &mut S, last_inbound: &mut Instant) -> Option<Result<T, E>>
+where
+    S: futures_util::Stream<Item = Result<T, E>> + Unpin,
+{
+    let next = socket.next().await;
+    if matches!(next, Some(Ok(_))) {
+        *last_inbound = Instant::now();
+    }
+    next
+}
+
+/// A capture reply's event; `None` for any other text.
+fn capture_event(text: &str) -> Option<SessionEvent> {
+    capture::server_reply(text).map(SessionEvent::Capture)
+}
+
+/// An uplink frame as sent (binary, through [`Wire::send_binary`], primary only), and only
+/// once the session is ready.
+fn uplink_message(ready: bool, frame: Vec<u8>) -> Option<Vec<u8>> {
+    ready.then_some(frame)
+}
+
+/// A camera frame for the writer's camera slot, only once the session is ready.
+fn camera_uplink(ready: bool, frame: Vec<u8>) -> Option<Vec<u8>> {
+    ready.then_some(frame)
+}
+
+/// The next uplink frame. A closed channel (or none) never yields, and is forgotten.
+async fn uplink(frames: &mut Option<mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    if let Some(receiver) = frames {
+        if let Some(frame) = receiver.recv().await {
+            return frame;
+        }
+    }
+    *frames = None;
+    std::future::pending().await
+}
+
+/// The action of a `system,{"action": "<action>"}` frame; `None` for anything else.
+fn system_action(text: &str) -> Option<String> {
+    let json = text.strip_prefix("system,")?;
+    let data: Value = serde_json::from_str(json).ok()?;
+    data["action"].as_str().map(str::to_owned)
+}
+
+/// One match for every `system,` action Skerry reads: rumble (`ARCH-032`) and the Apps
+/// window's (`ARCH-035`). Any other action is ignored.
+fn system_event(action: &str) -> Option<SessionEvent> {
+    match action.split_once(',').map_or(action, |(kind, _)| kind) {
+        "rumble" => crate::gamepad::Rumble::parse(action).map(SessionEvent::Rumble),
+        "apps_state" | "apps_job" => Some(SessionEvent::Apps(
+            // Unreadable JSON still shows the server speaks the apps protocol.
+            crate::apps::parse_action(action).unwrap_or(crate::apps::Event::Unreadable),
+        )),
+        "command_error" => crate::apps::parse_action(action).map(SessionEvent::Apps),
+        _ => None,
+    }
+}
+
+/// A text frame that is a `system,` frame: `Some` (consumed, so it never reaches the
+/// cursor, clipboard or JSON parsers) with its event, if Skerry reads that action.
+fn system_frame(text: &str) -> Option<Option<SessionEvent>> {
+    text.starts_with("system,")
+        .then(|| system_action(text).and_then(|action| system_event(&action)))
 }
 
 #[derive(Clone, Copy)]
@@ -397,6 +763,10 @@ pub enum Input {
     Pointer(Pointer),
     Zoom(i8, Pointer),
     Audio(bool),
+    /// Play through this output device's Core Audio UID; `None` follows the Mac's default.
+    AudioOutput(Option<String>),
+    /// Ask the server for this audio bitrate (bps).
+    AudioBitrate(u32),
     Video(bool),
     Settings(Vec<(Key, u32)>),
     Resolution(DisplayRequest),
@@ -406,6 +776,142 @@ pub enum Input {
     Clipboard(clipboard::Content),
     /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
     Stats(bool),
+    /// Gamepad slots another window drives now: forgotten here, nothing sent (`ARCH-032`).
+    ForgetPads(Vec<u8>),
+    /// Display 2 moved to this side (`ARCH-039`): later frames carry it, and the server is
+    /// told now with a `SETTINGS` (and the resize, if any). Ignored by a primary.
+    Position(Side, Option<DisplayRequest>),
+    /// End the stream: release every held key, then send a close frame (`ARCH-GAP-DC-09`).
+    Close,
+}
+
+/// What a closing stream sends before its close frame: `p,0` and
+/// `SET_NATIVE_CURSOR_RENDERING,0` while the pointer is captured (the server's cursor
+/// compositing is global and outlives this connection, `ARCH-032`), then a `ku` for every
+/// key the session still holds. No `kr`: on a clean close the server already resets the
+/// keyboard of the departing input owner, and every reset injects Super, Meta and Escape
+/// releases.
+fn closing_commands(
+    held: &BTreeSet<u32>,
+    pointer: PointerLock,
+    pads: &mut crate::gamepad::JsTracker,
+    role: StreamRole,
+) -> Vec<String> {
+    // Every announced gamepad slot first (`ARCH-032`). Display 2 never drives pads or the
+    // capture, so it releases only its keys (`ARCH-039`).
+    let mut commands: Vec<String> = if role.is_primary() {
+        pads.closing()
+    } else {
+        Vec::new()
+    };
+    if pointer.locked && role.is_primary() {
+        commands.extend(["p,0".into(), "SET_NATIVE_CURSOR_RENDERING,0".into()]);
+        if pointer.buttons != 0 {
+            commands.push("m2,0,0,0,0".into());
+        }
+    }
+    commands.extend(held.iter().map(|key| format!("ku,{key}")));
+    commands
+}
+
+/// The capture as the server was last told it: `p,1` and the buttons the last relative
+/// `m2` held (`ARCH-032`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PointerLock {
+    locked: bool,
+    buttons: u8,
+}
+
+impl PointerLock {
+    fn observe(&mut self, text: &str) {
+        if let Some(locked) = pointer_lock_command(text) {
+            *self = Self { locked, buttons: 0 };
+        } else if self.locked {
+            if let Some(buttons) = m2_buttons(text) {
+                self.buttons = buttons;
+            }
+        }
+    }
+}
+
+/// The buttons an `m2,dx,dy,mask,0` holds; wheel pulses (a magnitude) leave them alone.
+fn m2_buttons(text: &str) -> Option<u8> {
+    let mut parts = text.strip_prefix("m2,")?.split(',');
+    let (_, _, mask, magnitude) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (magnitude == "0")
+        .then(|| mask.parse::<u8>().ok())
+        .flatten()
+}
+
+/// The pointer lock the server was last told: `Some(true)` for `p,1`, `Some(false)` for
+/// `p,0`, `None` for anything else.
+fn pointer_lock_command(text: &str) -> Option<bool> {
+    match text {
+        "p,1" => Some(true),
+        "p,0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether `SKERRY_INPUT_TRACE=1` asks for a trace of key traffic on stderr. Read once.
+fn input_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SKERRY_INPUT_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Logs one input command the transport writes, when tracing: key commands (`kd`, `ku`,
+/// `kh`, `kr`, redacted) and the capture's (`p`, `SET_NATIVE_CURSOR_RENDERING`, `m2`).
+fn trace_input(text: &str) {
+    if input_trace_enabled() {
+        if let Some(line) = trace_line(text) {
+            eprintln!("skerry input: {line}");
+        }
+    }
+}
+
+/// The trace line for a command, if it is traced at all.
+fn trace_line(text: &str) -> Option<String> {
+    let verb = text.split(',').next().unwrap_or_default();
+    if matches!(verb, "p" | "SET_NATIVE_CURSOR_RENDERING" | "m2")
+        || text.starts_with("js,c,")
+        || text.starts_with("js,d,")
+    {
+        return Some(text.into());
+    }
+    redact_key_command(text)
+}
+
+/// Logs a stream event that matters to key traffic (close frame, watchdog abort).
+pub fn trace_input_event(event: &str) {
+    if input_trace_enabled() {
+        eprintln!("skerry input: {event}");
+    }
+}
+
+/// A key command with every printable keysym hidden, so the trace never records typed
+/// text. Modifiers, function and navigation keys (0xff00 to 0xffff) keep their numbers.
+/// Anything other than `kd`, `ku`, `kh` and `kr` gives `None`.
+fn redact_key_command(text: &str) -> Option<String> {
+    if text == "kr" {
+        return Some(text.into());
+    }
+    let (verb, keys) = text.split_once(',')?;
+    if !matches!(verb, "kd" | "ku" | "kh") {
+        return None;
+    }
+    let keys: Vec<String> = keys
+        .split(',')
+        .map(|key| match key.parse::<u32>() {
+            // Keypad digits and operators (0xff80 to 0xffbd) are typed text too.
+            Ok(keysym)
+                if (0xff00..=0xffff).contains(&keysym) && !(0xff80..=0xffbd).contains(&keysym) =>
+            {
+                keysym.to_string()
+            }
+            _ => "<char>".into(),
+        })
+        .collect();
+    Some(format!("{verb},{}", keys.join(",")))
 }
 
 pub struct SessionOptions {
@@ -416,6 +922,86 @@ pub struct SessionOptions {
     pub display: Option<DisplayRequest>,
     /// Whether the Stats section is open, so the session subscribes once ready.
     pub stats: bool,
+    /// How long start-up errors are retried before [`RunError::StartupTimeout`]: 45 s, or
+    /// [`KEEP_WAITING_GRACE`] after the person chose Keep Waiting (`ARCH-027`).
+    pub startup_grace: Duration,
+    /// The waiting overlay's text until the first frame.
+    pub waiting: String,
+    /// The saved output device's Core Audio UID; `None` follows the Mac's default.
+    pub audio_output: Option<String>,
+    /// The saved audio bitrate (bps), requested once ready if the server offers it.
+    pub audio_bitrate: Option<u32>,
+    /// The display this stream claims: the session window's, or Display 2 (`ARCH-039`).
+    pub role: StreamRole,
+    /// `0x02` microphone frames from the window's `skerry-mic` thread (`ARCH-038`). Dropping
+    /// it when the stream ends stops that thread's capture. Always `None` for Display 2.
+    pub mic: Option<mpsc::Receiver<Vec<u8>>>,
+    /// `0x06` camera frames from the window's `skerry-camera` thread (`ARCH-038`).
+    pub camera: Option<CameraFrames>,
+}
+
+/// The camera's frame channel and its feedback, which the socket writer sets
+/// when it drops a frame.
+pub struct CameraFrames {
+    pub frames: mpsc::Receiver<Vec<u8>>,
+    pub feedback: Arc<crate::camera::Feedback>,
+}
+
+/// Why a stream ended with an error.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RunError {
+    /// The session kept answering like one still starting until the grace ran out: it
+    /// may still be booting, so the window offers Retry and Keep Waiting.
+    StartupTimeout,
+    /// The server sent `KILL <reason>`: no retry (`ARCH-039`).
+    Killed(Kill),
+    Other(&'static str),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartupTimeout => f.write_str("The session hasn’t answered yet."),
+            Self::Killed(kill) => kill.fmt(f),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<&'static str> for RunError {
+    fn from(message: &'static str) -> Self {
+        Self::Other(message)
+    }
+}
+
+/// Whether a failed WebSocket attempt looks like a session still starting: `None` is an
+/// attempt that timed out (the session accepts TCP but hangs, R7), like a refusal or a
+/// proxy's 404/5xx.
+fn attempt_transient(failure: Result<(), Option<&tokio_tungstenite::tungstenite::Error>>) -> bool {
+    match failure {
+        Ok(()) => false,
+        Err(None) => true,
+        Err(Some(error)) => transient_socket_error(error),
+    }
+}
+
+/// What to do after one failed WebSocket attempt during start-up.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    Again,
+    Timeout,
+    Fail,
+}
+
+/// A start-up error (a proxy's 404/5xx, a refused connection, or an attempt that timed
+/// out while the session accepts TCP but hangs) is retried until `give_up`, then becomes a
+/// [`RunError::StartupTimeout`]. Anything else fails at once.
+fn retry_decision(transient: bool, now: Instant, give_up: Instant) -> Retry {
+    match (transient, now < give_up) {
+        (true, true) => Retry::Again,
+        (true, false) => Retry::Timeout,
+        (false, _) => Retry::Fail,
+    }
 }
 
 struct HardwareVideo {
@@ -466,52 +1052,171 @@ impl HardwareVideo {
     }
 }
 
-fn finger_scroll_capability(text: &str) -> Option<bool> {
-    let payload = text.strip_prefix("DISPLAY_CONFIG_UPDATE,").unwrap_or(text);
-    let data: Value = serde_json::from_str(payload).ok()?;
-    if data["type"] != "display_config_update" {
-        return None;
-    }
-    Some(data["finger_scroll"].as_bool().unwrap_or(false))
+/// A `print_document` frame as its event; `None` for any other frame or a name Selkies
+/// itself would refuse.
+fn print_event(data: &Value) -> Option<SessionEvent> {
+    print_jobs::Announcement::parse(data).map(SessionEvent::PrintDocument)
 }
 
+/// Runs `work` unless the stream is cancelled first (`None`). A dropped sender counts as
+/// cancelled: the session that owned it is gone.
+async fn unless_cancelled<T>(
+    cancel: &mut watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => None,
+        out = work => Some(out),
+    }
+}
+
+/// Where a stream connects: a SealSkin session URL (cookie exchange first), or a direct
+/// Selkies server with its own login and TLS (`ARCH-036`).
+#[derive(Clone, Debug)]
+pub enum SessionTarget {
+    SealSkin(Url),
+    Selkies(crate::direct::SelkiesServer),
+}
+
+/// A direct server's upgrade refused: 401/400 are its login (fatal, never retried), 409 is
+/// WebSockets mode switched off after the gate.
+fn direct_upgrade_error(error: &tokio_tungstenite::tungstenite::Error) -> Option<&'static str> {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) => match response.status().as_u16() {
+            400 | 401 => Some(crate::direct::DIRECT_LOGIN_ERROR),
+            409 => Some(crate::direct::DIRECT_WEBRTC_ERROR),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Selkies closes a direct stream with 4001 when the session token is unknown: it upgraded
+/// first (secure mode checks the token after the 101), so this is the login refusal.
+fn direct_close_error(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> Option<&'static str> {
+    (u16::from(frame?.code) == 4001).then_some(crate::direct::DIRECT_LOGIN_ERROR)
+}
+
+/// Runs one Selkies stream. `cancel` turns true when the session drops this stream: until
+/// the main loop reads `Input::Close`, the transport checks it so a stream dropped while
+/// still connecting never opens its socket or sends SETTINGS (`ARCH-GAP-DC-09`).
 pub async fn run(
-    url: Url,
+    target: SessionTarget,
     frames: watch::Sender<Frame>,
-    mut input: mpsc::UnboundedReceiver<Input>,
+    input: mpsc::UnboundedReceiver<Input>,
     pointer: watch::Receiver<Option<Pointer>>,
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
-) -> Result<(), &'static str> {
-    let (template, access) = socket_request(url).await?;
-    if let Some(access) = access {
+    mut cancel: watch::Receiver<bool>,
+) -> Result<(), RunError> {
+    let direct = matches!(target, SessionTarget::Selkies(_));
+    // A direct server's verifier records a refused leaf: that failure is fatal, not a
+    // session still starting (tokio-rustls reports it as an I/O error).
+    let direct_server = match &target {
+        SessionTarget::Selkies(server) => Some(server.clone()),
+        SessionTarget::SealSkin(_) => None,
+    };
+    let Some(requested) = unless_cancelled(&mut cancel, socket_request(target)).await else {
+        return Ok(());
+    };
+    let (template, access, connector) = requested?;
+    if let Some(access) = access.filter(|_| options.role.is_primary()) {
         let _ = events.send(SessionEvent::Files(access));
     }
     let config = WebSocketConfig::default().max_message_size(Some(16 * 1024 * 1024));
     // A just-launched session answers 404/5xx or refuses connections until Selkies is up, so
     // keep retrying transient failures for a while instead of failing the first attempt.
-    let give_up = Instant::now() + SOCKET_STARTUP_GRACE;
-    let mut socket = loop {
+    let give_up = Instant::now() + options.startup_grace;
+    let socket = loop {
         let mut request = template
             .uri()
             .clone()
             .into_client_request()
             .map_err(|_| "Couldn’t connect to the Selkies WebSocket.")?;
         request.headers_mut().extend(template.headers().clone());
+        if let Some(server) = &direct_server {
+            server.clear_rejected();
+        }
         let attempt = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio_tungstenite::connect_async_with_config(request, Some(config), false),
-        )
-        .await
-        .map_err(|_| "The Selkies WebSocket did not respond.")?;
-        match attempt {
-            Ok((socket, _)) => break socket,
-            Err(error) if transient_socket_error(&error) && Instant::now() < give_up => {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                Some(config),
+                false,
+                connector.clone(),
+            ),
+        );
+        let Some(attempt) = unless_cancelled(&mut cancel, attempt).await else {
+            return Ok(());
+        };
+        let transient = match attempt {
+            Ok(Ok((socket, _))) => break socket,
+            Ok(Err(_))
+                if direct_server
+                    .as_ref()
+                    .is_some_and(|s| s.take_rejected().is_some()) =>
+            {
+                return Err(RunError::Other(crate::direct::DIRECT_CERT_ERROR));
             }
-            Err(_) => return Err("Couldn’t connect to the Selkies WebSocket."),
+            Ok(Err(error)) if direct && direct_upgrade_error(&error).is_some() => {
+                return Err(RunError::Other(
+                    direct_upgrade_error(&error).unwrap_or_default(),
+                ));
+            }
+            Ok(Err(error)) => attempt_transient(Err(Some(&error))),
+            Err(_) => attempt_transient(Err(None)),
+        };
+        match retry_decision(transient, Instant::now(), give_up) {
+            Retry::Again => {
+                let wait = tokio::time::sleep(Duration::from_millis(1500));
+                if unless_cancelled(&mut cancel, wait).await.is_none() {
+                    return Ok(());
+                }
+            }
+            Retry::Timeout => return Err(RunError::StartupTimeout),
+            Retry::Fail => return Err("Couldn’t connect to the Selkies WebSocket.".into()),
         }
     };
+    // Writes go through Wire's writer task, so a camera keyframe never holds the stream's
+    // loop; camera frames wait while the kernel holds unsent bytes (`socket_writer`,
+    // `ARCH-038`). The camera, like the microphone, is the primary's (`ARCH-039`).
+    let mut options = options;
+    options.camera = options.camera.take().filter(|_| options.role.is_primary());
+    let feedback = options
+        .camera
+        .as_ref()
+        .map_or_else(Arc::default, |camera| camera.feedback.clone());
+    let socket = Wire::with_camera(socket, options.role, feedback);
+    stream(
+        socket, direct, frames, input, pointer, options, events, cancel,
+    )
+    .await
+}
+
+/// The stream on an open socket: the claim, then the loop until it ends. `direct`: a
+/// direct Selkies server (`ARCH-036`), whose 4001 close is its login failing.
+#[allow(clippy::too_many_arguments)]
+async fn stream(
+    mut socket: Wire,
+    direct: bool,
+    frames: watch::Sender<Frame>,
+    mut input: mpsc::UnboundedReceiver<Input>,
+    pointer: watch::Receiver<Option<Pointer>>,
+    mut options: SessionOptions,
+    events: &mpsc::UnboundedSender<SessionEvent>,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), RunError> {
+    // The microphone is the primary's (`ARCH-038`, `ARCH-039`).
+    let mut mic_frames = options.mic.take().filter(|_| options.role.is_primary());
+    let mut cam_frames = options
+        .camera
+        .take()
+        .filter(|_| options.role.is_primary())
+        .map(|camera| camera.frames);
     let mut codec = if options.codec.supported() {
         options.codec
     } else {
@@ -531,30 +1236,37 @@ pub async fn run(
     settings["encoderFallback"] = json!(true);
     settings["video_10bit"] = json!(false);
     settings["video_fullcolor"] = json!(false);
-    settings["displayId"] = json!("primary");
+    options.role.claim(&mut settings);
     settings["audioRedundancy"] = json!(false);
     let disconnected = "The Selkies stream disconnected. Choose Reconnect to resume.";
+    if *cancel.borrow() {
+        // Dropped while the handshake finished: leave without sending the stale SETTINGS.
+        trace_input_event("close frame (cancelled before SETTINGS)");
+        let _ = socket.close(None).await;
+        return Ok(());
+    }
     socket
-        .send(format!("SETTINGS,{settings}").into())
+        .send(format!("SETTINGS,{settings}"))
         .await
         .map_err(|_| disconnected)?;
     let mut frame = Canvas::default();
     let mut jpeg_size = Resolution(1280, 720);
     let mut active_size = jpeg_size;
-    let mut changed = false;
-    // The JPEG frame id last gathered, and the one last shown, so a frame whose
-    // stripes straddle two flushes is counted once (`ARCH-021`).
-    let mut jpeg_frame = None;
-    let mut shown_jpeg_frame = None;
+    let mut pacer = JpegPacer::default();
     let mut last_frame = None;
     let mut seen_video = false;
     let mut unsupported_video = false;
-    let mut audio = None;
+    let mut audio: Option<Playback> = None;
+    // The last output picked during this stream, so a pick made before audio starts counts.
+    let mut audio_pick: Option<Option<String>> = None;
     let mut ready = false;
     let mut diagnostics = Diagnostics::default();
     diagnostics.set_stats(options.stats);
     let mut sample_start = Instant::now();
     let mut ping = None;
+    // Anything from the server, pongs included; silence past `PEER_TIMEOUT` ends the stream,
+    // so the window's stop runs and the microphone closes (M-QA-2).
+    let mut last_inbound = Instant::now();
     let mut sample_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
@@ -571,35 +1283,222 @@ pub async fn run(
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
     present.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // JPEG stripes gather into one canvas, flushed this often while any changed.
-    let mut jpeg_flush = tokio::time::interval(Duration::from_millis(8));
-    jpeg_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Shows the last frame of a burst; each stripe pushes it back, and it is polled only
+    // while a frame is pending, so a static desktop never wakes for it (`ARCH-034`).
+    let settle = tokio::time::sleep(SETTLE);
+    tokio::pin!(settle);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
+    // The last `p,N` sent: a close while captured restores the server's cursor (`ARCH-032`).
+    let mut pointer_lock = PointerLock::default();
+    // Gamepad slots announced on this stream, and `js,h` while any is off rest.
+    let mut pads = crate::gamepad::JsTracker::default();
+    let mut pad_heartbeat = tokio::time::interval(crate::gamepad::HEARTBEAT);
+    pad_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clipboard_in = clipboard::Receiver::default();
     let mut clipboard_transfer = 0u64;
+    let mut uplink_retry = tokio::time::interval(Duration::from_millis(20));
+    uplink_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            incoming = socket.next() => match incoming {
+            // In source order. Input, gamepad and key heartbeats come first, so a burst of stripes
+            // never delays them. A stripe already waiting on the socket is read before the
+            // settle timer can fire, so the settle never splits a frame that is still
+            // arriving back to back (`ARCH-034`).
+            biased;
+            command = input.recv() => {
+                let text = match command {
+                    // Gamepads stay on the primary's stream (`ARCH-039`).
+                    Some(Input::Command(text)) if !socket.role().is_primary() && text.starts_with("js,") => continue,
+                    Some(Input::Command(text)) => text,
+                    Some(Input::Pointer(position)) => {
+                        let Some(text) = position.command_for(active_size) else { continue; };
+                        text
+                    }
+                    Some(Input::Zoom(notches, position)) => {
+                        let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
+                        for command in zoom_commands(notches, position, active_size, control_held) {
+                            trace_input(&command);
+                            socket.send(command).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Video(enabled)) => {
+                        if let Some(video) = &mut hardware {
+                            video.decoder = Decoder::default();
+                            video.deadline = enabled.then(|| Instant::now() + WAIT_FOR_VIDEO);
+                        }
+                        if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
+                    }
+                    // Display 2 has no audio, stats, colour scheme or DPI: those stay on the
+                    // primary (`ARCH-039`).
+                    Some(Input::Audio(_) | Input::AudioOutput(_) | Input::AudioBitrate(_) | Input::Stats(_) | Input::Appearance(_) | Input::Screen(ScreenChange::Dpi(_)))
+                        if !socket.role().is_primary() => continue,
+                    Some(Input::Position(side, request)) => {
+                        if socket.role().is_primary() { continue; }
+                        socket.set_side(side);
+                        // Without a size, only later frames carry the side: a size-less
+                        // SETTINGS would re-seat display2 without its size.
+                        if let Some(request) = request {
+                            let settings = request.settings();
+                            socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
+                            let command = socket.role().resize_command(request.resolution);
+                            socket.send(command).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Audio(enabled)) => {
+                        if let Some(audio) = &mut audio { audio.clear(); }
+                        if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
+                    }
+                    Some(Input::AudioOutput(chosen)) => {
+                        if let Some(audio) = &audio { audio.set_output(chosen.clone()); }
+                        audio_pick = Some(chosen);
+                        continue;
+                    }
+                    Some(Input::AudioBitrate(bps)) => {
+                        let Some((command, applied)) = audio_bitrate_command(&capabilities, bps) else { continue; };
+                        socket.send(command).await.map_err(|_| disconnected)?;
+                        // Selkies may not echo it to the controller that asked.
+                        capabilities.live(&applied);
+                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
+                    }
+                    Some(Input::Settings(changes)) => {
+                        let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
+                        socket.send(command).await.map_err(|_| disconnected)?;
+                        // Some Selkies versions only echo changes to other controllers.
+                        capabilities.live(&applied);
+                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
+                    }
+                    Some(Input::Screen(change)) => {
+                        if let Some(settings) = screen_policy.apply(change) {
+                            socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
+                            let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
+                        }
+                        continue;
+                    }
+                    Some(Input::Resolution(request)) => {
+                        // Display 2 always resizes, as the web's does (`ARCH-039`).
+                        if resize_allowed || !socket.role().is_primary() {
+                            let settings = request.settings();
+                            socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
+                            let command = socket.role().resize_command(request.resolution);
+                            socket.send(command).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Appearance(next)) => {
+                        dark = next;
+                        if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
+                            socket.send(color_command(scheme)).await.map_err(|_| disconnected)?;
+                            sent_scheme = Some(scheme);
+                        }
+                        continue;
+                    }
+                    Some(Input::Clipboard(content)) => {
+                        clipboard_transfer += 1;
+                        for frame in clipboard::encode(&content, clipboard_transfer) {
+                            socket.send(frame).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::ForgetPads(slots)) => {
+                        for slot in slots {
+                            pads.forget(slot);
+                        }
+                        continue;
+                    }
+                    Some(Input::Stats(on)) => {
+                        if on == diagnostics.stats_on { continue; }
+                        diagnostics.set_stats(on);
+                        if !ready { continue; }
+                        format!("_stats,{}", u8::from(on))
+                    }
+                    // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
+                    // an explicit close: release held keys, then close cleanly.
+                    Some(Input::Close) | None => {
+                        for command in closing_commands(&held, pointer_lock, &mut pads, socket.role()) {
+                            trace_input(&command);
+                            let _ = socket.send(command).await;
+                        }
+                        trace_input_event("close frame");
+                        let _ = socket.close(None).await;
+                        return Ok(());
+                    }
+                };
+                pointer_lock.observe(&text);
+                pads.observe(&text);
+                if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
+                    held.insert(key);
+                } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
+                    held.remove(&key);
+                }
+                trace_input(&text);
+                socket.send(text).await.map_err(|_| disconnected)?;
+            }
+            _ = pad_heartbeat.tick(), if pads.active() && socket.role().is_primary() => {
+                for text in pads.heartbeat() {
+                    socket.send(text).await.map_err(|_| disconnected)?;
+                }
+            }
+            _ = heartbeat.tick(), if !held.is_empty() => {
+                let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                let text = format!("kh,{keys}");
+                trace_input(&text);
+                socket.send(text).await.map_err(|_| disconnected)?;
+            }
+            // About 80 B every 20 ms: inline after input, before anything received
+            // (`ARCH-038`). Frames before the session is ready are dropped. Taken only while
+            // the writer has room, so a stalled uplink fills the microphone's own channel and
+            // its 2 s stall stop fires (M-QA-2).
+            frame = uplink(&mut mic_frames), if socket.mic_room() => {
+                if let Some(frame) = uplink_message(ready, frame) {
+                    socket.send_binary(frame).await.map_err(|_| disconnected)?;
+                }
+            }
+            // Camera frames go to the writer's camera queue, behind every queued command and
+            // microphone frame; frames before the session is ready are dropped. Bounded like
+            // the microphone's.
+            frame = uplink(&mut cam_frames), if socket.camera_room() => {
+                if let Some(frame) = camera_uplink(ready, frame) {
+                    socket.send_camera(frame);
+                }
+            }
+            incoming = inbound(&mut socket, &mut last_inbound) => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
                     diagnostics.received_bytes += data.len() as u64;
                     match data.first().copied() {
                     Some(3) if data.len() > 6 && hardware.as_ref().is_none_or(|video| !video.decoded) => {
-                        frame.resize(jpeg_size.0, jpeg_size.1)?;
+                        if frame.resize(jpeg_size.0, jpeg_size.1)? {
+                            pacer.reset();
+                        }
                         active_size = jpeg_size;
                         let id = u16::from_be_bytes([data[2], data[3]]);
                         let y = u16::from_be_bytes([data[4], data[5]]);
                         last_frame = Some(id);
-                        jpeg_frame = Some(id);
                         let started = Instant::now();
-                        if frame.stripe(y, &data[6..]).is_some() {
+                        if let Some(stripe) = frame.decode(y, &data[6..]) {
                             diagnostics.packets += 1;
                             diagnostics.codec = Some(Codec::Jpeg);
                             diagnostics.decode += started.elapsed();
-                            changed = true;
+                            let now = Instant::now();
+                            if let Some(present) = pacer.stripe(id, y, started) {
+                                present_jpeg(&frames, &frame, &mut diagnostics, present);
+                            }
+                            let bottom = frame.is_bottom(&stripe);
+                            frame.insert(stripe);
+                            if bottom {
+                                if let Some(present) = pacer.present(PresentReason::Bottom, now) {
+                                    present_jpeg(&frames, &frame, &mut diagnostics, present);
+                                }
+                            } else if let Some(timer) = pacer.timer() {
+                                settle.as_mut().reset(timer.into());
+                            }
                             seen_video = true;
                         } else {
                             diagnostics.dropped += 1;
@@ -615,12 +1514,12 @@ pub async fn run(
                             let started = Instant::now();
                             if let Some(picture) = packet.as_ref().and_then(|packet| video.decode(packet)) {
                                 frame = Canvas::default();
+                                pacer.reset();
                                 active_size = Resolution(picture.width, picture.height);
                                 // A hardware frame is a whole picture: show it now rather
                                 // than on the next tick, which capped video at 30 fps (`ARCH-021`).
                                 diagnostics.frames += 1;
                                 frames.send_replace(picture);
-                                changed = false;
                                 diagnostics.codec = Some(video.codec);
                                 diagnostics.packets += 1;
                                 diagnostics.decode += started.elapsed();
@@ -645,6 +1544,21 @@ pub async fn run(
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
+                    // Before anything else: the 1008 close right behind it must not read as
+                    // a plain disconnect (`ARCH-039`).
+                    if let Some(kill) = role::kill_reason(&text) {
+                        trace_input_event("killed by the server");
+                        return Err(RunError::Killed(kill));
+                    }
+                    if let Some(event) = system_frame(&text) {
+                        if let Some(event) = event {
+                            if matches!(event, SessionEvent::Rumble(_)) && input_trace_enabled() {
+                                eprintln!("skerry input: {text}");
+                            }
+                            let _ = events.send(event);
+                        }
+                        continue;
+                    }
                     if let Some(cursor) = text.strip_prefix("cursor,") {
                         if let Some(cursor) = RemoteCursor::parse(cursor) {
                             let _ = events.send(SessionEvent::Cursor(cursor));
@@ -654,16 +1568,24 @@ pub async fn run(
                     match clipboard_in.on_text(&text) {
                         clipboard::Frame::NotClipboard => {}
                         clipboard::Frame::Pending => continue,
+                        // Only the primary writes the Mac pasteboard (`ARCH-039`).
                         clipboard::Frame::Payload(payload) => {
-                            let _ = events.send(SessionEvent::Clipboard(payload));
+                            if socket.role().is_primary() {
+                                let _ = events.send(SessionEvent::Clipboard(payload));
+                            }
                             continue;
                         }
                     }
                     if text.starts_with("MODE ") && text != "MODE websockets" {
-                        return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.");
+                        return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.".into());
                     }
-                    if let Some(finger_scroll) = finger_scroll_capability(&text) {
-                        let _ = events.send(SessionEvent::FingerScroll(finger_scroll));
+                    if let Some(event) = capture_event(&text) {
+                        let _ = events.send(event);
+                        continue;
+                    }
+                    if let Some(config) = role::display_config(&text) {
+                        let _ = events.send(SessionEvent::FingerScroll(config.finger_scroll));
+                        let _ = events.send(SessionEvent::DisplayLayout(config));
                         continue;
                     }
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
@@ -673,29 +1595,42 @@ pub async fn run(
                                     let _ = events.send(SessionEvent::StreamInfo(Box::new(info)));
                                 }
                             }
-                            Some("stream_stats") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
+                            Some("stream_stats") if socket.role().owns(&data, false) => {
                                 diagnostics.server = Some((Instant::now(), ServerFigures::parse(&data["stats"])));
                             }
-                            Some("stream_resolution") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
+                            Some("stream_resolution") if socket.role().owns(&data, false) => {
                                 let width = dimension(&data["width"])?;
                                 let height = dimension(&data["height"])?;
                                 if !valid_resolution(width, height) {
-                                    return Err("The remote display resolution is outside the supported range.");
+                                    return Err("The remote display resolution is outside the supported range.".into());
                                 }
                                 jpeg_size = Resolution(width, height);
                                 active_size = jpeg_size;
-                                if hardware.as_ref().is_none_or(|video| !video.decoded) {
-                                    frame.resize(width, height)?;
-                                    changed = true;
+                                // A new size presents at once (empty), so the view retires
+                                // the old-size stripes.
+                                if hardware.as_ref().is_none_or(|video| !video.decoded)
+                                    && frame.resize(width, height)?
+                                {
+                                    pacer.reset();
+                                    frames.send_replace(frame.snapshot());
                                 }
                             }
-                            Some("server_settings") | Some("display_settings") if primary_display(&data) => {
+                            Some("server_settings") | Some("display_settings") if socket.role().owns(&data, data["type"] == "server_settings") => {
+                                let primary = socket.role().is_primary();
                                 if data["type"] == "display_settings" {
                                     capabilities.live(&data["settings"]);
                                 } else {
+                                    if !primary && data["settings"]["second_screen"]["value"].as_bool() == Some(false) {
+                                        return Err(RunError::Killed(Kill::Refused(role::SECOND_SCREEN_OFF.into())));
+                                    }
                                     capabilities.announce(&data["settings"]);
                                     let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
-                                    let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
+                                    if primary {
+                                        let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
+                                        let _ = events.send(SessionEvent::PrintPolicy(print_jobs::enabled(&data["settings"])));
+                                        let _ = events.send(SessionEvent::CapturePolicy(capture::CapturePolicy::from_server(&data["settings"])));
+                                        let _ = events.send(SessionEvent::AppsPolicy(crate::apps::Policy::from_server(&data["settings"])));
+                                    }
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -704,43 +1639,63 @@ pub async fn run(
                                     if !capabilities.codecs.contains(&codec) {
                                         codec = capabilities.codecs.first().copied().ok_or("This server offers no video codec this Mac can play.")?;
                                         hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
+                                        pacer.reset();
                                         seen_video = false;
                                         let command = codec_command(codec);
-                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        socket.send(command).await.map_err(|_| disconnected)?;
                                         socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                                         video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
                                     }
                                 }
                                 let _ = events.send(SessionEvent::Settings(capabilities.clone()));
-                                if data["type"] == "server_settings" {
+                                if data["type"] == "server_settings" && primary {
                                     if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
-                                        socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
+                                        socket.send(color_command(scheme)).await.map_err(|_| disconnected)?;
                                         sent_scheme = Some(scheme);
                                     }
                                 }
                                 if data["type"] == "server_settings" && !ready {
                                     ready = true;
-                                    if diagnostics.stats_on {
+                                    // Display 2 sends only its video preferences: stats, the
+                                    // legacy defaults, the audio bitrate and audio are the
+                                    // primary's (`ARCH-039`).
+                                    if diagnostics.stats_on && primary {
                                         socket.send("_stats,1".into()).await.map_err(|_| disconnected)?;
                                     }
-                                    if let Some(legacy) = legacy_settings(&capabilities) {
-                                        socket.send(legacy.into()).await.map_err(|_| disconnected)?;
+                                    if let Some(legacy) = legacy_settings(&capabilities).filter(|_| primary) {
+                                        socket.send(legacy).await.map_err(|_| disconnected)?;
                                     }
                                     if let Some((command, applied)) = settings_command(&capabilities, options.preferences.iter().copied()) {
-                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        socket.send(command).await.map_err(|_| disconnected)?;
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
-                                    if data["settings"]["audio_enabled"]["value"].as_bool() == Some(false) {
-                                        let _ = events.send(SessionEvent::AudioUnavailable("Audio is disabled by the server."));
+                                    if let Some((command, applied)) = options.audio_bitrate.filter(|_| primary).and_then(|bps| audio_bitrate_command(&capabilities, bps)) {
+                                        socket.send(command).await.map_err(|_| disconnected)?;
+                                        capabilities.live(&applied);
+                                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                                    }
+                                    if !primary {
+                                        // Display 2 never plays audio; the server sends it none.
+                                    } else if data["settings"]["audio_enabled"]["value"].as_bool() == Some(false) {
+                                        let _ = events.send(SessionEvent::AudioUnavailable("Audio turned off by the server"));
                                     } else {
-                                        audio = Playback::new();
+                                        let statuses = events.clone();
+                                        audio = Playback::new(starting_output(options.audio_output.as_ref(), audio_pick.as_ref()), move |status| {
+                                            let _ = statuses.send(SessionEvent::AudioOutput(status));
+                                        });
                                         match audio_start(&data["settings"], audio.is_some(), options.muted) {
                                             AudioStart::Play => socket.send("START_AUDIO".into()).await.map_err(|_| disconnected)?,
                                             AudioStart::Muted => { let _ = events.send(SessionEvent::Audio(false)); }
-                                            AudioStart::Unavailable => { let _ = events.send(SessionEvent::AudioUnavailable("No compatible 48 kHz stereo audio output is available.")); }
+                                            AudioStart::Unavailable => { let _ = events.send(SessionEvent::AudioUnavailable("Audio couldn’t start on this Mac.")); }
                                         }
                                     }
+                                }
+                            }
+                            // Replayed to every socket on connect; documents are the primary's.
+                            Some("print_document") if socket.role().is_primary() => {
+                                if let Some(event) = print_event(&data) {
+                                    let _ = events.send(event);
                                 }
                             }
                             _ => {}
@@ -761,131 +1716,52 @@ pub async fn run(
                     }
                 }
                 Some(Ok(Message::Ping(_))) => { socket.flush().await.map_err(|_| disconnected)?; }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(disconnected),
+                Some(Ok(Message::Close(frame))) if direct && direct_close_error(frame.as_ref()).is_some() => {
+                    return Err(RunError::Other(direct_close_error(frame.as_ref()).unwrap_or_default()));
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(disconnected.into()),
                 _ => {}
             },
-            command = input.recv() => {
-                let text = match command {
-                    Some(Input::Command(text)) => text,
-                    Some(Input::Pointer(position)) => {
-                        let Some(text) = position.command_for(active_size) else { continue; };
-                        text
-                    }
-                    Some(Input::Zoom(notches, position)) => {
-                        let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
-                        for command in zoom_commands(notches, position, active_size, control_held) {
-                            socket.send(command.into()).await.map_err(|_| disconnected)?;
-                        }
-                        continue;
-                    }
-                    Some(Input::Video(enabled)) => {
-                        if let Some(video) = &mut hardware {
-                            video.decoder = Decoder::default();
-                            video.deadline = enabled.then(|| Instant::now() + WAIT_FOR_VIDEO);
-                        }
-                        if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
-                    }
-                    Some(Input::Audio(enabled)) => {
-                        if let Some(audio) = &mut audio { audio.clear(); }
-                        if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
-                    }
-                    Some(Input::Settings(changes)) => {
-                        let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
-                        // Some Selkies versions only echo changes to other controllers.
-                        capabilities.live(&applied);
-                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
-                        continue;
-                    }
-                    Some(Input::Screen(change)) => {
-                        if let Some(settings) = screen_policy.apply(change) {
-                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
-                            let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
-                        }
-                        continue;
-                    }
-                    Some(Input::Resolution(request)) => {
-                        if resize_allowed {
-                            let Resolution(width, height) = request.resolution;
-                            let settings = request.settings();
-                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
-                            socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
-                        }
-                        continue;
-                    }
-                    Some(Input::Appearance(next)) => {
-                        dark = next;
-                        if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
-                            socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
-                            sent_scheme = Some(scheme);
-                        }
-                        continue;
-                    }
-                    Some(Input::Clipboard(content)) => {
-                        clipboard_transfer += 1;
-                        for frame in clipboard::encode(&content, clipboard_transfer) {
-                            socket.send(frame.into()).await.map_err(|_| disconnected)?;
-                        }
-                        continue;
-                    }
-                    Some(Input::Stats(on)) => {
-                        if on == diagnostics.stats_on { continue; }
-                        diagnostics.set_stats(on);
-                        if !ready { continue; }
-                        format!("_stats,{}", u8::from(on))
-                    }
-                    None => { let _ = socket.close(None).await; return Ok(()); }
-                };
-                if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
-                    held.insert(key);
-                } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
-                    held.remove(&key);
-                }
-                socket.send(text.into()).await.map_err(|_| disconnected)?;
-            }
-            _ = heartbeat.tick(), if !held.is_empty() => {
-                let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-                socket.send(format!("kh,{keys}").into()).await.map_err(|_| disconnected)?;
-            }
             _ = sample_tick.tick() => {
                 let now = Instant::now();
+                if peer_silent(last_inbound, now) {
+                    return Err(SILENT.into());
+                }
                 let sample = diagnostics.sample(now.duration_since(sample_start), active_size.0, active_size.1);
                 let _ = events.send(SessionEvent::Stats(sample));
                 sample_start = now;
-                if ping.is_none() {
-                    socket.send(Message::Ping(b"sealskin-rtt".as_slice().into())).await.map_err(|_| disconnected)?;
+                // A lost pong is re-pinged, so a quiet but healthy session never reads as gone.
+                if ping.is_none_or(|sent: Instant| now.duration_since(sent) >= Duration::from_secs(3)) {
+                    socket.ping(b"sealskin-rtt").await.map_err(|_| disconnected)?;
                     ping = Some(now);
                 }
             }
-            _ = jpeg_flush.tick(), if changed => {
-                let picture = frame.snapshot();
-                if picture.picture.is_some() && jpeg_frame != shown_jpeg_frame {
-                    diagnostics.frames += 1;
-                    shown_jpeg_frame = jpeg_frame;
+            _ = &mut settle, if pacer.deadline().is_some() => {
+                if let Some(present) = pacer.present(PresentReason::Settle, Instant::now()) {
+                    present_jpeg(&frames, &frame, &mut diagnostics, present);
                 }
-                frames.send_replace(picture);
-                changed = false;
             }
             _ = present.tick() => {
                 if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
                     if !capabilities.codecs.contains(&Codec::Jpeg) {
-                        return Err("Hardware video decoding failed and the server does not allow JPEG fallback.");
+                        return Err("Hardware video decoding failed and the server does not allow JPEG fallback.".into());
                     }
                     codec = Codec::Jpeg;
                     hardware = None;
+                    pacer.reset();
                     seen_video = false;
                     unsupported_video = false;
                     video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
-                    socket.send(codec_command(codec).into()).await.map_err(|_| disconnected)?;
+                    socket.send(codec_command(codec)).await.map_err(|_| disconnected)?;
                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                 }
                 if let Some(id) = last_frame.take() {
-                    socket.send(format!("CLIENT_FRAME_ACK {id} 0").into()).await.map_err(|_| disconnected)?;
+                    socket.send(format!("CLIENT_FRAME_ACK {id} 0")).await.map_err(|_| disconnected)?;
                 }
                 if pointer.has_changed().unwrap_or(false) {
                     let position = *pointer.borrow_and_update();
                     if let Some(command) = position.and_then(|p| p.command_for(active_size)) {
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        socket.send(command).await.map_err(|_| disconnected)?;
                     }
                 }
             }
@@ -894,10 +1770,33 @@ pub async fn run(
                     "The server did not switch to JPEG. Enable JPEG for this session and reconnect."
                 } else {
                     "No video arrived from Selkies. Choose Reconnect to try again."
-                });
+                }
+                .into());
             }
+            // Last: wakes the loop to look again at an uplink held back for a full writer.
+            _ = uplink_retry.tick(), if !socket.mic_room() || !socket.camera_room() => {}
         }
     }
+}
+
+/// The output a new `Playback` starts with: the last pick this stream saw (System Default
+/// included), else the saved device.
+fn starting_output(saved: Option<&String>, picked: Option<&Option<String>>) -> Option<String> {
+    picked.map_or_else(|| saved.cloned(), Clone::clone)
+}
+
+/// The web client's audio bitrate message, `SETTINGS,{"audio_bitrate":<bps>,"picked":[…]}`
+/// (`picked` makes a non-owner controller's change count), and the value to apply locally.
+/// `None` unless the server offers `bps` and it differs from the current value.
+fn audio_bitrate_command(settings: &Settings, bps: u32) -> Option<(String, Value)> {
+    let bps = settings.audio_bitrate.as_ref()?.request(bps)?;
+    Some((
+        format!(
+            "SETTINGS,{}",
+            json!({"audio_bitrate": bps, "picked": ["audio_bitrate"]})
+        ),
+        json!({"audio_bitrate": bps}),
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -907,8 +1806,9 @@ enum AudioStart {
     Unavailable,
 }
 
-fn audio_start(settings: &Value, output: bool, muted: bool) -> AudioStart {
-    if !output {
+/// `decoder`: whether `Playback` started (it fails only when the Opus decoder can't).
+fn audio_start(settings: &Value, decoder: bool, muted: bool) -> AudioStart {
+    if !decoder {
         return AudioStart::Unavailable;
     }
     if muted || settings["audio_on_start"]["value"].as_bool() == Some(false) {
@@ -935,10 +1835,6 @@ fn color_command(scheme: &str) -> String {
 fn allows_resize(settings: &Value) -> bool {
     settings["enable_resize"]["value"].as_bool().unwrap_or(true)
         && settings["manual_resolution"]["locked"].as_bool() != Some(true)
-}
-
-fn primary_display(data: &Value) -> bool {
-    data["displayId"].as_str().unwrap_or("primary") == "primary"
 }
 
 fn legacy_settings(settings: &Settings) -> Option<String> {
@@ -993,7 +1889,9 @@ fn dimension(value: &Value) -> Result<u16, &'static str> {
 }
 
 /// How long to keep retrying the WebSocket while a newly launched session starts.
-const SOCKET_STARTUP_GRACE: Duration = Duration::from_secs(45);
+pub const SOCKET_STARTUP_GRACE: Duration = Duration::from_secs(45);
+/// How long Keep Waiting keeps retrying a session that hasn't answered yet.
+pub const KEEP_WAITING_GRACE: Duration = Duration::from_secs(300);
 
 fn transient_socket_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
     use tokio_tungstenite::tungstenite::Error;
@@ -1009,41 +1907,47 @@ fn transient_status(status: u16) -> bool {
     matches!(status, 404 | 502 | 503 | 504)
 }
 
-/// The WebSocket handshake for the session, and the session's file routes under the same
-/// cookie (`ARCH-023`), or `None` when they cannot be built.
-async fn socket_request(
-    url: Url,
-) -> Result<
-    (
-        tokio_tungstenite::tungstenite::handshake::client::Request,
-        Option<selkies::SelkiesClient>,
-    ),
-    &'static str,
-> {
-    let address_error =
-        "SealSkin returned an unsupported session address. Open an individual session.";
-    let auth_error =
-        "Couldn’t authorize the native session. Refresh the launcher and resume again.";
+/// A session's cookie, from SealSkin's `GET /<id>/?access_token=…` → 303 exchange
+/// (`sessions.py::initial_session_auth`). The token is compared and copied into the cookie,
+/// not used up, so the exchange can repeat while a stream is open (`ARCH-028`).
+pub struct SessionAccess {
+    /// Where the 303 sent us: the session's own path, still with its query.
+    pub redirect: Url,
+    /// `redirect` without query or fragment: the base of the session's routes.
+    pub base: Url,
+    /// Every cookie the exchange set, marked sensitive.
+    pub cookie: reqwest::header::HeaderValue,
+}
+
+const ADDRESS_ERROR: &str =
+    "SealSkin returned an unsupported session address. Open an individual session.";
+const AUTH_ERROR: &str =
+    "Couldn’t authorize the native session. Refresh the launcher and resume again.";
+
+/// The cookie exchange for an individual session URL, on its own client with no
+/// credentials: the application key never goes to a session origin. A collaboration room
+/// (`/room/<id>?token=`) has no `access_token` and is refused.
+pub async fn session_access(url: Url) -> Result<SessionAccess, &'static str> {
     if !url.query_pairs().any(|(key, _)| key == "access_token") || !url.path().ends_with('/') {
-        return Err(address_error);
+        return Err(ADDRESS_ERROR);
     }
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(10))
         .build()
-        .map_err(|_| auth_error)?;
-    let response = http.get(url.clone()).send().await.map_err(|_| auth_error)?;
+        .map_err(|_| AUTH_ERROR)?;
+    let response = http.get(url.clone()).send().await.map_err(|_| AUTH_ERROR)?;
     if response.status() != reqwest::StatusCode::SEE_OTHER {
-        return Err(auth_error);
+        return Err(AUTH_ERROR);
     }
     let location = response
         .headers()
         .get("location")
         .and_then(|value| value.to_str().ok())
-        .ok_or(address_error)?;
-    let redirect = url.join(location).map_err(|_| address_error)?;
+        .ok_or(ADDRESS_ERROR)?;
+    let redirect = url.join(location).map_err(|_| ADDRESS_ERROR)?;
     if redirect.origin() != url.origin() || redirect.path() != url.path() {
-        return Err(address_error);
+        return Err(ADDRESS_ERROR);
     }
     let cookie = response
         .headers()
@@ -1053,21 +1957,58 @@ async fn socket_request(
         .collect::<Vec<_>>()
         .join("; ");
     if cookie.is_empty() {
-        return Err(auth_error);
+        return Err(AUTH_ERROR);
     }
-    let mut websocket = redirect.join("api/websockets").map_err(|_| address_error)?;
-    websocket.set_scheme("wss").map_err(|_| address_error)?;
-    let mut request = websocket
-        .as_str()
-        .into_client_request()
-        .map_err(|_| address_error)?;
     let mut cookie = cookie
         .parse::<reqwest::header::HeaderValue>()
-        .map_err(|_| auth_error)?;
+        .map_err(|_| AUTH_ERROR)?;
     cookie.set_sensitive(true);
     let mut base = redirect.clone();
     base.set_query(None);
     base.set_fragment(None);
+    Ok(SessionAccess {
+        redirect,
+        base,
+        cookie,
+    })
+}
+
+/// The session's Selkies file routes without a stream: the cookie exchange, then a
+/// `SelkiesClient` under that cookie (the Library's Files button, `ARCH-028`).
+pub async fn selkies_for_session(url: Url) -> Result<selkies::SelkiesClient, &'static str> {
+    let access = session_access(url).await?;
+    selkies::SelkiesClient::new(access.base, access.cookie).map_err(|_| ADDRESS_ERROR)
+}
+
+type SocketRequest = (
+    tokio_tungstenite::tungstenite::handshake::client::Request,
+    Option<selkies::SelkiesClient>,
+    Option<tokio_tungstenite::Connector>,
+);
+
+/// The WebSocket handshake for the session, the session's file routes under the same
+/// credentials (`ARCH-023`; `None` when they cannot be built), and the TLS connector: the
+/// default roots for SealSkin, the server's pinned config for a direct server.
+async fn socket_request(target: SessionTarget) -> Result<SocketRequest, &'static str> {
+    let url = match target {
+        SessionTarget::SealSkin(url) => url,
+        SessionTarget::Selkies(server) => {
+            let request = server.websocket_request()?;
+            let connector = tokio_tungstenite::Connector::Rustls(server.tls_config());
+            return Ok((request, Some(server.selkies_client()), Some(connector)));
+        }
+    };
+    let SessionAccess {
+        redirect,
+        base,
+        cookie,
+    } = session_access(url.clone()).await?;
+    let mut websocket = redirect.join("api/websockets").map_err(|_| ADDRESS_ERROR)?;
+    websocket.set_scheme("wss").map_err(|_| ADDRESS_ERROR)?;
+    let mut request = websocket
+        .as_str()
+        .into_client_request()
+        .map_err(|_| ADDRESS_ERROR)?;
     let access = selkies::SelkiesClient::new(base, cookie.clone()).ok();
     request.headers_mut().insert("cookie", cookie);
     request.headers_mut().insert(
@@ -1075,9 +2016,9 @@ async fn socket_request(
         url.origin()
             .ascii_serialization()
             .parse()
-            .map_err(|_| address_error)?,
+            .map_err(|_| ADDRESS_ERROR)?,
     );
-    Ok((request, access))
+    Ok((request, access, None))
 }
 
 #[cfg(test)]
@@ -1085,18 +2026,1329 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_selkies_prefixed_display_capabilities() {
+    fn print_document_frames_become_print_events() {
+        let frame = json!({"type": "print_document", "name": "Report.pdf", "size_bytes": 3400});
+        match print_event(&frame) {
+            Some(SessionEvent::PrintDocument(announcement)) => {
+                assert_eq!(announcement.name, "Report.pdf");
+                assert_eq!(announcement.size, 3400);
+            }
+            _ => panic!("expected a print event"),
+        }
+        assert!(print_event(&json!({"type": "stream_info", "name": "a.pdf"})).is_none());
+        assert!(print_event(&json!({"type": "print_document", "name": "../a.pdf"})).is_none());
+    }
+
+    fn test_options() -> SessionOptions {
+        SessionOptions {
+            preferences: Vec::new(),
+            dark: false,
+            muted: true,
+            codec: Codec::Jpeg,
+            display: None,
+            stats: false,
+            startup_grace: SOCKET_STARTUP_GRACE,
+            waiting: String::new(),
+            audio_output: None,
+            audio_bitrate: None,
+            role: StreamRole::Primary,
+            mic: None,
+            camera: None,
+        }
+    }
+
+    /// What a fake Selkies saw and the stream raised, for the role tests (`ARCH-039`).
+    struct Played {
+        ended: Result<(), RunError>,
+        /// Every text frame the server received, the handshake first.
+        received: Vec<String>,
+        events: Vec<SessionEvent>,
+    }
+
+    /// The server's on-connect and live messages, as Selkies sends them to any socket.
+    fn selkies_script() -> Vec<String> {
+        vec![
+            json!({"type": "print_document", "name": "Report.pdf", "size_bytes": 3400}).to_string(),
+            json!({"type": "server_settings", "settings": {
+                "framerate": {"value": 30, "min": 15, "max": 60},
+                "audio_bitrate": {"value": "128000", "allowed": ["64000", "128000"]},
+                "color_scheme": {"value": "light", "allowed": ["light", "dark"]},
+                "scaling_dpi": {"value": 96, "allowed": ["96", "192"]},
+                "second_screen": {"value": true},
+                "printing_enabled": {"value": true},
+            }})
+            .to_string(),
+            r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","displays":["primary","display2"],"finger_scroll":false,"layouts":{"primary":{"x":0,"y":0,"w":1920,"h":1080},"display2":{"x":1920,"y":0,"w":1280,"h":720}}}"#.into(),
+            json!({"type": "server_settings", "displayId": "display2", "settings": {
+                "framerate": {"value": 30, "min": 15, "max": 60},
+                "second_screen": {"value": true},
+            }})
+            .to_string(),
+            json!({"type": "stream_resolution", "displayId": "primary", "width": 1920, "height": 1080}).to_string(),
+            json!({"type": "stream_resolution", "displayId": "display2", "width": 1280, "height": 720}).to_string(),
+        ]
+    }
+
+    /// Every `Input` a window can send, in the order the role tests drive them.
+    fn every_input() -> Vec<Input> {
+        vec![
+            Input::Settings(vec![(Key::Fps, 45)]),
+            Input::AudioBitrate(64_000),
+            Input::Screen(ScreenChange::Dpi(192)),
+            Input::Screen(ScreenChange::Alignment(true)),
+            Input::Resolution(DisplayRequest {
+                resolution: Resolution(1280, 720),
+                scale: Some(1.),
+            }),
+            Input::Appearance(true),
+            Input::Stats(true),
+            Input::Audio(true),
+            Input::AudioOutput(None),
+            Input::Clipboard(clipboard::Content::Text("hi".into())),
+            Input::Command("kd,97".into()),
+            Input::Command("js,c,0,Pad,4,16".into()),
+            Input::Zoom(
+                1,
+                Pointer {
+                    display: Resolution(1280, 720),
+                    position: (10, 10),
+                    buttons: 0,
+                },
+            ),
+            Input::Position(Side::Left, None),
+            Input::Settings(vec![(Key::Fps, 50)]),
+        ]
+    }
+
+    /// The input that tells the fake server every earlier input has been read.
+    const INPUTS_DONE: &str = "qa-inputs-done";
+
+    /// Runs `role`'s stream against a fake Selkies on plain TCP: the server sends
+    /// `script` (then an Apps frame that marks its end), the stream gets `inputs` once it
+    /// has read the whole script, then the server sends `last` (a `KILL`, say) once it has
+    /// read every input, and closes with `close` (1008 for a refusal). Every text frame it
+    /// read is returned. No fixed sleeps: each step waits on the one before.
+    async fn play(
+        role: StreamRole,
+        script: Vec<String>,
+        inputs: Vec<Input>,
+        last: Option<&'static str>,
+        close: u16,
+    ) -> Played {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let scripted = !script.is_empty();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut received = Vec::new();
+            // The handshake SETTINGS comes first.
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                received.push(text.to_string());
+            }
+            if scripted {
+                for message in script {
+                    ws.send(Message::text(message)).await.unwrap();
+                }
+                // Raises an Apps event in either role: the stream has read the script.
+                ws.send(Message::text(r#"system,{"action":"apps_state"}"#))
+                    .await
+                    .unwrap();
+            }
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) if text.as_str() == INPUTS_DONE => break,
+                    Some(Ok(Message::Text(text))) => received.push(text.to_string()),
+                    Some(Ok(Message::Binary(data))) => {
+                        received.push(format!("<binary {:02x}>", data[0]))
+                    }
+                    Some(Ok(_)) => {}
+                    // The stream closed or ended by itself.
+                    _ => return received,
+                }
+            }
+            if let Some(last) = last {
+                let _ = ws.send(Message::text(last)).await;
+            }
+            let _ = ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(close),
+                    reason: "".into(),
+                })))
+                .await;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(text) => received.push(text.to_string()),
+                    Message::Binary(data) => received.push(format!("<binary {:02x}>", data[0])),
+                    _ => {}
+                }
+            }
+            received
+        });
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(
+            format!("ws://{address}/api/websockets"),
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp),
+        )
+        .await
+        .unwrap();
+        let (frames, _frames_rx) = watch::channel(Frame::default());
+        let (input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let events_rx = tokio::sync::Mutex::new(events_rx);
+        let seen = std::cell::RefCell::new(Vec::new());
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let (mic_tx, mic) = mpsc::channel(4);
+        let options = SessionOptions {
+            muted: false,
+            stats: true,
+            audio_bitrate: Some(64_000),
+            role,
+            mic: Some(mic),
+            ..test_options()
+        };
+        let driver = async {
+            if scripted {
+                // Wait for the script's end marker.
+                loop {
+                    let event = events_rx.lock().await.recv().await;
+                    match event {
+                        Some(SessionEvent::Apps(_)) => break,
+                        Some(event) => seen.borrow_mut().push(event),
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+            }
+            // One microphone frame once ready: only a primary may send it.
+            let _ = mic_tx.send(crate::capture::mic_frame(&[1])).await;
+            for input in inputs {
+                let _ = input_tx.send(input);
+            }
+            let _ = input_tx.send(Input::Command(INPUTS_DONE.into()));
+            std::future::pending::<()>().await;
+        };
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                ended = stream(Wire::new(ws, role), false, frames, input, pointer, options, &events, cancel) => ended,
+                _ = driver => unreachable!(),
+            }
+        })
+        .await
+        .expect("the stream ends");
+        drop(events);
+        let mut seen = seen.into_inner();
+        let mut events_rx = events_rx.into_inner();
+        while let Ok(event) = events_rx.try_recv() {
+            seen.push(event);
+        }
+        Played {
+            ended,
+            received: server.await.unwrap(),
+            events: seen,
+        }
+    }
+
+    fn settings_frames(received: &[String]) -> Vec<Value> {
+        received
+            .iter()
+            .filter_map(|text| text.strip_prefix("SETTINGS,"))
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_secondary_stream_claims_display2_and_ends_on_kill() {
+        let played = play(
+            StreamRole::Secondary(Side::Right),
+            selkies_script(),
+            every_input(),
+            Some("KILL The host compositor has a single output, so a second display has nothing to capture."),
+            1008,
+        )
+        .await;
         assert_eq!(
-            finger_scroll_capability(
+            played.ended,
+            Err(RunError::Killed(Kill::Refused(
+                "The host compositor has a single output, so a second display has nothing to capture.".into()
+            )))
+        );
+        let settings = settings_frames(&played.received);
+        assert!(settings.len() >= 4, "{:?}", played.received);
+        // The handshake claims display2 on the right, with its own size request.
+        assert_eq!(settings[0]["displayId"], "display2");
+        assert_eq!(settings[0]["displayPosition"], "right");
+        let mut moved = false;
+        for frame in &settings {
+            assert_eq!(frame["displayId"], "display2", "{frame}");
+            assert!(frame.get("color_scheme").is_none(), "{frame}");
+            assert!(frame.get("audio_bitrate").is_none(), "{frame}");
+            assert!(frame.get("scaling_dpi").is_none(), "{frame}");
+            moved |= frame["displayPosition"] == "left";
+            if moved {
+                // Every frame after the move carries the new side.
+                assert_eq!(frame["displayPosition"], "left", "{frame}");
+            }
+        }
+        assert!(moved, "{:?}", played.received);
+        // The last settings change, after Position(Left), names the new side.
+        let last = settings.last().unwrap();
+        assert_eq!(last["framerate"], 50);
+        assert_eq!(last["displayPosition"], "left");
+        assert!(!played
+            .received
+            .iter()
+            .any(|text| text.contains("\"primary\"")));
+        for text in &played.received {
+            assert!(
+                !(text == "START_AUDIO"
+                    || text.starts_with("_stats")
+                    || text.starts_with("s,")
+                    || text.starts_with("js,")),
+                "{text}"
+            );
+        }
+        // No microphone frame on Display 2.
+        assert!(!played
+            .received
+            .iter()
+            .any(|text| text.starts_with("<binary")));
+        // Display 2 always resizes, naming its display.
+        assert!(played
+            .received
+            .iter()
+            .any(|text| text == "r,1280x720,display2"));
+        // Keys and the clipboard still go over its own socket.
+        assert!(played.received.iter().any(|text| text == "kd,97"));
+        assert!(played.received.iter().any(|text| text.starts_with("cw,")));
+        for event in &played.events {
+            assert!(
+                !matches!(
+                    event,
+                    SessionEvent::PrintDocument(_)
+                        | SessionEvent::PrintPolicy(_)
+                        | SessionEvent::Audio(_)
+                        | SessionEvent::AudioUnavailable(_)
+                        | SessionEvent::AudioOutput(_)
+                        | SessionEvent::Files(_)
+                ),
+                "a secondary raised a primary-only event"
+            );
+        }
+        assert!(played
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::DisplayLayout(config) if config.layouts.contains_key("display2"))));
+    }
+
+    #[tokio::test]
+    async fn a_primary_taken_over_reports_superseded() {
+        let played = play(
+            StreamRole::Primary,
+            selkies_script(),
+            every_input(),
+            Some("KILL a new primary client connected connection killed"),
+            1000,
+        )
+        .await;
+        assert_eq!(played.ended, Err(RunError::Killed(Kill::Superseded)));
+        let settings = settings_frames(&played.received);
+        assert_eq!(settings[0]["displayId"], "primary");
+        // The primary's own frames are as before: no stamp, no position.
+        assert!(settings[1..]
+            .iter()
+            .all(|frame| frame.get("displayId").is_none()));
+        assert!(settings
+            .iter()
+            .all(|frame| frame.get("displayPosition").is_none()));
+        // It still sends what Display 2 skips, the microphone too.
+        assert!(played.received.iter().any(|text| text == "<binary 02>"));
+        assert!(played.received.iter().any(|text| text == "_stats,1"));
+        assert!(played.received.iter().any(|text| text.starts_with("js,")));
+        assert!(settings
+            .iter()
+            .any(|frame| frame.get("audio_bitrate").is_some()));
+        assert!(played
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::PrintDocument(_))));
+    }
+
+    #[tokio::test]
+    async fn second_screen_off_ends_a_secondary() {
+        let script = vec![json!({"type": "server_settings", "settings": {
+            "second_screen": {"value": false},
+        }})
+        .to_string()];
+        let played = play(
+            StreamRole::Secondary(Side::Right),
+            script,
+            Vec::new(),
+            None,
+            1000,
+        )
+        .await;
+        assert_eq!(
+            played.ended,
+            Err(RunError::Killed(Kill::Refused(
+                role::SECOND_SCREEN_OFF.into()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_without_kill_is_still_a_disconnect() {
+        let played = play(
+            StreamRole::Secondary(Side::Up),
+            Vec::new(),
+            Vec::new(),
+            None,
+            1000,
+        )
+        .await;
+        assert!(matches!(played.ended, Err(RunError::Other(_))));
+    }
+
+    #[tokio::test]
+    async fn owner_teardown_releases_display_two_keys_before_close() {
+        // What the owner's teardown does to Display 2: release the held key (the `ku` the
+        // view queues), then drop the stream (`Input::Close`): the release goes first.
+        let played = play(
+            StreamRole::Secondary(Side::Right),
+            Vec::new(),
+            vec![Input::Command("kd,97".into()), Input::Close],
+            None,
+            1000,
+        )
+        .await;
+        assert_eq!(played.ended, Ok(()));
+        let keys: Vec<_> = played
+            .received
+            .iter()
+            .filter(|text| text.starts_with("kd,") || text.starts_with("ku,"))
+            .collect();
+        assert_eq!(keys, ["kd,97", "ku,97"]);
+    }
+
+    #[test]
+    fn secondary_closing_commands_release_keys_only() {
+        let held = BTreeSet::from([0x61]);
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,Pad,4,16");
+        let lock = PointerLock {
+            locked: true,
+            buttons: 1,
+        };
+        assert_eq!(
+            closing_commands(&held, lock, &mut pads, StreamRole::Secondary(Side::Left)),
+            ["ku,97"]
+        );
+    }
+
+    #[test]
+    fn every_settings_frame_on_a_secondary_names_display2() {
+        let role = StreamRole::Secondary(Side::Down);
+        let mut settings = Settings::default();
+        settings.announce(&json!({
+            "framerate": {"value": 30, "min": 15, "max": 60},
+            "audio_bitrate": {"value": "128000", "allowed": ["64000", "128000"]},
+        }));
+        let request = DisplayRequest {
+            resolution: Resolution(800, 600),
+            scale: None,
+        };
+        let frames = [
+            settings_command(&settings, [(Key::Fps, 45)]).unwrap().0,
+            codec_command(Codec::Jpeg),
+            format!("SETTINGS,{}", request.settings()),
+            audio_bitrate_command(&settings, 64_000).unwrap().0,
+        ];
+        for frame in frames {
+            let stamped: Value =
+                serde_json::from_str(role.stamp(frame).strip_prefix("SETTINGS,").unwrap()).unwrap();
+            assert_eq!(stamped["displayId"], "display2");
+            assert_eq!(stamped["displayPosition"], "down");
+        }
+    }
+
+    #[test]
+    fn uplink_mic_frames_sent_as_binary_after_ready() {
+        let frame = capture::mic_frame(&[0x68, 0x01]);
+        assert_eq!(
+            uplink_message(true, frame).as_deref(),
+            Some(&[0x02, 0x68, 0x01][..])
+        );
+    }
+
+    #[test]
+    fn a_silent_peer_ends_the_stream_after_ten_seconds() {
+        let start = Instant::now();
+        assert!(!peer_silent(start, start + Duration::from_secs(9)));
+        assert!(peer_silent(start, start + PEER_TIMEOUT));
+        assert!(!peer_silent(start + Duration::from_secs(1), start));
+        // The error reaches the window as `SessionEvent::Error`, which stops capture.
+        assert_eq!(RunError::from(SILENT).to_string(), SILENT);
+    }
+
+    #[tokio::test]
+    async fn any_inbound_message_counts_as_alive() {
+        let old = Instant::now() - Duration::from_secs(30);
+        let mut last = old;
+        let mut stream = futures_util::stream::iter(vec![Ok::<_, ()>(1), Err(())]);
+        assert_eq!(inbound(&mut stream, &mut last).await, Some(Ok(1)));
+        assert!(last > old);
+        let noted = last;
+        assert_eq!(inbound(&mut stream, &mut last).await, Some(Err(())));
+        assert_eq!(last, noted, "an error is not a sign of life");
+    }
+
+    #[test]
+    fn uplink_dropped_before_ready() {
+        assert!(uplink_message(false, capture::mic_frame(&[1])).is_none());
+        assert!(camera_uplink(false, capture::webcam_frame(true, &[1])).is_none());
+    }
+
+    type Drive =
+        Box<dyn FnOnce(&mut Wire) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>>;
+
+    /// Everything a fake server receives on one Wire with `role`, after `drive` wrote and a
+    /// final `kd,65`.
+    async fn received_on(role: StreamRole, drive: Drive) -> Vec<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Binary(data) => seen.push(data.to_vec()),
+                    Message::Text(text) => seen.push(text.as_bytes().to_vec()),
+                    _ => {}
+                }
+            }
+            seen
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let mut wire = Wire::with_camera(socket, role, Arc::default());
+        drive(&mut wire).await;
+        // Let the writer take any camera frame before the close is queued.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        wire.send("kd,65".into()).await.unwrap();
+        wire.close(None).await.unwrap();
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn uplink_cam_frames_sent_as_binary_after_ready() {
+        let key = capture::webcam_frame(true, &[0, 0, 0, 1, 0x65, 9]);
+        assert!(camera_uplink(false, key.clone()).is_none());
+        let frame = camera_uplink(true, key.clone()).unwrap();
+        let seen = received_on(
+            StreamRole::Primary,
+            Box::new(|wire| Box::pin(async move { wire.send_camera(frame) })),
+        )
+        .await;
+        assert_eq!(seen, [key, b"kd,65".to_vec()]);
+        assert_eq!(&seen[0][..3], [0x06, 0x01, 0x01]);
+    }
+
+    #[tokio::test]
+    async fn camera_and_mic_frames_never_go_on_display_2() {
+        let seen = received_on(
+            StreamRole::Secondary(Side::Right),
+            Box::new(|wire| {
+                Box::pin(async move {
+                    wire.send_camera(capture::webcam_frame(true, &[0, 0, 0, 1, 0x65]));
+                    wire.send_binary(capture::mic_frame(&[0x68])).await.unwrap();
+                })
+            }),
+        )
+        .await;
+        // Only the text frame: no 0x06 and no 0x02 on Display 2's socket.
+        assert_eq!(seen, [b"kd,65".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn uplink_frames_dropped_after_close() {
+        let (sender, receiver) = mpsc::channel(capture::MIC_QUEUE);
+        let mut frames = Some(receiver);
+        sender.try_send(vec![2, 9]).unwrap();
+        assert_eq!(uplink(&mut frames).await, [2, 9]);
+        // The window's sender is gone: nothing more ever comes, and the channel is dropped.
+        drop(sender);
+        let waited = tokio::time::timeout(Duration::from_millis(50), uplink(&mut frames)).await;
+        assert!(waited.is_err());
+        assert!(frames.is_none());
+        // No channel at all (a stream without a microphone) never yields either.
+        let waited = tokio::time::timeout(Duration::from_millis(20), uplink(&mut None)).await;
+        assert!(waited.is_err());
+    }
+
+    #[test]
+    fn capture_replies_become_events() {
+        assert!(matches!(
+            capture_event("MICROPHONE_DISABLED"),
+            Some(SessionEvent::Capture(capture::Reply::Disabled(
+                capture::Subject::Microphone
+            )))
+        ));
+        assert!(matches!(
+            capture_event("CAPTURE_DEMAND microphone 1"),
+            Some(SessionEvent::Capture(capture::Reply::Demand(
+                capture::Subject::Microphone,
+                true
+            )))
+        ));
+        assert!(matches!(
+            capture_event("WEBCAM_DISABLED"),
+            Some(SessionEvent::Capture(capture::Reply::Disabled(
+                capture::Subject::Camera
+            )))
+        ));
+        assert!(matches!(
+            capture_event("WEBCAM_KEYFRAME"),
+            Some(SessionEvent::Capture(capture::Reply::Keyframe))
+        ));
+        assert!(matches!(
+            capture_event("CAPTURE_DEMAND webcam 0"),
+            Some(SessionEvent::Capture(capture::Reply::Demand(
+                capture::Subject::Camera,
+                false
+            )))
+        ));
+        assert!(capture_event("VIDEO_STARTED").is_none());
+        assert!(capture_event(r#"{"type":"server_settings"}"#).is_none());
+    }
+
+    #[test]
+    fn capture_policy_event_on_server_settings() {
+        let data = json!({"type": "server_settings", "settings": {
+            "microphone_enabled": {"value": false, "locked": true}
+        }});
+        assert!(StreamRole::Primary.owns(&data, true));
+        let policy = capture::CapturePolicy::from_server(&data["settings"]);
+        assert!(!policy.mic.permitted && policy.mic.locked);
+    }
+
+    #[test]
+    fn capture_policy_emitted_on_live_server_settings_with_display_id() {
+        // Live changes come as `server_settings` with a `displayId`: the primary's count.
+        let live = json!({"type": "server_settings", "displayId": "primary", "settings": {}});
+        assert!(StreamRole::Primary.owns(&live, true));
+        let secondary = json!({"type": "server_settings", "displayId": "display2", "settings": {}});
+        assert!(!StreamRole::Primary.owns(&secondary, true));
+    }
+
+    #[test]
+    fn an_attempt_timeout_is_retried_then_becomes_a_startup_timeout() {
+        use tokio_tungstenite::tungstenite::Error;
+        // The attempt's own 10 s timeout maps to transient, as a refused connection does.
+        assert!(attempt_transient(Err(None)));
+        let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(attempt_transient(Err(Some(&refused))));
+        assert!(!attempt_transient(Err(Some(&Error::Utf8(String::new())))));
+        let start = Instant::now();
+        let give_up = start + SOCKET_STARTUP_GRACE;
+        assert_eq!(
+            retry_decision(attempt_transient(Err(None)), start, give_up),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_decision(attempt_transient(Err(None)), give_up, give_up),
+            Retry::Timeout
+        );
+    }
+
+    #[test]
+    fn startup_grace_expiry_is_a_startup_timeout_not_a_generic_error() {
+        let start = Instant::now();
+        let give_up = start + SOCKET_STARTUP_GRACE;
+        assert_eq!(retry_decision(true, start, give_up), Retry::Again);
+        assert_eq!(retry_decision(true, give_up, give_up), Retry::Timeout);
+        assert_eq!(retry_decision(false, start, give_up), Retry::Fail);
+        assert_eq!(retry_decision(false, give_up, give_up), Retry::Fail);
+        // An attempt that timed out counts as transient (the caller passes `true`), so a
+        // session that accepts TCP but hangs is retried, then times out the same way.
+        assert_eq!(
+            retry_decision(true, start + Duration::from_secs(44), give_up),
+            Retry::Again
+        );
+        assert_eq!(
+            RunError::from("x").to_string(),
+            "x",
+            "other errors keep their message"
+        );
+    }
+
+    fn selkies_audio_settings(value: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": {
+            "value": value,
+            "allowed": ["32000", "64000", "96000", "128000", "320000"]
+        }}));
+        settings
+    }
+
+    #[test]
+    fn audio_bitrate_command_matches_web_settings_message() {
+        let settings = selkies_audio_settings("128000");
+        let (command, applied) = audio_bitrate_command(&settings, 96_000).unwrap();
+        assert_eq!(
+            command,
+            r#"SETTINGS,{"audio_bitrate":96000,"picked":["audio_bitrate"]}"#
+        );
+        assert_eq!(applied, json!({"audio_bitrate": 96000}));
+    }
+
+    #[test]
+    fn saved_audio_bitrate_is_sent_on_ready_only_when_allowed_and_different() {
+        let settings = selkies_audio_settings("128000");
+        assert!(audio_bitrate_command(&settings, 320_000).is_some());
+        assert!(audio_bitrate_command(&settings, 128_000).is_none());
+        assert!(audio_bitrate_command(&settings, 100_000).is_none());
+        assert!(audio_bitrate_command(&Settings::default(), 96_000).is_none());
+    }
+
+    #[test]
+    fn saved_bitrate_skipped_when_locked() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": {
+            "value": "128000", "locked": true, "allowed": ["64000", "128000"]
+        }}));
+        assert!(audio_bitrate_command(&settings, 64_000).is_none());
+    }
+
+    #[test]
+    fn a_pick_before_audio_starts_wins_over_the_saved_device() {
+        let saved = Some("AirPods".to_string());
+        assert_eq!(starting_output(saved.as_ref(), None), saved);
+        assert_eq!(starting_output(saved.as_ref(), Some(&None)), None);
+        let usb = Some("USB".to_string());
+        assert_eq!(starting_output(saved.as_ref(), Some(&usb)), usb);
+        assert_eq!(starting_output(None, None), None);
+    }
+
+    /// Runs a stream against `listener` with `cancel`, and returns how it ended and every
+    /// connection the listener saw (each one's first bytes) within `wait`.
+    async fn run_against(
+        listener: tokio::net::TcpListener,
+        cancel: watch::Receiver<bool>,
+        wait: Duration,
+    ) -> (Result<(), RunError>, Vec<String>) {
+        use tokio::io::AsyncReadExt as _;
+        let address = listener.local_addr().unwrap();
+        let url = Url::parse(&format!("http://{address}/s/?access_token=t")).unwrap();
+        let seen = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            // Accept everything, answer nothing: the HTTP step hangs as on a slow server.
+            let mut held = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+            {
+                let mut buf = [0u8; 256];
+                let read = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(0);
+                seen.push(String::from_utf8_lossy(&buf[..read]).to_string());
+                held.push(stream);
+            }
+            seen
+        });
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let ended = tokio::time::timeout(
+            wait,
+            run(
+                SessionTarget::SealSkin(url),
+                frames,
+                input,
+                pointer,
+                test_options(),
+                &events,
+                cancel,
+            ),
+        )
+        .await
+        .expect("a cancelled stream ends at once");
+        (ended, seen.await.unwrap())
+    }
+
+    /// A direct stream against a fake Selkies that answers each upgrade with `answer`.
+    async fn run_direct(
+        answer: impl Fn() -> Vec<u8> + Send + Sync + 'static,
+        wait: Duration,
+    ) -> (Result<(), RunError>, usize) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(&answer()).await;
+                held.push(stream);
+            }
+        });
+        let server = crate::direct::SelkiesServer::new(
+            Url::parse(&format!("http://localhost:{}/", address.port())).unwrap(),
+            crate::direct::SelkiesAuth::new("ubuntu", "pw", None),
+            None,
+            crate::direct::ServerSource::Typed,
+            false,
+        )
+        .unwrap();
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let ended = tokio::time::timeout(
+            wait,
+            run(
+                SessionTarget::Selkies(server),
+                frames,
+                input,
+                pointer,
+                test_options(),
+                &events,
+                cancel,
+            ),
+        )
+        .await
+        .unwrap_or(Err(RunError::Other("still running")));
+        (ended, attempts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn status_reply(status: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").into_bytes()
+    }
+
+    /// A 101 as Selkies sends it (any key works: tungstenite checks the accept hash, so
+    /// the fake computes it from the request in `upgrade_then`).
+    async fn upgrade_then(after: Vec<u8>, wait: Duration) -> (Result<(), RunError>, usize) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..read]).to_string();
+                let key = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let accept =
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+                let reply = format!("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\nsec-websocket-protocol: selkies\r\n\r\n");
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.write_all(&after).await;
+                held.push(stream);
+            }
+        });
+        let server = crate::direct::SelkiesServer::new(
+            Url::parse(&format!("http://localhost:{}/", address.port())).unwrap(),
+            crate::direct::SelkiesAuth::new("", "", Some("bad".into())),
+            None,
+            crate::direct::ServerSource::Typed,
+            false,
+        )
+        .unwrap();
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let ended = tokio::time::timeout(
+            wait,
+            run(
+                SessionTarget::Selkies(server),
+                frames,
+                input,
+                pointer,
+                test_options(),
+                &events,
+                cancel,
+            ),
+        )
+        .await
+        .unwrap_or(Err(RunError::Other("still running")));
+        (ended, attempts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_401_on_a_direct_upgrade_is_fatal_not_retried() {
+        let (ended, attempts) =
+            run_direct(|| status_reply("401 Unauthorized"), Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_LOGIN_ERROR))
+        );
+        assert_eq!(attempts, 1);
+        let (ended, _) =
+            run_direct(|| status_reply("400 Bad Request"), Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_LOGIN_ERROR))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_409_upgrade_says_webrtc() {
+        let (ended, attempts) =
+            run_direct(|| status_reply("409 Conflict"), Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_WEBRTC_ERROR))
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_4001_close_on_a_direct_stream_is_fatal_login_not_reconnect() {
+        // A server close frame: FIN + opcode 8, length 2 + reason, code 4001 (0x0FA1).
+        let reason = b"Invalid authentication token";
+        let mut close = vec![0x88, (2 + reason.len()) as u8, 0x0F, 0xA1];
+        close.extend_from_slice(reason);
+        let (ended, attempts) = upgrade_then(close, Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_LOGIN_ERROR))
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    /// Live check against a real Selkies server (`ARCH-036` QA): `SKERRY_SELKIES_URL` (with
+    /// `_USERNAME`, `_PASSWORD`, `_CERT_SHA256`). Gate, screenshot, Files, then a stream
+    /// that must reach `server_settings` and a picture. Run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "needs a live Selkies server in SKERRY_SELKIES_URL"]
+    async fn live_direct_server_streams() {
+        let Some(server) = crate::direct::environment() else {
+            panic!("set SKERRY_SELKIES_URL");
+        };
+        let server = server.unwrap();
+        let report = crate::direct::gate(&server).await;
+        if let Err(crate::direct::GateError::Untrusted(leaf)) = &report {
+            panic!(
+                "untrusted certificate; set SKERRY_SELKIES_CERT_SHA256={}",
+                crate::tls::fingerprint_text(leaf)
+            );
+        }
+        let report = report.unwrap();
+        eprintln!("gate ok: {} page(s) connected", report.pages.len());
+        let png = crate::direct::screenshot(&server).await;
+        eprintln!("screenshot: {:?} bytes", png.as_ref().map(Vec::len));
+        let listing = server.selkies_client().browse("").await.unwrap();
+        eprintln!("files: {} entries at the root", listing.entries.len());
+        let (frames, mut frame_rx) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel) = watch::channel(false);
+        let stream = tokio::spawn(async move {
+            run(
+                SessionTarget::Selkies(server),
+                frames,
+                input,
+                pointer,
+                SessionOptions {
+                    codec: Codec::Jpeg,
+                    ..test_options()
+                },
+                &events,
+                cancel,
+            )
+            .await
+        });
+        let mut settings = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !settings {
+            match tokio::time::timeout(Duration::from_secs(1), events_rx.recv()).await {
+                Ok(Some(SessionEvent::Settings(_))) => settings = true,
+                Ok(Some(SessionEvent::Error(error))) => panic!("stream error: {error}"),
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert!(settings, "no server_settings within 30 s");
+        let picture = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                frame_rx.changed().await.unwrap();
+                if frame_rx.borrow().width > 0 {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(picture.is_ok(), "no picture within 20 s");
+        eprintln!(
+            "stream ok: {}x{}",
+            frame_rx.borrow().width,
+            frame_rx.borrow().height
+        );
+        let _ = cancel_tx.send(true);
+        stream.abort();
+    }
+
+    #[tokio::test]
+    async fn a_certificate_failure_on_a_direct_socket_is_fatal_not_retried() {
+        use crate::tls::test_server;
+        let leaf = test_server::self_signed(&["localhost"]);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        let address = test_server::serve(vec![leaf.der.clone()], &leaf.key, move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            String::new()
+        })
+        .await;
+        let base = Url::parse(&format!("https://localhost:{}/", address.port())).unwrap();
+        // A changed certificate (a stale pin), then one that was never trusted.
+        for pin in [Some([7u8; 32]), None] {
+            let server = crate::direct::SelkiesServer::new(
+                base.clone(),
+                crate::direct::SelkiesAuth::new("ubuntu", "pw", None),
+                pin,
+                crate::direct::ServerSource::Typed,
+                false,
+            )
+            .unwrap();
+            let (frames, _) = watch::channel(Frame::default());
+            let (_input_tx, input) = mpsc::unbounded_channel();
+            let (_pointer_tx, pointer) = watch::channel(None);
+            let (events, _events_rx) = mpsc::unbounded_channel();
+            let (_cancel_tx, cancel) = watch::channel(false);
+            let started = Instant::now();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(5),
+                run(
+                    SessionTarget::Selkies(server),
+                    frames,
+                    input,
+                    pointer,
+                    test_options(),
+                    &events,
+                    cancel,
+                ),
+            )
+            .await
+            .expect("fails at once, no start-up retries");
+            assert_eq!(
+                ended,
+                Err(RunError::Other(crate::direct::DIRECT_CERT_ERROR))
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(crate::direct::is_fatal_session_error(
+                crate::direct::DIRECT_CERT_ERROR
+            ));
+        }
+        // The handshake never completed, so no request (and no login) reached the server.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_held_direct_handshake_keeps_connecting_without_counting_a_failure() {
+        // Secure mode holds the stream after the 101 until its token table arrives: the
+        // upgrade succeeded, so nothing is retried and the stream just waits.
+        let (ended, attempts) = upgrade_then(Vec::new(), Duration::from_millis(1500)).await;
+        assert_eq!(ended, Err(RunError::Other("still running")));
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stream_cancelled_before_it_starts_never_connects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cancel_tx, cancel) = watch::channel(true);
+        let (ended, seen) = run_against(listener, cancel, Duration::from_millis(200)).await;
+        drop(cancel_tx);
+        assert_eq!(ended, Ok(()));
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_while_connecting_stops_without_settings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cancel_tx, cancel) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // What `NativeSession::drop` does: set the flag, then drop the sender.
+            let _ = cancel_tx.send(true);
+        });
+        let (ended, seen) = run_against(listener, cancel, Duration::from_secs(2)).await;
+        assert_eq!(ended, Ok(()));
+        // Only the hung HTTP request ever reached the server: no WebSocket, no SETTINGS.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("GET /s/?access_token=t"), "{seen:?}");
+        assert!(!seen.iter().any(|request| request.contains("SETTINGS")));
+    }
+
+    #[test]
+    fn closing_restores_native_cursor_rendering() {
+        let held = BTreeSet::from([0x61]);
+        assert_eq!(
+            closing_commands(
+                &held,
+                PointerLock {
+                    locked: true,
+                    buttons: 0
+                },
+                &mut Default::default(),
+                StreamRole::Primary
+            ),
+            ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "ku,97"]
+        );
+        assert_eq!(pointer_lock_command("p,1"), Some(true));
+        assert_eq!(pointer_lock_command("p,0"), Some(false));
+        assert_eq!(pointer_lock_command("SET_NATIVE_CURSOR_RENDERING,1"), None);
+        // The capture's commands are traced verbatim; typed text never is.
+        assert_eq!(trace_line("m2,3,-2,1,0").as_deref(), Some("m2,3,-2,1,0"));
+        assert_eq!(trace_line("p,1").as_deref(), Some("p,1"));
+        assert_eq!(trace_line("kd,97").as_deref(), Some("kd,<char>"));
+        assert_eq!(trace_line("m,10,10,0,0"), None);
+    }
+
+    #[test]
+    fn closing_releases_every_held_key_then_closes() {
+        let held = BTreeSet::from([0x61, 0xffe3]);
+        assert_eq!(
+            closing_commands(
+                &held,
+                PointerLock::default(),
+                &mut Default::default(),
+                StreamRole::Primary
+            ),
+            ["ku,97", "ku,65507"]
+        );
+    }
+
+    #[test]
+    fn closing_with_nothing_held_sends_nothing() {
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            PointerLock::default(),
+            &mut Default::default(),
+            StreamRole::Primary
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn closing_while_captured_lifts_held_buttons() {
+        let mut lock = PointerLock::default();
+        // Buttons before a capture are the absolute path's, not tracked here.
+        lock.observe("m2,0,0,1,0");
+        assert_eq!(lock.buttons, 0);
+        lock.observe("p,1");
+        lock.observe("m2,0,0,4,0");
+        lock.observe("m2,3,-1,4,0");
+        // A wheel pulse carries the wheel bit and a magnitude: buttons unchanged.
+        lock.observe("m2,0,0,20,1");
+        assert_eq!(lock.buttons, 4);
+        assert_eq!(
+            closing_commands(
+                &BTreeSet::new(),
+                lock,
+                &mut Default::default(),
+                StreamRole::Primary
+            ),
+            ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "m2,0,0,0,0"]
+        );
+        // Released by the view first: nothing more at close.
+        lock.observe("m2,0,0,0,0");
+        lock.observe("p,0");
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            lock,
+            &mut Default::default(),
+            StreamRole::Primary
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn heartbeat_runs_only_while_a_slot_is_off_rest() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,UGFk,4,17");
+        assert!(!pads.active());
+        pads.observe("js,a,0,1,-0.5");
+        assert!(pads.active());
+        assert_eq!(pads.heartbeat(), ["js,h,0"]);
+        // Key commands never count.
+        pads.observe("kd,97");
+        assert_eq!(pads.heartbeat(), ["js,h,0"]);
+    }
+
+    #[test]
+    fn rest_values_stop_the_heartbeat() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,1,UGFk,4,17");
+        pads.observe("js,b,1,0,1");
+        pads.observe("js,b,1,7,0.25");
+        pads.observe("js,b,1,0,0");
+        assert!(pads.active());
+        pads.observe("js,b,1,7,0");
+        assert!(!pads.active());
+        assert!(pads.heartbeat().is_empty());
+        // A disconnected slot stops too.
+        pads.observe("js,b,1,3,1");
+        pads.observe("js,d,1");
+        assert!(!pads.active());
+    }
+
+    #[test]
+    fn closing_disconnects_announced_slots() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,UGFk,4,17");
+        pads.observe("js,c,2,UGFk,4,17");
+        pads.observe("js,d,0");
+        assert_eq!(
+            closing_commands(
+                &BTreeSet::from([0x61]),
+                PointerLock::default(),
+                &mut pads,
+                StreamRole::Primary
+            ),
+            ["js,d,2", "ku,97"]
+        );
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            PointerLock::default(),
+            &mut pads,
+            StreamRole::Primary
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn system_frame_with_rumble_becomes_an_event() {
+        let Some(Some(SessionEvent::Rumble(rumble))) =
+            system_frame(r#"system,{"action":"rumble,1,0.800,0.200,250"}"#)
+        else {
+            panic!("expected a rumble");
+        };
+        assert_eq!(rumble.slot, 1);
+        assert_eq!((rumble.strong, rumble.weak), (0.8, 0.2));
+        assert_eq!(rumble.duration, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn other_system_actions_are_ignored() {
+        let ignored = |text: &str| matches!(system_frame(text), Some(None));
+        assert!(ignored(r#"system,{"action":"reload"}"#));
+        assert!(ignored(r#"system,{"action":"rumble,9,1,1,10"}"#));
+        assert!(ignored("system,not json"));
+        assert!(system_frame(r#"{"action":"rumble,0,1,1,10"}"#).is_none());
+    }
+
+    #[test]
+    fn system_frames_yield_their_action() {
+        assert_eq!(
+            system_action(r#"system,{"action":"apps_job,{\"id\":1}"}"#).as_deref(),
+            Some(r#"apps_job,{"id":1}"#)
+        );
+        assert_eq!(system_action("system,nonsense"), None);
+        assert_eq!(system_action(r#"{"type":"x"}"#), None);
+        assert_eq!(system_action(r#"system,{"action":7}"#), None);
+    }
+
+    #[test]
+    fn apps_actions_share_the_system_match_with_rumble() {
+        let frame = |action: &str| format!("system,{}", json!({ "action": action }));
+        match system_frame(&frame(r#"apps_state,{"installed":["gimp"],"jobs":[]}"#)) {
+            Some(Some(SessionEvent::Apps(crate::apps::Event::State(state)))) => {
+                assert_eq!(state["installed"][0], "gimp")
+            }
+            _ => panic!("expected apps_state"),
+        }
+        assert!(matches!(
+            system_frame(&frame(r#"apps_job,{"id":3,"app":"vlc"}"#)),
+            Some(Some(SessionEvent::Apps(crate::apps::Event::Job(_))))
+        ));
+        match system_frame(&frame("command_error,not found, sorry")) {
+            Some(Some(SessionEvent::Apps(crate::apps::Event::CommandError(text)))) => {
+                assert_eq!(text, "not found, sorry")
+            }
+            _ => panic!("expected command_error"),
+        }
+        assert!(matches!(
+            system_frame(&frame("rumble,0,1,1,10")),
+            Some(Some(SessionEvent::Rumble(_)))
+        ));
+        // Malformed apps JSON still counts as an answer; unknown actions are consumed.
+        assert!(matches!(
+            system_frame(&frame("apps_job,{bad")),
+            Some(Some(SessionEvent::Apps(crate::apps::Event::Unreadable)))
+        ));
+        assert!(matches!(system_frame(&frame("apps_other,{}")), Some(None)));
+    }
+
+    #[test]
+    fn a_system_frame_never_reaches_the_clipboard_parser() {
+        // A system action that looks like a clipboard frame is consumed by `system_frame`,
+        // which the stream checks first.
+        let text = format!("system,{}", json!({"action": "clipboard,aGk="}));
+        assert!(matches!(system_frame(&text), Some(None)));
+        // The clipboard parser would have taken the same text apart otherwise.
+        assert!(!matches!(
+            clipboard::Receiver::default().on_text("clipboard,aGk="),
+            clipboard::Frame::NotClipboard
+        ));
+    }
+
+    #[test]
+    fn the_input_trace_hides_typed_characters() {
+        assert_eq!(redact_key_command("kd,97").as_deref(), Some("kd,<char>"));
+        assert_eq!(
+            redact_key_command("ku,16777729").as_deref(),
+            Some("ku,<char>")
+        );
+        assert_eq!(redact_key_command("kd,65507").as_deref(), Some("kd,65507"));
+        assert_eq!(redact_key_command("ku,65307").as_deref(), Some("ku,65307"));
+        assert_eq!(
+            redact_key_command("kh,97,65505,32").as_deref(),
+            Some("kh,<char>,65505,<char>")
+        );
+        assert_eq!(redact_key_command("kd,65457").as_deref(), Some("kd,<char>"));
+        assert_eq!(redact_key_command("kr").as_deref(), Some("kr"));
+        assert_eq!(redact_key_command("m2,0,0,1,0"), None);
+        assert_eq!(redact_key_command("SETTINGS,{}"), None);
+    }
+
+    #[test]
+    fn reads_selkies_prefixed_display_capabilities() {
+        let finger_scroll = |text: &str| role::display_config(text).map(|c| c.finger_scroll);
+        assert_eq!(
+            finger_scroll(
                 r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","finger_scroll":true}"#
             ),
             Some(true)
         );
         assert_eq!(
-            finger_scroll_capability(r#"{"type":"display_config_update"}"#),
+            finger_scroll(r#"{"type":"display_config_update"}"#),
             Some(false)
         );
-        assert_eq!(finger_scroll_capability(r#"{"type":"stream_info"}"#), None);
+        assert_eq!(finger_scroll(r#"{"type":"stream_info"}"#), None);
     }
 
     fn jpeg(color: [u8; 3]) -> Vec<u8> {
@@ -1263,14 +3515,482 @@ mod tests {
         let red = jpeg([255, 0, 0]);
         let blue = jpeg([0, 0, 255]);
         canvas.stripe(0, &red).unwrap();
-        let unchanged = *canvas.pixels.get_pixel(0, 0);
         canvas.stripe(1, &blue).unwrap();
-        assert_eq!(*canvas.pixels.get_pixel(0, 0), unchanged);
-        assert!(unchanged.0[2] > 240); // BGRA red
-        assert!(canvas.pixels.get_pixel(0, 1).0[0] > 240); // BGRA blue
+        let before = stripes(&canvas.snapshot());
+        canvas.stripe(1, &red).unwrap();
+        let after = stripes(&canvas.snapshot());
+        assert_eq!(after.len(), 2);
+        assert!(Arc::ptr_eq(&before[0].image, &after[0].image));
+        assert!(!Arc::ptr_eq(&before[1].image, &after[1].image));
+        assert!(pixel(&before[0], 1)[2] > 240); // BGRA red
+        assert!(pixel(&before[1], 1)[0] > 240); // BGRA blue
         assert!(canvas.stripe(2, &red).is_none());
+    }
+
+    impl Canvas {
+        fn stripe(&mut self, y: u16, jpeg: &[u8]) -> Option<()> {
+            let stripe = self.decode(y, jpeg)?;
+            self.insert(stripe);
+            Some(())
+        }
+    }
+
+    fn stripes(frame: &Frame) -> Vec<JpegStripe> {
+        match &frame.picture {
+            Some(Picture::Jpeg(picture)) => picture.stripes.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The first pixel of padded row `row` of a stripe, BGRA.
+    fn pixel(stripe: &JpegStripe, row: usize) -> [u8; 4] {
+        let bytes = stripe.image.as_bytes(0).unwrap();
+        let start = row * usize::from(stripe.image.size(0).width.0 as u16) * 4;
+        bytes[start..start + 4].try_into().unwrap()
+    }
+
+    fn jpeg_sized(
+        width: u16,
+        height: u16,
+        quality: u8,
+        pixel: impl Fn(u32, u32) -> [u8; 3],
+    ) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(usize::from(width) * usize::from(height) * 3);
+        for y in 0..u32::from(height) {
+            for x in 0..u32::from(width) {
+                rgb.extend_from_slice(&pixel(x, y));
+            }
+        }
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode(
+                &rgb,
+                width.into(),
+                height.into(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_stripe_replaces_every_overlapping_stripe() {
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 16).unwrap();
+        let red = |height| jpeg_sized(2, height, 90, |_, _| [255, 0, 0]);
+        for y in [0, 4, 8, 12] {
+            canvas.stripe(y, &red(4)).unwrap();
+        }
+        // Eight stripes of two rows: 2..4 overlaps the end of the stripe at 0.
+        canvas.stripe(2, &red(2)).unwrap();
+        let ys: Vec<u16> = stripes(&canvas.snapshot()).iter().map(|s| s.y).collect();
+        assert_eq!(ys, [2, 4, 8, 12]);
+        for y in (0..16).step_by(2) {
+            canvas.stripe(y, &red(2)).unwrap();
+        }
+        let geometry: Vec<(u16, u16)> = stripes(&canvas.snapshot())
+            .iter()
+            .map(|s| (s.y, s.height))
+            .collect();
+        assert_eq!(
+            geometry,
+            (0..16).step_by(2).map(|y| (y, 2)).collect::<Vec<_>>()
+        );
+        // One tall stripe covers several.
+        canvas.stripe(3, &red(6)).unwrap();
+        let ys: Vec<u16> = stripes(&canvas.snapshot()).iter().map(|s| s.y).collect();
+        assert_eq!(ys, [0, 3, 10, 12, 14]);
+    }
+
+    #[test]
+    fn resize_clears_stripes() {
+        let mut canvas = Canvas::default();
+        assert!(canvas.resize(2, 2).unwrap());
+        canvas.stripe(0, &jpeg([255, 0, 0])).unwrap();
+        assert!(!canvas.resize(2, 2).unwrap());
         assert!(canvas.snapshot().picture.is_some());
-        canvas.resize(3, 2).unwrap();
+        assert!(canvas.resize(3, 2).unwrap());
+        let frame = canvas.snapshot();
+        assert!(frame.picture.is_none());
+        assert_eq!((frame.width, frame.height), (3, 2));
+    }
+
+    #[test]
+    fn rejects_wrong_width_overflow_zero_height_and_headers_cut_short() {
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 4).unwrap();
+        let two_rows = jpeg_sized(2, 2, 90, |_, _| [0, 255, 0]);
+        assert!(canvas
+            .decode(0, &jpeg_sized(4, 2, 90, |_, _| [0; 3]))
+            .is_none());
+        assert!(canvas.decode(3, &two_rows).is_none()); // runs past the bottom
+        assert!(canvas.decode(4, &two_rows).is_none());
+        assert!(canvas.decode(u16::MAX, &two_rows).is_none());
+        assert!(canvas.decode(0, &[]).is_none());
+        // Cut inside the headers (before the start of scan) fails; scan data cut short
+        // decodes with filler, since the decoder is not strict.
+        let scan = two_rows.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        assert!(canvas.decode(0, &two_rows[..scan]).is_none());
+        assert!(canvas.decode(0, &two_rows[..scan / 2]).is_none());
+        assert!(canvas.decode(2, &two_rows).is_some());
+    }
+
+    #[test]
+    fn decoded_stripe_is_bgra_with_repeated_edge_rows() {
+        let mut canvas = Canvas::default();
+        canvas.resize(8, 16).unwrap();
+        let bands = jpeg_sized(
+            8,
+            8,
+            95,
+            |_, y| if y < 4 { [255, 0, 0] } else { [0, 0, 255] },
+        );
+        let stripe = canvas.decode(8, &bands).unwrap();
+        assert_eq!((stripe.y, stripe.height), (8, 8));
+        assert_eq!(stripe.image.size(0).height.0, 10);
+        assert!(pixel(&stripe, 1)[2] > 240); // red, BGRA
+        assert!(pixel(&stripe, 8)[0] > 240); // blue, BGRA
+        let bytes = stripe.image.as_bytes(0).unwrap();
+        let row = 8 * 4;
+        assert_eq!(bytes[..row], bytes[row..2 * row]);
+        assert_eq!(bytes[9 * row..], bytes[8 * row..9 * row]);
+    }
+
+    #[test]
+    fn zune_bgra_matches_image_crate_decode() {
+        let gradient = jpeg_sized(64, 24, 75, |x, y| {
+            [(x * 4) as u8, (y * 10) as u8, ((x + y) * 3) as u8]
+        });
+        let (_, padded) = decode_stripe(&gradient, 64, 24, &mut Vec::new()).unwrap();
+        let reference = image::load_from_memory_with_format(&gradient, ImageFormat::Jpeg)
+            .unwrap()
+            .into_rgba8();
+        let row = 64 * 4;
+        for (bgra, rgba) in padded[row..row * 25].chunks(4).zip(reference.pixels()) {
+            for (ours, theirs) in [(bgra[2], rgba[0]), (bgra[1], rgba[1]), (bgra[0], rgba[2])] {
+                assert!(ours.abs_diff(theirs) <= 1, "{bgra:?} vs {rgba:?}");
+            }
+            assert_eq!(bgra[3], 255);
+        }
+    }
+
+    #[test]
+    fn a_new_frame_id_presents_the_previous_frame_once() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        assert_eq!(pacer.stripe(1, 0, start), None);
+        assert_eq!(pacer.stripe(1, 0, start + Duration::from_millis(1)), None);
+        let present = pacer
+            .stripe(2, 0, start + Duration::from_millis(3))
+            .unwrap();
+        assert_eq!(present.reason, PresentReason::Boundary);
+        assert!(present.new_frame);
+        assert_eq!(present.delay, Duration::from_millis(2));
+        assert_eq!(pacer.stripe(2, 0, start + Duration::from_millis(4)), None);
+    }
+
+    #[test]
+    fn settle_deadline_follows_the_last_stripe() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        assert_eq!(pacer.deadline(), None);
+        assert_eq!(pacer.timer(), None);
+        pacer.stripe(1, 0, start);
+        assert_eq!(pacer.deadline(), Some(start + SETTLE));
+        // Each stripe pushes it back.
+        for ms in [1, 3, 5] {
+            let at = start + Duration::from_millis(ms);
+            pacer.stripe(1, 0, at);
+            assert_eq!(pacer.deadline(), Some(at + SETTLE));
+            // Armed early by the timer's lateness, never before the stripe itself.
+            let timer = pacer.timer().unwrap();
+            assert!(timer >= at && timer <= at + SETTLE);
+            assert_eq!(timer, (at + SETTLE - TIMER_LATENESS).max(at));
+        }
+        let at = start + Duration::from_millis(5) + SETTLE;
+        let present = pacer.present(PresentReason::Settle, at).unwrap();
+        assert_eq!(present.reason, PresentReason::Settle);
+        assert_eq!(present.delay, SETTLE);
+        assert_eq!(pacer.deadline(), None, "nothing to wake for while static");
+        assert_eq!(pacer.timer(), None);
+        assert_eq!(pacer.present(PresentReason::Settle, start), None);
+    }
+
+    #[test]
+    fn a_frame_split_over_a_settle_is_counted_once() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        pacer.stripe(7, 0, start);
+        let first = pacer
+            .present(PresentReason::Settle, start + SETTLE)
+            .unwrap();
+        assert!(first.new_frame);
+        pacer.stripe(7, 0, start + Duration::from_millis(9));
+        let rest = pacer
+            .present(PresentReason::Settle, start + Duration::from_millis(13))
+            .unwrap();
+        assert!(!rest.new_frame);
+        // The first stripe of the next frame after a settle presents nothing extra.
+        assert_eq!(pacer.stripe(8, 0, start + Duration::from_millis(20)), None);
+    }
+
+    #[test]
+    fn only_the_bottom_stripe_completes_a_frame() {
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 8).unwrap();
+        let red = jpeg_sized(2, 4, 90, |_, _| [255, 0, 0]);
+        let top = canvas.decode(0, &red).unwrap();
+        let bottom = canvas.decode(4, &red).unwrap();
+        assert!(!canvas.is_bottom(&top));
+        assert!(canvas.is_bottom(&bottom));
+    }
+
+    #[test]
+    fn grayscale_and_subsampled_stripes_decode() {
+        let mut canvas = Canvas::default();
+        canvas.resize(16, 16).unwrap();
+        let mut gray = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut gray, 95)
+            .encode(&[200u8; 16 * 8], 16, 8, image::ExtendedColorType::L8)
+            .unwrap();
+        let stripe = canvas.decode(0, &gray).unwrap();
+        let [b, g, r, a] = pixel(&stripe, 1);
+        assert!(b.abs_diff(200) <= 2 && g == b && r == b && a == 255);
+        let odd = jpeg_sized(16, 7, 90, |x, _| [0, (x * 16) as u8, 255]);
+        let stripe = canvas.decode(9, &odd).unwrap();
+        assert_eq!(stripe.height, 7);
+        assert!(pixel(&stripe, 1)[0] > 240); // blue, BGRA
+    }
+
+    #[test]
+    fn rgb_to_bgra_covers_neon_blocks_and_the_tail() {
+        for count in [0usize, 1, 15, 16, 17, 33, 100] {
+            let rgb: Vec<u8> = (0..count * 3).map(|i| i as u8).collect();
+            let mut out = Vec::with_capacity(count * 4);
+            rgb_to_bgra(&rgb, &mut out.spare_capacity_mut()[..count * 4]);
+            // SAFETY: rgb_to_bgra wrote every byte.
+            unsafe { out.set_len(count * 4) };
+            for (px, bgra) in rgb.chunks(3).zip(out.chunks(4)) {
+                assert_eq!(bgra, [px[2], px[1], px[0], 255]);
+            }
+        }
+    }
+
+    #[test]
+    fn leaving_jpeg_resets_the_pacer_and_canvas() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 2).unwrap();
+        canvas.stripe(0, &jpeg([255, 0, 0])).unwrap();
+        pacer.stripe(3, 0, start);
+        // A hardware frame (or codec switch) clears both: no settle can send a stale picture.
+        canvas = Canvas::default();
+        pacer.reset();
+        assert_eq!(pacer.deadline(), None);
+        assert_eq!(pacer.present(PresentReason::Settle, start + SETTLE), None);
         assert!(canvas.snapshot().picture.is_none());
+        // After a reset the same id counts as a new frame again.
+        pacer.stripe(3, 0, start);
+        assert!(
+            pacer
+                .present(PresentReason::Settle, start + SETTLE)
+                .unwrap()
+                .new_frame
+        );
+    }
+
+    /// The old path: `image` to RGB, to RGBA, swap R and B, copy into a full canvas, then one
+    /// full clone per flush.
+    fn old_decode(stripes: &[(u16, Vec<u8>)], canvas: &mut image::RgbaImage) -> image::RgbaImage {
+        use image::ImageDecoder as _;
+        let row = canvas.width() as usize * 4;
+        for (y, jpeg) in stripes {
+            let decoder = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg)
+                .into_decoder()
+                .unwrap();
+            let height = decoder.dimensions().1 as usize;
+            let mut stripe = image::DynamicImage::from_decoder(decoder)
+                .unwrap()
+                .into_rgba8();
+            for pixel in stripe.pixels_mut() {
+                pixel.0.swap(0, 2);
+            }
+            let start = usize::from(*y) * row;
+            let pixels: &mut [u8] = canvas;
+            pixels[start..start + height * row].copy_from_slice(&stripe);
+        }
+        canvas.clone()
+    }
+
+    /// Real stripes from `SKERRY_JPEG_BENCH_STRIPES`: 1492-wide files named `*_<y>_<h>.jpg`.
+    fn bench_stripes_from_disk() -> Option<Vec<(u16, Vec<u8>)>> {
+        let dir = std::env::var_os("SKERRY_JPEG_BENCH_STRIPES")?;
+        let mut stripes: Vec<(u16, Vec<u8>)> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let name = path.file_stem()?.to_str()?.to_owned();
+                let y = name.rsplit('_').nth(1)?.parse().ok()?;
+                Some((y, std::fs::read(path).ok()?))
+            })
+            .collect();
+        stripes.sort_by_key(|(y, _)| *y);
+        Some(stripes)
+    }
+
+    /// `cargo test --release -p skerry-mac jpeg_stripe_decode_cost -- --ignored --nocapture`
+    /// Prints CPU ms per frame for every stripe changing (motion) and for one (typing).
+    #[test]
+    #[ignore = "benchmark"]
+    fn jpeg_stripe_decode_cost() {
+        let (width, height, count) = (1492u16, 1868u16, 8u16);
+        let rows = height / count;
+        let synthetic = || -> Vec<(u16, Vec<u8>)> {
+            (0..count)
+                .map(|i| {
+                    let y = i * rows;
+                    let h = if i == count - 1 { height - y } else { rows };
+                    let jpeg = jpeg_sized(width, h, 75, |x, row| {
+                        let y = u32::from(y) + row;
+                        let noise = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 27;
+                        [
+                            (x / 6) as u8,
+                            (y / 8) as u8,
+                            ((x ^ y) as u8 & 0xf0) | noise as u8,
+                        ]
+                    });
+                    (y, jpeg)
+                })
+                .collect()
+        };
+        let (source, stripes) = match bench_stripes_from_disk() {
+            Some(stripes) => ("disk", stripes),
+            None => ("synthetic", synthetic()),
+        };
+        let mut canvas = Canvas::default();
+        canvas.resize(width, height).unwrap();
+        let mut full = image::RgbaImage::new(width.into(), height.into());
+        let frames = 120;
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            let started = Instant::now();
+            for _ in 0..frames {
+                f();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(frames)
+        };
+        for (workload, changed) in [("motion", &stripes[..]), ("typing", &stripes[3..4])] {
+            let old = time(&mut || {
+                std::hint::black_box(old_decode(changed, &mut full));
+            });
+            let new = time(&mut || {
+                for (y, jpeg) in changed {
+                    let stripe = canvas.decode(*y, jpeg).unwrap();
+                    canvas.insert(stripe);
+                }
+                std::hint::black_box(canvas.snapshot());
+            });
+            println!(
+                "jpeg {source} {workload}: old {old:.3} ms/frame, new {new:.3} ms/frame ({:.0}% less)",
+                (1.0 - new / old) * 100.0
+            );
+        }
+    }
+
+    // ---- Session access without a stream (ARCH-028) --------------------------------------
+
+    /// Answers one request per response, in order, and returns each request's head.
+    async fn answer_heads(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                seen.push(String::from_utf8_lossy(&request).to_lowercase());
+            }
+            seen
+        });
+        (address, task)
+    }
+
+    fn see_other(location: &str) -> String {
+        format!(
+            "HTTP/1.1 303 See Other\r\nlocation: {location}\r\nset-cookie: sealskin_session_s1=tok; Path=/s1; HttpOnly\r\nset-cookie: other=2; Path=/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn session_access_exchanges_the_token_for_a_cookie() {
+        let (address, seen) = answer_heads(vec![see_other("/s1/")]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=tok")).unwrap();
+        let access = session_access(url).await.unwrap();
+        assert_eq!(access.base.as_str(), format!("http://{address}/s1/"));
+        assert_eq!(access.base.query(), None);
+        assert_eq!(
+            access.cookie.to_str().unwrap(),
+            "sealskin_session_s1=tok; other=2"
+        );
+        assert!(access.cookie.is_sensitive());
+        assert_eq!(seen.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_access_refuses_what_socket_request_refuses() {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string();
+        let (address, _) = answer_heads(vec![ok]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=t")).unwrap();
+        assert_eq!(session_access(url).await.err(), Some(AUTH_ERROR));
+
+        let (address, _) = answer_heads(vec![see_other("https://evil.test/s1/")]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=t")).unwrap();
+        assert_eq!(session_access(url).await.err(), Some(ADDRESS_ERROR));
+
+        let room = Url::parse("https://seal.example/room/abc?token=t").unwrap();
+        assert_eq!(session_access(room).await.err(), Some(ADDRESS_ERROR));
+    }
+
+    #[tokio::test]
+    async fn session_access_and_selkies_requests_carry_no_authorization() {
+        let listing = r#"{"path":"","entries":[]}"#;
+        let browse = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{listing}",
+            listing.len()
+        );
+        let (address, seen) = answer_heads(vec![see_other("/s1/"), browse]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=tok")).unwrap();
+        let files = selkies_for_session(url).await.unwrap();
+        files.browse("").await.unwrap();
+        let seen = seen.await.unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with("get /s1/?access_token=tok "));
+        assert!(
+            seen[1].starts_with("get /s1/api/file-manager/browse"),
+            "{}",
+            seen[1]
+        );
+        assert!(
+            seen[1].contains("cookie: sealskin_session_s1=tok"),
+            "{}",
+            seen[1]
+        );
+        for request in &seen {
+            assert!(!request.contains("authorization:"), "{request}");
+            assert!(!request.contains("x-sealskin-app"), "{request}");
+        }
     }
 }

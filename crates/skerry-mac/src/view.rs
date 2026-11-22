@@ -1,10 +1,16 @@
+mod capture;
+mod keys;
 mod pinch;
+mod stripes;
+
+pub use capture::CaptureHint;
 
 use crate::app::ToggleSessionControls;
 use crate::clipboard::{ClipboardSettings, Content, Effective, Incoming, Policy};
 use crate::input::{commit_command, InputSettings, RemoteChord};
 use crate::pasteboard;
 use crate::settings::{Key, ScreenChange};
+use crate::shortcuts;
 use crate::transport::{
     self, DisplayRequest, Frame, Input, Picture, Pointer, RemoteCursor, Resolution, SessionEvent,
     SessionOptions,
@@ -13,22 +19,21 @@ use gpui_kit::{
     canvas, div, point, prelude::*, px, size, AnyView, App, Bounds, ContentMask, Context, Corners,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, HitboxBehavior,
     KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, Task,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, SharedString, Task,
     UTF16Selection, Window,
 };
-use reqwest::Url;
 use skerry_ui::session;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     runtime::Handle,
     sync::{mpsc, watch},
 };
 
+/// The key context of a session's remote desktop.
+pub(crate) const DESKTOP_CONTEXT: &str = "SessionDesktop";
 const MENU_SIZE: Pixels = px(32.);
 /// How long a secret the session copied may stay on the Mac (the web core's
 /// `SECRET_CLIPBOARD_TTL_MS`).
@@ -41,12 +46,15 @@ pub struct NativeSession {
     view: Entity<Desktop>,
     input: mpsc::UnboundedSender<Input>,
     task: tokio::task::JoinHandle<()>,
+    /// Set on drop, so a transport still connecting stops before it talks to the server.
+    cancel: watch::Sender<bool>,
+    runtime: Handle,
     _pinch: Option<pinch::Monitor>,
 }
 
 impl NativeSession {
     pub fn open(
-        address: Url,
+        address: transport::SessionTarget,
         window: &mut Window,
         cx: &mut App,
         runtime: &Handle,
@@ -56,24 +64,45 @@ impl NativeSession {
         let (frame_tx, frames) = watch::channel(Frame::default());
         let (input, commands) = mpsc::unbounded_channel();
         let (pointer, motion) = watch::channel(None);
-        let view = cx.new(|cx| Desktop::new(input.clone(), pointer, frames, window, cx));
+        let waiting = SharedString::from(options.waiting.clone());
+        let capture_events = events.clone();
+        let view = cx.new(|cx| {
+            let mut desktop =
+                Desktop::new(input.clone(), pointer, frames, capture_events, window, cx);
+            desktop.waiting = waiting;
+            desktop
+        });
         let pinch = crate::app::native_window(window).and_then(|native| {
             let desktop = view.read(cx);
             pinch::Monitor::install(native, desktop.pinch_target.clone(), input.clone())
         });
         let focus = view.read(cx).focus.clone();
         window.focus(&focus, cx);
+        let (cancel, cancelled) = watch::channel(false);
         let task = runtime.spawn(async move {
-            if let Err(message) =
-                transport::run(address, frame_tx, commands, motion, options, &events).await
+            match transport::run(
+                address, frame_tx, commands, motion, options, &events, cancelled,
+            )
+            .await
             {
-                let _ = events.send(SessionEvent::Error(message.into()));
+                Ok(()) => {}
+                Err(transport::RunError::StartupTimeout) => {
+                    let _ = events.send(SessionEvent::StartupTimeout);
+                }
+                Err(transport::RunError::Killed(kill)) => {
+                    let _ = events.send(SessionEvent::Killed(kill));
+                }
+                Err(error) => {
+                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                }
             }
         });
         Self {
             view,
             input,
             task,
+            cancel,
+            runtime: runtime.clone(),
             _pinch: pinch,
         }
     }
@@ -148,8 +177,19 @@ impl NativeSession {
         });
     }
 
+    /// Lifts every key and modifier the session holds. Idempotent; called before a child
+    /// window (Session Controls, Files) or a full-screen change takes the keyboard.
+    pub fn release_keys(&self, cx: &mut App) {
+        self.view.update(cx, |desktop, _| desktop.release_input());
+    }
+
     pub fn set_resolution(&self, request: DisplayRequest) {
         let _ = self.input.send(Input::Resolution(request));
+    }
+
+    /// Display 2 sits on `side` now (`ARCH-039`); `request` is its current size, if any.
+    pub fn set_position(&self, side: transport::Side, request: Option<DisplayRequest>) {
+        let _ = self.input.send(Input::Position(side, request));
     }
 
     pub fn set_appearance(&self, dark: bool) {
@@ -162,6 +202,15 @@ impl NativeSession {
 
     pub fn set_audio(&self, enabled: bool) {
         let _ = self.input.send(Input::Audio(enabled));
+    }
+
+    /// Plays through this output device's Core Audio UID; `None` follows the Mac's default.
+    pub fn set_audio_output(&self, uid: Option<String>) {
+        let _ = self.input.send(Input::AudioOutput(uid));
+    }
+
+    pub fn set_audio_bitrate(&self, bps: u32) {
+        let _ = self.input.send(Input::AudioBitrate(bps));
     }
 
     pub fn set_clipboard_policy(&self, policy: Policy, window: &mut Window, cx: &mut App) {
@@ -208,8 +257,84 @@ impl NativeSession {
         });
     }
 
+    /// **Mac shortcuts active** changed (or a server lock arrived): the desktop's key context
+    /// follows on the next render, and nothing stays held across the switch.
+    pub fn set_mac_shortcuts(&self, active: bool, cx: &mut App) {
+        self.view.update(cx, |desktop, cx| {
+            if desktop.mac_shortcuts != active {
+                desktop.release_input();
+                desktop.mac_shortcuts = active;
+                cx.notify();
+            }
+        });
+    }
+
+    /// Gamepad slots another window drives now: the transport forgets them.
+    pub fn forget_pads(&self, slots: Vec<u8>) {
+        if !slots.is_empty() {
+            let _ = self.input.send(Input::ForgetPads(slots));
+        }
+    }
+
+    /// Sends an `apps,` request (`ARCH-035`). It holds no secrets, so the input trace may
+    /// print it as is.
+    pub fn send_apps(&self, request: String) {
+        let _ = self.input.send(Input::Command(request));
+    }
+
+    /// Sends each command in order (the gamepads' `js,…`).
+    pub fn send_commands(&self, commands: Vec<String>) {
+        for command in commands {
+            let _ = self.input.send(Input::Command(command));
+        }
+    }
+
     pub fn set_stats(&self, open: bool) {
         let _ = self.input.send(Input::Stats(open));
+    }
+
+    /// ⌃⌥⇧Z or View → Capture Pointer in the key session window (`ARCH-032`): the chord's
+    /// modifiers are retracted, then the pointer is captured or released.
+    pub fn toggle_capture(&self, window: &mut Window, cx: &mut App) {
+        self.view
+            .update(cx, |desktop, cx| desktop.toggle_capture(window, cx));
+    }
+
+    /// Captures the pointer, if this window is active (a pending capture from Session
+    /// Controls or the menu, once the window has activated).
+    pub fn engage_capture(&self, window: &mut Window, cx: &mut App) {
+        self.view.update(cx, |desktop, cx| {
+            // The chord may have been pressed in another window: modifiers the ledger
+            // recorded are lifted, the ones still held never reach the session, and the
+            // chord's auto-repeats here don't release what this engages.
+            let mac = window.modifiers();
+            let commands = desktop.keys.mute_mods_until_clear(mac);
+            desktop.commands(commands);
+            desktop.chord.hold(capture::modifiers_held(mac));
+            desktop.engage_capture(window, cx)
+        });
+    }
+
+    /// Entering or leaving full screen: the capture ends with the "Pointer released" hint.
+    pub fn release_capture_for_full_screen(&self, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            desktop.release_capture(capture::Release::FullScreen)
+        });
+    }
+
+    /// The stream failed: the capture ends with no hint (the banner explains).
+    pub fn release_capture(&self, cx: &mut App) {
+        self.view.update(cx, |desktop, _| {
+            desktop.release_capture(capture::Release::Disconnected)
+        });
+    }
+
+    pub fn picture_painted(&self, cx: &App) -> bool {
+        self.view.read(cx).painted_display.is_some()
+    }
+
+    pub fn pointer_captured(&self, cx: &App) -> bool {
+        self.view.read(cx).captured()
     }
 
     pub fn release_focus(&self, window: &mut Window, cx: &mut App) {
@@ -218,7 +343,7 @@ impl NativeSession {
             if let Some(RemoteCursor::Image { image, .. }) = desktop.cursor.take() {
                 let _ = window.drop_image(image);
             }
-            if let Some(image) = desktop.painted.borrow_mut().take() {
+            for image in desktop.painted.borrow_mut().take_all() {
                 let _ = window.drop_image(image);
             }
         });
@@ -226,24 +351,41 @@ impl NativeSession {
 }
 
 impl Drop for NativeSession {
+    /// Closes the stream in order (`ARCH-GAP-DC-09`): `Input::Close` queues behind the `ku`s
+    /// that `release_focus` sent, so the transport sends them, then a close frame. Aborting
+    /// here would drop them, and the server would hold those keys through its reconnect
+    /// grace. A watchdog aborts a transport that hasn't finished within a second.
     fn drop(&mut self) {
-        self.task.abort();
+        let _ = self.cancel.send(true);
+        let _ = self.input.send(Input::Close);
+        let abort = self.task.abort_handle();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(CLOSE_WATCHDOG).await;
+            if !abort.is_finished() {
+                transport::trace_input_event("watchdog abort");
+                abort.abort();
+            }
+        });
     }
 }
 
+/// How long a closing transport may take to send its key releases and close frame.
+const CLOSE_WATCHDOG: Duration = Duration::from_secs(1);
+
 struct Desktop {
     focus: FocusHandle,
+    /// The overlay's text until the first frame: "Connecting to Firefox…".
+    waiting: SharedString,
     scale_locally: bool,
     frame: Frame,
-    painted: Rc<RefCell<Option<Arc<RenderImage>>>>,
+    painted: Rc<RefCell<stripes::StripeRetirer>>,
     painted_display: Option<PaintedDisplay>,
     pinch_target: pinch::Target,
     input: mpsc::UnboundedSender<Input>,
     pointer: watch::Sender<Option<Pointer>>,
     buttons: u8,
     position: Option<(Resolution, (u16, u16))>,
-    keys: HashMap<String, u32>,
-    modifiers: Modifiers,
+    keys: keys::KeyLedger,
     scroll: (f32, f32),
     finger_scroll_allowed: bool,
     finger_scroll_task: Option<Task<()>>,
@@ -259,6 +401,16 @@ struct Desktop {
     /// The pointer is in the top-left corner, so the window's own buttons are shown.
     buttons_corner: bool,
     clipboard: ClipboardBridge,
+    /// **Mac shortcuts active** (`ARCH-031`): off, Skerry's own chords go to the session.
+    mac_shortcuts: bool,
+    /// Capture Pointer (`ARCH-032`), shared with the capture's AppKit monitor.
+    capture: Rc<RefCell<capture::Capture>>,
+    capture_monitor: Option<capture::Monitor>,
+    cursor_lock: Option<capture::CursorLock>,
+    /// One toggle per press of ⌃⌥⇧Z, whatever its auto-repeats.
+    chord: capture::ChordGuard,
+    /// Session events this view raises itself (the capture's state and hints).
+    events: mpsc::UnboundedSender<SessionEvent>,
 }
 
 /// The Mac side of clipboard sync (`ARCH-017`).
@@ -297,6 +449,7 @@ impl Desktop {
         input: mpsc::UnboundedSender<Input>,
         pointer: watch::Sender<Option<Pointer>>,
         mut frames: watch::Receiver<Frame>,
+        events: mpsc::UnboundedSender<SessionEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -309,6 +462,7 @@ impl Desktop {
         })
         .detach();
         cx.on_blur(&focus, window, |desktop, _, cx| {
+            desktop.release_capture(capture::Release::FocusLost);
             desktop.release_input();
             cx.notify();
         })
@@ -317,6 +471,13 @@ impl Desktop {
             if window.is_window_active() {
                 desktop.sync_to_session(false);
             } else {
+                // ⌘-Tab leaves the window on screen; a miniaturize or a screen lock doesn't.
+                let visible = crate::app::native_window(window).is_some_and(|native| {
+                    native
+                        .occlusionState()
+                        .contains(objc2_app_kit::NSWindowOcclusionState::Visible)
+                });
+                desktop.release_capture(capture::Release::Window { visible });
                 desktop.release_input();
             }
             cx.notify();
@@ -330,6 +491,9 @@ impl Desktop {
                         if (desktop.frame.width, desktop.frame.height)
                             != (frame.width, frame.height)
                         {
+                            // A capture stays: buttons lift, motion waits for the picture.
+                            let commands = desktop.capture.borrow_mut().frame_changed();
+                            desktop.commands(commands);
                             desktop.painted_display = None;
                             desktop.release_pointer();
                         }
@@ -345,6 +509,7 @@ impl Desktop {
         .detach();
         Self {
             focus,
+            waiting: SharedString::default(),
             scale_locally: true,
             frame: Frame::default(),
             painted: Rc::default(),
@@ -354,8 +519,7 @@ impl Desktop {
             pointer,
             buttons: 0,
             position: None,
-            keys: HashMap::new(),
-            modifiers: Modifiers::default(),
+            keys: keys::KeyLedger::default(),
             scroll: (0.0, 0.0),
             finger_scroll_allowed: false,
             finger_scroll_task: None,
@@ -368,7 +532,88 @@ impl Desktop {
             hot_corner: false,
             buttons_corner: false,
             clipboard: ClipboardBridge::default(),
+            mac_shortcuts: true,
+            capture: Rc::default(),
+            capture_monitor: None,
+            cursor_lock: None,
+            chord: capture::ChordGuard::default(),
+            events,
         }
+    }
+
+    fn captured(&self) -> bool {
+        self.capture.borrow().is_on()
+    }
+
+    /// The chord (or the menu) in the key session window. The chord's modifiers already
+    /// reached the session, so they are lifted and muted until they come up (`ARCH-032`).
+    fn toggle_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mac = window.modifiers();
+        if !self.chord.press(capture::modifiers_held(mac)) {
+            return;
+        }
+        let mut commands = self.keys.release_all();
+        commands.extend(self.keys.mute_mods_until_clear(mac));
+        self.commands(commands);
+        if self.captured() {
+            self.release_capture(capture::Release::Chord);
+        } else {
+            self.engage_capture(window, cx);
+        }
+    }
+
+    /// Captures the pointer: `p,1`, the cursor frozen at the picture's centre and hidden,
+    /// and the monitor sending relative motion. Only in an active window with a painted
+    /// picture; with no picture yet, a hint says so.
+    fn engage_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.captured() || !window.is_window_active() {
+            return;
+        }
+        let Some(display) = self.painted_display else {
+            let _ = self
+                .events
+                .send(SessionEvent::PointerCapture(Some(CaptureHint::Unavailable)));
+            return;
+        };
+        let Some(native) = crate::app::native_window(window) else {
+            return;
+        };
+        window.focus(&self.focus, cx);
+        self.release_pointer();
+        let commands = {
+            let mut capture = self.capture.borrow_mut();
+            capture.trackpad_scroll = self.settings.trackpad_scroll;
+            capture.engage(capture::scale(display), capture::event_clock())
+        };
+        self.commands(commands);
+        self.cursor_lock = Some(capture::CursorLock::lock(
+            native.clone(),
+            display.bounds.center(),
+        ));
+        self.capture_monitor =
+            capture::Monitor::install(native, self.capture.clone(), self.input.clone());
+        self.pinch_target.set(None);
+        let _ = self
+            .events
+            .send(SessionEvent::PointerCapture(Some(CaptureHint::Captured)));
+        cx.notify();
+    }
+
+    /// Ends a capture: `p,0`, the monitor removed, the cursor shown again. The only caller
+    /// of `CursorLock::unlock`. Does nothing while not captured.
+    fn release_capture(&mut self, reason: capture::Release) {
+        let commands = self.capture.borrow_mut().release();
+        if commands.is_empty() {
+            return;
+        }
+        self.commands(commands);
+        self.capture_monitor = None;
+        if let Some(lock) = self.cursor_lock.take() {
+            lock.unlock();
+        }
+        let _ = self
+            .events
+            .send(SessionEvent::PointerCapture(reason.hint()));
     }
 
     /// Send the Mac's clipboard to the session when it changed since it was last seen, or,
@@ -446,6 +691,12 @@ impl Desktop {
         let _ = self.input.send(Input::Command(text));
     }
 
+    fn commands(&self, commands: Vec<String>) {
+        for text in commands {
+            self.command(text);
+        }
+    }
+
     fn mouse_position(&mut self, point: Point<Pixels>, clamp: bool) -> bool {
         self.position = self.painted_display.and_then(|display| {
             display
@@ -510,34 +761,13 @@ impl Desktop {
             }
         }
         self.end_finger_scroll();
-        let (x, y) = match event.delta {
-            ScrollDelta::Lines(p) => (p.x, p.y),
-            ScrollDelta::Pixels(p) => {
-                let points_per_step = if self.settings.trackpad_scroll {
-                    12.
-                } else {
-                    40.
-                };
-                (
-                    f32::from(p.x) / points_per_step,
-                    f32::from(p.y) / points_per_step,
-                )
-            }
-        };
-        self.scroll.0 += x;
-        self.scroll.1 += y;
-        let (x, y) = (self.scroll.0.trunc(), self.scroll.1.trunc());
-        self.scroll.0 -= x;
-        self.scroll.1 -= y;
-        for (delta, positive, negative) in [(x, 64, 128), (y, 16, 8)] {
-            if delta == 0. {
-                continue;
-            }
-            let mask = self.buttons | if delta > 0. { positive } else { negative };
-            let amount = (delta.abs() as u32).min(16);
-            self.command(format!("m2,0,0,{mask},{amount}"));
-            self.command(format!("m2,0,0,{},0", self.buttons));
-        }
+        let commands = capture::wheel_pulses(
+            &mut self.scroll,
+            event.delta,
+            self.settings.trackpad_scroll,
+            self.buttons,
+        );
+        self.commands(commands);
     }
 
     fn end_finger_scroll(&mut self) {
@@ -546,26 +776,22 @@ impl Desktop {
         }
     }
 
-    fn modifiers(&mut self, mut next: Modifiers) {
-        next.control |= self.settings.command_as_control && next.platform;
-        next.platform = false;
-        for (current, next, key) in [
-            (self.modifiers.shift, next.shift, 0xffe1),
-            (self.modifiers.control, next.control, 0xffe3),
-            (self.modifiers.alt, next.alt, 0xffe9),
-        ] {
-            if current != next {
-                self.command(format!("{},{key}", if next { "kd" } else { "ku" }));
-            }
-        }
-        self.modifiers = next;
+    fn modifiers(&mut self, next: Modifiers) {
+        let commands = self.keys.mac_modifiers_with(
+            next,
+            self.settings.command_as_control,
+            &keys::physically_down,
+        );
+        self.commands(commands);
     }
 
     fn release_input(&mut self) {
-        for (_, key) in std::mem::take(&mut self.keys) {
-            self.command(format!("ku,{key}"));
-        }
-        self.modifiers(Modifiers::default());
+        // Child windows, full screen, settings changes and the stream's end all pass here.
+        self.release_capture(capture::Release::Closed);
+        // Whatever took the keyboard, the next ⌃⌥⇧Z is a fresh press.
+        self.chord = capture::ChordGuard::default();
+        let commands = self.keys.release_all();
+        self.commands(commands);
         self.marked.clear();
         self.selection = 0..0;
         self.ime_click = None;
@@ -634,8 +860,7 @@ impl EntityInputHandler for Desktop {
             if let Some(command) = commit_command(text) {
                 self.modifiers(Modifiers::default());
                 if let Some(key) = keysym(text, None) {
-                    self.command(format!("kd,{key}"));
-                    self.command(format!("ku,{key}"));
+                    self.commands(self.keys.tap(key));
                 } else {
                     self.command(command);
                 }
@@ -730,13 +955,23 @@ impl Render for Desktop {
                         }
                     })
                 });
-                desktop.update(cx, |desktop, _| {
+                let captured = desktop.update(cx, |desktop, _| {
                     desktop.painted_display = display;
+                    let captured = desktop.captured();
+                    if captured {
+                        desktop
+                            .capture
+                            .borrow_mut()
+                            .set_scale(display.and_then(capture::scale));
+                    }
                     desktop.pinch_target.set(
                         display
-                            .filter(|_| focus.is_focused(window) && window.is_window_active())
+                            .filter(|_| {
+                                !captured && focus.is_focused(window) && window.is_window_active()
+                            })
                             .map(|display| (display, desktop.buttons)),
                     );
+                    captured
                 });
                 if mac_ime {
                     window.handle_input(
@@ -750,6 +985,10 @@ impl Render for Desktop {
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
                         v.update(cx, |desktop, cx| {
+                            // Captured, the monitor owns the pointer; this is a defence.
+                            if desktop.captured() {
+                                return;
+                            }
                             if desktop.mouse_position(event.position, false) {
                                 window.focus(&desktop.focus, cx);
                                 desktop.ime_click = Some(event.position);
@@ -763,6 +1002,9 @@ impl Render for Desktop {
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                     if phase == DispatchPhase::Bubble {
                         v.update(cx, |desktop, _| {
+                            if desktop.captured() {
+                                return;
+                            }
                             if desktop.buttons != 0 && desktop.mouse_position(event.position, true)
                             {
                                 desktop.mouse_button(event.button, false);
@@ -779,6 +1021,9 @@ impl Render for Desktop {
                         let hot = in_hot_corner(viewport, event.position);
                         let buttons = in_buttons_corner(viewport, event.position);
                         v.update(cx, |desktop, cx| {
+                            if desktop.captured() {
+                                return;
+                            }
                             if desktop.buttons_corner != buttons && !window.is_fullscreen() {
                                 desktop.buttons_corner = buttons;
                                 crate::app::reveal_window_buttons(window, buttons);
@@ -801,6 +1046,9 @@ impl Render for Desktop {
                 window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
                     if phase == DispatchPhase::Bubble && hb.is_hovered(window) {
                         v.update(cx, |desktop, cx| {
+                            if desktop.captured() {
+                                return;
+                            }
                             if desktop.mouse_position(event.position, false) {
                                 desktop.pointer.send_replace(None);
                                 desktop.send_pointer();
@@ -809,26 +1057,37 @@ impl Render for Desktop {
                         });
                     }
                 });
-                let mut jpeg = None;
+                let mut shown = Vec::new();
                 if let (Some(display), Some(picture)) = (display, &frame.picture) {
                     match picture {
-                        Picture::Jpeg(image) => {
-                            let _ = window.paint_image(
-                                display.bounds,
-                                display.bounds,
-                                Corners::default(),
-                                image.clone(),
-                                0,
-                                false,
-                            );
-                            jpeg = Some(image.clone());
+                        Picture::Jpeg(jpeg) => {
+                            let scale_factor = window.scale_factor();
+                            for stripe in jpeg.stripes.iter() {
+                                let (bounds, image_bounds) = stripes::stripe_bounds(
+                                    display.bounds,
+                                    scale_factor,
+                                    frame.height,
+                                    stripe.y,
+                                    stripe.height,
+                                );
+                                let _ = window.paint_image(
+                                    bounds,
+                                    image_bounds,
+                                    Corners::default(),
+                                    stripe.image.clone(),
+                                    0,
+                                    false,
+                                );
+                                shown.push(stripe.image.clone());
+                            }
                         }
                         Picture::Video(surface) => {
                             window.paint_surface(display.bounds, surface.pixel_buffer())
                         }
                     }
                 }
-                if let (Some(cursor), Some(display)) = (&cursor, display) {
+                // Captured, the server composites the cursor (`p,1`): no second one here.
+                if let (Some(cursor), Some(display), false) = (&cursor, display, captured) {
                     let mouse = window.mouse_position();
                     if window.is_window_active()
                         && focus.is_focused(window)
@@ -878,10 +1137,8 @@ impl Render for Desktop {
                         }
                     }
                 }
-                if let Some(old) = painted.replace(jpeg.clone()) {
-                    if !jpeg.as_ref().is_some_and(|new| Arc::ptr_eq(new, &old)) {
-                        let _ = window.drop_image(old);
-                    }
+                for old in painted.borrow_mut().painted(&shown) {
+                    let _ = window.drop_image(old);
                 }
             },
         )
@@ -890,10 +1147,32 @@ impl Render for Desktop {
             .relative()
             .size_full()
             .overflow_hidden()
+            // The Library's ⌘O / ⌘L are bound to "Library" only, so they never resolve here
+            // and the keys reach the remote app (`ARCH-028`). With Mac shortcuts off, the
+            // flag lets `shortcuts::suppress_bindings` hand Skerry's chords to the session
+            // (`ARCH-031`).
+            .key_context(if self.mac_shortcuts {
+                DESKTOP_CONTEXT
+            } else {
+                shortcuts::REMOTE_DESKTOP_CONTEXT
+            })
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
                 let stroke = &event.keystroke;
-                if stroke.modifiers.platform && !desktop.settings.command_as_control {
+                // A Skerry chord GPUI suppressed: forwarded with ⌘ as Control, and always
+                // claimed, or AppKit's menu key equivalent would run it locally.
+                let pass = shortcuts::passes_to_session(stroke, desktop.mac_shortcuts);
+                if pass {
+                    cx.stop_propagation();
+                    desktop.keys.latch_command();
+                } else if !keys::sends_key_down(
+                    stroke.modifiers,
+                    desktop.settings.command_as_control,
+                ) {
+                    // ⌘O / ⌘L: claimed, so the File menu's key equivalents don't fire.
+                    if keys::claims_library_shortcut(stroke.modifiers, &stroke.key) {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 let shortcut = stroke.modifiers.control || stroke.modifiers.platform;
@@ -911,24 +1190,33 @@ impl Render for Desktop {
                 desktop.modifiers(stroke.modifiers);
                 let text = (!shortcut).then_some(stroke.key_char.as_deref()).flatten();
                 if let Some(key) = keysym(&stroke.key, text) {
-                    let paste = (key == KEY_V && desktop.modifiers.control)
-                        || (key == KEY_INSERT && desktop.modifiers.shift);
+                    let paste = (key == KEY_V && desktop.keys.control())
+                        || (key == KEY_INSERT && desktop.keys.shift());
                     if paste {
                         // Ordered socket: the clipboard lands before the paste keystroke.
                         desktop.sync_to_session(false);
                     }
-                    desktop.keys.insert(event.keystroke.key.clone(), key);
-                    desktop.command(format!("kd,{key}"));
+                    let commands = if pass {
+                        desktop.keys.tap_chord(&event.keystroke.key, key)
+                    } else {
+                        desktop.keys.press(event.keystroke.key.clone(), key)
+                    };
+                    desktop.commands(commands);
                     cx.stop_propagation();
                 }
             }))
             .on_key_up(cx.listener(|desktop, event: &KeyUpEvent, _, cx| {
-                if let Some(key) = desktop.keys.remove(&event.keystroke.key) {
-                    desktop.command(format!("ku,{key}"));
+                desktop.chord.key_up(&event.keystroke.key);
+                let commands = desktop.keys.release(&event.keystroke.key);
+                if !commands.is_empty() {
+                    desktop.commands(commands);
                     cx.stop_propagation();
                 }
             }))
             .on_modifiers_changed(cx.listener(|desktop, event: &ModifiersChangedEvent, _, _| {
+                desktop
+                    .chord
+                    .modifiers(capture::modifiers_held(event.modifiers));
                 desktop.modifiers(event.modifiers);
             }))
             .child(surface)
@@ -942,7 +1230,9 @@ impl Render for Desktop {
                     |_, window, cx| window.dispatch_action(Box::new(ToggleSessionControls), cx),
                 ))
             })
-            .when(empty, |view| view.child(session::waiting_overlay()))
+            .when(empty, |view| {
+                view.child(session::waiting_overlay(self.waiting.clone()))
+            })
     }
 }
 
@@ -1110,6 +1400,48 @@ fn keysym(key: &str, text: Option<&str>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a Super regression would come from: no GPUI key name maps to Super or Meta.
+    #[test]
+    fn no_key_name_maps_to_super_or_meta() {
+        let names = [
+            "cmd",
+            "command",
+            "super",
+            "meta",
+            "platform",
+            "win",
+            "hyper",
+            "shift",
+            "control",
+            "ctrl",
+            "alt",
+            "option",
+            "fn",
+            "function",
+            "capslock",
+            "escape",
+            "tab",
+            "space",
+            "a",
+            "z",
+            "1",
+            "f1",
+            "f12",
+            "f13",
+            "left",
+            "delete",
+            "backspace",
+            "enter",
+        ];
+        for name in names {
+            for text in [None, Some(name)] {
+                if let Some(key) = keysym(name, text) {
+                    assert!(!(0xffe7..=0xffee).contains(&key), "{name} -> {key:#x}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn ime_anchor_uses_click_pointer_or_visible_picture() {

@@ -205,6 +205,8 @@
 
 ## ARCH-019: Stats Section Follows the Selkies Web Sidebar's Stats
 
+- **Amended by `ARCH-031`:** the subscription is held while Stats is open or the stream strip is on, and history resets only when a subscription starts.
+
 - **Status:** settled — design approved in the preview workbench on 2026-11-21; amends the 1-second Stream Diagnostics of `ARCH-003` (`playback-and-diagnostics`)
 - **Finding (2026-11-21):** Selkies' web sidebar Stats (`selkies-dashboard/src/panels/stats.tsx` `StatsSection`, `stats-data.ts`, `selkies-web-core/lib/stream-stats{,-view}.ts`) shows four status rows, three history graphs, figure tiles, and host meters, and copies a plain-text report. Its numbers come from the server only while the stats are on screen: the page sends `_stats,1`, and the server answers once a second with `stream_stats` (`encode_ms`, `encoded_fps`, `pipeline_ms` with `pipeline_min_ms`/`pipeline_max_ms`, `send_ms` with its range, `video_mbps`, `peak_mbps`, `target_mbps` under CBR, `rtt_ms`, `throttled`, and the host's `cpu_percent`, `mem_used`/`mem_total`, `gpu_percent`, `gpu_mem_used`/`gpu_mem_total`). `stream_info` describes the encoder and capture path. Skerry showed nine label/value lines from its own counters and read only `stream_info.encoder`.
 - **Decision:** The Session Controls section is titled **Stats** and draws, in order, what the web sidebar draws for a WebSockets session:
@@ -237,17 +239,19 @@
 | **Stats** | "Show over the stream" switch; status rows, graphs, tiles, meters, copy (`StatsSection`) | Rows, graphs, tiles, meters, copy (`ARCH-019`) | Strip and floating gauges: `ARCH-GAP-VS-06` |
 | **Clipboard** | The server clipboard's text, editable (sent on blur, `clipboardUpdateFromUI`); image upload when binary clipboard is on (`enable_binary_clipboard`); masked-secret copy button | Clipboard section: Send to Session, Receive from Session, Seamless; Send Mac Clipboard / Copy Session Clipboard when Seamless is off; `NSPasteboard` sync on focus (`ARCH-017`). No editable text box: the Mac's own pasteboard is the clipboard | Settled: `ARCH-017` (`ARCH-GAP-DC-01`) |
 | **Files** | Opens the file manager: browse the session's directories, upload and download (shown when the server allows either transfer) | A native **Files** window per session (⌘⇧F, Session Controls → Files): browse, transfers, Finder copy/paste and drag both ways, Delete via SealSkin storage (`ARCH-023`, `ARCH-024`) | Settled (`ARCH-GAP-DC-02`); mount `ARCH-GAP-DC-14`, rename/move `ARCH-GAP-DC-15` |
-| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` |
-| **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
+| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
+| **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | settled (`ARCH-035`) | An Apps window per session over `apps,{op}`. Support is detected, the GitHub catalog is fetched with no credentials, and icons are rasterised in a sandboxed worker process. |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
-| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
-| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` |
-| **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
+| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
+| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
+| **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | excluded (`ARCH-035`) | An agent loop that can act on the desktop and needs a model key; not surfaced to people. |
 | Footer | "Cite our paper academically" link | — | Excluded |
 
 - **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/desktop-and-collaboration.prose.md`
 
 ## ARCH-021: Decoded Frames Are Presented as They Arrive, Not on a 30 Hz Tick
+
+- **Amended by `ARCH-034`:** JPEG frames are presented on their bottom stripe or after a 2 ms settle, as per-stripe images, instead of an 8 ms full-canvas flush.
 
 - **Status:** settled — amends the presentation pacing of `ARCH-003` (`codec-and-rate-control`)
 - **Finding (2026-11-21):** the Stats FPS graph (`ARCH-019`) showed the client at 30 fps while the server encoded 60. `transport::run` handed frames to the window only on its 33 ms `present` tick, which the first client (`e0835a5`) used to gather a JPEG frame's stripes into one picture. A hardware frame decoded between ticks waited in `decoded`, and a second one replaced it unseen, so H.264/H.265/AV1 were shown, and counted, at 30 fps at most.
@@ -259,6 +263,8 @@
 - **Affected Rust:** `crates/skerry-mac/src/transport.rs`
 
 ## ARCH-022: Multi-Window Session Behaviour (`ARCH-GAP-LS-08`)
+
+- **Amended by `ARCH-039`:** a session may now have a second connection, its Display 2 window. "Never a second connection" still holds for resuming an open session.
 
 - **Status:** settled (decided and verified live 2026-11-22). Settles `ARCH-GAP-LS-08` and builds on `ARCH-010`.
 - **Decision:**
@@ -302,42 +308,589 @@
 - **Affected Contracts:** `index.prose.md`, `desktop-and-collaboration.prose.md`, `launcher-and-sessions.prose.md`, `implement-feature.prose.md`, `skerry.test.prose.md`. Earlier decisions keep their original `api.rs` / `Api` names as history.
 - **Design review 2026-11-22 (subagent, preview screenshots in Light and Dark):** first pass applied — one-line transfer rows in a collapsible "Transfers (n)" panel above the status bar (capped at about four rows); selection in the accent colour with white text, grey when the window is not key; Trash (not ⌫) at the toolbar's end and a folder-plus New Folder icon (both embedded through `skerry_ui::assets::SkerryAssets`, since gpui-kit's default bundle lacks them); header columns built like the rows so labels sit over values; the extension kept visible when a name truncates; Finder dates (`Today at 10:04`, `2 Nov 2026 at 08:05`) and `--` for folder sizes; error notices tinted with an icon and kept, information notices fading after 4 s or on navigation; Delete progress as a status-bar spinner; Try Again on a listing error; a loading spinner; drops onto a folder row upload into that folder; "Uploaded as “a 2.txt”" when keep-both renames; Delete alert copy ("This item will be deleted immediately from the persistent storage “X”. You can’t undo this action.") with Cancel as the cancel button; one name, **Files** (View menu, Session Controls button, window title `<app> — Files`, root crumb **Desktop**); blue folder icons; a primary Create button; plainer error wording. Second pass applied: a right-click menu on the list (Open, Quick Look, Download, Download To…, Copy, New Folder, Upload…, Paste, Delete…; a right-click on an unselected row selects it, on empty space clears the selection) and **File** (New Folder, Upload…, Download, Download To…, Open, Quick Look, Delete…, Close Window), **Edit** (Copy, Paste, Select All), and **Go** (Back, Forward, Enclosing Folder) menus bound to the window's actions, disabled where no Files window has focus. To check live: that the Edit menu's ⌘C/⌘V key equivalents never take those keys from a session window (GPUI handles the key window's keys before the menu). Left for later (low): type-to-select, Home/End/Page keys, a unified title bar, collapsing breadcrumbs, resizable columns.
 
+## ARCH-025: Frontier Build Plan of 2026-11-22 (PM Triage)
+
+- **Status:** settled 2026-11-22 (planning decision; each task settles its own `ARCH-*` when it ships).
+- **Asked by the person:** "check the rest of missing feature, build them, decide for me", with every task run as PLAN → design → review → build → QA → code review in subagents and the main agent acting only as PM.
+- **Process:** work lands on the integration branch `frontier-2026-11-22`; each task is built on its own branch in a worktree and merged into the integration branch only after its code review passes. Product questions inside a task are decided by the PM and recorded in that task's `ARCH-*` entry.
+- **Build order (tasks, each one `ARCH-*` when settled):**
+  - **A. Polish and hardening:** `ARCH-GAP-LS-10`, `ARCH-GAP-LS-11`, `ARCH-GAP-VS-05`, `ARCH-GAP-DC-09`.
+  - **B. Library organization and quick launch:** `ARCH-GAP-LS-04` (favorites, hidden, recents, session reuse) and `ARCH-GAP-LS-01` (startup progress, one-click remembered launch).
+  - **C. Open links and files, Send File:** `ARCH-GAP-LS-03`, `ARCH-GAP-LS-02`.
+  - **D. Account and key recovery:** `ARCH-GAP-LS-06`.
+  - **E. Audio devices and quality:** `ARCH-GAP-DC-03`.
+  - **F. Stats overlay and Shortcuts panel:** `ARCH-GAP-VS-06`, `ARCH-GAP-DC-12`.
+  - **G. Gaming controls:** `ARCH-GAP-DC-06`.
+  - **H. Remote printing:** `ARCH-GAP-DC-04` (only if the pinned Selkies sends print jobs; otherwise recorded as blocked by the server).
+  - **I. JPEG CPU cost:** `ARCH-GAP-VS-04`.
+  - **J. Pelorus and Apps catalog:** `ARCH-GAP-DC-13`, `ARCH-GAP-DC-11`.
+  - **K. Direct Selkies sessions:** `ARCH-GAP-LS-13`.
+  - **L. Persistent storage and shares:** `ARCH-GAP-LS-05`.
+  - **M. Microphone and webcam:** `ARCH-GAP-DC-05`.
+  - **N. Second display:** `ARCH-GAP-VS-01`.
+- **Deferred by the PM (not built in this plan):** `ARCH-GAP-VS-02` WebRTC (a second transport stack, needs a prototype before it can be designed); `ARCH-GAP-VS-03` VP8/VP9 software decode, 10-bit, and 4:4:4 (VideoToolbox has no hardware path; the hardware codecs already cover the need); `ARCH-GAP-DC-07` rooms and viewer roles (SealSkin 0.5.0 room messages carry only the sender alias, so control handoff can't be built cleanly); `ARCH-GAP-DC-08` raw multitouch (kept deferred on its own condition); `ARCH-GAP-DC-14` Finder mount (needs a signed File Provider extension); `ARCH-GAP-DC-15` rename and move (blocked: no server route); `ARCH-GAP-LS-07` cluster placement and per-session origins (no test cluster to verify against); `ARCH-GAP-LS-09` native per-app Dock presence (needs code-signing and a helper-process design of its own).
+- **Outcome (2026-11-22, all 14 tasks merged into `frontier-2026-11-22`):** A `ARCH-026`, B `ARCH-027`, C `ARCH-028`, D `ARCH-029`, E `ARCH-030`, F `ARCH-031`, G `ARCH-032`, H `ARCH-033`, I `ARCH-034`, J `ARCH-035`, K `ARCH-036`, L1 `ARCH-037`, M1 and M2 `ARCH-038`, N `ARCH-039`.
+  - Gates: 870 + 53 tests, clippy `-D warnings`, `fmt --check`; no aws-lc-rs.
+  - **Deferred during the build:** public share links (`ARCH-GAP-LS-14`), mic echo cancellation (`ARCH-GAP-DC-16`), and cross-display drag (`ARCH-GAP-VS-07`).
+  - **Excluded:** Pelorus (`ARCH-GAP-DC-13`).
+  - **Deferred by the PM at close:** the web sidebar's stream-toggle tile row, the last part of `ARCH-GAP-VS-05`. Every toggle in it is already in Session Controls.
+  - **Not yet done for any task:** a visual check of the new UI in Light and Dark, because the screen was locked or in use during every QA run.
+- **Rationale:** the order puts small, low-risk, client-only work first, then the launcher features people use every day, then in-session media and input. Tasks that need a second protocol stack, signing infrastructure, or a server we can't test against are deferred, so that what ships can be verified.
+
+## ARCH-026: Launcher Polish, Control-Plane Hardening, Session Controls Memory, and Key Release Before Close (Task A)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-10`, `ARCH-GAP-LS-11`, and `ARCH-GAP-DC-09` (client side). `ARCH-GAP-VS-05` is now settled except the web's stream-toggle tile row (`ARCH-020`).
+- **Process:** plan → design → review (14 required changes) → build → QA (1 major, 5 minor) → code review (2 rounds, MERGE), all done by subagents (`ARCH-025`). Branch `task-a-polish`, merged into `frontier-2026-11-22`.
+- **Launcher (`LS-10`):**
+  - **Sign Out…** replaces **Disconnect Server** and asks for confirmation in a modal built like Stop Session (Cancel, then **Sign Out** in danger).
+    - The wording depends on where the key came from. With `config.toml` it says the saved key is removed. With `SEALSKIN_APPLICATION_KEY` or `.env` it says Skerry doesn't store that key and will use it again next launch.
+    - It says open session windows stay connected (`ARCH-022`).
+    - It removes `application_key` whenever `config.toml` holds the active key, and ignores a Refresh or launch still in flight.
+  - The Library content column is capped at 1200 pt and centred. Tiles and cards keep their sizes.
+  - Toasts are a `skerry-ui` component: bottom centre, 3 s, a new one replaces the old, successes only. They read "Library refreshed" (manual Refresh) and "Link copied".
+  - "Started … ago" updates every 30 s, only while the Library is visible and has sessions.
+- **Hardening (`LS-11`):**
+  - The application key is attached only to requests whose resolved path is under `/companion/api/`. Logos and `/app/<id>/icon.png` go through a second HTTP client that has no key. This is chosen on the resolved path in release builds too, and tested over raw TCP.
+  - Preference and key writes go through one first-in-first-out write queue on Tokio (`persist.rs`). It is the only writer, with an in-memory copy that every reader uses, so reads always see queued writes. On quit it flushes within 1 s (`block_on` in `on_app_quit`).
+  - Preferences load field by field. Unknown top-level keys from newer builds are written back. An unreadable file is copied to `<file>.bak-<timestamp>` before it is overwritten.
+  - Library items are cached as `Rc` slices and rebuilt only when marked dirty. Every image retirement (`ARCH-014`) marks them dirty.
+- **Session Controls (`VS-05`):**
+  - Which sections are open is saved per server. Restoring Stats open subscribes as a click would.
+  - Scroll position is kept per session window across closing the panel and reconnecting; it is not saved to disk.
+  - Preset was already a dropdown (`ARCH-018`), so no picker changed.
+  - Session Controls dropdowns use a `skerry-ui` `menu_dropdown` with a stronger, theme-aware shadow. Light: 0 8 24 at 16 % plus 0 2 6 at 8 %. Dark: 0 12 32 at 60 % plus a 1 px white 12 % ring, with GPUI blur at half the CSS value. Launch Dialog `Select` popups keep gpui-kit's own shadow.
+- **Stray Super key (`DC-09`):**
+  - Root cause in Skerry: `NativeSession::drop` aborted the transport task before the queued key releases were sent, so a key held during a codec switch stayed down on the remote.
+  - Now the transport sends `ku` for every held key, then a WebSocket close frame. A 1 s abort watchdog is the fallback, and a cancel flag stops a stream that is dropped while still connecting from ever sending `SETTINGS`.
+  - **No `kr` is sent anywhere.** Selkies' `reset_keyboard` releases Super/Meta/Control/Escape even when they aren't down, which could itself open a menu.
+  - Key bookkeeping lives in a pure `KeyLedger` (`view/keys.rs`):
+    - Command never maps to Super or Meta.
+    - A keysym that Shift changes while held is released.
+    - Keys are released on blur and before Session Controls, Files, or full screen.
+  - `SKERRY_INPUT_TRACE=1` prints each input message, with printable keys redacted.
+- **Corrections from review:** Selkies `disconnect()`/`connect()` reset only at server start and stop. An aborted socket (1006) leaves keys held until the server's roughly 2 s stale sweep, and a clean close runs `reset_keyboard`. Ctrl+Esc is a likelier trigger than Super.
+- **Not verified live:** the screen was locked during QA, so nothing was checked visually (Light/Dark shots, dropdown shadow, toasts). The Sign Out run and the codec-switch input trace were checked in code and unit tests only. The Library loading, keyless logo fetches (a proxy saw no Authorization), and resilience to a corrupt preferences file were verified live.
+- **Known, not fixed:** quitting still ends streams abruptly (1006), so the server holds keys for its grace period. The in-memory preferences stay ahead of disk after a failed write.
+- **Affected Rust:** `persist.rs` (new), `view/keys.rs` (new), `sealskin.rs`, `settings.rs`, `app.rs`, `view.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{library.rs,controls.rs,components.rs}`, `examples/preview.rs`.
+
+## ARCH-030: Audio Output Follows the Mac, with a Device Picker, Recovery, and Audio Bitrate (Task E)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-03`.
+- **Process:** plan → design → review (12 required changes) → build → QA (3 minor, 1 trivial, all fixed) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-e-audio`.
+- **Decision:**
+  - Each session has its own `skerry-audio` thread behind a `Backend` seam. Every cpal/Core Audio call runs on that thread, never on GPUI or Tokio. This is the one exception to "all I/O on Tokio". `Drop` sends a shutdown message and never joins.
+  - **Following the default:** cpal 0.17's error callback does nothing for the default device, so a 1 s poll of the default device's UID rebuilds the stream when it changes.
+  - **Output Device** dropdown in a new **Audio Settings** card (between Video Settings and Stats, collapsed by default):
+    - It lists "System Default (<active name>)" and then the connected devices by name. The choice is saved per server by raw UID.
+    - A saved device that is missing appears greyed and checked as "<name> (not connected)". Sound plays through the default until the device returns.
+    - A chosen device that fails falls back with the note "X isn't responding. Playing through Y while Skerry keeps trying."
+  - The stream always opens at 48 kHz f32 and Core Audio (AUHAL) converts. cpal never sets the device rate. Mono devices get an L+R downmix. There is no in-tree resampler.
+  - **Recovery:** rebuild on a stream error, on a stall (render callbacks stop for 2 s, counted only while a stream exists, so mute and pause don't count), on a default change, or when the chosen device returns.
+    - At most one rebuild per second, with 2–30 s exponential backoff.
+    - Strikes clear only after 5 s of steady callbacks.
+    - A retry of the chosen device opens a silent probe stream beside the playing fallback, and swaps only once the probe renders.
+    - A single failed device listing keeps the last list.
+    - The first recovery shows nothing; "Audio output stopped" appears only when nothing can play.
+  - The 125 ms drop-oldest queue is kept across rebuilds.
+  - **Audio Bitrate:** Selkies publishes `audio_bitrate` as an enum (bps strings in `allowed`, and a live value that can be a number). Skerry sends `SETTINGS,{"audio_bitrate":N,"picked":["audio_bitrate"]}`, as the Selkies web client does.
+    - The dropdown reads "128 kbps".
+    - It is hidden when the server doesn't send the setting, and shown disabled when locked or when only one value is allowed.
+    - The choice is saved per server and re-sent when the session is ready, if it is still allowed.
+  - Preferences (`AudioPreferences`, `ControlsSections.audio`) use struct-level `#[serde(default)]` and are written only through `persist.rs` (`ARCH-026`).
+- **Evidence:** Selkies 715df7c `settings/table.rs`, `ws/server.rs:2294`, `selkies-ws-core.ts:6204`, and the dashboard's `utils.ts:184` visibility rule. cpal 0.17.3 `device.rs:916` (no error callback for the default device) and l.751 (sample rate is set only for input). Prior art: Parsec and Windows App on the Mac follow the macOS default with no picker, so the picker exists for parity with the Selkies web client.
+- **QA (live, real Core Audio over the real transport against a fake WebSocket server):**
+  - Audio started on 44.1 kHz speakers, and the bitrate pick went out as the exact `SETTINGS` text.
+  - With a temporary aggregate device, the stream followed default changes in about 0.2 s. A chosen device that was also the default stayed put when the default moved, and a missing chosen device fell back and came back.
+  - 15 open/close cycles leaked no threads.
+- **Not verified:** real plug/unplug, sleep/wake, and mono hardware (all simulated); nothing on screen, because the screen was locked. "Sound Settings…" in the menu was deferred as scope creep.
+- **Affected Rust:** `audio.rs`, `settings.rs`, `transport.rs`, `app/controls.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{controls.rs,components.rs}`, `examples/preview.rs`.
+
+## ARCH-027: Favorites, Hidden Apps, Recents, Session Reuse, Launch Progress, and One-Click Launch (Task B)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-04` and `ARCH-GAP-LS-01`, and lifts the `ARCH-013` hold on Favorite and Hide.
+- **Process:** plan → design → review (11 required changes) → build → QA (4 low, fixed) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-b-library`, merged after Task E.
+- **Organization (`LS-04`):**
+  - SealSkin 0.5 has no per-user favorites, hidden or recents API: its web launcher keeps all three in browser storage (`home.js:113-116, 214-220`). Skerry saves them per server in a `library` key of the preferences JSON, through `persist.rs`.
+    - One bad entry drops only that entry.
+    - Lists are capped at 512 ids (Recent at 8) on load and on write.
+    - Unknown app ids are kept, never pruned.
+  - **Library order:** Running sessions, a Favorites row, a Recent row, then Applications. The rows show only on All with an empty search, as compact 120×112 pt tiles.
+  - **Recent:** at most 8, newest first, recorded only after a successful launch. It leaves out favorites and hidden apps.
+  - **Hidden apps:** they leave All, the categories and both rows, but still match a search. A **Hidden (n)** chip, last in the row, lists them. The chip is a filter enum, so it can't collide with a category named "Hidden", and it resets once nothing is hidden.
+  - Favorite and Hide are offered both in the Launch Dialog (toggle buttons; the dialog stays open) and in a tile right-click menu. The menu items are "Launch with Last Options", "Launch Options…", "Add to/Remove from Favorites" and "Hide from/Show in Library"; a bare "Hide" would read as ⌘H.
+  - **Session reuse** follows the web launcher (`open.js:240-249`): the oldest running session with the same app, the same resolved storage and the same Collaborative flag.
+    - When one matches, the Launch Dialog shows **Open Running Session** as the primary button and **Launch New** as secondary, and updates as Storage or Collaborative change.
+    - Sessions created locally carry their real `created_at`.
+- **Launch progress (`LS-01`):**
+  - Every launch sends a UUID `launch_id`, which is also the `X-Idempotency-Key`. The companion lane runs a POST at most once and caches its result for 600 s (`security.py:245-330`).
+  - Skerry polls `GET /companion/api/launch/progress/<id>` (`progress.py`). The launch timeout is 960 s, since Kubernetes image pulls can take up to 900 s.
+  - **Stages shown:** Requesting, Pulling image (Docker only), Starting (which covers `client`), and Connecting. They never move backwards.
+  - A launching card shows first under Running sessions, with a checklist and the server's sentence; the app's tile shows the stage. There is no Cancel, because SealSkin has no cancel route.
+  - Launches no longer lock the Library; one launch runs per app at a time.
+  - **Follower rules (no second container):**
+    - Progress decides, and a POST success always wins.
+    - A launch is called lost only after its POST has ended.
+    - A same-id Retry is offered only after the request was lost; a fresh-id Retry only once nothing is outstanding.
+    - Results that arrive after Ready are ignored.
+    - A 401 from progress waits for the outstanding POST.
+    - A gateway 502 or 504 counts as a lost request.
+  - **Recovery:** 180 s with no stage change before the session exists shows Keep Waiting / Retry. A failure shows "Couldn't launch {App}" with Retry and Dismiss.
+  - **In the session window:** when the 45 s connection retry runs out, a banner offers Keep Waiting (5 more minutes), Retry and Disconnect. A single timed-out socket attempt counts as transient. A new stream clears the banner. Only Keep Waiting keeps the longer grace period.
+  - A Refresh that was requested before a launch became ready keeps that launch's session.
+  - Closing the Library window drops the launches it was following. The server finishes them, and the session appears under Running sessions next time.
+- **One-click launch:** tiles with remembered options show a hover ▶ ("Launch with Last Options"), and Option-click does the same. It always starts a new session and rechecks the remembered options as the dialog does. A plain click still opens the dialog.
+- **QA (live, `sealskin.kebot.me`, Kubernetes):**
+  - Two POSTs with the same `launch_id` returned the same `session_id`, and the list grew by one. A third resend after ready came back cached in 31 ms.
+  - Progress went 404 → starting → waiting → ready in 4.5 s, with no image stage on Kubernetes.
+  - A copy of the Task A-era preferences file kept every key.
+  - Not verified: anything on screen (screen locked), the 180 s stall prompt, a gateway 504 mid-launch, and closing the Library mid-launch.
+- **Known:** a progress run that the server pruned after 900 s can still offer a fresh Retry.
+- **Affected Rust:** `launch_progress.rs` (new), `sealskin.rs`, `settings.rs`, `launch_options.rs`, `transport.rs`, `app.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,session.rs,components.rs}`, `examples/preview.rs`.
+
+## ARCH-029: Account Menu and Key Recovery (Task D)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-06`.
+- **Process:** plan → design → review (10 required changes) → build → QA (2 medium, fixed) → code review (1 high, 1 medium, fixed; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-d-account`.
+- **What SealSkin 0.5.0 gives a key:**
+  - `POST /companion/api/admin/status` (`routers/admin.py:116`) is open to every user. It returns name, admin flag, groups, rights (storage, GPU, VPN), limits (sessions, session length, idle, CPUs, memory, storage), the hours allowance, `held`, and storage used (with `?storage=1`).
+  - Key refusals are `401` with `detail` = `unknown` / `expired` / `dormant` / `disabled` / `client` (`security.py:489-513`).
+  - A key's own expiry, name and last use are not available to the key (`/api/keys` answers web sign-ins only), so they are left out.
+  - Only the built-in `admin` user never goes dormant.
+- **Account menu:**
+  - The Library header's right edge holds an account button (user icon, name, caret). It takes the place of Task A's header Sign Out (macOS convention and SealSkin's own profile card).
+  - Its 300 pt popover shows: name with an Admin tag, server, groups; Storage/GPU/VPN chips; and limit rows in the web profile's order with 4 pt meters (warning at 80 %, danger at 100 %, with a caption). Storage uses binary GB, as `quota.py` does, and is measured only when the menu opens; only a failed measure is retried. The key's source and its sleep time come next.
+  - The footer has **Open SealSkin in Browser** and **Sign Out…** (in red), which closes the popover and then opens Task A's confirmation (`ARCH-026`).
+  - Admins see "Administrators have every capability and no limits." The key id appears only in a tooltip.
+- **Recovery:**
+  - **Dormant:** a panel with **Sign In on the Web** (opens `<origin>/?wake=1`, never with the key in the URL), Try Again, and Use a Different Key. Skerry checks again every 5 s for up to 3 minutes and when the window becomes active. The poll is a GPUI task the Launcher owns, cancelled on every exit; `WakeState` clears its in-flight mark whenever a poll starts or stops.
+  - **Revoked or expired:** back to Connect with a red alert. The field is relabelled "New Application Key", empty and focused. The saved key stays in `config.toml` until a replacement connects. An empty Connect says "Paste a new application key." and sends nothing.
+  - **Disabled, client not allowed, or inactive:** a yellow alert, and an empty field retries the current key. Use a Different Key keeps the current key as the retry target, and a network failure on retry doesn't lose it.
+  - **Held:** read from `held: true` before any text match. It shows a panel with Open SealSkin in Browser and Try Again.
+  - Any unrecognised 403 shows the server's own sentence under "SealSkin refused the request" and allows a retry. Quota or permission 403s show the server's sentence alone.
+  - A key from the environment or `.env` gets a note: a pasted key is saved, but the environment key wins at the next launch.
+  - A pasted key that is refused at first and connects later (wake poll, Try Again, empty Connect) is kept as a pending credential and saved on that success. Environment and `.env` keys are never saved.
+  - Refusals on Refresh, Launch (including home creation and Task B's progress 401) and Stop all reach this flow. Session windows keep streaming; their Files window's Storage pane shows the refusal; a new key reaches a session window only after it is reopened.
+- **Evidence:** SealSkin 0.5.0 `routers/admin.py`, `security.py:489-513`, `api.md:42`, `shell/host.js:253`, `ui/app.js:122-165`. Prior art: gh and Tailscale re-authenticate in the browser and keep the old credential until the new one works.
+- **QA:**
+  - Live and read-only: the real `admin/status` for the admin user gives the expected menu.
+  - A fake HTTPS server with the real binary: every refusal code mapped to the right recovery state with one Library round, `config.toml` stayed byte-identical, and the key went only to the control-plane host.
+  - Not verified: anything on screen (screen locked) and the wake flow in a real browser.
+- **Affected Rust:** `app/account.rs` (new), `crates/skerry-ui/src/account.rs` (new), `sealskin.rs`, `app.rs`, `launch_progress.rs`, `app/files_window.rs`, `crates/skerry-ui/src/{library.rs,connect.rs,assets.rs}`, `examples/preview.rs`.
+
+## ARCH-028: Open Links and Files in Remote Apps, and Files from the Launcher (Task C)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-03` and `ARCH-GAP-LS-02`. Amends `ARCH-023`: a Files window can now be opened from the Library without a stream.
+- **Process:** plan → design → review (17 required changes) → build → QA (4 minor, 2 trivial) → code review (1 medium; 2 rounds, MERGE), all by subagents (`ARCH-025`). Branch `task-c-open`, rebased over Task D.
+- **Server facts** (sealskin `1ba09a7`):
+  - Apps declare `url_support` and `extensions` (`models.py::Application`).
+  - `POST /companion/api/launch/url` takes the `launch/simple` body plus `url`, checked against `^(?:(?:https?|ftp)://|magnet:\?)[^\s\x00-\x1f\x7f]+$`, at most 8192 characters.
+  - `launch/file` works as `upload/initiate` → `upload/chunk` (base64, at most 8 MiB; Skerry sends 1 MiB) → `launch/file`.
+  - `POST /companion/api/sessions/<id>/open_url` answers 200 `opened`, 409 when nothing took the link, and 404 when the session isn't the caller's.
+  - The session cookie comes from a plain GET that answers 303, and the access token is not used up by it.
+- **Links:**
+  - Text typed or pasted into the Library search becomes a link by the web launcher's rule, plus `ftp` and space-free `magnet`. A bare host gets `https://`, and the scheme is lower-cased.
+  - The chooser above the results offers **Open Here** for compatible running sessions (`open_url`) and **Launch & Open** for apps with `url_support`. If a session refuses, Skerry shows a notice and never launches anything by itself.
+  - The chooser shows the real host and drops userinfo.
+  - Return acts only on text the user typed that has a scheme or one of 32 common TLDs. Links from Finder, `skerry:`, drops or ⌘O always need a click.
+  - ⌘L (Open Location…) works only while the Library is key.
+- **Files:**
+  - Files arrive by ⌘O (Library only), a drop on the Library or on a session card (blue ring and pill), Finder **Open With**, or the Dock icon. The bundle declares `public.data` at Alternate rank, so Skerry is never the default app, plus a `skerry://open?url=` scheme. Skerry doesn't register for http or https.
+  - The chooser filters apps by extension, and shows every app when none matches. A running session gets **Copy to Desktop** (an upload through its Files window).
+  - Uploads open the file once and stream 1 MiB chunks. They stop if the file changes, and Cancel aborts the Tokio task.
+  - Files over 4 GiB and folders are refused, and several files go one at a time.
+  - Errors map from the response status: 403 means storage is full, 413 too large, 429 too many uploads.
+  - Uploads ride Task B's launching card. A long upload never shows the stall notice.
+- **Launch & Open dialog:** it keeps its own copy of the target, so a link that arrives mid-dialog joins the queue instead of replacing it. It shows "Opens “report.pdf” · PDF · 2.4 MB", hides Copy link and B's Open Running Session, and its button reads **Launch & Open**.
+- **Files from the launcher (`LS-02`):**
+  - Each running-session card has an icon-only Files button. It opens that session's Files window with no stream window, using `transport::session_access`, which does the cookie exchange on its own client and never sends the application key.
+  - There is one Files window per session, shared between the Library and the session window. Windows the Library opened close on Stop and on Sign Out.
+  - With no stream, Skerry assumes both directions are allowed and turns one off if the server answers 403.
+  - A session that is still starting reads "The session is still starting. Try again in a moment."
+- **Refusals** from launch/url, launch/file, uploads and `open_url` go through `ARCH-029`'s key classification.
+- **⌘O/⌘L in session windows:** these are bound only in the Library's key context, and the session desktop (the `SessionDesktop` key context) claims them, so a remote app gets them when Command sends Control is on. When it is off, they do nothing, like every other ⌘ key. File → Open… does nothing unless the Library is key.
+- **QA (live):**
+  - launch/url worked. launch/file sent a 2.6 MB file as 3 chunks and it reached the session.
+  - `open_url` refusals mapped as expected (422 → refused, 404/409 → not taken). A successful `open_url` was not shown live: Zen answered 409 on its first-run screen.
+  - `session_access` got the cookie with no WebSocket, and `SelkiesClient` listed and uploaded.
+  - `plutil -lint` passed on the bundle.
+  - Not verified: anything on screen, Finder Open With, Dock drops, and 413/429.
+- **Known:** the TLD list includes `app` and `ai`, so "Zen.app" followed by Return opens `https://zen.app`. A key refusal clears the chooser.
+- **Affected Rust:** `open_target.rs` (new), `sealskin.rs`, `transport.rs`, `selkies.rs`, `launch_progress.rs`, `app.rs`, `app/files_window.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,files.rs,assets.rs}`, `scripts/bundle.sh`, `examples/preview.rs`.
+
+## ARCH-031: Stats Strip over the Stream and a Shortcuts Card (Task F)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-06` and `ARCH-GAP-DC-12`. Amends `ARCH-019`: Stats history now resets only when a subscription starts.
+- **Process:** plan → design → review (7 required changes) → build → QA (4 trivial) → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-f-overlay-shortcuts`.
+- **Stats strip (`VS-06`):**
+  - A **Show over the stream** switch sits at the top of the Stats card, and View → **Toggle Stats Over Stream** does the same.
+  - The strip copies the Selkies web client's "over the stream" strip:
+    - four status marks (encoder, capture, decoder, connection), then fps, video Mbps against the target (amber above 1.1×), capture-to-sent ms, and RTT
+    - a 55 % black pill centred 8 pt from the top, in every theme
+    - tabular digits and fixed minimum widths so it doesn't jump
+    - it wraps whole figures in narrow windows
+  - It has no hitbox, so clicks pass through, including to the ⋯ button it draws over.
+  - It is saved per server through `persist.rs`.
+  - Only the strip was built. Moonlight, Parsec and Steam all use text overlays, and Selkies draws its gauges only in layouts Skerry doesn't follow.
+  - `_stats,1` is sent while the Stats card is open or the strip is on (`StatsInterest`), and sent again after a reconnect.
+  - `stats::strip_bottom` tells later overlays where to start below the strip.
+- **Shortcuts (`DC-12`):**
+  - A Shortcuts card after Input lists Skerry's own chords from one table (`shortcuts::CHORDS`): ⇧⌘M Session Controls, ⌃⌘F full screen, ⇧⌘F, ⌘0 Library, and ⌘Q "Always on the Mac". The glyphs are macOS menu glyphs in Apple's modifier order.
+  - **Mac shortcuts active** follows the server's `keyboard_shortcuts` until the user changes it, then the saved per-server value. A server lock wins, shows as a disabled switch, and survives reconnects.
+  - When it is off, those chords go to the session with ⌘ sent as Control. The key is sent as a down-up tap while Control stays held, so holding ⌘ never auto-repeats it. There is no escape chord: the View menu, the ⋯ button and ⌘Q always work, as in Jump Desktop and Windows App.
+  - One ordered `app::key_bindings()` puts the global chords first, then Files, then the Library's ⌘O/⌘L (`ARCH-028`), then a `NoAction` suppression layer under the `SessionDesktop` key context last. gpui-pre 0.3.12 lets the last binding win at equal depth.
+  - `passes_to_session` reuses the suppression bindings and always calls `stop_propagation`, so neither the menu nor AppKit's own ⌃⌘F item fires.
+- **Key release (amends `ARCH-026`):**
+  - AppKit sends no key-up while ⌘ is held. When ⌘ lifts, every key the ledger still holds is checked against the real HID key state (`CGEventSourceKeyState`) and released if it's up; keys still physically down stay held.
+- **QA:**
+  - A GPUI test window with the shipped key bindings, plus the real transport against a fake WebSocket server, showed:
+    - chords skip their actions and arrive as Ctrl
+    - ⌘Q stays local, and ⌘O/⌘L still work in the Library
+    - the letter's `ku` comes before Control's
+    - `_stats` ref-counting holds across 41 rapid flips and a reconnect
+  - Not verified (screen locked): the strip's look, clicking through it, full screen, and AppKit's ⌃⌘F item live.
+- **Affected Rust:** `shortcuts.rs` (new), `view/keys.rs`, `view.rs`, `stats.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{stats.rs,controls.rs,session.rs}`, `examples/preview.rs`.
+
+## ARCH-033: Remote Printing Through the macOS Print Dialog (Task H)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-04`.
+- **Process:** plan → design → review (12 required changes) → build → QA (1 medium) → code review (3 medium; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-h-printing`.
+- **Server facts (Selkies 715df7c):**
+  - The server sends text JSON `{"type":"print_document","name","size_bytes"}` to the primary controller, and sends it again after `server_settings`.
+  - `GET /api/print/{name}` deletes the file on a 200 before the body is sent (`transfer.rs:297`), so the fetch is one-shot.
+  - Gated by `printing_enabled` (default on). SealSkin's `harden_container` turns it off.
+- **Decision:**
+  - **Fetch:** each job downloads immediately on Tokio through `SelkiesClient::print_document`.
+    - The local file is created before the GET.
+    - Never `Range`.
+    - 30 s timeouts on the headers and on each chunk.
+    - A 1 GiB cap, checked before the request, on Content-Length, and while streaming. An over-cap announcement shows **Too large** and is never fetched.
+    - A `%PDF-` check as the bytes arrive.
+    - Failures before a 200, including a SealSkin cookie 403, say "Reconnect to receive", because the document is still on the server.
+    - No fetch starts once the window has closed.
+  - **Print…:** the PDFKit print operation runs as a sheet on the session window, from a `cx.spawn` task with no `cx.update` around the AppKit call. It takes the `NSWindow` and checks again before opening that the window is visible, has no sheet, and is key. A damaged or locked PDF shows **Unreadable**, with Open as the main button. `objc2-pdf-kit` 0.3.2 was added; it is the only new crate.
+  - **Notices:** stacked at top right, 340 pt wide, below the ⋯ button or below `ARCH-031`'s strip (`stats::strip_bottom`), with at most three shown. A Ready notice (Print… / Open / Save…) hides after 15 s. A name that failed and is announced again replaces the earlier failed job.
+  - **Printing card:** placed after Clipboard and shown only while `printing_enabled` is on. It holds **Open Print Dialog Automatically** (default on, like the web client's `print_auto`, saved per server through `persist.rs`) and the session's jobs, with Print…, Open, Save… and Remove per row.
+  - **Auto-open:** only when the session window or its sheet is key; otherwise the job waits for the window to become active (up to 5 min) and the notice says so.
+    - PM decision: documents already waiting at connect (announced within 3 s of `server_settings`, aged by `Last-Modified`) each get a notice. Only the newest auto-opens, and only if it is less than 5 minutes old, so a reconnect never brings up a burst of print dialogs.
+  - **Cache** (`~/Library/Caches/SealSkin Native/Print/`):
+    - Remove and window close delete unopened files. A job under an open sheet survives.
+    - Cmd-Q cleans every window's jobs synchronously in `on_app_quit`.
+    - A startup sweep removes anything older than 24 h.
+    - Closing with a sheet up ends the sheet and then removes the window, in one task.
+- **Prior art:** Parallels RAS and Windows App on the Mac open the native print dialog without an extra step.
+- **QA (live, real server):**
+  - `lp` printed through Selkies came back as a PDF. A second fetch got 404.
+  - A file over 1 GiB was listed as Too large and never fetched.
+  - A reconnect with 6 waiting documents auto-opened only the newest fresh one.
+  - The cleanup sweeps work in the real binary, and PDFKit rejects damaged, locked and no-print PDFs.
+  - Not verified (screen locked): the notices, the card, and the print sheet on screen.
+- **Affected Rust:** `print_jobs.rs` (new), `print_dialog.rs` (new), `selkies.rs`, `transport.rs`, `settings.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{session.rs,controls.rs}`, `examples/preview.rs`.
+
+## ARCH-032: Pointer Capture and Gamepads (Task G)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-06`. Custom chords were dropped, following `ARCH-031`.
+- **Process:** plan → design → review (13 required changes) → build (G1 pointer capture, G2 gamepads) → QA (2 medium, 3 low) → code review (4 rounds; one high found in rounds 2 and 3, fixed) by subagents (`ARCH-025`). Branch `task-g-gaming`, merged after Task H.
+- **Protocol (Selkies 715df7c):**
+  - Relative motion is `m2,<dx>,<dy>,<mask>,<magnitude>,<seq>`, integers only, so Skerry carries fractions forward.
+  - Pointer lock is `p,0|1` plus `SET_NATIVE_CURSOR_RENDERING,0|1`.
+  - Gamepads use `js,c,<idx>,<b64 name>,<axes>,<buttons>`, `js,d`, `js,b`/`js,a`, and a `js,h` heartbeat. Mapping follows the W3C standard layout.
+  - Rumble comes back as the system frame `rumble,<slot>,<strong>,<weak>,<ms>`.
+  - Everything is gated by `gamepad_enabled`, read as `{value, locked}`.
+- **Pointer capture (G1):**
+  - **Capture Pointer** lives in the Input card and in the View menu. ⌃⌥⇧Z (Moonlight's chord) captures and releases. It joins `shortcuts::CHORDS` as always-local, and a held chord toggles only once. VMware's ⌃⌘ clashes with ⌃⌘F, and Parallels' ⌃⌥ is a common Linux chord.
+  - **Capturing:**
+    - An app-wide AppKit monitor (`view/capture.rs`, built like `pinch.rs`) sends raw deltas to the input channel as scaled `m2` with carry.
+    - Skerry sends `p,1`, warps the cursor to the picture centre (primary-display flip), drops the first motion after the warp, dissociates the mouse from the cursor, and hides the cursor.
+  - **Releasing:** on the chord, on blur or deactivation, on child windows (including a print sheet, `ARCH-033`), on full screen, on disconnect, and on drop.
+    - Release shows "Pointer released". Errors release with no hint.
+    - Modifiers are lifted before they are muted.
+    - The transport sends `p,0`, `SET_NATIVE_CURSOR_RENDERING,0`, and `js,d` on close, because the server's cursor setting outlives the connection.
+  - Server pointer-lock requests are not honoured: Selkies sends none.
+  - Hint pill: "Pointer captured · ⌃⌥⇧Z releases it" at the bottom centre for 3 s.
+- **Gamepads (G2):**
+  - Apple's GameController framework (`objc2-game-controller` 0.3.2) and CoreHaptics (`objc2-core-haptics` 0.3.2; `createEngineWithLocality` is called through `msg_send!` because the crate gates it to iOS).
+  - **Slots:** an app-wide table gives each pad the lowest free slot 0–3. Drivers are keyed by session (host + session id), because each Selkies session has its own slot table.
+  - **Sending:** only changes are sent, plus `js,h` every 100 ms from the transport.
+    - Pads send only while the session window is key, as in Moonlight. When the window loses key, its slots return to rest.
+    - A window sends `js,d` only for the slots it drove.
+  - **Rumble:** each message starts a fresh haptics player, capped at 5 s. Engines stop with their players, and a start that races a stop is retried once.
+  - **Gamepads card:** four fixed slot rows, each with a numbered badge (Sending / Ready / Not sent), the name, and "· No rumble" when the pad has none. Battery display was cut.
+  - Skerry drives up to four slots; the web client drives one.
+- **Risks recorded:**
+  - Every `p` change makes the server reconfigure its displays.
+  - If the main thread hangs while the pointer is captured, the cursor stays frozen until ⌥⌘Esc.
+  - In collaboration rooms (master token set), the server drops Skerry's `js,` messages (`ARCH-GAP-DC-07`).
+- **QA:**
+  - The app launched with GameController and CoreHaptics loaded and didn't crash.
+  - A fake-server harness confirmed every message, the 100 ms heartbeat, and rumble reaching the haptics path.
+  - Not verified (screen locked, no controller): capture and warp on screen, `kill -9` while captured, real pads and haptics, and the server's display restart.
+- **Affected Rust:** `view/capture.rs` (new), `gamepad/` (new, `native.rs`), `view.rs`, `view/keys.rs`, `transport.rs`, `settings.rs`, `shortcuts.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{controls.rs,session.rs,assets.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
+## ARCH-034: JPEG Stripes as Their Own Images, Presented per Frame (Task I)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-04`. Amends `ARCH-021`: JPEG frames are now presented on the bottom stripe, or after a 2 ms settle, not flushed every 8 ms. Amends `ARCH-003`: the JPEG path no longer composites into a full canvas.
+- **Process:** plan → (no visible UI, so design N/A) → review (8 required changes) → build → QA (3 medium, 1 low, against targets) → fix round → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-i-jpeg`.
+- **Findings:**
+  - Since `ARCH-021`, the whole 11 MB canvas was cloned every 8 ms, and each flush built a new full-size RenderImage. That meant a new Metal texture and an 11 MB upload, even when one stripe changed.
+  - VideoToolbox JPEG decoding is not hardware on Apple Silicon: it moves the work to VTDecoderXPCService. ImageIO was slower than zune-jpeg.
+  - libjpeg-turbo needs cmake, which isn't available.
+- **Decision:**
+  - Each stripe becomes its own RenderImage. Only changed stripes are uploaded, and the canvas buffer is gone.
+  - Decoding: zune-jpeg decodes to RGB with NEON into a reused scratch buffer, then one NEON pass makes BGRA. It compiles only on aarch64, with a scalar fallback elsewhere. Grayscale stripes are accepted.
+  - Each stripe gets one padding row top and bottom, and every edge is snapped to whole device pixels, so there are no seams at any scale.
+  - Replaced stripes are retired with `window.drop_image` 4 paints later, because GPUI does not wait for the GPU (`metal_renderer.rs`). Every exit (resize, codec switch, fallback, stream end, reconnect) goes through the retirer.
+  - **Presentation:** a frame shows as soon as its bottom stripe arrives, since pixelflux sends stripes top to bottom. Otherwise it shows 2 ms after the last stripe, with the timer armed early to absorb tokio's rounding. The pacer resets on hardware frames, codec switch, and resize.
+  - The transport's biased select runs input, gamepad heartbeat, key heartbeat, socket, then settle, so stripes never starve input.
+  - `SKERRY_PRESENT_TRACE=1` logs each present's reason, delay, frame id, and stripe rows.
+- **Measured** (QA's headless harness: the real transport against a fake server replaying real stripes; release builds; excludes GPUI/Metal, so the removed 11 MB texture upload per flush is extra savings on top):
+  - Motion: instructions −27 %, cycles −27 to −30 %, CPU median about 27 % → 17–29 % (noisy).
+  - Typing: cycles −38 %, and last-stripe-to-present p50 1.6 ms against a 0.7–1.9 ms baseline (target ≤ baseline + 1 ms, met).
+  - Footprint 55 MB → 12–35 MB.
+- **Not verified live** (screen locked): real-app CPU, WindowServer and VTDecoder deltas, GPU memory, visual seams and tearing, and the top-to-bottom stripe order on a live server (use the trace).
+- **Affected Rust:** `transport.rs`, `view.rs`, `view/stripes.rs` (new), `Cargo.toml` (zune-jpeg 0.5).
+
+## ARCH-035: Apps Catalog Window; Pelorus Excluded (Task J)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-11`. Closes `ARCH-GAP-DC-13` (Pelorus) as excluded. Amends the index rule that Skerry talks only to SealSkin and Selkies: one keyless catalog fetch from GitHub is allowed.
+- **Process:** plan → design → review (13 required changes) → build → QA (1 high: older Selkies; 1 medium: SVG CPU bombs) → code review (4 rounds; an entity bomb, a marker bomb, an ancestor-class bypass and a `url()` whitespace bypass found and fixed, then a worker process added) by subagents (`ARCH-025`). Branch `task-j-apps`.
+- **Protocol (Selkies 715df7c, c72a9ef7 or newer):**
+  - The client sends `apps,{"op":install|remove|update|launch|list|cancel|clear,...}` on the session WebSocket.
+  - The server replies with the system actions `apps_state` (replaces the state) and `apps_job` (console `append`/`reset`), plus `command_error`.
+  - Gated by `command_enabled`, and hidden by `ui_sidebar_show_apps`.
+  - One shared `system_action` match in the transport routes these and `ARCH-032`'s rumble.
+- **Decision:**
+  - **Window:** one **Apps** window per session, like Files (`ARCH-023`): source list (Installed, All Apps, categories with counts, Activity), a 112×104 icon grid, and a 300 pt detail pane. Installed apps get Open, then Update and Remove…, with a confirm. The pane also has a monospace console with auto-scroll, Copy, and Cancel ("Canceling…", since cancel gets no reply). ⌘⌫ removes.
+  - **Opening:** from a Session Controls header button and View → Apps, with no chord. It stays open across a reconnect, and teardown closes it.
+  - **Support detection:** older Selkies drop the ops silently. Skerry sends `list` once per stream and waits 5 s for `apps_state`. If nothing comes, the button hides, the View item is disabled, and an open window shows "This session's Selkies is too old for the Apps catalog." A late reply re-enables it. There is no old-protocol fallback.
+  - **Catalog:**
+    - From the Selkies web client's GitHub raw URL: a separate HTTP client with no key, cookie or user agent, HTTPS only, at most 3 redirects, size-capped, 5 s timeout. This is the one sanctioned third-party fetch.
+    - Or from the session's local repository (`api/apps/`, with the session cookie), whose generated entries may have no icon, description or category.
+    - YAML is parsed under a budget.
+  - **Icons (untrusted SVG):**
+    - Refused outright: any `<!ENTITY` or internal DTD subset, `<marker>`, CSS escapes and `@import`, and `<use>` or element or depth counts over budget.
+    - Removed rather than refused: filters, so drop shadows are dropped.
+    - Checked: nested mask, clipPath and pattern references are resolved through attributes, `style=` and stylesheet classes on the element and its ancestors. `url()` is read exactly as svgtypes reads it, and anything unreadable counts as a reference.
+    - SVGs up to 1 MiB.
+    - Rasterising runs in a child process (`--skerry-svg-worker`, checked first in `main`). It has RLIMIT_CPU 2 s, a 3 s kill, at most 2 at a time, an empty environment, and only stdin and stdout. Output is size-capped and bounds-checked.
+    - PNG icons are capped at 2048 px and 32 MB.
+    - All 137 real catalog icons decode.
+    - Textures retire through a queue drained in render, with a generation counter (`ARCH-014`).
+- **Pelorus excluded (`DC-13`):** `/pelorus/api/run` is an agent loop of up to 50 steps that clicks, types and can run shell commands, so even a "describe" prompt can change the desktop. The panel is aimed at agents, and it needs a model key that Skerry would have to store. Revisit if VoiceOver-style reading of remote windows becomes a goal.
+- **QA:**
+  - Hostile inputs were refused in 0.03–25 ms.
+  - The GitHub fetch got 161 apps in 218 ms with only `accept` and `host` headers.
+  - The live server runs a Selkies older than c72a9ef7, so install, remove and the job console were not verified live, nor anything on screen (screen locked).
+- **Affected Rust:** `apps.rs` (new), `app/apps_window.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `main.rs`, `crates/skerry-ui/src/{apps.rs,controls.rs,assets.rs}`, `examples/preview.rs`, `tests/fixtures/proot-apps-metadata.yml`.
+
+## ARCH-036: Direct Selkies Servers, with No SealSkin in Front (Task K)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-13`. Amends `ARCH-011`: Selkies credentials may be kept in the same `0600` `config.toml`, never the Keychain. Amends `ARCH-009`: Selkies reports no version, so a capability gate replaces the version check.
+- **Process:** plan → design → review (15 required changes) → build (live against a stock Selkies container) → QA (2 medium, against a local container) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-k-selkies`.
+- **Decision:**
+  - **Connect card:**
+    - A **SealSkin | Selkies** segmented switch. The Selkies side takes the browser link (a `#token=` fragment becomes the token, form-decoded), Username and Password, **Remember on this Mac**, and Recent Servers (up to 5).
+    - Pasting a URL into the key field switches tabs.
+    - Prior art: Windows App splits Add Workspace from Add PC, and Finder ⌘K and Screens use an address plus a login.
+  - **Storage:**
+    - Up to 5 `[[selkies]]` entries in `config.toml` (`url`, `username`, `password`, `token`, `certificate_sha256`), newest first, with a warning comment above them. One connection at a time.
+    - The certificate pin is saved even when Remember is off.
+    - `SKERRY_SELKIES_URL` and `SKERRY_SELKIES_CERT_SHA256` are read for QA and never saved.
+  - **Auth:**
+    - Basic is sent on HTTP requests and on the WebSocket upgrade.
+    - A token goes as Bearer on HTTP, and on the WebSocket as the `selkies.token.` subprotocol plus the `selkies_token` cookie.
+    - No Origin header.
+    - Credentials go only to the configured origin, with redirects off.
+    - A token from a pasted link is dropped when the address changes to another host.
+  - **TLS:**
+    - HTTPS only, plus plain HTTP to loopback. Userinfo is refused, and so is port 0.
+    - The stock container makes its own certificate per install, so it is trusted once by the SHA-256 of the leaf certificate. The Mac's trust store and the hostname are checked first, and the pin is tried only when they fail. Signature checks stay with rustls.
+    - A changed certificate is a hard stop, including on the session socket, with no startup retry.
+    - rustls is ring-only (`default-features = false`, `builder_with_provider`). aws-lc-rs would make the SealSkin tungstenite connector panic, and `cargo tree -i aws-lc-rs` is empty.
+  - **Gate (instead of a version):**
+    - The open `GET /api/status` must report WebSockets mode. A WebRTC-mode server is refused with its own message.
+    - A logged-in `GET /api/sessions` must answer 200.
+    - `GET /api/tokens` tells secure mode apart, and a token is checked on its own with Bearer.
+    - 401 bodies tell "needs password", "wrong password" and "needs token" apart.
+    - A bad token shows up as Close 4001 after the upgrade, and is fatal, never retried.
+  - **Library:**
+    - One Desktop card (thumbnail from `api/screenshot`, login, an "n other pages connected" line, Files, and Open).
+    - A server menu replaces the account menu: Address, Login, Security, Mode, Open in Browser (hidden for token-only servers), Disconnect, and Forget This Server… with a confirmation.
+    - There is no catalog, launch, Stop, account, or Delete in Files (`ARCH-024`).
+    - Stream, audio, clipboard, gamepads, printing, Files and Apps all work.
+    - Connecting to Selkies clears SealSkin recovery, pending saves, and queued opens. A Refresh that fails on the network keeps the Library.
+- **QA (live):** run against `selkies/desktop:latest-ubuntu26.04` on a remote host by the builder, and against a local Selkies 2.2.1 by QA. Basic login, Files, first-trust pin, pin mismatch after the container was recreated, wrong password, needs-token, bad token (no loop), WebRTC refused, and the `config.toml` rules all passed. No request reached another origin under redirects. Not verified: anything on screen (screen locked), and plain-HTTP localhost.
+- **Affected Rust:** `tls.rs` (new), `config_store.rs` (moved out of `sealskin.rs`), `direct.rs`, `app/selkies_home.rs`, `selkies.rs`, `transport.rs`, `persist.rs`, `app.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{connect.rs,selkies.rs,library.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
+## ARCH-038: Microphone and Camera Uplinks (Tasks M1 and M2)
+
+- **Status:** settled 2026-11-22: the microphone (M1) and then the camera (M2). This settles `ARCH-GAP-DC-05`. Echo cancellation is deferred, as `ARCH-GAP-DC-16`.
+- **Process:** plan → design → review (which cut echo cancellation and split the camera off) → build → QA (1 high, 1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-m-mic`.
+- **Protocol (Selkies 715df7c):**
+  - Binary `0x02` plus one Opus packet: mono, 24 kHz, 20 ms.
+  - The server sends `MICROPHONE_DISABLED` and `CAPTURE_DEMAND microphone <0|1>`.
+  - Settings: `microphone_enabled` and `microphone_on_start` (true, false, or demand). "Not enabled but not locked" still allows the mic, as in the web client.
+- **Decision:**
+  - **Encoding:** macOS's own AudioToolbox Opus encoder (streaming `AudioConverterFillComplexBuffer` with a private "no data yet" status and per-packet descriptions), 32 kbps. It resamples and downmixes in the same step. No C library is added; the bindings would need cmake.
+  - **Capture thread:** a per-session `skerry-mic` thread, following `ARCH-030`'s model. It exists only from a granted Start to Stop and opens the cpal device by UID.
+  - **Device list:** comes from plain CoreAudio properties (`input_devices.rs`). Nothing touches the microphone or triggers a macOS privacy request before capture is asked for and granted.
+  - **Starting:** on `on_start` true, on `CAPTURE_DEMAND`, or on the person's switch.
+    - PM decision: a mic the server locks on starts like `on_start` (after permission), with the switch shown on and disabled.
+    - The start policy runs only on the first `server_settings`.
+    - Late permission answers are ignored.
+    - PM decision: after a lock or `MICROPHONE_DISABLED`, the person's earlier "on" is not restored (the safe direction).
+  - **Stopping:** one `stop()` runs on every stream end: Error, StartupTimeout, `end_stream` (Reconnect, close, disconnect), teardown, and quit.
+    - The thread also stops itself when its sink closes, or when its frame channel stays full for 2 s.
+    - A blocked thread is detached, never stacked.
+    - A 10 s silence from the server (no message or pong) ends the stream, so a dead network can't keep the mic open.
+  - **UI:**
+    - A **Microphone & Camera** card after Audio, with a switch, a picker, a 5-segment level meter, the locked and denied states, and Open Privacy Settings.
+    - An in-window badge (left 12, top 48/52/88, with no hitbox) shows while the device is open.
+    - `NSMicrophoneUsageDescription` is in the bundle, and `bundle.sh` fails if the key is missing.
+  - **Echo cancellation deferred (`ARCH-GAP-DC-16`):** VoiceProcessingIO would have to take over playback on the `ARCH-030` thread, losing its health checks, device-return swap and default-following, and its spike could pass falsely.
+- **QA (fake-server harness, real AudioToolbox):**
+  - `0x02` frames decode as 24 kHz mono, 480 samples, 53–123 B, and none are sent before ready.
+  - `on_start`, demand, `MICROPHONE_DISABLED`, and locks all behave.
+  - Every stream end closes the stream and ends `skerry-mic`, and 15 cycles leaked no threads.
+  - Connecting causes no microphone privacy request (`preflight=true` only).
+  - Not verified: real capture and the menu-bar indicator (permission was undetermined with the screen locked), the card on screen, a real Selkies with the mic enabled, and macOS 13 (Opus encoder availability). The encoder emits Hybrid TOC `0x68`.
+- **Camera (M2; branch `task-m-camera`):** QA found 1 medium issue (keyframe size against input latency). Code review took 3 rounds and returned MERGE.
+  - **Protocol:** binary `0x06`, then codec `0x01` (H.264), then a flags byte, then Annex B. The server sends `WEBCAM_KEYFRAME`, `WEBCAM_DISABLED`, and `CAPTURE_DEMAND webcam`. The settings `webcam_enabled` and `webcam_on_start` work like the microphone's.
+  - **Capture:** AVFoundation (`objc2-av-foundation`) feeds NV12 frames zero-copy into a hardware VideoToolbox H.264 encoder (Constrained Baseline) on a per-session `skerry-camera` thread.
+    - The compression session is owned and invalidated on the capture delegate queue.
+    - A keyframe goes out every 4 s, on request, and after drops. Forced keyframes are capped at one per 500 ms, wait while one is unsent, and double their gap on repeats.
+    - Cameras are listed and opened only after authorisation.
+    - The macOS 14 device types (External, Continuity Camera) are looked up at runtime, so the app still launches on macOS 13. `bundle.sh` fails on any `AVCaptureDeviceType` symbol import.
+    - `NSCameraUsageDescription` and `NSCameraUseContinuityCameraDeviceType` are in the bundle.
+  - **Socket writer (`socket_writer.rs`, inside `ARCH-039`'s `Wire`):**
+    - Text commands and mic frames go first. Camera frames go through a slot that waits while the kernel holds unsent bytes.
+    - PM decision: input latency wins over camera quality. A WebSocket message can't be interleaved, so camera frames are kept small.
+    - It starts at 640×480 or smaller and 500 kbps, capped at 1.5 Mbps.
+    - The rate adapts to the measured backlog that hasn't been sent yet (the send buffer beyond min(cwnd, send window), plus srtt above its minimum, from `TCP_CONNECTION_INFO`), so round-trip time isn't read as congestion.
+    - Frames are capped at 1/8 s of the link. An oversized keyframe is dropped, the bitrate halves, and no P frame goes out until the next keyframe.
+    - Bounded queues (10 mic frames, 6 camera frames) keep the 2 s stall stop working.
+    - Mic and camera frames go only on the primary display.
+  - **Also fixed:** a Start that lands while the old thread is still exiting is retried from the 1 s ticker.
+  - **Measured (modelled uplink, 60–120 KB keyframes):**
+    - 1 Mbps: `kd` p95 under 87 ms.
+    - 1 Mbps with 150 ms RTT: p95 56–89 ms beyond the one-way delay.
+    - 3 Mbps: P frames keep flowing.
+    - 10 Mbps with 150 ms RTT: climbs to the 1.5 Mbps cap.
+  - **QA:** a synthetic NV12 source ran through the real encoder and transport. Frames were well formed with an IDR first, and the keyframe-request storm was capped. Every stream end stopped `skerry-camera` within 50 ms, 15 cycles leaked no threads, Display 2 got no `0x06` frames, and connecting with `on_start` false caused no camera privacy request.
+  - **Not verified:** a real camera and the green menu-bar light, a real throttled link, a real Selkies server with the webcam enabled, and macOS 13 launch.
+- **Affected Rust:** `capture.rs`, `microphone.rs`, `permissions.rs`, `input_devices.rs`, `app/media_capture.rs` (all new), `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `crates/skerry-ui/src/{controls.rs,session.rs}`, `scripts/bundle.sh`, `Cargo.toml` (`objc2-av-foundation`).
+
+## ARCH-037: Storage Window for SealSkin Homes and Shared Files (Task L1; public links deferred)
+
+- **Status:** L1 settled 2026-11-22. `ARCH-GAP-LS-05` stays open only for public share links (L2), now tracked as `ARCH-GAP-LS-14`.
+- **Process:** plan → design → review (17 required changes) → build → QA (1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-l-storage`.
+- **Server facts (SealSkin 0.5.0):**
+  - There is no search route, so Skerry filters the folder shown, as the web UI does.
+  - Transfers are 2 MiB base64 chunks, and uploads never overwrite.
+  - `launch/file_path` opens only top-level Shared Files (`_sealskin_shared_files`) and refuses Cleanroom.
+  - `DELETE /homedirs/_sealskin_shared_files` would wipe Shared Files.
+  - A bad home name answers 409, not 422.
+  - There is no upload-abort route, so a cancelled upload holds one of the 16 upload slots for 24 h.
+- **Decision:**
+  - **Window:** one **Storage** window per SealSkin server, hidden for direct Selkies servers (`ARCH-036`). It opens from a Library header button, **Manage Storage…** in the account menu, or Window → Storage ⇧⌘I (Library only).
+    - The sidebar shows Shared Files, Homes, App Homes (with the `auto-` prefix hidden), and a quota meter.
+    - The right side is the session Files pane, with its I/O behind `FilesBackend` (Selkies or SealSkin storage), so transfers, Quick Look, drags and ⌘C carry over.
+    - The pane stays out of `OpenWindows.files`, and the window closes on Sign Out.
+  - **Safety:**
+    - No DELETE is ever sent for Shared Files or Cleanroom (names compared ignoring case, refused before any request).
+    - Delete Home re-reads sessions and transfers both before and after the confirm, counting meta-app and in-flight launch homes, and refuses while a session uses the home.
+    - Uploads into a home's `/Desktop/files` go to Shared Files, and mkdir there is refused.
+    - Storage 403s (quota, storage off) never turn uploads off.
+  - **Transfers:**
+    - Streamed in chunks of at most 2 MiB. A retried upload finalize carries `X-Idempotency-Key = upload_id`.
+    - A download cut off mid-body is treated as a network error and resumes.
+    - A kept partial resumes only when its `com.skerry.partial` xattr (home, path, size, server mtime) matches the listing, and the final size is checked.
+    - A folder whose listing is truncated (over 10,000 entries) fails rather than downloading part of it.
+  - **Open in…:** Shared Files top level only, through `ARCH-028`'s chooser and Launch Dialog. It offers only apps with `home_directories`, or meta apps, then calls `launch/file_path` with a `launch_id` (`ARCH-027`).
+  - **Public links (L2) deferred (`ARCH-GAP-LS-14`):** split off at review to keep L1 reviewable. A link would serve a copy of the file as it was when made, with password, expiry and revoke, where the server permits.
+- **QA (live, harness):**
+  - A QA home was created, filled and deleted.
+  - Uploads: 2.6 MB in 0.48 s and 200 MB in 29.9 s (debug build), plus a nested folder, and cancel followed by upload.
+  - Downloads ran at 21.5 MB/s with matching md5.
+  - Quota matched `admin/status?storage=1`.
+  - Open in… a PDF reached the session's `Desktop/files`.
+  - Delete Home was refused while a session ran on the home.
+  - A 571-request log had no Shared Files DELETE.
+  - The session Files window still uploads and downloads (md5 checked).
+  - Not verified: anything on screen.
+- **Affected Rust:** `storage.rs`, `app/files_backend.rs`, `app/storage_window.rs` (new), `sealskin.rs`, `app/files_window.rs`, `app/account.rs`, `app.rs`, `crates/skerry-ui/src/{storage.rs,files.rs,library.rs,account.rs}`, `examples/preview.rs`.
+
+## ARCH-039: Second Display Window (Task N)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-01`. Amends `ARCH-022`: Skerry now opens a second connection to a session, for its `display2` only. Cross-window drag is deferred as `ARCH-GAP-VS-07`.
+- **Process:** plan → design → review (12 required changes; drag deferred) → build → QA (1 medium) → code review (2 rounds, MERGE; merged after K, M1 and L1) by subagents (`ARCH-025`). Branch `task-n-display2`.
+- **Protocol (Selkies 715df7c):**
+  - A second `/api/websockets` connection claims `displayId:"display2"` with `displayPosition` in its first `SETTINGS`, and resizes are `r,WxH,display2`. Layout arrives in `DISPLAY_CONFIG_UPDATE`.
+  - Any `SETTINGS` without `displayId` counts as the primary (`protocol.rs:280`, `handler.rs:779`), so one unstamped message from Display 2 would kill the main stream. The web client has this bug itself.
+  - `KILL <reason>` comes with close code 1008. Gated by `second_screen`.
+  - The server adds each display's offset to input. Display 2 gets no audio or stats, but it does get the print replay on connect.
+- **Decision:**
+  - **Transport:** `transport::run` gets a role (primary or secondary) instead of being forked, and is split into connect plus `stream()`.
+    - Every outgoing frame goes through `transport/role.rs::Wire`. On Display 2 its only text send stamps, and overwrites, `displayId`, so a raw send doesn't compile. `send_binary` sends only on the primary (mic, `ARCH-038`).
+    - The primary's bytes on the wire are unchanged.
+  - **What Display 2 drops:** print events, audio and audio bitrate, stats, colour scheme, DPI, `js,`, mic, and incoming clipboard. Audio, stats, gamepad, print, file and Apps events never reach its window. It has no stats strip, print notices, capture hint or drop target.
+  - **Window:** "{App} — Display 2", opened from **Add Screen +** in the Screen card or View → Second Display, shown when `second_screen` is true.
+    - Placement follows the web dashboard's `addScreen`, using `CGDisplayBounds`, because GPUI display origins are always zero. With exactly one Mac display beside the session window, Display 2 opens there. Otherwise a side picker (Left, Right, Above, Below, with a diagram) asks.
+    - Full screen is ⌃⌘F on whichever display it's on.
+  - **Lifecycle:**
+    - Display 2 resumes on the primary's first picture, including when `second_screen` becomes true later.
+    - It goes to Waiting when the primary errors, is killed, or reconnects.
+    - It closes with the primary, releasing keys and dropping its stream first, and ignores late events by generation.
+    - Each stream has its own 10 s silence timeout.
+    - On direct Selkies servers it uses the primary's `SessionTarget` (`ARCH-036`).
+  - **KILL:** "Display 2 isn't available. {reason}" with Try Again and Close. A takeover of the primary reads "This session was opened somewhere else."
+  - Pointer capture hands off to the primary. Gamepads stay on the primary's stream, with a 120 ms focus hand-off.
+- **QA (live, `sealskin.kebot.me`, real transport, primary plus Display 2):**
+  - Both streamed, with Display 2 placed at x=1024.
+  - Every `SETTINGS` Display 2 sent carried `displayId` (resize, HiDPI, codec, position), and the primary was never killed.
+  - Takeovers gave Superseded, and Display 2 resumed after the primary reconnected. Key releases went out before close, and no print, file or audio events reached Display 2.
+  - SealSkin's proxy accepts the second WebSocket (R10).
+  - Not verified: the GUI, placement across two Mac displays, and a server refusal.
+- **Affected Rust:** `transport/role.rs` (new), `transport.rs`, `app/second_display.rs` (new), `app/session_window.rs`, `app/display.rs`, `app.rs`, `crates/skerry-ui/src/{session.rs,controls.rs,components.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
 
 | ID | Owning Contract | Concept | Status | Summary |
 |---|---|---|---|---|
-| `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | unresolved (backlog) | Open a second remote display in its own GPUI window following server display placement while primary session owns audio. |
-| `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
-| `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
-| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | partially settled (`ARCH-013`, `ARCH-016`) | Settled: storage (Auto/Cleanroom/named homes), GPU, VPN, language, timezone, Wayland, collaborative, remembered options, Copy link options. Open: startup progress stages and one-click remembered launch. |
-| `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | partially settled (`ARCH-013`) | Settled: thumbnails and confirmed Stop. Open: Send File. |
-| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
-| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | partially settled (`ARCH-013`, `ARCH-016`) | Settled: search (apps + sessions), app icons, category filters, per-app launch preferences. Open: recents, favorites, hidden apps, and matching running-session reuse. |
-| `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
-| `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
-| `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
+| `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | settled (`ARCH-039`) | A Display 2 window on a stamped second connection, with no audio, placed beside the session window. |
+| `ARCH-GAP-VS-07` | `video-and-screen` | `cross-display-drag` | deferred (`ARCH-039`) | Map a drag that crosses from one display window into the other. |
+| `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | deferred (`ARCH-025`) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
+| `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | deferred (`ARCH-025`) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
+| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Launch options, plus staged progress via `launch_id`, idempotent retries, timeout recovery, and one-click remembered launch. |
+| `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | settled (`ARCH-013`, `ARCH-028`) | Thumbnails, confirmed Stop, and a Files button that opens a session's Files window with no stream. |
+| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | settled (`ARCH-028`) | Omnibar link chooser, ⌘O/⌘L, drops, Finder Open With and Dock, `skerry:` scheme, launch/url, launch/file, open_url. |
+| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Search, icons, categories, favorites, hidden apps, recents (saved per server), and reuse of a matching running session. |
+| `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | settled except links (`ARCH-037`) | Storage window: homes, Shared Files, quota, transfers with resume, and Open in…. |
+| `ARCH-GAP-LS-14` | `launcher-and-sessions` | `public-share-links` | deferred (`ARCH-037`) | Public links with password, expiry and revoke, where the server permits (L2). |
+| `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | settled (`ARCH-029`) | Account menu with limits and meters, plus dormant / revoked / expired / disabled / held key recovery that keeps the old key until a new one connects. |
+| `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | deferred (`ARCH-025`) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
 | `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | settled (`ARCH-022`) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
-| `ARCH-GAP-LS-09` | `launcher-and-sessions` | `native-mac-app-presence` | unresolved (backlog) | Per-app native macOS presence (Dock icon, `Cmd+Tab`, optionally Spotlight); mechanism (`.app` shims vs. helper processes vs. both) and existing-session relaunch behavior deferred to future compose decision. |
+| `ARCH-GAP-LS-09` | `launcher-and-sessions` | `native-mac-app-presence` | deferred (`ARCH-025`) | Per-app native macOS presence (Dock icon, `Cmd+Tab`, optionally Spotlight); mechanism (`.app` shims vs. helper processes vs. both) and existing-session relaunch behavior deferred to future compose decision. |
 | `ARCH-GAP-DC-01` | `desktop-and-collaboration` | `clipboard-sync` | settled (`ARCH-017`) | Bridge Selkies clipboard messages to `NSPasteboard` honoring server direction policy, Unicode, focus changes, and loop prevention. |
 | `ARCH-GAP-DC-02` | `desktop-and-collaboration` | `file-transfers` | settled (`ARCH-023`, `ARCH-024`) | Per-session Files window over Selkies' HTTP file routes: browse, New Folder, upload/download with progress and Cancel, Finder copy/paste and drag-and-drop both ways. |
 | `ARCH-GAP-DC-14` | `desktop-and-collaboration` | `session-file-mount` | future scope | Mount session files in Finder via a File Provider extension, a local WebDAV server, or a local NFS server. |
 | `ARCH-GAP-DC-15` | `desktop-and-collaboration` | `remote-rename-move` | blocked (server) | Delete settled via SealSkin storage (`ARCH-024`); no server offers rename or move, and Cleanroom/direct-Selkies sessions cannot delete. |
-| `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | unresolved (todo) | Output device selection, sample-rate conversion, sleep/wake recovery, and server-allowed audio bitrate controls. |
-| `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | unresolved (todo) | Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference. |
-| `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
-| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
-| `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
+| `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
+| `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
+| `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | settled (`ARCH-038`) | Mic: AudioToolbox Opus `0x02`. Camera: VideoToolbox H.264 `0x06` with adaptive rate. Both are TCC-safe, primary-only, and stop on every stream end. |
+| `ARCH-GAP-DC-16` | `desktop-and-collaboration` | `mic-echo-cancellation` | deferred (`ARCH-038`) | VoiceProcessingIO would have to own playback, which breaks `ARCH-030`'s output thread guarantees. |
+| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
+| `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | deferred (`ARCH-025`) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
-| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
-| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | partially settled (`ARCH-018`) | Settled: web-sidebar cards, dropdowns, sliders, switches. Open: Session Controls forgets section state/scroll; popovers lack shadow; the web's stream-toggle tile row (`ARCH-020`). |
-| `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | unresolved (todo) | Disconnect Server confirmation, wide-window Library density, Refresh/Copy feedback, live "Started … ago". |
-| `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | unresolved (goal) | Connect to a standalone Selkies server with no SealSkin, through `SelkiesClient` alone (`ARCH-024`). |
-| `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | unresolved (todo) | No Bearer key on logo fetches, off-main-thread preference/key writes, fewer per-render clones. |
-| `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | unresolved (needs repro) | Remote start menu opened during a codec switch while focus moved; possible unreleased Cmd/Super. |
+| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | settled (`ARCH-034`) | Per-stripe RenderImages, NEON decode, present on the bottom stripe or after a 2 ms settle; about 27–30 % fewer cycles. |
+| `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | settled except tile row (`ARCH-018`, `ARCH-026`) | Section memory, scroll, and dropdown shadow are settled. The web's stream-toggle tile row is deferred (`ARCH-025`), since every toggle in it is already in Session Controls. |
+| `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | settled (`ARCH-026`) | Sign Out… with confirmation, 1200 pt Library column, success toasts, live "Started … ago". |
+| `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | settled (`ARCH-036`) | Connect to a standalone Selkies server: Basic or token login, a pinned self-signed certificate, up to 5 servers in `config.toml`, and a Desktop card. |
+| `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | settled (`ARCH-026`) | Key only on `/companion/api/`, single FIFO write queue off the main thread, cached Library items. |
+| `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | settled client-side (`ARCH-026`) | Key releases are sent before the socket closes; no `kr`; `KeyLedger`. A live input trace is still to be taken. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
-| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | unresolved (backlog) | The web's "Show over the stream" strip (status marks, fps, video rate vs target, capture-to-sent, RTT over the picture, no pointer input) and its compact/detailed floating gauges (FPS, Mbps, RTT, CPU, GPU, MEM, VRAM half-circles) (`ARCH-020`). |
-| `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | unresolved (backlog) | The web's Apps panel: proot-apps catalog by category with search, install/remove/update/launch and job consoles, gated by the server's `command_enabled` (`ARCH-020`). |
-| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | unresolved (backlog) | A Shortcuts panel listing Skerry's own chords (`cmd-shift-m`, full screen, and any gaming-mode / pointer-lock chord from `ARCH-GAP-DC-06`) with a switch that hands them to the remote session instead, as the web's "Shortcuts active" (`ARCH-020`). |
-| `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | unresolved (backlog) | The web's Pelorus panel: a prompt against the server's `/pelorus/api`, which describes the desktop as text for a caller without vision; evaluate whether Skerry should surface it (`ARCH-020`). |
+| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | settled (`ARCH-031`) | The web's over-the-stream strip, with no hitbox and saved per server; the floating gauges were not built. |
+| `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | settled (`ARCH-035`) | An Apps window per session over `apps,{op}`. Support is detected, the GitHub catalog is fetched with no credentials, and icons are rasterised in a sandboxed worker process. |
+| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
+| `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | excluded (`ARCH-035`) | An agent loop that can act on the desktop and needs a model key; not surfaced to people. |

@@ -1,9 +1,11 @@
+use crate::library::OpeningKind;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     label::Label,
     select::{SearchableVec, Select, SelectItem, SelectState},
-    Disableable as _, IconName, IndexPath, Sizable as _, StyledExt as _, Theme,
+    Disableable as _, Icon, IconName, IndexPath, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
     div, img, prelude::*, px, rgb, rgba, App, Div, Entity, FontWeight, ObjectFit, RenderImage,
@@ -57,11 +59,35 @@ pub struct LaunchDialogProps {
     pub wayland: bool,
     pub busy: bool,
     pub show_copy_link: bool,
-    /// Shows Favorite / Hide. Off until those choices are saved anywhere (ARCH-GAP-LS-04),
-    /// so the dialog never offers a control that does nothing.
+    /// Shows Favorite / Hide, saved per server (`ARCH-027`). Off only in the preview's
+    /// Minimal story.
     pub show_organize: bool,
     /// The deep link was just copied; the Copy button confirms it in place.
     pub link_copied: bool,
+    /// A running session these options would duplicate: the footer offers to open it.
+    pub running_match: Option<RunningMatch>,
+    /// The Launch & Open variant: the link or file this launch opens (`ARCH-028`). Copy link
+    /// and the running-session footer hide, since neither carries it.
+    pub opening: Option<OpeningLabel>,
+}
+
+/// What a Launch & Open dialog opens, as its context strip shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpeningLabel {
+    pub kind: OpeningKind,
+    /// The link's label (the real host first) or the file name.
+    pub label: String,
+    /// "PDF · 2.4 MB" (files only).
+    pub detail: Option<String>,
+    /// The full address or path.
+    pub tooltip: Option<String>,
+}
+
+/// The running session the dialog's storage and room flag match (`ARCH-027`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningMatch {
+    /// Lowercase, as it follows a "·": "started 12m ago".
+    pub started_label: Option<String>,
 }
 
 /// The items behind one Launch Dialog dropdown; searchable so long lists (languages) filter as you type.
@@ -147,7 +173,10 @@ pub enum LaunchDialogAction {
     SetCollaborative(bool),
     SetWayland(bool),
     CopyLink,
+    /// Launch (or, with a running match, Launch New).
     Launch,
+    /// Open the matching running session instead of launching.
+    OpenRunning,
 }
 
 /// Renders the Launch Application dialog centered over a dimmed modal backdrop.
@@ -232,10 +261,17 @@ pub fn render_card(
                 .child(icon_view)
                 .child(
                     div()
-                        .text_lg()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .truncate()
-                        .child(props.app_name.clone()),
+                        .v_flex()
+                        .gap_0p5()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .truncate()
+                                .child(props.app_name.clone()),
+                        )
+                        .children(subtitle(theme, props)),
                 ),
         )
         .child(
@@ -245,40 +281,33 @@ pub fn render_card(
                 .gap_2()
                 .flex_none()
                 .when(props.show_organize, |row| {
-                    row.child({
-                        let mut btn = Button::new("launch-favorite")
+                    // Toggle buttons: the icon stays, the fill (or the gold star) shows
+                    // the state.
+                    row.child(
+                        Button::new("launch-favorite")
                             .small()
+                            .outline()
                             .icon(if props.favorite {
-                                IconName::StarFill
+                                Icon::new(IconName::StarFill).text_color(theme.warning)
                             } else {
-                                IconName::Star
+                                Icon::new(IconName::Star)
                             })
                             .tooltip(if props.favorite {
-                                "Remove Favorite"
+                                "Remove from Favorites"
                             } else {
-                                "Add Favorite"
+                                "Add to Favorites"
                             })
                             .disabled(!enabled)
                             .on_click(move |_, window, cx| {
                                 on_fav(LaunchDialogAction::ToggleFavorite, window, cx)
-                            });
-                        if props.favorite {
-                            btn = btn.primary();
-                        } else {
-                            btn = btn.outline();
-                        }
-                        btn
-                    })
+                            }),
+                    )
                 })
                 .when(props.show_organize, |row| {
                     row.child({
                         let mut btn = Button::new("launch-hide")
                             .small()
-                            .icon(if props.hidden {
-                                IconName::Eye
-                            } else {
-                                IconName::EyeOff
-                            })
+                            .icon(IconName::EyeOff)
                             .tooltip(if props.hidden {
                                 "Show in Library"
                             } else {
@@ -314,6 +343,9 @@ pub fn render_card(
         .p_5()
         .v_flex()
         .gap_4()
+        .when_some(props.opening.as_ref(), |body, opening| {
+            body.child(opening_strip(theme, opening))
+        })
         .when_some(selects.storage.as_ref(), |body, state| {
             body.child(select_field(theme, "Storage", state, enabled))
         })
@@ -344,14 +376,27 @@ pub fn render_card(
                 .pt_1()
                 .v_flex()
                 .gap_3()
-                .child(
-                    Checkbox::new("launch-collaborative")
-                        .label("Collaborative Session")
-                        .checked(props.collaborative)
-                        .disabled(!enabled)
-                        .on_click(move |checked, window, cx| {
-                            on_collab(LaunchDialogAction::SetCollaborative(*checked), window, cx)
-                        }),
+                // `launch/file_path` has no room flag (`ARCH-037`).
+                .when(
+                    props
+                        .opening
+                        .as_ref()
+                        .is_none_or(|opening| opening.kind != OpeningKind::Stored),
+                    |column| {
+                        column.child(
+                            Checkbox::new("launch-collaborative")
+                                .label("Collaborative Session")
+                                .checked(props.collaborative)
+                                .disabled(!enabled)
+                                .on_click(move |checked, window, cx| {
+                                    on_collab(
+                                        LaunchDialogAction::SetCollaborative(*checked),
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        )
+                    },
                 )
                 .child(
                     Checkbox::new("launch-wayland")
@@ -366,6 +411,21 @@ pub fn render_card(
 
     let on_copy = Rc::clone(&on_action);
     let on_launch = Rc::clone(&on_action);
+    let on_open = Rc::clone(&on_action);
+    let on_launch_new = Rc::clone(&on_action);
+    let opening = props.opening.is_some();
+    let running = props.running_match.is_some() && !opening;
+    let show_copy_link = props.show_copy_link && !opening;
+    let launch_label = match (props.busy, opening) {
+        (true, _) => "Launching…",
+        (false, true) => "Launch & Open",
+        (false, false) => "Launch",
+    };
+    let copy_label = if props.link_copied {
+        "Copied"
+    } else {
+        "Copy link"
+    };
     let footer = div()
         .px_5()
         .py_4()
@@ -374,39 +434,64 @@ pub fn render_card(
         .h_flex()
         .items_center()
         .gap_3()
-        .when(props.show_copy_link, |footer| {
-            footer.child(
-                Button::new("launch-copy-link")
-                    .outline()
-                    .icon(if props.link_copied {
-                        IconName::Check
-                    } else {
-                        IconName::Copy
-                    })
-                    .label(if props.link_copied {
-                        "Copied"
-                    } else {
-                        "Copy link"
-                    })
-                    .disabled(!enabled)
-                    .on_click(move |_, window, cx| {
-                        on_copy(LaunchDialogAction::CopyLink, window, cx)
-                    }),
-            )
+        .when(show_copy_link, |footer| {
+            let copy = Button::new("launch-copy-link")
+                .outline()
+                .icon(if props.link_copied {
+                    IconName::Check
+                } else {
+                    IconName::Copy
+                })
+                .disabled(!enabled)
+                .on_click(move |_, window, cx| on_copy(LaunchDialogAction::CopyLink, window, cx));
+            // Three labelled buttons don't fit 420 pt; Copy link gives up its label.
+            footer.child(if running {
+                copy.tooltip(copy_label)
+            } else {
+                copy.label(copy_label)
+            })
         })
-        .child(
-            div().flex_1().child(
-                Button::new("launch-submit")
-                    .primary()
-                    .w_full()
-                    .icon(IconName::Play)
-                    .label(if props.busy { "Launching…" } else { "Launch" })
-                    .disabled(!enabled)
-                    .on_click(move |_, window, cx| {
-                        on_launch(LaunchDialogAction::Launch, window, cx)
-                    }),
-            ),
-        );
+        .when(running, |footer| {
+            footer
+                .child(
+                    Button::new("launch-new")
+                        .outline()
+                        .icon(IconName::Play)
+                        .label("Launch New")
+                        .disabled(!enabled)
+                        .on_click(move |_, window, cx| {
+                            on_launch_new(LaunchDialogAction::Launch, window, cx)
+                        }),
+                )
+                .child(
+                    div().flex_1().child(
+                        Button::new("launch-open-running")
+                            .primary()
+                            .w_full()
+                            .icon(IconName::ExternalLink)
+                            .label("Open Running Session")
+                            .disabled(!enabled)
+                            .on_click(move |_, window, cx| {
+                                on_open(LaunchDialogAction::OpenRunning, window, cx)
+                            }),
+                    ),
+                )
+        })
+        .when(!running, |footer| {
+            footer.child(
+                div().flex_1().child(
+                    Button::new("launch-submit")
+                        .primary()
+                        .w_full()
+                        .icon(IconName::Play)
+                        .label(launch_label)
+                        .disabled(!enabled)
+                        .on_click(move |_, window, cx| {
+                            on_launch(LaunchDialogAction::Launch, window, cx)
+                        }),
+                ),
+            )
+        });
 
     div()
         .id("launch-dialog-card")
@@ -422,6 +507,95 @@ pub fn render_card(
         .child(header)
         .child(body)
         .child(footer)
+}
+
+/// "Opens “report.pdf”" or "Opens wiki.lan/page", above the fields.
+fn opening_strip(theme: &Theme, opening: &OpeningLabel) -> gpui_kit::Stateful<Div> {
+    let icon = match opening.kind {
+        OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
+        OpeningKind::File => Icon::new(IconName::FileText),
+        OpeningKind::Stored => Icon::new(gpui_kit::assets::IconName::FolderHeart),
+    };
+    let name = match opening.kind {
+        OpeningKind::File => format!("“{}”", opening.label),
+        OpeningKind::Stored => format!("“{}” from Shared Files", opening.label),
+        OpeningKind::Link => opening.label.clone(),
+    };
+    let tooltip = opening.tooltip.clone();
+    div()
+        .id("launch-opening")
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .text_sm()
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.muted_foreground)
+                .child(icon.with_size(px(16.))),
+        )
+        .child(div().flex_none().child("Opens"))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(name),
+        )
+        .when_some(opening.detail.clone(), |strip, detail| {
+            strip.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+        })
+        .when_some(tooltip, |strip, tooltip| {
+            strip.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        })
+}
+
+/// The line under the app name: the running match, or that the app is hidden.
+fn subtitle(theme: &Theme, props: &LaunchDialogProps) -> Option<Div> {
+    let line = div()
+        .h_flex()
+        .items_center()
+        .gap_1p5()
+        .min_w_0()
+        .text_xs()
+        .text_color(theme.muted_foreground);
+    if let Some(running) = &props.running_match {
+        let mut text = if props.collaborative {
+            "A collaborative session is already running with this storage".to_string()
+        } else {
+            "Already running with this storage".to_string()
+        };
+        if let Some(started) = &running.started_label {
+            text.push_str(" · ");
+            text.push_str(started);
+        }
+        return Some(
+            line.child(
+                div()
+                    .size(px(6.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme.success),
+            )
+            .child(div().min_w_0().truncate().child(text)),
+        );
+    }
+    props
+        .hidden
+        .then(|| line.child(div().truncate().child("Hidden from Library")))
 }
 
 fn field_label(theme: &Theme, label: &'static str) -> Div {

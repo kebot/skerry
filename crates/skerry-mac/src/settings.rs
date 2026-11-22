@@ -1,6 +1,7 @@
 use crate::clipboard::ClipboardSettings;
 use crate::input::InputSettings;
 use crate::launch_options::LaunchMemory;
+use crate::shortcuts::ShortcutPolicy;
 use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -88,6 +89,15 @@ pub struct Control {
 pub struct Settings {
     controls: BTreeMap<Key, Control>,
     pub codecs: Vec<Codec>,
+    /// The server's audio bitrate choices; `None` when it doesn't expose them.
+    pub audio_bitrate: Option<AudioBitrate>,
+    /// The server's `keyboard_shortcuts` (`ARCH-031`).
+    pub keyboard_shortcuts: ShortcutPolicy,
+    /// The server's gamepad settings (`ARCH-032`).
+    pub gamepad: crate::gamepad::GamepadPolicy,
+    /// `second_screen.value`: whether this session allows Display 2 now (`ARCH-039`).
+    /// `None` when the server doesn't say.
+    pub second_screen: Option<bool>,
 }
 
 impl Default for Settings {
@@ -98,6 +108,10 @@ impl Default for Settings {
                 .into_iter()
                 .filter(|codec| codec.supported())
                 .collect(),
+            audio_bitrate: None,
+            keyboard_shortcuts: ShortcutPolicy::default(),
+            gamepad: crate::gamepad::GamepadPolicy::default(),
+            second_screen: None,
         }
     }
 }
@@ -137,6 +151,10 @@ impl Settings {
                 self.controls.remove(&key);
             }
         }
+        self.audio_bitrate = AudioBitrate::from_server(&payload[AudioBitrate::WIRE]);
+        self.keyboard_shortcuts = ShortcutPolicy::from_server(payload);
+        self.gamepad = crate::gamepad::GamepadPolicy::from_server(payload);
+        self.second_screen = payload["second_screen"]["value"].as_bool();
     }
 
     pub fn live(&mut self, payload: &Value) {
@@ -144,6 +162,9 @@ impl Settings {
             if let Some(value) = key.read(&payload[key.wire()]) {
                 control.current = value.clamp(control.min, control.max);
             }
+        }
+        if let Some(bitrate) = &mut self.audio_bitrate {
+            bitrate.live(&payload[AudioBitrate::WIRE]);
         }
     }
 
@@ -156,6 +177,71 @@ impl Settings {
             .filter(|control| !control.locked && control.min != control.max)
             .map(|control| value.clamp(control.min, control.max))
     }
+}
+
+/// The server's `audio_bitrate` enum (bps), as the web sidebar's Audio Bitrate reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioBitrate {
+    pub value: u32,
+    /// Ascending, without repeats, always holding `value`.
+    pub choices: Vec<u32>,
+    /// The server locked it.
+    pub locked: bool,
+}
+
+impl AudioBitrate {
+    pub const WIRE: &'static str = "audio_bitrate";
+
+    /// `None` when the entry is absent or has no readable value. `allowed` arrives as
+    /// strings in `server_settings`; numbers are read too.
+    pub fn from_server(entry: &Value) -> Option<Self> {
+        let value = bps(&entry["value"])?;
+        let mut bitrate = Self {
+            value,
+            choices: entry["allowed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(bps)
+                .collect(),
+            locked: entry["locked"] == true,
+        };
+        bitrate.insert(value);
+        Some(bitrate)
+    }
+
+    /// Follows a live value (a number in `display_settings`, a string elsewhere). A value
+    /// outside the list joins it, as Selkies does, rather than being clamped.
+    pub fn live(&mut self, value: &Value) {
+        if let Some(value) = bps(value) {
+            self.value = value;
+            self.insert(value);
+        }
+    }
+
+    /// Whether the person can change it: not locked, and more than one choice.
+    pub fn editable(&self) -> bool {
+        !self.locked && self.choices.len() > 1
+    }
+
+    /// `bps` if it may be requested now: a listed value other than the current one.
+    pub fn request(&self, bps: u32) -> Option<u32> {
+        (self.editable() && bps != self.value && self.choices.contains(&bps)).then_some(bps)
+    }
+
+    fn insert(&mut self, value: u32) {
+        self.choices.push(value);
+        self.choices.sort_unstable();
+        self.choices.dedup();
+    }
+}
+
+fn bps(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+        .and_then(|bps| u32::try_from(bps).ok())
+        .filter(|bps| *bps > 0)
 }
 
 pub fn encoder_allowed(encoder: &Value, name: &str) -> bool {
@@ -268,22 +354,388 @@ impl ScreenPolicy {
 
 pub type VideoSettings = BTreeMap<Key, u32>;
 
-#[derive(Default, Deserialize, Serialize)]
+/// Which Session Controls sections are open. The default matches a fresh panel: Screen open,
+/// the rest closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlsSections {
+    pub input: bool,
+    pub shortcuts: bool,
+    pub gamepads: bool,
+    pub clipboard: bool,
+    pub printing: bool,
+    pub screen: bool,
+    pub video: bool,
+    pub audio: bool,
+    /// Microphone & Camera (`ARCH-038`).
+    pub capture: bool,
+    pub stats: bool,
+}
+
+impl Default for ControlsSections {
+    fn default() -> Self {
+        Self {
+            input: false,
+            shortcuts: false,
+            gamepads: false,
+            clipboard: false,
+            printing: false,
+            screen: true,
+            video: false,
+            audio: false,
+            capture: false,
+            stats: false,
+        }
+    }
+}
+
+impl ControlsSections {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// In Session Controls order: Input, Shortcuts, Gamepads, Clipboard, Printing, Screen,
+    /// Video, Audio, Microphone & Camera, Stats.
+    pub fn to_array(self) -> [bool; 10] {
+        [
+            self.input,
+            self.shortcuts,
+            self.gamepads,
+            self.clipboard,
+            self.printing,
+            self.screen,
+            self.video,
+            self.audio,
+            self.capture,
+            self.stats,
+        ]
+    }
+
+    pub fn from_array(
+        [input, shortcuts, gamepads, clipboard, printing, screen, video, audio, capture, stats]: [bool; 10],
+    ) -> Self {
+        Self {
+            input,
+            shortcuts,
+            gamepads,
+            clipboard,
+            printing,
+            screen,
+            video,
+            audio,
+            capture,
+            stats,
+        }
+    }
+}
+
+/// The most apps the Recent row remembers, as SealSkin's web launcher (`RECENT_MAX`).
+pub const RECENT_MAX: usize = 8;
+/// The most ids one Library list keeps; past it the oldest go first.
+pub const LIST_CAP: usize = 512;
+
+/// How the person organized this server's Library (`ARCH-027`). Kept only here: SealSkin
+/// 0.5 has no per-user API for it, and its web launcher keeps the same lists in the browser.
+/// Ids of apps the server no longer lists stay (an app can come back) and are skipped when
+/// drawing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LibraryOrganization {
+    /// App ids, oldest favorite first.
+    #[serde(
+        default,
+        deserialize_with = "capped_oldest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub favorites: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "capped_oldest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub hidden: Vec<String>,
+    /// App ids, newest launch first, at most [`RECENT_MAX`].
+    #[serde(
+        default,
+        deserialize_with = "capped_newest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub recent: Vec<String>,
+}
+
+/// The ids in a saved list: entries that aren't strings are dropped one by one (a list
+/// that isn't a list reads as empty), and duplicates go.
+fn read_ids<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
+/// Favorites and hidden apps, capped on load at the newest [`LIST_CAP`].
+fn capped_oldest_first<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut ids = read_ids(deserializer)?;
+    if ids.len() > LIST_CAP {
+        ids.drain(..ids.len() - LIST_CAP);
+    }
+    Ok(ids)
+}
+
+/// Recents, capped on load at the newest [`RECENT_MAX`].
+fn capped_newest_first<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut ids = read_ids(deserializer)?;
+    ids.truncate(RECENT_MAX);
+    Ok(ids)
+}
+
+impl LibraryOrganization {
+    pub fn is_empty(&self) -> bool {
+        self.favorites.is_empty() && self.hidden.is_empty() && self.recent.is_empty()
+    }
+
+    pub fn is_favorite(&self, app_id: &str) -> bool {
+        self.favorites.iter().any(|id| id == app_id)
+    }
+
+    pub fn is_hidden(&self, app_id: &str) -> bool {
+        self.hidden.iter().any(|id| id == app_id)
+    }
+
+    /// Adds `app_id` at the end of Favorites, or removes it. Setting, not toggling, so the
+    /// write queue can apply the same change to its copy and to the file.
+    pub fn set_favorite(&mut self, app_id: &str, favorite: bool) {
+        set_member(&mut self.favorites, app_id, favorite);
+    }
+
+    pub fn set_hidden(&mut self, app_id: &str, hidden: bool) {
+        set_member(&mut self.hidden, app_id, hidden);
+    }
+
+    /// Moves `app_id` to the front of Recent, keeping the newest [`RECENT_MAX`].
+    pub fn record_launch(&mut self, app_id: &str) {
+        self.recent.retain(|id| id != app_id);
+        self.recent.insert(0, app_id.to_string());
+        self.recent.truncate(RECENT_MAX);
+    }
+}
+
+/// Adds `app_id` at the end of `list` or removes it, dropping duplicates and, past
+/// [`LIST_CAP`], the oldest ids.
+fn set_member(list: &mut Vec<String>, app_id: &str, member: bool) {
+    let mut seen = std::collections::HashSet::new();
+    list.retain(|id| id != app_id && seen.insert(id.clone()));
+    if member {
+        list.push(app_id.to_string());
+    }
+    if list.len() > LIST_CAP {
+        list.drain(..list.len() - LIST_CAP);
+    }
+}
+
+/// The audio choices saved for a server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioPreferences {
+    /// The chosen output device's raw Core Audio UID (`kAudioDevicePropertyDeviceUID`, not
+    /// cpal's `coreaudio:` form); `None` follows the Mac's default output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+    /// The chosen device's last-seen name, to label it while it isn't connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device_name: Option<String>,
+    /// The audio bitrate (bps) last picked, re-requested when a session starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+    /// The chosen microphone's raw Core Audio UID; `None` follows the Mac's default input
+    /// (`ARCH-038`). Whether the microphone is on is never saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+    /// The chosen microphone's last-seen name, to label it while it isn't connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device_name: Option<String>,
+}
+
+impl AudioPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The camera choice saved for a server (`ARCH-038`). Whether the camera is on is never
+/// saved.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraPreferences {
+    /// The chosen camera's `AVCaptureDevice.uniqueID`; `None` follows the Mac's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// The chosen camera's last-seen name, to label it while it isn't connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+impl CameraPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The Gamepads card's switches, saved for a server (`ARCH-032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadPreferences {
+    /// **Gamepad input** as the person set it; `None` follows `gamepad_on_start`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<bool>,
+    /// **Rumble**; on by default.
+    pub rumble: bool,
+}
+
+impl Default for GamepadPreferences {
+    fn default() -> Self {
+        Self {
+            input: None,
+            rumble: true,
+        }
+    }
+}
+
+impl GamepadPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Remote printing choices for a server (`ARCH-033`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrintingPreferences {
+    /// **Open Print Dialog Automatically**: on, as the web client's `print_auto`.
+    pub auto_print: bool,
+}
+
+impl Default for PrintingPreferences {
+    fn default() -> Self {
+        Self { auto_print: true }
+    }
+}
+
+impl PrintingPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Preferences {
     #[serde(default)]
     pub codec: Codec,
-    #[serde(default, skip_serializing_if = "InputSettings::is_default")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "InputSettings::is_default"
+    )]
     pub input: InputSettings,
-    #[serde(default, skip_serializing_if = "ClipboardSettings::is_default")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "ClipboardSettings::is_default"
+    )]
     pub clipboard: ClipboardSettings,
     /// The Launch Dialog options each app last launched with, by app id.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub launch: BTreeMap<String, LaunchMemory>,
-    #[serde(flatten)]
+    /// Which Session Controls sections were open last on this server.
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "ControlsSections::is_default"
+    )]
+    pub controls: ControlsSections,
+    /// Favorites, hidden apps, and recents (`ARCH-027`); never written while empty.
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "LibraryOrganization::is_empty"
+    )]
+    pub library: LibraryOrganization,
+    #[serde(default, skip_serializing_if = "AudioPreferences::is_default")]
+    pub audio: AudioPreferences,
+    /// The chosen camera (`ARCH-038`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "CameraPreferences::is_default"
+    )]
+    pub camera: CameraPreferences,
+    /// **Mac shortcuts active** as the person set it; `None` follows the server (`ARCH-031`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_shortcuts: Option<bool>,
+    /// **Show over the stream**: the stats strip (`ARCH-031`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stats_strip: bool,
+    /// The Gamepads card's switches (`ARCH-032`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "GamepadPreferences::is_default"
+    )]
+    pub gamepads: GamepadPreferences,
+    /// Remote printing (`ARCH-033`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "PrintingPreferences::is_default"
+    )]
+    pub printing: PrintingPreferences,
+    /// The Apps window's last source-list choice: `"Installed"`, `"All"`, or a category
+    /// (`ARCH-035`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps_category: Option<String>,
+    #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
 
-fn path(server: &str) -> Option<PathBuf> {
+/// Reads the flattened video map, skipping keys this build doesn't know. (Files are read
+/// field by field in `read_file`; this keeps `Preferences`' own `Deserialize` lenient too.)
+fn lenient_video<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<VideoSettings, D::Error> {
+    let raw = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let key = serde_json::from_value::<Key>(Value::String(name)).ok()?;
+            Some((key, serde_json::from_value::<u32>(value).ok()?))
+        })
+        .collect())
+}
+
+/// Reads a field, or its default when the value has another shape (a newer build's, or a
+/// hand edit), so one bad field never fails the whole `Preferences`.
+fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::de::DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
+}
+
+/// Where `server`'s preferences live. Writes go only through `persist::WriteQueue`.
+pub(crate) fn path(server: &str) -> Option<PathBuf> {
     Some(
         PathBuf::from(std::env::var_os("HOME")?)
             .join("Library/Application Support/SealSkin Native")
@@ -291,39 +743,118 @@ fn path(server: &str) -> Option<PathBuf> {
     )
 }
 
-pub fn load(server: &str) -> Preferences {
-    path(server)
-        .map(|path| load_from(&path))
-        .unwrap_or_default()
-}
-
 /// Re-reads the saved preferences, applies `change`, and saves them, so that windows
-/// changing different preferences never overwrite each other's (`ARCH-022`).
-pub fn update(server: &str, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
-    let path = path(server).ok_or_else(|| io::Error::other("Home directory unavailable"))?;
-    update_at(&path, change)
-}
-
-fn update_at(path: &Path, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
-    let mut preferences = load_from(path);
+/// changing different preferences never overwrite each other's (`ARCH-022`). Blocking:
+/// only `persist`'s write queue calls it, so writes never race each other.
+///
+/// Top-level keys this build doesn't know (a newer build's) are written back unchanged. A
+/// file that doesn't parse, or holds a value this build can't read, is first copied to
+/// `<file>.bak-<unix seconds>`, so the defaults that replace the bad values lose nothing.
+pub(crate) fn update_at(path: &Path, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
+    let Loaded {
+        mut preferences,
+        extra,
+        damaged,
+    } = read_file(path);
+    if damaged && path.exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        std::fs::copy(path, format!("{}.bak-{stamp}", path.display()))?;
+    }
     change(&mut preferences);
-    save_to(path, &preferences)
+    let mut saved = match serde_json::to_value(&preferences)? {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    for (name, value) in extra {
+        saved.entry(name).or_insert(value);
+    }
+    save_to(path, &Value::Object(saved))
 }
 
-fn load_from(path: &Path) -> Preferences {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// The saved preferences at `path`; defaults for whatever is missing or unreadable.
+pub(crate) fn load_at(path: &Path) -> Preferences {
+    read_file(path).preferences
 }
 
-fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
+/// A preferences file as this build reads it.
+struct Loaded {
+    preferences: Preferences,
+    /// Top-level keys this build doesn't know, kept to write back.
+    extra: serde_json::Map<String, Value>,
+    /// The file exists but didn't parse, or a value in it couldn't be read.
+    damaged: bool,
+}
+
+/// Reads the file field by field, so one bad value costs only that value.
+fn read_file(path: &Path) -> Loaded {
+    let mut loaded = Loaded {
+        preferences: Preferences::default(),
+        extra: serde_json::Map::new(),
+        damaged: false,
+    };
+    let map = match std::fs::read(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return loaded,
+        Err(_) => None,
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        },
+    };
+    let Some(map) = map else {
+        loaded.damaged = true;
+        return loaded;
+    };
+    let prefs = &mut loaded.preferences;
+    for (name, value) in map {
+        let read = match name.as_str() {
+            "codec" => field(value, &mut prefs.codec),
+            "input" => field(value, &mut prefs.input),
+            "clipboard" => field(value, &mut prefs.clipboard),
+            "launch" => field(value, &mut prefs.launch),
+            "controls" => field(value, &mut prefs.controls),
+            "library" => field(value, &mut prefs.library),
+            "audio" => field(value, &mut prefs.audio),
+            "mac_shortcuts" => field(value, &mut prefs.mac_shortcuts),
+            "stats_strip" => field(value, &mut prefs.stats_strip),
+            "gamepads" => field(value, &mut prefs.gamepads),
+            "printing" => field(value, &mut prefs.printing),
+            "apps_category" => field(value, &mut prefs.apps_category),
+            "camera" => field(value, &mut prefs.camera),
+            _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
+                Ok(key) => serde_json::from_value::<u32>(value)
+                    .map(|number| {
+                        prefs.video.insert(key, number);
+                    })
+                    .is_ok(),
+                Err(_) => {
+                    loaded.extra.insert(name, value);
+                    true
+                }
+            },
+        };
+        loaded.damaged |= !read;
+    }
+    loaded
+}
+
+/// Reads one field into `slot`; `false` (and the default kept) when it can't be read.
+fn field<T: serde::de::DeserializeOwned>(value: Value, slot: &mut T) -> bool {
+    serde_json::from_value(value)
+        .map(|read| *slot = read)
+        .is_ok()
+}
+
+fn save_to(path: &Path, preferences: &Value) -> io::Result<()> {
     let dir = path.parent().expect("preferences directory");
     std::fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer(&mut file, preferences)?;
     file.as_file().sync_all()?;
     file.persist(path)?;
+    // The rename is durable only once the folder is synced.
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -331,6 +862,494 @@ fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn announce_reads_second_screen() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"second_screen": {"value": true}}));
+        assert_eq!(settings.second_screen, Some(true));
+        settings.announce(&json!({"second_screen": {"value": false}}));
+        assert_eq!(settings.second_screen, Some(false));
+    }
+
+    #[test]
+    fn second_screen_absent_reads_none() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({}));
+        assert_eq!(settings.second_screen, None);
+    }
+
+    #[test]
+    fn library_organization_is_absent_from_old_files_and_never_written_empty() {
+        let prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
+        assert!(prefs.library.is_empty());
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert!(saved.get("library").is_none(), "{saved}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.library.set_favorite("zen", true)).unwrap();
+        update_at(&path, |p| p.library.set_favorite("zen", false)).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("library").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn library_organization_round_trips_with_launch_and_video_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"jpeg": 45, "launch": {"zen": {"gpu": "intel-gpu"}}}"#,
+        )
+        .unwrap();
+        update_at(&path, |p| {
+            p.library.set_favorite("zen", true);
+            p.library.set_hidden("krita", true);
+            p.library.record_launch("obsidian");
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.library.favorites, ["zen"]);
+        assert_eq!(saved.library.hidden, ["krita"]);
+        assert_eq!(saved.library.recent, ["obsidian"]);
+        assert!(saved.launch.contains_key("zen"));
+        assert_eq!(saved.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(saved.video.len(), 1);
+        // A clean file leaves no backup.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unknown_top_level_keys_do_not_reset_preferences() {
+        let prefs: Preferences = serde_json::from_value(
+            json!({"codec": "hevc", "jpeg": 45, "sidebar": {"width": 3}, "fps": "fast"}),
+        )
+        .unwrap();
+        assert_eq!(prefs.codec, Codec::Hevc);
+        assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(prefs.video.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_library_entry_costs_only_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"library": {"favorites": ["a", 5, "b", "a"], "hidden": ["z"], "recent": "x"}}"#,
+        )
+        .unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.library.favorites, ["a", "b"]);
+        assert_eq!(loaded.library.hidden, ["z"]);
+        assert!(loaded.library.recent.is_empty());
+    }
+
+    #[test]
+    fn library_lists_are_capped_on_load() {
+        let ids: Vec<String> = (0..600).map(|n| format!("app{n}")).collect();
+        let prefs: Preferences = serde_json::from_value(
+            json!({"library": {"favorites": ids, "hidden": ids, "recent": ids}}),
+        )
+        .unwrap();
+        assert_eq!(prefs.library.favorites.len(), LIST_CAP);
+        assert_eq!(prefs.library.favorites[0], "app88");
+        assert_eq!(prefs.library.hidden.len(), LIST_CAP);
+        assert_eq!(prefs.library.recent, ids[..RECENT_MAX]);
+    }
+
+    #[test]
+    fn a_malformed_library_keeps_every_other_preference() {
+        for library in [json!(5), json!({"favorites": [1]}), json!({"hidden": "x"})] {
+            let raw = json!({"codec": "hevc", "jpeg": 45, "library": library,
+                "launch": {"zen": {"gpu": "intel-gpu"}}, "controls": {"video": true}});
+            let prefs: Preferences = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(prefs.codec, Codec::Hevc);
+            assert!(prefs.library.is_empty());
+            assert!(prefs.launch.contains_key("zen"));
+            assert!(prefs.controls.video);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("server.json");
+            std::fs::write(&path, raw.to_string()).unwrap();
+            let loaded = load_at(&path);
+            assert_eq!(loaded.codec, Codec::Hevc);
+            assert_eq!(loaded.video.get(&Key::Jpeg), Some(&45));
+            assert!(loaded.launch.contains_key("zen"));
+            assert!(loaded.library.is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_keys_survive_a_round_trip_through_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"jpeg": 45, "future": [1, 2], "theme": "plum"}"#).unwrap();
+        update_at(&path, |p| p.library.set_favorite("zen", true)).unwrap();
+        update_at(&path, |p| p.library.record_launch("zen")).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["future"], json!([1, 2]));
+        assert_eq!(saved["theme"], json!("plum"));
+        assert_eq!(
+            saved["library"],
+            json!({"favorites": ["zen"], "recent": ["zen"]})
+        );
+    }
+
+    #[test]
+    fn favorite_saved_by_launcher_survives_a_session_windows_codec_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.library.set_favorite("zen", true)).unwrap();
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.codec, Codec::Hevc);
+        assert!(saved.library.is_favorite("zen"));
+    }
+
+    #[test]
+    fn recents_keep_the_newest_eight_without_duplicates() {
+        let mut library = LibraryOrganization::default();
+        for id in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "b"] {
+            library.record_launch(id);
+        }
+        assert_eq!(library.recent, ["b", "i", "h", "g", "f", "e", "d", "c"]);
+    }
+
+    #[test]
+    fn toggles_deduplicate_and_cap_each_list() {
+        let mut library = LibraryOrganization {
+            favorites: vec!["a".into(), "a".into(), "b".into()],
+            ..LibraryOrganization::default()
+        };
+        library.set_favorite("c", true);
+        library.set_favorite("c", true);
+        assert_eq!(library.favorites, ["a", "b", "c"]);
+        library.set_favorite("a", false);
+        assert_eq!(library.favorites, ["b", "c"]);
+        for n in 0..LIST_CAP + 10 {
+            library.set_hidden(&format!("app{n}"), true);
+        }
+        assert_eq!(library.hidden.len(), LIST_CAP);
+        // The oldest go first.
+        assert_eq!(library.hidden[0], "app10");
+        assert!(library.is_hidden(&format!("app{}", LIST_CAP + 9)));
+    }
+
+    #[test]
+    fn controls_sections_default_is_not_written() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("controls").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn controls_sections_round_trip_beside_video_settings() {
+        let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
+        prefs.controls = ControlsSections::from_array([
+            true, false, false, false, false, false, true, true, false, false,
+        ]);
+        let saved = serde_json::to_value(&prefs).unwrap();
+        let restored: Preferences = serde_json::from_value(saved).unwrap();
+        // `controls` is read as the struct, not swallowed by the flattened video map.
+        assert_eq!(
+            restored.controls.to_array(),
+            [true, false, false, false, false, false, true, true, false, false]
+        );
+        assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(restored.video.len(), 1);
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_shortcuts() {
+        for bits in 0..1024u16 {
+            let open: [bool; 10] = std::array::from_fn(|i| bits & (1 << i) != 0);
+            assert_eq!(ControlsSections::from_array(open).to_array(), open);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"controls": {"stats": true}}"#).unwrap();
+        let old = load_at(&path).controls;
+        assert!(old.stats && !old.shortcuts && old.screen);
+    }
+
+    #[test]
+    fn controls_sections_ten_roundtrip_and_old_nine_file_loads() {
+        let open = ControlsSections {
+            capture: true,
+            ..ControlsSections::default()
+        };
+        // Microphone & Camera sits between Audio and Stats.
+        assert!(open.to_array()[8]);
+        assert_eq!(ControlsSections::from_array(open.to_array()), open);
+        let saved = serde_json::to_value(Preferences {
+            controls: open,
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(saved["controls"]["capture"], json!(true));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // A file from a build with nine sections: the new card starts collapsed.
+        std::fs::write(
+            &path,
+            r#"{"controls": {"input": true, "shortcuts": false, "gamepads": false, "clipboard": false, "printing": false, "screen": false, "video": false, "audio": true, "stats": true}}"#,
+        )
+        .unwrap();
+        let loaded = load_at(&path).controls;
+        assert!(!loaded.capture && loaded.audio && loaded.stats && loaded.input);
+    }
+
+    #[test]
+    fn audio_input_device_saved_and_old_file_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"audio": {"output_device": "USB-DAC"}}"#).unwrap();
+        let old = load_at(&path);
+        assert_eq!(old.audio.input_device, None);
+        assert_eq!(old.audio.output_device.as_deref(), Some("USB-DAC"));
+        update_at(&path, |p| {
+            p.audio.input_device = Some("AppleUSBAudioEngine:Shure".into());
+            p.audio.input_device_name = Some("Shure MV7".into());
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(
+            saved.audio.input_device.as_deref(),
+            Some("AppleUSBAudioEngine:Shure")
+        );
+        assert_eq!(saved.audio.input_device_name.as_deref(), Some("Shure MV7"));
+        assert_eq!(saved.audio.output_device.as_deref(), Some("USB-DAC"));
+        // Nothing else about the microphone is written: no on/off state.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut keys: Vec<_> = written["audio"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["input_device", "input_device_name", "output_device"]);
+    }
+
+    #[test]
+    fn camera_preferences_default_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.stats_strip = true).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(written.get("camera").is_none(), "{written}");
+        update_at(&path, |p| {
+            p.camera.device = Some("0x1420000005ac8600".into());
+            p.camera.device_name = Some("FaceTime HD Camera".into());
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.camera.device.as_deref(), Some("0x1420000005ac8600"));
+        assert_eq!(
+            saved.camera.device_name.as_deref(),
+            Some("FaceTime HD Camera")
+        );
+        // Only the choice: no on/off state.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut keys: Vec<_> = written["camera"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["device", "device_name"]);
+        // A bad shape reads as the default without failing the file.
+        std::fs::write(&path, r#"{"camera": 7, "stats_strip": true}"#).unwrap();
+        let loaded = load_at(&path);
+        assert!(loaded.camera.is_default() && loaded.stats_strip);
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_printing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // Files from before Shortcuts, before Printing, and with every key of today.
+        for old in [
+            r#"{"controls": {"input": true, "clipboard": true, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+            r#"{"controls": {"input": true, "shortcuts": true, "clipboard": true, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+            r#"{"controls": {"input": true, "shortcuts": true, "clipboard": true, "printing": false, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+        ] {
+            std::fs::write(&path, old).unwrap();
+            let loaded = load_at(&path).controls;
+            assert!(!loaded.printing, "{old}");
+            assert!(loaded.input && loaded.clipboard && !loaded.screen && loaded.stats);
+        }
+        let open = ControlsSections {
+            printing: true,
+            ..ControlsSections::default()
+        };
+        assert!(open.to_array()[4], "Printing follows Clipboard");
+        assert_eq!(ControlsSections::from_array(open.to_array()), open);
+    }
+
+    #[test]
+    fn printing_preferences_default_to_auto_print_and_round_trip() {
+        assert!(Preferences::default().printing.auto_print);
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("printing").is_none(), "{saved}");
+        let mut prefs = Preferences::default();
+        prefs.printing.auto_print = false;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(saved["printing"], json!({"auto_print": false}));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, saved.to_string()).unwrap();
+        assert!(!load_at(&path).printing.auto_print);
+        // A damaged value falls back to the default.
+        std::fs::write(&path, r#"{"printing": 3}"#).unwrap();
+        assert!(load_at(&path).printing.auto_print);
+    }
+
+    #[test]
+    fn a_preferences_file_without_printing_keeps_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        let old = json!({"codec": "jpeg", "jpeg": 45, "stats_strip": true, "future_key": [1]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.preferences.printing.auto_print);
+        assert!(loaded.preferences.stats_strip);
+        assert_eq!(loaded.preferences.video.get(&Key::Jpeg), Some(&45));
+        assert!(loaded.extra.contains_key("future_key"));
+        let written = serde_json::to_value(&loaded.preferences).unwrap();
+        assert!(written.get("printing").is_none(), "{written}");
+    }
+
+    #[test]
+    fn apps_category_round_trips_and_old_files_load_without_it() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("apps_category").is_none(), "{saved}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"codec": "jpeg", "stats_strip": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(!loaded.damaged);
+        assert_eq!(loaded.preferences.apps_category, None);
+        update_at(&path, |p| p.apps_category = Some("AudioVideo".into())).unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.apps_category.as_deref(), Some("AudioVideo"));
+        assert!(loaded.stats_strip, "other keys kept");
+        std::fs::write(&path, r#"{"apps_category": 4, "stats_strip": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.damaged);
+        assert_eq!(loaded.preferences.apps_category, None);
+        assert!(
+            loaded.preferences.stats_strip,
+            "one bad value costs only that value"
+        );
+    }
+
+    #[test]
+    fn shortcut_and_strip_preferences_round_trip() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("mac_shortcuts").is_none(), "{saved}");
+        assert!(saved.get("stats_strip").is_none(), "{saved}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| {
+            p.mac_shortcuts = Some(false);
+            p.stats_strip = true;
+        })
+        .unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.mac_shortcuts, Some(false));
+        assert!(loaded.stats_strip);
+
+        // A value of the wrong shape loads as the default and the file is backed up.
+        std::fs::write(&path, r#"{"stats_strip": "yes", "mac_shortcuts": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.damaged);
+        assert!(!loaded.preferences.stats_strip);
+        assert_eq!(loaded.preferences.mac_shortcuts, Some(true));
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn announce_reads_keyboard_shortcuts() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.keyboard_shortcuts, ShortcutPolicy::default());
+        settings.announce(&json!({"keyboard_shortcuts": {"value": false, "locked": true}}));
+        assert_eq!(
+            settings.keyboard_shortcuts,
+            ShortcutPolicy {
+                value: false,
+                locked: true
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_preferences_from_a_newer_build_dont_wipe_the_file() {
+        let prefs: Preferences = serde_json::from_value(
+            json!({"codec": "hevc", "jpeg": 45, "future": {"favorites": ["zen"]}}),
+        )
+        .unwrap();
+        assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(prefs.video.len(), 1);
+    }
+
+    #[test]
+    fn unknown_top_level_keys_survive_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"jpeg": 45, "future": {"favorites": ["zen"]}}"#).unwrap();
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["future"], json!({"favorites": ["zen"]}));
+        assert_eq!(saved["jpeg"], json!(45));
+        assert_eq!(saved["codec"], json!("hevc"));
+        // A clean file leaves no backup.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_value_is_backed_up_and_the_rest_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        let original = r#"{"codec": "h266", "jpeg": 45, "launch": {"zen": {"gpu": "intel-gpu"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        update_at(&path, |p| p.controls.video = true).unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.codec, Codec::default());
+        assert_eq!(saved.video.get(&Key::Jpeg), Some(&45));
+        assert!(saved.launch.contains_key("zen"));
+        assert!(saved.controls.video);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("server.json.bak-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_file_that_doesnt_parse_is_backed_up_before_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"codec": "hevc", "jpe"#).unwrap();
+        update_at(&path, |p| p.codec = Codec::Av1).unwrap();
+        assert_eq!(load_at(&path).codec, Codec::Av1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
 
     #[test]
     fn updates_keep_what_other_windows_saved() {
@@ -341,7 +1360,7 @@ mod tests {
             p.video.insert(Key::Fps, 30);
         })
         .unwrap();
-        let saved = load_from(&path);
+        let saved = load_at(&path);
         assert_eq!(saved.codec, Codec::Hevc);
         assert_eq!(saved.video.get(&Key::Fps), Some(&30));
     }
@@ -450,5 +1469,217 @@ mod tests {
         assert!(settings.codecs.contains(&Codec::Jpeg));
         settings.announce(&json!({"encoder": {"value": "h264enc", "allowed": ["h264enc"]}}));
         assert!(!settings.codecs.contains(&Codec::Jpeg));
+    }
+    /// The `audio_bitrate` entry Selkies 715df7c sends in `server_settings`.
+    fn selkies_audio_bitrate() -> Value {
+        json!({
+            "value": "128000",
+            "overridden": false,
+            "allowed": ["32000", "48000", "64000", "96000", "128000", "192000", "256000",
+                        "320000", "384000", "510000"]
+        })
+    }
+
+    #[test]
+    fn audio_bitrate_parses_server_allowed_strings() {
+        let bitrate = AudioBitrate::from_server(&selkies_audio_bitrate()).unwrap();
+        assert_eq!(bitrate.value, 128_000);
+        assert_eq!(
+            bitrate.choices,
+            [
+                32_000, 48_000, 64_000, 96_000, 128_000, 192_000, 256_000, 320_000, 384_000,
+                510_000
+            ]
+        );
+        assert!(bitrate.editable());
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": selkies_audio_bitrate()}));
+        assert_eq!(settings.audio_bitrate, Some(bitrate));
+    }
+
+    #[test]
+    fn audio_bitrate_hidden_only_when_absent() {
+        assert_eq!(AudioBitrate::from_server(&Value::Null), None);
+        assert_eq!(AudioBitrate::from_server(&json!({"value": "fast"})), None);
+        let mut settings = Settings::default();
+        settings.announce(&json!({}));
+        assert_eq!(settings.audio_bitrate, None);
+    }
+
+    #[test]
+    fn audio_bitrate_disabled_when_locked_or_single() {
+        let mut locked = selkies_audio_bitrate();
+        locked["locked"] = json!(true);
+        let locked = AudioBitrate::from_server(&locked).unwrap();
+        assert!(!locked.editable());
+        assert_eq!(locked.request(96_000), None);
+        let single =
+            AudioBitrate::from_server(&json!({"value": "96000", "allowed": ["96000"]})).unwrap();
+        assert_eq!((single.value, single.editable()), (96_000, false));
+        let bare = AudioBitrate::from_server(&json!({"value": 64000})).unwrap();
+        assert_eq!(bare.choices, [64_000]);
+        assert!(!bare.editable());
+    }
+
+    #[test]
+    fn audio_bitrate_request_accepts_only_listed_values() {
+        let bitrate = AudioBitrate::from_server(&selkies_audio_bitrate()).unwrap();
+        assert_eq!(bitrate.request(96_000), Some(96_000));
+        assert_eq!(bitrate.request(128_000), None, "already the value");
+        assert_eq!(bitrate.request(100_000), None, "not offered");
+    }
+
+    #[test]
+    fn audio_bitrate_follows_live_updates() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": selkies_audio_bitrate()}));
+        settings.live(&json!({"audio_bitrate": "320000"}));
+        assert_eq!(settings.audio_bitrate.as_ref().unwrap().value, 320_000);
+        settings.live(&json!({"framerate": 30}));
+        assert_eq!(settings.audio_bitrate.as_ref().unwrap().value, 320_000);
+    }
+
+    #[test]
+    fn audio_bitrate_live_accepts_numeric_display_settings() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": selkies_audio_bitrate()}));
+        settings.live(&json!({"audio_bitrate": 64000}));
+        assert_eq!(settings.audio_bitrate.unwrap().value, 64_000);
+    }
+
+    #[test]
+    fn audio_bitrate_off_list_value_is_shown_not_clamped() {
+        let mut bitrate = AudioBitrate::from_server(&selkies_audio_bitrate()).unwrap();
+        bitrate.live(&json!(100_000));
+        assert_eq!(bitrate.value, 100_000);
+        assert_eq!(&bitrate.choices[3..6], [96_000, 100_000, 128_000]);
+        let operator =
+            AudioBitrate::from_server(&json!({"value": "24000", "allowed": ["32000", "64000"]}))
+                .unwrap();
+        assert_eq!(operator.choices, [24_000, 32_000, 64_000]);
+    }
+
+    #[test]
+    fn audio_preferences_round_trip_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // A file from before audio preferences: loads with the defaults, video untouched.
+        std::fs::write(&path, r#"{"jpeg": 45, "controls": {"video": true}}"#).unwrap();
+        let old = load_at(&path);
+        assert!(old.audio.is_default());
+        assert_eq!(old.video.get(&Key::Jpeg), Some(&45));
+        update_at(&path, |p| {
+            p.audio.output_device = Some("AppleUSBAudioEngine:1234".into());
+            p.audio.output_device_name = Some("USB DAC".into());
+            p.audio.bitrate = Some(96_000);
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(
+            saved.audio.output_device.as_deref(),
+            Some("AppleUSBAudioEngine:1234")
+        );
+        assert_eq!(saved.audio.output_device_name.as_deref(), Some("USB DAC"));
+        assert_eq!(saved.audio.bitrate, Some(96_000));
+        assert_eq!(saved.video.get(&Key::Jpeg), Some(&45));
+        assert!(saved.controls.video);
+        // Defaults are left out of the file.
+        assert!(!serde_json::to_value(Preferences::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("audio"));
+    }
+
+    #[test]
+    fn controls_sections_without_audio_still_load() {
+        // Written by a build whose Session Controls had no Audio card.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"controls": {"input": true, "clipboard": false, "screen": false, "video": true, "stats": true}}"#,
+        )
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(
+            saved.controls.to_array(),
+            [true, false, false, false, false, false, true, false, false, true]
+        );
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_gamepads() {
+        let mut prefs = Preferences::default();
+        prefs.controls.gamepads = true;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(saved["controls"]["gamepads"], json!(true));
+        let restored: Preferences = serde_json::from_value(saved).unwrap();
+        assert!(restored.controls.gamepads);
+        assert_eq!(
+            restored.controls.to_array(),
+            [false, false, true, false, false, true, false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn gamepad_preferences_round_trip() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("gamepads").is_none(), "{saved}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| {
+            p.gamepads.input = Some(false);
+            p.gamepads.rumble = false;
+        })
+        .unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            written["gamepads"],
+            json!({"input": false, "rumble": false})
+        );
+        let loaded = load_at(&path).gamepads;
+        assert_eq!(loaded.input, Some(false));
+        assert!(!loaded.rumble);
+    }
+
+    #[test]
+    fn old_files_load_gamepad_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"jpeg": 45, "controls": {"stats": true}}"#).unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.gamepads, GamepadPreferences::default());
+        assert!(loaded.gamepads.rumble);
+        assert!(!loaded.controls.gamepads);
+        // Only one field written: the other keeps its default.
+        std::fs::write(&path, r#"{"gamepads": {"input": true}}"#).unwrap();
+        let partial = load_at(&path).gamepads;
+        assert_eq!(partial.input, Some(true));
+        assert!(partial.rumble);
+    }
+
+    #[test]
+    fn announce_reads_gamepad_policy() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"gamepad_enabled": {"value": false, "locked": true}}));
+        assert!(!settings.gamepad.enabled);
+        assert!(settings.gamepad.on_start);
+    }
+
+    #[test]
+    fn audio_preferences_round_trip_beside_video_and_controls() {
+        let mut prefs: Preferences = serde_json::from_value(json!({"bitrate": 8000})).unwrap();
+        prefs.audio.bitrate = Some(320_000);
+        prefs.controls.audio = true;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        // Audio is its own struct: its `bitrate` never lands in the flattened video map.
+        assert_eq!(saved["audio"], json!({"bitrate": 320000}));
+        assert_eq!(saved["bitrate"], json!(8000));
+        let restored: Preferences = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.audio.bitrate, Some(320_000));
+        assert!(restored.controls.audio);
+        assert_eq!(restored.video.get(&Key::Bitrate), Some(&8000));
+        assert_eq!(restored.video.len(), 1);
     }
 }

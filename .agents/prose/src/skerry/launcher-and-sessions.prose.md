@@ -7,17 +7,9 @@ id: 067NC4KG01SKERRY0000000003
 # Launcher and Sessions Domain
 
 <!-- compose:status=provisional provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-LS-01 concept="launch-options-and-progress" question="Storage (Auto/Cleanroom/named homes), GPU, VPN, language, timezone, Wayland, collaborative, remembered options, and Copy link options are settled (ARCH-013, ARCH-016). Still open: stage progress and cold-pull timeout recovery, and one-click remembered launch." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-02 concept="session-management" question="Thumbnails and Stop with a data-loss confirmation are settled (ARCH-013). Still open: Send File from the launcher." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-03 concept="open-links-and-files" question="Accept pasted URLs in the omnibar and local files via native macOS mechanisms (File -> Open... Cmd+O, window drag-and-drop, and .app bundle CFBundleDocumentTypes / on_open_urls Finder 'Open With' handler — no web-style 'Upload a file' omnibar button), filter apps by declared URL/extension support, and launch with open-or-stage progress via SealSkin 0.5.0 /api/launch/url|file|file_path, or hand a URL to a running session via POST /api/sessions/<id>/open_url; send only http, https, ftp, or space-free magnet addresses." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-04 concept="launcher-library" question="Search (apps and sessions), app icons, category filters (ARCH-013), and per-app saved launch options (ARCH-016) are settled. Still open: recents, favorites and hidden apps (where they are saved, and how a hidden app is shown again), and running-session reuse matching app + storage." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-06 concept="account-and-key-recovery" question="Display signed-in account, effective capabilities, and usage limits; offer browser wake flow for dormant keys and replacement prompt for expired/revoked keys." -->
+<!-- compose:unresolved id=ARCH-GAP-LS-14 concept="public-share-links" question="Storage window settled (ARCH-037). Still open: public share links with password, expiry, and revocation (L2)." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-09 concept="native-mac-app-presence" question="Give remote applications first-class native macOS app presence (separate Dock icon, Cmd+Tab entry, and optionally Spotlight); decide in a future compose turn between generated .app shims, automatic per-app helper processes, or both, and how relaunch behaves when a session is already running." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-10 concept="launcher-polish" question="Disconnect Server forgets the saved key with no confirmation; at wide windows (~2540 pt) about 75 % of the Library is empty; Refresh and Copy link give little lasting feedback; 'Started … ago' only updates on render. Add a confirm (or rename to Sign Out), a max content width or denser grid, and transient success toasts?" -->
-<!-- compose:unresolved id=ARCH-GAP-LS-13 concept="direct-selkies-sessions" question="Connect to a standalone Selkies server with no SealSkin in front (its own Basic or secure-mode token login), through `SelkiesClient` alone: what the Library shows for it, and how the credential is kept. The Files window already needs only `SelkiesClient` (`ARCH-024`); Delete stays SealSkin-only." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-11 concept="control-plane-hardening" question="Icon fetches send the Bearer application key to any same-origin `logo` path, which shares an origin with container-served session paths (matters once per-session origins land, ARCH-GAP-LS-07); preference and key writes fsync on the main thread; Library render clones the app list once and the session list twice per frame. Use an unauthenticated client (or an allow-listed prefix) for logos, move writes to the Tokio runtime, and borrow instead of cloning?" -->
 
 ### Goal
 
@@ -29,30 +21,56 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
 
 ### Maintains
 
-- `credential-and-connect` (settled baseline; recovery open in `ARCH-GAP-LS-06`):
+- `credential-and-connect` (settled; account and recovery in `ARCH-029`):
   - Parses `ssk_<id>_<secret>@<host>[:port]`, enforces HTTPS with no path/query/userinfo, loads from `SEALSKIN_APPLICATION_KEY` -> `.env` -> `application_key` in `~/.config/skerry/config.toml` (saved only after a successful Connect from the key field, `0600` file in a `0700` folder, other settings and comments in the file preserved, removed on **Disconnect Server**; the macOS Keychain is never read or written, `ARCH-011`), and authenticates with `Authorization: Bearer <key>` and `x-sealskin-app: other`.
   - Minimum server version (settled, `ARCH-009`): before loading the library on Connect or Refresh, `Api::check_version` reads `GET /companion/api/ui/version` and refuses any server older than `0.5.0` (`MINIMUM_SEALSKIN_VERSION`), a `0.5.0` pre-release, an unparseable version, or a missing route. A refused server leaves Skerry on the Connect screen with an error naming the minimum and found versions. This also applies on Refresh: the Library and its textures are dropped, and Connect with an empty key field checks the same server again (`LibraryError::Refused`, decided 2026-11-21); the library is not loaded and the key is not saved to `~/.config/skerry/config.toml`.
-  - Unresolved frontier (`ARCH-GAP-LS-06`): show account limits/capabilities, dormant-key browser wake flow, and expired/revoked key replacement.
+  - Account and recovery (settled: `ARCH-029`):
+    - The account menu shows `admin/status` (name, groups, rights, limits with meters, storage used, key source, and sleep time) and holds **Sign Out…**.
+    - A dormant key gets **Sign In on the Web** (`<origin>/?wake=1`, never with the key in the URL), with a 5 s poll for up to 3 min.
+    - A revoked or expired key returns to Connect for a new key while the old one stays saved. Disabled, client, inactive and held keys get their own notices.
+    - Refusals on Refresh, Launch, and Stop all go through the same flow.
 - `application-library-and-launch` (Library, search, icons, and Launch Dialog settled in `ARCH-013`; launch options settled in `ARCH-016`; progress & organization open in `ARCH-GAP-LS-01`, `ARCH-GAP-LS-03`, `ARCH-GAP-LS-04`):
   - Loads the library via `POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/admin/status` (launch rights, GPUs, VPNs; optional), and `GET /companion/api/homedirs` (with persistent storage), and launches via `POST /companion/api/launch/simple` from the **Launch Dialog**. Escape, the close button, or a backdrop click dismiss it. The backdrop occludes the Library, so a backdrop click never also activates what is underneath.
   - Launch options match SealSkin's web launcher (`ARCH-016`, `launch_options.rs`): **Storage** (Auto, Cleanroom, named homes; hidden without persistent storage; Auto creates and sends `auto-<app>`), **GPU** ("None" plus the GPUs that fit the app; hidden without GPU rights or a fitting GPU), **VPN** and **VPN endpoint** (endpoint only with two or more), searchable **Language** labelled with the Mac's locale names and defaulting to the locale nearest the Mac's, **Collaborative Session**, **Wayland Mode**, the Mac's time zone sent with every launch, and **Copy link** carrying the non-default options. Options are remembered per app after a successful launch and reused where they still hold.
   - Search filters applications and running sessions by name; category chips filter applications. App icons come from `GET /companion/api/app_icon/<id>` (meta apps) or the same-origin `logo` path, decoded with size limits and downscaled to 256 px.
-  - Favorite / Hide are not shown until they are saved somewhere (`ARCH-GAP-LS-04`); the Launch Dialog never offers a control that does nothing.
-  - Unresolved frontier (`ARCH-GAP-LS-01`): startup progress stages and one-click remembered launch.
-  - Unresolved frontier (`ARCH-GAP-LS-03`): open pasted URLs and local files in compatible remote apps.
-  - Unresolved frontier (`ARCH-GAP-LS-04`): recents, favorites, hidden apps, and matching session reuse.
+  - Library organization (settled: `ARCH-027`):
+    - Favorites, hidden apps and recents (up to 8) are saved per server in the preferences `library` key. The Library shows Running sessions, Favorites, Recent, then Applications.
+    - Hidden apps leave All and the categories but still match a search, and a **Hidden (n)** chip lists them.
+    - Favorite and Hide are offered in the Launch Dialog and in a tile right-click menu.
+    - A running session with the same app, storage and Collaborative flag turns the dialog's primary button into **Open Running Session**.
+  - Launch progress (settled: `ARCH-027`):
+    - Every launch carries a `launch_id`, sent again as `X-Idempotency-Key`. A launching card follows `GET /companion/api/launch/progress/<id>` (Requesting, Pulling image, Starting, Connecting) for up to 960 s.
+    - The card offers Keep Waiting / Retry on a stall and Retry / Dismiss on a failure, without ever starting a second container.
+    - A session window that is still waiting offers Keep Waiting / Retry / Disconnect.
+    - Tiles with remembered options launch in one click (hover ▶ or Option-click).
+  - Open links and files (settled: `ARCH-028`):
+    - A typed or pasted link offers **Open Here** in compatible running sessions (`POST /companion/api/sessions/<id>/open_url`) or **Launch & Open** in `url_support` apps (`launch/url`). Only http, https, ftp, and space-free magnet links are sent.
+    - Files from ⌘O, drops, Finder Open With, or the Dock go to apps filtered by extension (`launch/file`, streamed in 1 MiB chunks) or to a running session's Desktop.
+    - Nothing launches without a click.
 - `running-sessions-supervision` (list/resume/disconnect, thumbnails, and Stop settled in `ARCH-013`; Send File open in `ARCH-GAP-LS-02`):
   - Lists sessions via `GET /companion/api/sessions` and resumes over Selkies WebSocket; disconnecting leaves the remote session running. Session cards show a thumbnail (`GET /companion/api/sessions/<id>/screenshot`, downscaled to 960 px), the app icon, start time, a GPU pill, and a storage pill ("Cleanroom" when the session has no home).
   - **Stop** (labelled button) asks for confirmation that explains the remote app ends and cleanroom data is deleted, then calls the session stop API; Escape or Cancel keeps the session.
   - A just-launched session's WebSocket is retried for up to 45 s while it answers 404/502/503/504 or refuses connections (`ARCH-014`).
-  - Unresolved frontier (`ARCH-GAP-LS-02`): Send File from the launcher.
-- `launcher-polish` (unresolved: `ARCH-GAP-LS-10`) and `control-plane-hardening` (unresolved: `ARCH-GAP-LS-11`): open findings from QA 2026-11-21.
-- `persistent-storage-and-shares` (unresolved: `ARCH-GAP-LS-05`):
-  - Manage SealSkin homes, shared files, direct remote file opening without re-upload, and public share links (password, expiry, revocation).
+  - Files from the launcher (settled: `ARCH-028`): each running-session card has a Files button that opens that session's Files window with no stream. It gets the session cookie through `transport::session_access`, without sending the application key, and there is one Files window per session.
+- `launcher-polish-and-hardening` (settled: `ARCH-026`):
+  - **Sign Out…** (was Disconnect Server) asks for confirmation. The wording names where the key came from (`config.toml`, environment, `.env`) and says open session windows stay connected. `application_key` is removed only when `config.toml` holds the active key.
+  - The Library content is a centred column capped at 1200 pt. Success toasts ("Library refreshed", "Link copied") show for 3 s at the bottom centre. "Started … ago" updates every 30 s while the Library is visible.
+  - The application key is attached only to requests under `/companion/api/`. Logos and icons use a client with no key.
+  - Preference and key writes go through the single first-in-first-out write queue in `persist.rs` on Tokio. Its in-memory copy serves every read, it flushes within 1 s on quit, and an unreadable file is backed up before it is overwritten.
+- `persistent-storage-and-shares` (settled: `ARCH-037`; public links open in `ARCH-GAP-LS-14`):
+  - A per-server **Storage** window (⇧⌘I, Manage Storage…) browses Shared Files and homes through the Files pane on a SealSkin `FilesBackend`, and shows quota.
+  - Homes can be created, and deleted only when no session uses them. Skerry never deletes Shared Files.
+  - Transfers use 2 MiB chunks, resume only from a matching partial, and are idempotent on retry.
+  - **Open in…** launches a stored Shared File in a compatible app via `launch/file_path`.
 - `cluster-and-session-origins` (unresolved: `ARCH-GAP-LS-07`):
   - Automatic/pool/node placement, storage move evaluation, and validated token handoff to isolated per-session origins without leaking the control-plane application key.
+- `direct-selkies-sessions` (settled: `ARCH-036`):
+  - Connect's **Selkies** side reaches a standalone Selkies server with a link, Basic login or token, through `SelkiesClient` alone.
+  - Credentials and the leaf-certificate SHA-256 pin live in `0600` `config.toml` `[[selkies]]` entries (at most 5).
+  - The gate is WebSockets mode plus an authorised `api/sessions`.
+  - The Library shows one Desktop card and a server menu. SealSkin-only features (catalog, launch, Stop, account, Delete) are hidden.
 - `multi-window-sessions` (settled: `ARCH-010`, `ARCH-022`):
-  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it.
+  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it for that, though its Display 2 window has its own connection (`ARCH-039`).
   - The Library window can close while sessions stream. **Window → Library** (`cmd-0`) or a Dock-icon click reopens it. `cmd-q` disconnects every session and stops none.
   - A session window closes from its own buttons, which appear when the pointer enters the top-left corner, or from **Window → Disconnect Session**. `cmd-w` stays with the remote app.
   - Codec, input, clipboard, and video changes are saved per server for the next session. Other open windows keep theirs. Display mode, resolution, mute, and pause are per window.

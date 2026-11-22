@@ -1,9 +1,19 @@
+use super::gamepads::Gamepads;
 use super::session_window::SessionWindow;
 use super::{
-    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, ToggleSessionControls,
+    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, TogglePointerCapture,
+    ToggleSessionControls, ToggleStatsStrip,
 };
+use crate::audio::{OutputProblem, OutputStatus};
+use crate::camera::{CamProblem, CamStatus};
+use crate::capture::{CapturePolicy, DevicePolicy, DeviceState, Phase, Subject};
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
+use crate::microphone::{MicProblem, MicStatus};
+use crate::persist::WriteQueue;
+use crate::print_jobs::{self, JobState, PrintJobs};
+use crate::settings::{AudioBitrate, ControlsSections};
+use crate::shortcuts;
 use crate::stats;
 use crate::video::Codec;
 use crate::{
@@ -17,13 +27,18 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context, Entity,
-    FocusHandle, Task, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
+    FocusHandle, Pixels, Point, Task, TitlebarOptions, Window, WindowBounds, WindowKind,
+    WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
-    self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
-    ScreenProps, Section, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureDeviceProps, CaptureProps,
+    CaptureSubject, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps,
+    ControlsUiState, GamepadsProps, MediaCaptureProps, PadRow, PadStatus, PrintJobRow,
+    PrintRowKind, PrintingProps, ScreenProps, Section, ShortcutRow, ShortcutsProps, SliderUnit,
+    SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
+use skerry_ui::session::PrintJobAction;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -41,14 +56,20 @@ pub(super) struct ControlPanel {
     height: Entity<InputState>,
     /// Shows the Stats copy button's check, and clears it after a moment.
     copied: Option<Task<()>>,
+    /// The scroll offset kept while the panel's content is incomplete (a reconnect), to
+    /// restore once it has refilled.
+    scroll_saved: Option<Point<Pixels>>,
+    /// The session's `print_reveal` this panel has acted on (`ARCH-033`).
+    print_reveal_seen: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Command {
     Close,
     FullScreen,
     Reconnect,
     Files,
+    Apps,
     Disconnect,
     Audio(bool),
     Playback(bool),
@@ -65,6 +86,23 @@ enum Command {
     Chord(RemoteChord),
     Clipboard(ClipboardAction),
     Stats(bool),
+    AudioOutput(Option<String>),
+    AudioBitrate(u32),
+    StatsStrip(bool),
+    MacShortcuts(bool),
+    /// The session window activates and captures the pointer (`ARCH-032`).
+    CapturePointer,
+    GamepadInput(bool),
+    GamepadRumble(bool),
+    AutoPrint(bool),
+    PrintJob(u64, PrintJobAction),
+    /// Add Screen + / Close Screen 2 (`ARCH-039`).
+    SecondDisplay,
+    Microphone(bool),
+    InputDevice(Option<String>),
+    Camera(bool),
+    CameraDevice(Option<String>),
+    PrivacySettings(Subject),
 }
 
 impl ControlPanel {
@@ -80,6 +118,21 @@ impl ControlPanel {
         };
         let parent = native_window(window);
         let fullscreen = window.is_fullscreen();
+        // The queue's copy of this server's preferences already has every toggle queued
+        // from any window.
+        let sections = {
+            let server = session.read(cx).server().to_string();
+            cx.global::<WriteQueue>().read(&server).controls
+        };
+        let mut ui = ControlsUiState::default().with_sections(sections.to_array());
+        // "+N more in Session Controls › Printing" opened this panel (`ARCH-033`).
+        let (reveal, print_reveal_seen) = session.update(cx, |session, _| {
+            (
+                std::mem::take(&mut session.print_reveal_on_open),
+                session.print_reveal,
+            )
+        });
+        ui.printing_open |= reveal;
         let bounds = window.bounds();
         let panel_size = size(px(388.), px(680.));
         let display = window.display(cx);
@@ -176,16 +229,29 @@ impl ControlPanel {
                         },
                     )
                     .detach();
+                    let focus = cx.focus_handle();
                     Self {
                         owner: panel_owner,
-                        focus: cx.focus_handle(),
+                        ui: ControlsUiState {
+                            return_focus: Some(focus.clone()),
+                            ..ui
+                        },
+                        focus,
                         fullscreen,
-                        ui: ControlsUiState::default(),
                         width,
                         height,
                         copied: None,
+                        scroll_saved: None,
+                        print_reveal_seen,
                     }
                 });
+                if reveal {
+                    panel.update(cx, |panel, cx| panel.remember_sections(cx));
+                }
+                if sections.stats {
+                    // A restored open Stats section subscribes, as a click on it would.
+                    Self::send(owner.clone(), Command::Stats(true), cx);
+                }
                 window.on_window_should_close(cx, move |_, cx| {
                     Self::send(owner.clone(), Command::Close, cx);
                     false
@@ -211,6 +277,7 @@ impl ControlPanel {
                         }
                         Command::Reconnect => session.reconnect(window, cx),
                         Command::Files => session.toggle_files(window, cx),
+                        Command::Apps => session.toggle_apps(window, cx),
                         Command::Disconnect => session.disconnect(window, cx),
                         Command::Audio(enabled) => {
                             if let Some(stream) = &session.current {
@@ -277,6 +344,25 @@ impl ControlPanel {
                         }
                         Command::Clipboard(action) => session.change_clipboard(action, window, cx),
                         Command::Stats(open) => session.set_stats_open(open),
+                        Command::AudioOutput(uid) => session.change_audio_output(uid, cx),
+                        Command::AudioBitrate(bps) => session.change_audio_bitrate(bps, cx),
+                        Command::StatsStrip(on) => session.set_stats_strip(on, cx),
+                        Command::MacShortcuts(active) => session.change_mac_shortcuts(active, cx),
+                        Command::CapturePointer => session.request_capture(window, cx),
+                        Command::SecondDisplay => session.toggle_second_display(window, cx),
+                        Command::GamepadInput(on) => session.change_gamepad_input(on, cx),
+                        Command::GamepadRumble(on) => session.change_gamepad_rumble(on, cx),
+                        Command::AutoPrint(on) => session.set_auto_print(on, cx),
+                        Command::Microphone(on) => session.set_microphone(on, cx),
+                        Command::InputDevice(uid) => session.change_input_device(uid, cx),
+                        Command::Camera(on) => session.set_camera(on, cx),
+                        Command::CameraDevice(uid) => session.change_camera_device(uid, cx),
+                        Command::PrivacySettings(subject) => {
+                            session.open_privacy_settings(subject, cx)
+                        }
+                        Command::PrintJob(id, action) => {
+                            session.print_action(id, action, window, cx)
+                        }
                         Command::Chord(chord) => {
                             session.close_controls(window, cx);
                             if let Some(stream) = &session.current {
@@ -317,16 +403,11 @@ impl ControlPanel {
     ) {
         match action {
             ControlsAction::ToggleSection(section) => {
-                match section {
-                    Section::Input => self.ui.input_open = !self.ui.input_open,
-                    Section::Clipboard => self.ui.clipboard_open = !self.ui.clipboard_open,
-                    Section::Screen => self.ui.screen_open = !self.ui.screen_open,
-                    Section::Video => self.ui.video_open = !self.ui.video_open,
-                    Section::Stats => {
-                        self.ui.stats_open = !self.ui.stats_open;
-                        Self::send(self.owner.clone(), Command::Stats(self.ui.stats_open), cx);
-                    }
+                let open = self.ui.toggle(section);
+                if section == Section::Stats {
+                    Self::send(self.owner.clone(), Command::Stats(open), cx);
                 }
+                self.remember_sections(cx);
                 cx.notify();
             }
             ControlsAction::SetAudio(enabled) => {
@@ -340,6 +421,7 @@ impl ControlPanel {
             }
             ControlsAction::Reconnect => Self::send(self.owner.clone(), Command::Reconnect, cx),
             ControlsAction::OpenFiles => Self::send(self.owner.clone(), Command::Files, cx),
+            ControlsAction::OpenApps => Self::send(self.owner.clone(), Command::Apps, cx),
             ControlsAction::Disconnect => Self::send(self.owner.clone(), Command::Disconnect, cx),
             ControlsAction::SetInput { id, enabled } => {
                 if let Some((feature, _)) = InputFeature::ALL
@@ -435,6 +517,56 @@ impl ControlPanel {
                 }
             }
             ControlsAction::ResetVideo => Self::send(self.owner.clone(), Command::ResetVideo, cx),
+            ControlsAction::SelectAudioOutput(uid) => {
+                Self::send(self.owner.clone(), Command::AudioOutput(uid), cx)
+            }
+            ControlsAction::SetAudioBitrate(bps) => {
+                Self::send(self.owner.clone(), Command::AudioBitrate(bps), cx)
+            }
+            ControlsAction::SetStatsStrip(on) => {
+                Self::send(self.owner.clone(), Command::StatsStrip(on), cx)
+            }
+            ControlsAction::SetMacShortcuts(active) => {
+                Self::send(self.owner.clone(), Command::MacShortcuts(active), cx)
+            }
+            ControlsAction::CapturePointer => {
+                Self::send(self.owner.clone(), Command::CapturePointer, cx)
+            }
+            ControlsAction::SecondScreen => {
+                Self::send(self.owner.clone(), Command::SecondDisplay, cx)
+            }
+            ControlsAction::SetGamepadInput(on) => {
+                Self::send(self.owner.clone(), Command::GamepadInput(on), cx)
+            }
+            ControlsAction::SetGamepadRumble(on) => {
+                Self::send(self.owner.clone(), Command::GamepadRumble(on), cx)
+            }
+            ControlsAction::SetAutoPrint(on) => {
+                Self::send(self.owner.clone(), Command::AutoPrint(on), cx)
+            }
+            ControlsAction::PrintJob(id, action) => {
+                Self::send(self.owner.clone(), Command::PrintJob(id, action), cx)
+            }
+            ControlsAction::SetMicrophone(on) => {
+                Self::send(self.owner.clone(), Command::Microphone(on), cx)
+            }
+            ControlsAction::SelectInputDevice(uid) => {
+                Self::send(self.owner.clone(), Command::InputDevice(uid), cx)
+            }
+            ControlsAction::SetCamera(on) => {
+                Self::send(self.owner.clone(), Command::Camera(on), cx)
+            }
+            ControlsAction::SelectCamera(uid) => {
+                Self::send(self.owner.clone(), Command::CameraDevice(uid), cx)
+            }
+            ControlsAction::OpenPrivacySettings(subject) => Self::send(
+                self.owner.clone(),
+                Command::PrivacySettings(match subject {
+                    CaptureSubject::Microphone => Subject::Microphone,
+                    CaptureSubject::Camera => Subject::Camera,
+                }),
+                cx,
+            ),
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -454,7 +586,30 @@ impl ControlPanel {
         }
     }
 
-    fn build_props(&self, session: &SessionWindow, app_name: String) -> ControlsProps {
+    /// Keeps the open sections for this server through the write queue (its in-memory copy
+    /// at once, the file after). A failed save shows in the session window's banner.
+    fn remember_sections(&self, cx: &mut Context<Self>) {
+        let sections = ControlsSections::from_array(self.ui.sections());
+        let server = self.owner.session.read(cx).server().to_string();
+        let done = cx
+            .global::<WriteQueue>()
+            .preferences(&server, move |p| p.controls = sections);
+        let owner = self.owner.clone();
+        cx.spawn(async move |_, cx| {
+            if !matches!(done.await, Ok(Ok(()))) {
+                let _ = owner.window.update(cx, |_, _, cx| {
+                    owner.session.update(cx, |session, cx| {
+                        session
+                            .set_status("Couldn’t save the open Session Controls sections.".into());
+                        cx.notify();
+                    })
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn build_props(&self, session: &SessionWindow, app_name: String, cx: &App) -> ControlsProps {
         let input = session.preferences.input;
         let input_switches = InputFeature::ALL
             .into_iter()
@@ -501,9 +656,22 @@ impl ControlPanel {
             dpi_override: session.dpi_override,
             preset_label,
             scale_locally: session.scale_locally,
+            second_screen: session
+                .second
+                .props(session.settings.as_ref().and_then(|s| s.second_screen), cx),
         };
 
         let video_settings = build_video_props(session);
+        let audio = AudioInputs {
+            status: session.audio_output.as_ref(),
+            chosen: session.preferences.audio.output_device.as_deref(),
+            saved_name: session.preferences.audio.output_device_name.as_deref(),
+            bitrate: session
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.audio_bitrate.as_ref()),
+            unavailable: session.audio_unavailable,
+        };
 
         let stats = (!session.stats_history.is_empty()).then(|| {
             let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -515,21 +683,617 @@ impl ControlPanel {
             stats::props(session.stream_info.as_ref(), &history, framerate)
         });
 
+        // The capturing thread's status while it runs; otherwise the card's own device list
+        // (the thread exists only while capturing, `ARCH-038`).
+        let mic_card_status = session.capture.mic_status.clone().or_else(|| {
+            let (devices, default_uid) = session.capture.devices();
+            (session.capture.inputs().is_some() || session.capture.encoder_unavailable).then(|| {
+                MicStatus {
+                    devices,
+                    default_uid,
+                    chosen: session.preferences.audio.input_device.clone(),
+                    problem: session
+                        .capture
+                        .encoder_unavailable
+                        .then_some(MicProblem::EncoderUnavailable),
+                    ..MicStatus::default()
+                }
+            })
+        });
+
+        let cam_card_status = session.capture.cam_status.clone().or_else(|| {
+            let (devices, default_uid) = session.capture.cameras();
+            (!devices.is_empty() || session.capture.cam_encoder_unavailable).then(|| CamStatus {
+                devices,
+                default_uid,
+                chosen: session.preferences.camera.device.clone(),
+                problem: session
+                    .capture
+                    .cam_encoder_unavailable
+                    .then_some(CamProblem::EncoderUnavailable),
+                ..CamStatus::default()
+            })
+        });
+
         ControlsProps {
             app_name,
             fullscreen: self.fullscreen,
             audio: session.audio,
             video: session.video,
-            audio_unavailable: session.audio_unavailable.map(str::to_string),
+            audio_unavailable: audio_header_line(&audio),
             input_switches,
             chords,
             clipboard,
             screen,
             video_settings,
+            audio_settings: audio_props(&audio),
             stats,
             stats_copied: self.copied.is_some(),
+            stats_strip: session.preferences.stats_strip,
+            shortcuts: shortcuts_props(session.mac_shortcuts(), session.shortcuts_locked()),
+            capture: capture_props(
+                session.picture_painted(cx) && session.settings.is_some(),
+                session.pointer_captured(cx),
+            ),
+            gamepads: gamepads_props(session, cx),
+            printing: (session.print_policy == Some(true)).then(|| {
+                printing_props(
+                    &session.print_jobs,
+                    session.preferences.printing.auto_print,
+                    std::time::Instant::now(),
+                )
+            }),
+            media_capture: media_capture_props(
+                &MicInputs {
+                    policy: session.capture.state.policy,
+                    state: session.capture.state.mic,
+                    status: mic_card_status.as_ref(),
+                    chosen: session.preferences.audio.input_device.as_deref(),
+                    saved_name: session.preferences.audio.input_device_name.as_deref(),
+                },
+                Some(&CamInputs {
+                    state: session.capture.state.cam,
+                    status: cam_card_status.as_ref(),
+                    chosen: session.preferences.camera.device.as_deref(),
+                    saved_name: session.preferences.camera.device_name.as_deref(),
+                }),
+            ),
+            apps_available: session.apps_available(),
         }
     }
+}
+
+/// What the Microphone & Camera card's microphone group is drawn from (`ARCH-038`).
+struct MicInputs<'a> {
+    /// The stream's capture policy; `None` until its first `server_settings`.
+    policy: Option<CapturePolicy>,
+    state: DeviceState,
+    status: Option<&'a MicStatus>,
+    /// The saved choice (its UID); `None` is System Default.
+    chosen: Option<&'a str>,
+    saved_name: Option<&'a str>,
+}
+
+/// What the card's camera group is drawn from.
+struct CamInputs<'a> {
+    state: DeviceState,
+    status: Option<&'a CamStatus>,
+    /// The saved choice (its unique ID); `None` is System Default.
+    chosen: Option<&'a str>,
+    saved_name: Option<&'a str>,
+}
+
+/// A device problem, as the card words it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trouble {
+    NoDevice,
+    Failed,
+    EncoderUnavailable,
+    /// Shown elsewhere (the missing-device note).
+    Other,
+}
+
+/// One device's thread status, whichever device.
+struct StatusView<'a> {
+    devices: &'a [crate::audio::OutputDevice],
+    default: Option<&'a crate::audio::OutputDevice>,
+    active: Option<&'a crate::audio::OutputDevice>,
+    problem: Option<Trouble>,
+    live: bool,
+    level: u8,
+}
+
+impl<'a> StatusView<'a> {
+    fn device(&self, uid: &str) -> Option<&'a crate::audio::OutputDevice> {
+        self.devices.iter().find(|device| device.uid == uid)
+    }
+
+    fn mic(status: &'a MicStatus) -> Self {
+        Self {
+            devices: &status.devices,
+            default: status.default_device(),
+            active: status.active.as_ref(),
+            problem: status.problem.map(|problem| match problem {
+                MicProblem::NoDevice => Trouble::NoDevice,
+                MicProblem::Failed => Trouble::Failed,
+                MicProblem::EncoderUnavailable => Trouble::EncoderUnavailable,
+                MicProblem::ChosenMissing => Trouble::Other,
+            }),
+            live: status.live,
+            level: status.level,
+        }
+    }
+
+    fn cam(status: &'a CamStatus) -> Self {
+        Self {
+            devices: &status.devices,
+            default: status
+                .default_uid
+                .as_deref()
+                .and_then(|uid| status.device(uid)),
+            active: status.active.as_ref(),
+            problem: status.problem.map(|problem| match problem {
+                CamProblem::NoDevice => Trouble::NoDevice,
+                CamProblem::InUse | CamProblem::Failed => Trouble::Failed,
+                CamProblem::EncoderUnavailable => Trouble::EncoderUnavailable,
+                CamProblem::ChosenMissing => Trouble::Other,
+            }),
+            live: status.live,
+            level: 0,
+        }
+    }
+}
+
+/// The words that differ between the two groups.
+struct Words {
+    denied: &'static str,
+    demand: &'static str,
+    no_device: &'static str,
+    failed: &'static str,
+    encoder: &'static str,
+    saved: &'static str,
+    your_saved: &'static str,
+    none_other: &'static str,
+}
+
+const MIC_WORDS: Words = Words {
+    denied: "SealSkin Native isn’t allowed to use the microphone.",
+    demand: "Starts when an app in the session listens",
+    no_device: "No microphone found.",
+    failed: "The microphone stopped. Trying again…",
+    encoder: "This Mac can’t encode microphone audio.",
+    saved: "Saved Microphone",
+    your_saved: "Your saved microphone",
+    none_other: "no other microphone is available",
+};
+
+const CAM_WORDS: Words = Words {
+    denied: "SealSkin Native isn’t allowed to use the camera.",
+    demand: "Starts when an app in the session uses the camera",
+    no_device: "No camera found.",
+    failed: "The camera is in use by another app or stopped. Trying again…",
+    encoder: "This Mac can’t encode camera video.",
+    saved: "Saved Camera",
+    your_saved: "Your saved camera",
+    none_other: "no other camera is available",
+};
+
+/// One device's group in the card.
+fn device_props(
+    words: &Words,
+    policy: DevicePolicy,
+    state: DeviceState,
+    status: Option<StatusView<'_>>,
+    chosen: Option<&str>,
+    saved_name: Option<&str>,
+    meter: bool,
+) -> CaptureDeviceProps {
+    let permitted = policy.permitted && !state.server_disabled;
+    let status = status.filter(|_| permitted);
+    let live = status.as_ref().is_some_and(|status| status.live);
+    let problem = status.as_ref().and_then(|status| status.problem);
+    let detail = if !permitted {
+        Some(if policy.audio_off {
+            "Unavailable while session audio is off"
+        } else {
+            "Turned off by the server"
+        })
+    } else if live {
+        Some("Sending to the session")
+    } else if state.denied {
+        Some(words.denied)
+    } else {
+        match state.phase {
+            Phase::Asking => Some("Waiting for permission…"),
+            Phase::On => Some(match problem {
+                Some(Trouble::NoDevice) => words.no_device,
+                Some(Trouble::Failed) => words.failed,
+                _ => "Starting…",
+            }),
+            Phase::Off => match problem {
+                Some(Trouble::EncoderUnavailable) => Some(words.encoder),
+                _ if !state.touched && policy.on_demand && !state.refused => Some(words.demand),
+                _ if policy.locked => Some("Set by the server"),
+                _ => None,
+            },
+        }
+    };
+    // The menu, as E's Output Device menu.
+    let default_label = status
+        .as_ref()
+        .and_then(|status| status.default)
+        .map_or_else(
+            || "System Default".to_string(),
+            |device| format!("System Default ({})", device.name),
+        );
+    let mut devices = vec![AudioOutputItem {
+        uid: None,
+        label: default_label.clone(),
+        checked: chosen.is_none() || status.is_none(),
+        connected: true,
+    }];
+    let mut device_label = default_label;
+    let mut note = None;
+    if let Some(status) = &status {
+        devices.extend(status.devices.iter().map(|device| AudioOutputItem {
+            uid: Some(device.uid.clone()),
+            label: device.name.clone(),
+            checked: chosen == Some(device.uid.as_str()),
+            connected: true,
+        }));
+        let saved = saved_name.unwrap_or(words.saved);
+        match chosen {
+            Some(uid) if status.device(uid).is_none() => {
+                let missing = format!("{saved} (not connected)");
+                devices.push(AudioOutputItem {
+                    uid: Some(uid.to_string()),
+                    label: missing.clone(),
+                    checked: true,
+                    connected: false,
+                });
+                device_label = missing;
+                let subject = saved_name.unwrap_or(words.your_saved);
+                let using = status
+                    .active
+                    .or(status.default)
+                    .or_else(|| status.devices.first());
+                note = Some(match using {
+                    Some(device) => format!(
+                        "{subject} isn’t connected. Using {} until it’s back.",
+                        device.name
+                    ),
+                    None => format!("{subject} isn’t connected, and {}.", words.none_other),
+                });
+            }
+            Some(uid) => {
+                if let Some(device) = status.device(uid) {
+                    device_label = device.name.clone();
+                }
+            }
+            None => {}
+        }
+    }
+    CaptureDeviceProps {
+        on: permitted && (state.wanted || live),
+        locked: !permitted || policy.locked,
+        picker_locked: !permitted,
+        live,
+        detail: detail.map(str::to_string),
+        denied: permitted && state.denied && !live,
+        device_label,
+        devices,
+        note,
+        level: (meter && (live || state.phase == Phase::On))
+            .then(|| status.as_ref().map_or(0, |status| status.level)),
+    }
+}
+
+/// The Microphone & Camera card: hidden until the server's settings arrive. The camera
+/// group is left out while the server hides the camera.
+fn media_capture_props(mic: &MicInputs, cam: Option<&CamInputs>) -> Option<MediaCaptureProps> {
+    let policy = mic.policy?;
+    let camera = cam.filter(|_| policy.cam_shown).map(|cam| {
+        device_props(
+            &CAM_WORDS,
+            policy.cam,
+            cam.state,
+            cam.status.map(StatusView::cam),
+            cam.chosen,
+            cam.saved_name,
+            false,
+        )
+    });
+    Some(MediaCaptureProps {
+        mic: device_props(
+            &MIC_WORDS,
+            policy.mic,
+            mic.state,
+            mic.status.map(StatusView::mic),
+            mic.chosen,
+            mic.saved_name,
+            true,
+        ),
+        camera,
+    })
+}
+
+/// The Gamepads card (`ARCH-032`): hidden until the server's settings arrive, and when
+/// `ui_sidebar_show_gamepads` is off. Reads the global, never updates it.
+fn gamepads_props(session: &SessionWindow, cx: &App) -> Option<GamepadsProps> {
+    let policy = session
+        .settings
+        .as_ref()
+        .map(|settings| settings.gamepad)
+        .filter(|policy| policy.show_panel)?;
+    let input = session.gamepad_input();
+    let key = session.window_active();
+    let pads = cx
+        .try_global::<Gamepads>()
+        .map(|gamepads| gamepads.pads())
+        .unwrap_or_default();
+    let status = pad_state(input, policy.enabled, key);
+    let slots = std::array::from_fn(|slot| {
+        pads.iter()
+            .find(|pad| pad.slot == Some(slot as u8))
+            .map(|pad| PadRow {
+                name: pad.name.clone(),
+                status,
+                rumble: pad.rumble,
+            })
+    });
+    Some(GamepadsProps {
+        input,
+        input_locked: policy.on_start_locked,
+        rumble: session.preferences.gamepads.rumble,
+        server_off: !policy.enabled,
+        key,
+        slots,
+        overflow: pads.iter().filter(|pad| pad.slot.is_none()).count(),
+    })
+}
+
+/// Whether a pad with a Player reaches the session: not when the server or the switch has
+/// gamepads off, ready while another window is key, sending otherwise.
+fn pad_state(input_on: bool, server_on: bool, key: bool) -> PadStatus {
+    if !server_on || !input_on {
+        PadStatus::NotSent
+    } else if !key {
+        PadStatus::Ready
+    } else {
+        PadStatus::Sending
+    }
+}
+
+/// The Input card's Capture Pointer button, its glyphs from `shortcuts::CHORDS`.
+fn capture_props(available: bool, captured: bool) -> CaptureProps {
+    let chord = shortcuts::chord(shortcuts::ChordId::CapturePointer);
+    let (modifiers, key) = shortcuts::glyphs(chord.keystroke);
+    CaptureProps {
+        available,
+        captured,
+        modifiers,
+        key,
+    }
+}
+
+/// The Printing card (`ARCH-033`): the switch and this window's jobs, newest first.
+fn printing_props(jobs: &PrintJobs, auto_print: bool, now: std::time::Instant) -> PrintingProps {
+    let rows =
+        jobs.jobs()
+            .iter()
+            .rev()
+            .map(|job| {
+                let size = skerry_ui::session::size_label(job.size);
+                let age = print_jobs::age_label(now.saturating_duration_since(job.arrived));
+                let (kind, state) = match &job.state {
+                    JobState::Receiving => {
+                        let received = job.received.load(std::sync::atomic::Ordering::Relaxed);
+                        let fraction =
+                            (job.size > 0).then(|| (received as f32 / job.size as f32).min(1.));
+                        let meta = if job.size > 0 {
+                            format!("{} of {size}", skerry_ui::session::size_label(received))
+                        } else {
+                            skerry_ui::session::size_label(received)
+                        };
+                        (PrintRowKind::Receiving { fraction }, Some(meta))
+                    }
+                    JobState::Ready => (PrintRowKind::Ready, None),
+                    JobState::Unreadable => (PrintRowKind::Unreadable, None),
+                    JobState::Failed(print_jobs::FetchFailure::TooLarge(_))
+                    | JobState::TooLarge => (PrintRowKind::TooLarge, None),
+                    JobState::Failed(_) => (PrintRowKind::Failed, None),
+                    JobState::Missing => (PrintRowKind::Missing, None),
+                };
+                let note = if job.busy {
+                    Some("Finish the open print dialog first")
+                } else if job.save_failed {
+                    Some("Couldn’t save a copy")
+                } else {
+                    match kind {
+                        PrintRowKind::Unreadable => Some("Can’t print here"),
+                        PrintRowKind::Failed => Some("Couldn’t receive"),
+                        PrintRowKind::TooLarge => Some("Too large to receive"),
+                        PrintRowKind::Missing => Some("No longer on this Mac"),
+                        _ => None,
+                    }
+                };
+                let meta = state.unwrap_or_else(|| match note {
+                    Some(note) => format!("{size} · {age} · {note}"),
+                    None => format!("{size} · {age}"),
+                });
+                PrintJobRow {
+                    id: job.id,
+                    name: job.name.clone(),
+                    meta,
+                    kind,
+                    saved_to: job
+                        .saved_to
+                        .as_deref()
+                        .filter(|_| !job.save_failed)
+                        .map(super::session_window::saved_label),
+                    opened: job.opened,
+                }
+            })
+            .collect::<Vec<_>>();
+    PrintingProps {
+        auto_print,
+        at_cap: rows.len() >= print_jobs::JOBS_CAP,
+        jobs: rows,
+    }
+}
+
+/// The Shortcuts card, from `shortcuts::CHORDS` (`ARCH-031`).
+fn shortcuts_props(mac_active: bool, locked: bool) -> ShortcutsProps {
+    let rows = shortcuts::CHORDS
+        .iter()
+        .map(|chord| {
+            let (modifiers, key) = shortcuts::glyphs(chord.keystroke);
+            ShortcutRow {
+                label: chord.label.into(),
+                modifiers,
+                key,
+                remote: (!chord.always_local)
+                    .then(|| format!("Sent as {}", shortcuts::remote_label(chord.keystroke))),
+                always_local: chord.always_local,
+            }
+        })
+        .collect();
+    ShortcutsProps {
+        mac_active,
+        locked,
+        rows,
+    }
+}
+
+/// What the Audio Settings card is drawn from.
+struct AudioInputs<'a> {
+    status: Option<&'a OutputStatus>,
+    /// The saved choice (its UID); `None` is System Default.
+    chosen: Option<&'a str>,
+    saved_name: Option<&'a str>,
+    bitrate: Option<&'a AudioBitrate>,
+    /// Audio is off this session (server or decoder), as the card says it.
+    unavailable: Option<&'a str>,
+}
+
+impl AudioInputs<'_> {
+    /// The saved device when it isn't connected.
+    fn missing(&self, status: &OutputStatus) -> bool {
+        self.chosen.is_some_and(|uid| status.device(uid).is_none())
+    }
+
+    /// The status's problem, if it answers the current choice (a pick waits for the
+    /// audio thread for a moment; until then the old choice's problem is stale).
+    fn problem(&self, status: &OutputStatus) -> Option<OutputProblem> {
+        status
+            .problem
+            .filter(|_| status.chosen.as_deref() == self.chosen)
+    }
+}
+
+/// The muted line under the header buttons: only while no sound can play, since the Audio
+/// card is collapsed by default and would hide it.
+fn audio_header_line(audio: &AudioInputs) -> Option<String> {
+    if let Some(reason) = audio.unavailable {
+        return Some(reason.trim_end_matches('.').to_string());
+    }
+    let status = audio.status?;
+    match audio.problem(status) {
+        Some(OutputProblem::Failed) => Some("Audio output stopped".into()),
+        Some(OutputProblem::ChosenFailing) if status.active.is_none() => {
+            Some("Audio output stopped".into())
+        }
+        _ if status.devices.is_empty() => Some("No audio output".into()),
+        _ => None,
+    }
+}
+
+/// The Audio Settings card; `None` until the session's audio is ready (`ARCH-GAP-DC-03`).
+fn audio_props(audio: &AudioInputs) -> Option<AudioProps> {
+    if let Some(reason) = audio.unavailable {
+        return Some(AudioProps {
+            output_label: String::new(),
+            outputs: Vec::new(),
+            note: None,
+            bitrate: None,
+            unavailable: Some(reason.to_string()),
+        });
+    }
+    let status = audio.status?;
+    let default_label = status.default_device().map_or_else(
+        || "System Default".to_string(),
+        |device| format!("System Default ({})", device.name),
+    );
+    let missing = audio.missing(status);
+    let saved = audio.saved_name.unwrap_or("Saved Device");
+    let missing_label = format!("{saved} (not connected)");
+    let mut outputs = vec![AudioOutputItem {
+        uid: None,
+        label: default_label.clone(),
+        checked: audio.chosen.is_none(),
+        connected: true,
+    }];
+    outputs.extend(status.devices.iter().map(|device| AudioOutputItem {
+        uid: Some(device.uid.clone()),
+        label: device.name.clone(),
+        checked: audio.chosen == Some(device.uid.as_str()),
+        connected: true,
+    }));
+    if missing {
+        outputs.push(AudioOutputItem {
+            uid: audio.chosen.map(str::to_string),
+            label: missing_label.clone(),
+            checked: true,
+            connected: false,
+        });
+    }
+    let output_label = match audio.chosen {
+        None => default_label,
+        Some(_) if missing => missing_label,
+        Some(uid) => status
+            .device(uid)
+            .map_or_else(|| saved.to_string(), |device| device.name.clone()),
+    };
+    let subject = audio
+        .saved_name
+        .map_or_else(|| "Your saved output device".to_string(), str::to_string);
+    let playing = status.active.as_ref().map(|device| device.name.as_str());
+    let note = match (audio.problem(status), playing) {
+        (Some(OutputProblem::Failed), _) | (Some(OutputProblem::ChosenFailing), None) => {
+            Some("Audio output stopped. Trying again…".into())
+        }
+        _ if missing => Some(match playing {
+            Some(active) => {
+                format!("{subject} isn’t connected. Playing through {active} until it’s back.")
+            }
+            None => format!(
+                "{subject} isn’t connected, and no other audio output is available. Audio \
+                 resumes when one is."
+            ),
+        }),
+        _ if status.devices.is_empty() => {
+            Some("No audio output is connected. Audio resumes when one is.".into())
+        }
+        (Some(OutputProblem::ChosenFailing), Some(active)) => Some(format!(
+            "{} isn’t responding. Playing through {active} while Skerry keeps trying.",
+            audio
+                .chosen
+                .and_then(|uid| status.device(uid))
+                .map_or(saved, |d| d.name.as_str())
+        )),
+        _ => None,
+    };
+    Some(AudioProps {
+        output_label,
+        outputs,
+        note,
+        bitrate: audio.bitrate.map(|bitrate| AudioBitrateProps {
+            value: bitrate.value,
+            choices: bitrate.choices.clone(),
+            locked: !bitrate.editable(),
+        }),
+        unavailable: None,
+    })
 }
 
 fn current_codec(session: &SessionWindow) -> Codec {
@@ -661,10 +1425,15 @@ impl Render for ControlPanel {
         let close_owner = owner.clone();
         let toggle_owner = owner.clone();
         let fullscreen_owner = owner.clone();
+        let strip_owner = owner.clone();
+        let capture_owner = owner.clone();
+        let scroll = owner.session.read(cx).controls_scroll.clone();
         let root = div()
             .id("session-controls")
             .size_full()
-            .overflow_y_scrollbar()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .vertical_scrollbar(&scroll)
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
@@ -678,13 +1447,45 @@ impl Render for ControlPanel {
             })
             .on_action(move |_: &ToggleFullScreen, _, cx| {
                 Self::send(fullscreen_owner.clone(), Command::FullScreen, cx)
+            })
+            .on_action(move |_: &ToggleStatsStrip, _, cx| {
+                // View → Toggle Stats Over Stream while the panel is key.
+                let on = !strip_owner.session.read(cx).preferences.stats_strip;
+                Self::send(strip_owner.clone(), Command::StatsStrip(on), cx)
+            })
+            .on_action(move |_: &TogglePointerCapture, _, cx| {
+                // ⌃⌥⇧Z or the menu while the panel is key: the session window captures.
+                Self::send(capture_owner.clone(), Command::CapturePointer, cx)
             });
 
+        // "+N more" while the panel is open: show the Printing card (`ARCH-033`).
+        let reveal = owner.session.read(cx).print_reveal;
+        if reveal != self.print_reveal_seen {
+            self.print_reveal_seen = reveal;
+            if !self.ui.printing_open {
+                self.ui.printing_open = true;
+                self.remember_sections(cx);
+            }
+        }
         let session = owner.session.read(cx);
+        // A reconnect empties the panel for a moment (no stream, then no settings), and GPUI
+        // would clamp the offset to the short content. Keep it, and put it back as the
+        // content refills (`next_scroll`).
+        let complete = session.current.is_some() && session.settings.is_some();
+        let (saved, apply) = next_scroll(
+            self.scroll_saved,
+            complete,
+            scroll.offset(),
+            scroll.max_offset().y,
+        );
+        self.scroll_saved = saved;
+        if let Some(offset) = apply {
+            scroll.set_offset(offset);
+        }
         if session.current.is_none() {
             return root;
         }
-        let props = self.build_props(session, session.remote.app_name.clone());
+        let props = self.build_props(session, session.remote.app_name.clone(), cx);
         let entity = cx.entity().clone();
         let handler = Rc::new(
             move |action: ControlsAction, window: &mut Window, cx: &mut App| {
@@ -701,5 +1502,670 @@ impl Render for ControlPanel {
             window,
             cx,
         ))
+    }
+}
+
+/// One frame of the scroll keeper: `(offset to keep, offset to apply)`. While the content is
+/// incomplete the current offset is kept (once, before GPUI clamps it). Once complete, the
+/// kept offset is applied each frame until the content is tall enough for it, or until the
+/// person scrolls (the offset is no longer what applying it left). GPUI offsets are
+/// negative; `max_y` is the largest scroll distance the last layout allowed.
+fn next_scroll(
+    saved: Option<Point<Pixels>>,
+    complete: bool,
+    current: Point<Pixels>,
+    max_y: Pixels,
+) -> (Option<Point<Pixels>>, Option<Point<Pixels>>) {
+    if !complete {
+        return (saved.or(Some(current)), None);
+    }
+    let Some(saved) = saved else {
+        return (None, None);
+    };
+    let left = saved.y.max(-max_y);
+    if (f32::from(current.y) - f32::from(left)).abs() > 0.5 {
+        return (None, None);
+    }
+    if max_y >= -saved.y {
+        (None, Some(saved))
+    } else {
+        (Some(saved), Some(saved))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printing_props_list_jobs_newest_first() {
+        use crate::print_jobs::{Announced, Announcement, FetchFailure, Fetched};
+        use std::time::{Duration, Instant, SystemTime};
+        let mut jobs = PrintJobs::new("/cache/Print/w".into());
+        let (start, wall) = (Instant::now(), SystemTime::now());
+        let mut ids = Vec::new();
+        for name in ["old.pdf", "mid.pdf", "new.pdf"] {
+            let announced = jobs.announce(
+                Announcement {
+                    name: name.into(),
+                    size: 3_400_000,
+                    too_large: false,
+                },
+                false,
+                start,
+                wall,
+            );
+            let Announced::Fetch { id, .. } = announced else {
+                panic!("fetch");
+            };
+            ids.push(id);
+        }
+        let fetched = Fetched {
+            bytes: 3_400_000,
+            printed_at: None,
+        };
+        jobs.finished(ids[0], Ok(fetched), start);
+        jobs.finished(ids[1], Err(FetchFailure::NotPdf), start);
+        jobs.mark_opened(ids[0]);
+        let props = printing_props(&jobs, false, start + Duration::from_secs(120));
+        assert!(!props.auto_print && !props.at_cap);
+        let names: Vec<_> = props.jobs.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["new.pdf", "mid.pdf", "old.pdf"]);
+        assert_eq!(
+            props.jobs[0].kind,
+            PrintRowKind::Receiving { fraction: Some(0.) }
+        );
+        assert_eq!(props.jobs[0].meta, "0 bytes of 3.4 MB");
+        assert_eq!(props.jobs[1].kind, PrintRowKind::Failed);
+        assert_eq!(props.jobs[1].meta, "3.4 MB · 2 min ago · Couldn’t receive");
+        assert_eq!(props.jobs[2].meta, "3.4 MB · 2 min ago");
+        assert!(props.jobs[2].opened);
+    }
+    use crate::audio::OutputDevice;
+    use gpui_kit::px;
+
+    fn device(uid: &str, name: &str) -> OutputDevice {
+        OutputDevice {
+            uid: uid.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Speakers (the default) and AirPods connected, playing through `active`.
+    fn status(chosen: Option<&str>, active: Option<&str>) -> OutputStatus {
+        let devices = vec![
+            device("AirPods", "AirPods Pro"),
+            device("BuiltIn", "MacBook Pro Speakers"),
+        ];
+        OutputStatus {
+            active: active.and_then(|uid| devices.iter().find(|d| d.uid == uid).cloned()),
+            devices,
+            default_uid: Some("BuiltIn".into()),
+            chosen: chosen.map(str::to_string),
+            problem: None,
+        }
+    }
+
+    fn inputs<'a>(
+        status: Option<&'a OutputStatus>,
+        chosen: Option<&'a str>,
+        saved_name: Option<&'a str>,
+    ) -> AudioInputs<'a> {
+        AudioInputs {
+            status,
+            chosen,
+            saved_name,
+            bitrate: None,
+            unavailable: None,
+        }
+    }
+
+    #[test]
+    fn audio_props_label_system_default_with_active_device() {
+        let status = status(None, Some("BuiltIn"));
+        let props = audio_props(&inputs(Some(&status), None, None)).unwrap();
+        assert_eq!(props.output_label, "System Default (MacBook Pro Speakers)");
+        let labels: Vec<_> = props
+            .outputs
+            .iter()
+            .map(|o| (o.label.as_str(), o.checked, o.connected))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("System Default (MacBook Pro Speakers)", true, true),
+                ("AirPods Pro", false, true),
+                ("MacBook Pro Speakers", false, true),
+            ]
+        );
+        assert_eq!(props.note, None);
+        // A chosen device shows its name only, even when it is also the default.
+        let chosen = status_with_chosen("BuiltIn");
+        let props = audio_props(&inputs(Some(&chosen), Some("BuiltIn"), None)).unwrap();
+        assert_eq!(props.output_label, "MacBook Pro Speakers");
+        assert!(props.outputs[2].checked && !props.outputs[0].checked);
+    }
+
+    fn status_with_chosen(uid: &str) -> OutputStatus {
+        status(Some(uid), Some(uid))
+    }
+
+    #[test]
+    fn audio_props_mark_missing_saved_device_and_note_fallback() {
+        let mut status = status(Some("USB"), Some("BuiltIn"));
+        status.problem = Some(OutputProblem::ChosenMissing);
+        let props = audio_props(&inputs(Some(&status), Some("USB"), Some("USB DAC"))).unwrap();
+        assert_eq!(props.output_label, "USB DAC (not connected)");
+        let last = props.outputs.last().unwrap();
+        assert_eq!(
+            (last.label.as_str(), last.checked, last.connected),
+            ("USB DAC (not connected)", true, false)
+        );
+        assert!(!props.outputs[0].checked);
+        assert_eq!(
+            props.note.as_deref(),
+            Some("USB DAC isn’t connected. Playing through MacBook Pro Speakers until it’s back.")
+        );
+        // A name never seen.
+        let props = audio_props(&inputs(Some(&status), Some("USB"), None)).unwrap();
+        assert_eq!(props.output_label, "Saved Device (not connected)");
+        assert!(props
+            .note
+            .unwrap()
+            .starts_with("Your saved output device isn’t connected."));
+    }
+
+    #[test]
+    fn audio_props_missing_device_with_no_other_output() {
+        let status = OutputStatus {
+            chosen: Some("USB".into()),
+            problem: Some(OutputProblem::ChosenMissing),
+            ..OutputStatus::default()
+        };
+        let audio = inputs(Some(&status), Some("USB"), Some("USB DAC"));
+        let props = audio_props(&audio).unwrap();
+        assert_eq!(
+            props.note.as_deref(),
+            Some(
+                "USB DAC isn’t connected, and no other audio output is available. Audio \
+                 resumes when one is."
+            )
+        );
+        assert_eq!(props.outputs.len(), 2);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("No audio output")
+        );
+    }
+
+    #[test]
+    fn audio_props_hide_bitrate_when_server_does_not_expose_it() {
+        let status = status(None, Some("BuiltIn"));
+        let props = audio_props(&inputs(Some(&status), None, None)).unwrap();
+        assert_eq!(props.bitrate, None);
+        let bitrate = AudioBitrate {
+            value: 96_000,
+            choices: vec![96_000],
+            locked: false,
+        };
+        let mut audio = inputs(Some(&status), None, None);
+        audio.bitrate = Some(&bitrate);
+        assert_eq!(
+            audio_props(&audio).unwrap().bitrate,
+            Some(AudioBitrateProps {
+                value: 96_000,
+                choices: vec![96_000],
+                locked: true
+            })
+        );
+    }
+
+    #[test]
+    fn audio_props_show_only_reason_when_audio_disabled_by_server() {
+        let mut audio = inputs(None, None, None);
+        audio.unavailable = Some("Audio turned off by the server");
+        let props = audio_props(&audio).unwrap();
+        assert_eq!(
+            props.unavailable.as_deref(),
+            Some("Audio turned off by the server")
+        );
+        assert!(props.outputs.is_empty() && props.bitrate.is_none());
+        audio.unavailable = Some("Audio couldn’t start on this Mac.");
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("Audio couldn’t start on this Mac")
+        );
+        // Before the session is ready the card waits.
+        assert_eq!(audio_props(&inputs(None, None, None)), None);
+    }
+
+    #[test]
+    fn audio_props_header_line_only_when_no_sound_can_play() {
+        let playing = status(None, Some("BuiltIn"));
+        assert_eq!(audio_header_line(&inputs(Some(&playing), None, None)), None);
+        let mut missing = status(Some("USB"), Some("BuiltIn"));
+        missing.problem = Some(OutputProblem::ChosenMissing);
+        assert_eq!(
+            audio_header_line(&inputs(Some(&missing), Some("USB"), None)),
+            None,
+            "sound still plays"
+        );
+        let none = OutputStatus {
+            problem: Some(OutputProblem::NoDevice),
+            ..OutputStatus::default()
+        };
+        let audio = inputs(Some(&none), None, None);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("No audio output")
+        );
+        assert_eq!(
+            audio_props(&audio).unwrap().note.as_deref(),
+            Some("No audio output is connected. Audio resumes when one is.")
+        );
+        let mut failed = status(None, None);
+        failed.problem = Some(OutputProblem::Failed);
+        let audio = inputs(Some(&failed), None, None);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("Audio output stopped")
+        );
+        assert_eq!(
+            audio_props(&audio).unwrap().note.as_deref(),
+            Some("Audio output stopped. Trying again…")
+        );
+    }
+
+    #[test]
+    fn a_failing_choice_with_nothing_playing_says_so() {
+        let mut stuck = status(Some("AirPods"), None);
+        stuck.problem = Some(OutputProblem::ChosenFailing);
+        let audio = inputs(Some(&stuck), Some("AirPods"), None);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("Audio output stopped")
+        );
+        assert_eq!(
+            audio_props(&audio).unwrap().note.as_deref(),
+            Some("Audio output stopped. Trying again…")
+        );
+    }
+
+    #[test]
+    fn a_fresh_pick_ignores_the_previous_choices_problem() {
+        // Picked System Default; the thread still reports the failing AirPods choice.
+        let mut stale = status(Some("AirPods"), Some("BuiltIn"));
+        stale.problem = Some(OutputProblem::ChosenFailing);
+        let props = audio_props(&inputs(Some(&stale), None, None)).unwrap();
+        assert_eq!(props.note, None);
+        let props = audio_props(&inputs(Some(&stale), Some("AirPods"), None)).unwrap();
+        assert_eq!(
+            props.note.as_deref(),
+            Some("AirPods Pro isn’t responding. Playing through MacBook Pro Speakers while Skerry keeps trying.")
+        );
+    }
+
+    fn at(y: f32) -> Point<Pixels> {
+        point(px(0.), px(y))
+    }
+
+    #[test]
+    fn pad_state_rules() {
+        assert_eq!(pad_state(true, true, true), PadStatus::Sending);
+        assert_eq!(pad_state(true, true, false), PadStatus::Ready);
+        assert_eq!(pad_state(false, true, true), PadStatus::NotSent);
+        assert_eq!(pad_state(true, false, true), PadStatus::NotSent);
+        assert_eq!(pad_state(false, false, false), PadStatus::NotSent);
+    }
+
+    #[test]
+    fn capture_props_take_the_chord_from_chords() {
+        let props = capture_props(true, false);
+        assert_eq!((props.modifiers.as_str(), props.key.as_str()), ("⌃⌥⇧", "Z"));
+        assert!(props.available && !props.captured);
+    }
+
+    #[test]
+    fn scroll_offset_survives_an_empty_frame() {
+        // Scrolled 600 down, then a reconnect empties the panel.
+        let (saved, apply) = next_scroll(None, false, at(-600.), px(900.));
+        assert_eq!((saved, apply), (Some(at(-600.)), None));
+        // GPUI clamps the empty panel to 0; the kept offset stays.
+        let (saved, apply) = next_scroll(saved, false, at(0.), px(0.));
+        assert_eq!((saved, apply), (Some(at(-600.)), None));
+        // Settings arrive: the content is 300 tall so far. Apply, and keep waiting.
+        let (saved, apply) = next_scroll(saved, true, at(0.), px(0.));
+        assert_eq!((saved, apply), (Some(at(-600.)), Some(at(-600.))));
+        let (saved, apply) = next_scroll(saved, true, at(-300.), px(300.));
+        assert_eq!((saved, apply), (Some(at(-600.)), Some(at(-600.))));
+        // The policies refill the rest: the offset fits, applied one last time.
+        let (saved, apply) = next_scroll(saved, true, at(-600.), px(900.));
+        assert_eq!((saved, apply), (None, Some(at(-600.))));
+        assert_eq!(next_scroll(saved, true, at(-600.), px(900.)), (None, None));
+    }
+
+    #[test]
+    fn scrolling_during_the_refill_wins() {
+        let saved = Some(at(-600.));
+        // Content can scroll 300 but the person moved to 100.
+        assert_eq!(next_scroll(saved, true, at(-100.), px(300.)), (None, None));
+    }
+
+    fn mic_policy(permitted: bool, locked: bool) -> CapturePolicy {
+        CapturePolicy {
+            mic: crate::capture::DevicePolicy {
+                permitted,
+                locked,
+                ..Default::default()
+            },
+            ..CapturePolicy::default()
+        }
+    }
+
+    fn mic_status(live: bool) -> MicStatus {
+        MicStatus {
+            devices: vec![
+                device("BuiltIn", "MacBook Pro Microphone"),
+                device("Shure", "Shure MV7"),
+            ],
+            default_uid: Some("BuiltIn".into()),
+            active: live.then(|| device("BuiltIn", "MacBook Pro Microphone")),
+            live,
+            level: 3,
+            ..MicStatus::default()
+        }
+    }
+
+    fn mic_inputs(policy: Option<CapturePolicy>, status: Option<&MicStatus>) -> MicInputs<'_> {
+        MicInputs {
+            policy,
+            state: DeviceState::default(),
+            status,
+            chosen: None,
+            saved_name: None,
+        }
+    }
+
+    #[test]
+    fn media_capture_props_hidden_until_policy() {
+        let status = mic_status(false);
+        assert!(media_capture_props(&mic_inputs(None, Some(&status)), None).is_none());
+        let props = media_capture_props(
+            &mic_inputs(Some(mic_policy(true, false)), Some(&status)),
+            None,
+        )
+        .unwrap()
+        .mic;
+        assert!(!props.on && !props.locked && !props.live);
+        assert_eq!(props.detail, None, "plain Off says nothing more");
+        assert_eq!(
+            props.device_label,
+            "System Default (MacBook Pro Microphone)"
+        );
+        assert_eq!(props.devices.len(), 3);
+        assert_eq!(props.level, None);
+    }
+
+    #[test]
+    fn media_capture_props_locked_off_disabled_with_note() {
+        let props = media_capture_props(&mic_inputs(Some(mic_policy(false, true)), None), None)
+            .unwrap()
+            .mic;
+        assert!(props.locked && props.picker_locked && !props.on);
+        assert_eq!(props.detail.as_deref(), Some("Turned off by the server"));
+        assert_eq!(props.device_label, "System Default");
+        let mut audio_off = mic_policy(false, false);
+        audio_off.mic.audio_off = true;
+        let props = media_capture_props(&mic_inputs(Some(audio_off), None), None)
+            .unwrap()
+            .mic;
+        assert_eq!(
+            props.detail.as_deref(),
+            Some("Unavailable while session audio is off")
+        );
+        // MICROPHONE_DISABLED reads the same.
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), None);
+        inputs.state.server_disabled = true;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(props.locked);
+        assert_eq!(props.detail.as_deref(), Some("Turned off by the server"));
+    }
+
+    #[test]
+    fn locked_on_mic_switch_disabled_but_picker_works() {
+        let status = mic_status(false);
+        let props = media_capture_props(
+            &mic_inputs(Some(mic_policy(true, true)), Some(&status)),
+            None,
+        )
+        .unwrap()
+        .mic;
+        assert!(props.locked && !props.picker_locked);
+        // Locked on starts like on_start (M-QA-3): the switch shows on, and disabled.
+        let status = mic_status(true);
+        let mut inputs = mic_inputs(Some(mic_policy(true, true)), Some(&status));
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::On;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(props.on && props.locked && props.live);
+    }
+
+    #[test]
+    fn media_capture_props_denied_shows_privacy_button() {
+        let status = mic_status(false);
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.state.denied = true;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(props.denied && !props.on && !props.locked);
+        assert_eq!(
+            props.detail.as_deref(),
+            Some("SealSkin Native isn’t allowed to use the microphone.")
+        );
+        // A refusal of a start the server asked for stays silent.
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.state.refused = true;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(!props.denied && props.detail.is_none());
+    }
+
+    #[test]
+    fn media_capture_props_missing_device_greyed() {
+        let status = MicStatus {
+            chosen: Some("USB".into()),
+            problem: Some(MicProblem::ChosenMissing),
+            ..mic_status(true)
+        };
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.chosen = Some("USB");
+        inputs.saved_name = Some("USB Mic");
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        let last = props.devices.last().unwrap();
+        assert_eq!(last.label, "USB Mic (not connected)");
+        assert!(last.checked && !last.connected);
+        assert_eq!(props.device_label, "USB Mic (not connected)");
+        assert_eq!(
+            props.note.as_deref(),
+            Some("USB Mic isn’t connected. Using MacBook Pro Microphone until it’s back.")
+        );
+        // Nothing else to use.
+        let empty = MicStatus {
+            chosen: Some("USB".into()),
+            ..MicStatus::default()
+        };
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&empty));
+        inputs.chosen = Some("USB");
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert_eq!(
+            props.note.as_deref(),
+            Some("Your saved microphone isn’t connected, and no other microphone is available.")
+        );
+    }
+
+    #[test]
+    fn media_capture_props_follow_the_open_device() {
+        // Wanted and opening: the switch is on, the meter shows, no badge dot yet.
+        let status = mic_status(false);
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::On;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(props.on && !props.live);
+        assert_eq!(props.detail.as_deref(), Some("Starting…"));
+        assert_eq!(props.level, Some(3));
+        // Open: the dot and "Sending to the session", even before packets are delivered.
+        let status = mic_status(true);
+        inputs.status = Some(&status);
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(props.live);
+        assert_eq!(props.detail.as_deref(), Some("Sending to the session"));
+        assert_eq!(
+            skerry_ui::controls::media_capture_header(&MediaCaptureProps {
+                mic: props,
+                camera: None
+            }),
+            Some("Microphone on")
+        );
+        // Demand, untouched: says when it starts.
+        let mut demand = mic_policy(true, false);
+        demand.mic.on_demand = true;
+        let props = media_capture_props(&mic_inputs(Some(demand), None), None)
+            .unwrap()
+            .mic;
+        assert_eq!(
+            props.detail.as_deref(),
+            Some("Starts when an app in the session listens")
+        );
+        // Asking.
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), None);
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::Asking;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
+        assert!(props.on);
+        assert_eq!(props.detail.as_deref(), Some("Waiting for permission…"));
+    }
+
+    fn cam_status(live: bool) -> CamStatus {
+        CamStatus {
+            devices: vec![
+                device("FaceTime", "FaceTime HD Camera"),
+                device("iPhone", "iPhone Camera"),
+            ],
+            default_uid: Some("FaceTime".into()),
+            active: live.then(|| device("FaceTime", "FaceTime HD Camera")),
+            live,
+            ..CamStatus::default()
+        }
+    }
+
+    fn cam_inputs(status: Option<&CamStatus>) -> CamInputs<'_> {
+        CamInputs {
+            state: DeviceState::default(),
+            status,
+            chosen: None,
+            saved_name: None,
+        }
+    }
+
+    fn both_policy() -> CapturePolicy {
+        let mut policy = mic_policy(true, false);
+        policy.cam.permitted = true;
+        policy
+    }
+
+    #[test]
+    fn media_capture_props_camera_group() {
+        let status = cam_status(true);
+        let mic = mic_inputs(Some(both_policy()), None);
+        let mut cam = cam_inputs(Some(&status));
+        cam.state.wanted = true;
+        cam.state.phase = Phase::On;
+        let props = media_capture_props(&mic, Some(&cam)).unwrap();
+        let camera = props.camera.clone().unwrap();
+        assert!(
+            camera.on && camera.live && camera.level.is_none(),
+            "no meter"
+        );
+        assert_eq!(camera.device_label, "System Default (FaceTime HD Camera)");
+        assert_eq!(camera.detail.as_deref(), Some("Sending to the session"));
+        assert_eq!(
+            skerry_ui::controls::media_capture_header(&props),
+            Some("Camera on")
+        );
+        // Another app holds it.
+        let in_use = CamStatus {
+            problem: Some(CamProblem::InUse),
+            ..cam_status(false)
+        };
+        cam.status = Some(&in_use);
+        let camera = media_capture_props(&mic, Some(&cam))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("The camera is in use by another app or stopped. Trying again…")
+        );
+        // Demand, untouched.
+        let mut demand = both_policy();
+        demand.cam.on_demand = true;
+        let camera = media_capture_props(&mic_inputs(Some(demand), None), Some(&cam_inputs(None)))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("Starts when an app in the session uses the camera")
+        );
+        // Denied: the camera's own words and the privacy button.
+        let mut denied = cam_inputs(None);
+        denied.state.denied = true;
+        let camera = media_capture_props(&mic, Some(&denied))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert!(camera.denied);
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("SealSkin Native isn’t allowed to use the camera.")
+        );
+        // WEBCAM_DISABLED.
+        let mut disabled = cam_inputs(None);
+        disabled.state.server_disabled = true;
+        let camera = media_capture_props(&mic, Some(&disabled))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert!(camera.locked && camera.picker_locked);
+        assert_eq!(camera.detail.as_deref(), Some("Turned off by the server"));
+    }
+
+    #[test]
+    fn media_capture_props_camera_hidden_by_server() {
+        let mut hidden = both_policy();
+        hidden.cam_shown = false;
+        hidden.cam.permitted = false;
+        let props =
+            media_capture_props(&mic_inputs(Some(hidden), None), Some(&cam_inputs(None))).unwrap();
+        assert!(props.camera.is_none());
+    }
+
+    #[test]
+    fn media_capture_props_missing_camera_greyed() {
+        let status = CamStatus {
+            chosen: Some("Gone".into()),
+            problem: Some(CamProblem::ChosenMissing),
+            ..cam_status(true)
+        };
+        let mut cam = cam_inputs(Some(&status));
+        cam.chosen = Some("Gone");
+        let camera = media_capture_props(&mic_inputs(Some(both_policy()), None), Some(&cam))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(camera.device_label, "Saved Camera (not connected)");
+        assert_eq!(
+            camera.note.as_deref(),
+            Some("Your saved camera isn’t connected. Using FaceTime HD Camera until it’s back.")
+        );
     }
 }
