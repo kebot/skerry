@@ -125,10 +125,16 @@ pub fn suppress_bindings() -> Vec<KeyBinding> {
 /// [`suppress_bindings`] suppresses, matched the way GPUI matches them, and only while Mac
 /// shortcuts are off.
 pub fn passes_to_session(keystroke: &Keystroke, mac_active: bool) -> bool {
+    thread_local! {
+        /// Parsed once per thread (GPUI's bindings hold `Rc`s); key-downs only match.
+        static SUPPRESSED: Vec<KeyBinding> = suppress_bindings();
+    }
     !mac_active
-        && suppress_bindings()
-            .iter()
-            .any(|binding| binding.match_keystrokes(&[keystroke]) == Some(false))
+        && SUPPRESSED.with(|bindings| {
+            bindings
+                .iter()
+                .any(|binding| binding.match_keystrokes(&[keystroke]) == Some(false))
+        })
 }
 
 /// A chord as macOS menus write it: the modifiers in ⌃⌥⇧⌘ order, and the key.

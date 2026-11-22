@@ -1003,7 +1003,11 @@ impl Render for Desktop {
                         // Ordered socket: the clipboard lands before the paste keystroke.
                         desktop.sync_to_session(false);
                     }
-                    let commands = desktop.keys.press(event.keystroke.key.clone(), key);
+                    let commands = if pass {
+                        desktop.keys.tap_chord(&event.keystroke.key, key)
+                    } else {
+                        desktop.keys.press(event.keystroke.key.clone(), key)
+                    };
                     desktop.commands(commands);
                     cx.stop_propagation();
                 }

@@ -141,6 +141,9 @@ pub(super) struct SessionWindow {
     /// The Stats section is open, or the strip is shown: either subscribes the session to
     /// the server's `stream_stats` (`ARCH-019`, `ARCH-031`).
     stats_interest: stats::StatsInterest,
+    /// The server's last `keyboard_shortcuts`, kept across stream ends and reconnects so a
+    /// lock holds until the next `server_settings` (`ARCH-031`).
+    shortcut_policy: Option<crate::shortcuts::ShortcutPolicy>,
     /// Every second since the subscription started (on this stream), up to
     /// `stats::HISTORY_MAX`.
     pub(super) stats_history: VecDeque<StreamSample>,
@@ -203,6 +206,7 @@ impl SessionWindow {
             controls_scroll: ScrollHandle::new(),
             stats: None,
             stats_interest: stats::StatsInterest::new(preferences.stats_strip),
+            shortcut_policy: None,
             stats_history: VecDeque::new(),
             stream_info: None,
             display_mode: DisplayMode::default(),
@@ -350,6 +354,7 @@ impl SessionWindow {
             SessionEvent::Settings(settings) => {
                 // The session answered: later reconnects get the normal 45 s grace.
                 self.keep_waiting = false;
+                self.shortcut_policy = Some(settings.keyboard_shortcuts);
                 self.settings = Some(settings);
                 // The server's keyboard_shortcuts, possibly locked (`ARCH-031`).
                 if let Some(stream) = &self.current {
@@ -868,18 +873,11 @@ impl SessionWindow {
     /// Whether Skerry's chords act on the Mac (`ARCH-031`): a server lock wins, then the
     /// saved choice, then the server's value.
     pub(super) fn mac_shortcuts(&self) -> bool {
-        crate::shortcuts::effective(
-            self.settings
-                .as_ref()
-                .map(|settings| settings.keyboard_shortcuts),
-            self.preferences.mac_shortcuts,
-        )
+        crate::shortcuts::effective(self.shortcut_policy, self.preferences.mac_shortcuts)
     }
 
     pub(super) fn shortcuts_locked(&self) -> bool {
-        self.settings
-            .as_ref()
-            .is_some_and(|settings| settings.keyboard_shortcuts.locked)
+        self.shortcut_policy.is_some_and(|policy| policy.locked)
     }
 
     /// **Mac shortcuts active** switched; ignored while the server locks it.

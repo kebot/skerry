@@ -73,10 +73,12 @@ impl KeyLedger {
     /// first keysym, or it would stay down on the server.
     pub fn press(&mut self, code: String, keysym: u32) -> Vec<String> {
         let mut commands = Vec::new();
-        if self.command_held {
-            self.command_keys.insert(code.clone());
-        } else {
+        if !self.command_held {
             self.command_keys.remove(&code);
+        } else if !self.keys.contains_key(&code) {
+            // Only a key that went down under ⌘; one held before it (now repeating) keeps
+            // its own key-up.
+            self.command_keys.insert(code.clone());
         }
         if let Some(previous) = self.keys.insert(code, keysym) {
             if previous != keysym {
@@ -99,6 +101,15 @@ impl KeyLedger {
     /// One keystroke that is never held (an IME commit).
     pub fn tap(&self, keysym: u32) -> Vec<String> {
         vec![format!("kd,{keysym}"), format!("ku,{keysym}")]
+    }
+
+    /// A forwarded Skerry chord's key (`ARCH-031`): tapped, never held, since AppKit sends
+    /// no key-up while ⌘ is down and a held key would autorepeat on the remote. A macOS
+    /// autorepeat taps again. If the same key was already held, it is released first.
+    pub fn tap_chord(&mut self, code: &str, keysym: u32) -> Vec<String> {
+        let mut commands = self.release(code);
+        commands.extend(self.tap(keysym));
+        commands
     }
 
     /// Moves the held modifiers to `next`, in Shift, Control, Alt order.
@@ -399,6 +410,44 @@ mod tests {
             ledger.mac_modifiers(mac(false, false, false, false), true),
             ["ku,65507"]
         );
+    }
+
+    #[test]
+    fn a_forwarded_chord_taps_its_key_while_control_stays_latched() {
+        let mut ledger = KeyLedger::default();
+        let held = mac(true, false, false, true);
+        ledger.mac_modifiers(held, false);
+        ledger.latch_command();
+        let mut commands = ledger.mac_modifiers(held, false);
+        commands.extend(ledger.tap_chord("m", 109));
+        // A macOS autorepeat while ⌘ is held taps again; nothing stays down.
+        commands.extend(ledger.tap_chord("m", 109));
+        assert_eq!(
+            commands,
+            ["kd,65507", "kd,109", "ku,109", "kd,109", "ku,109"]
+        );
+        assert!(ledger.control());
+        assert_eq!(
+            ledger.mac_modifiers(mac(false, false, false, false), false),
+            ["ku,65505", "ku,65507"]
+        );
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_letter_held_before_the_chord_is_not_released_when_command_lifts() {
+        let mut ledger = KeyLedger::default();
+        ledger.press("a".into(), 0x61);
+        ledger.mac_modifiers(mac(false, false, false, true), true);
+        // The held letter repeats under ⌘: still its own key.
+        assert_eq!(ledger.press("a".into(), 0x61), ["kd,97"]);
+        ledger.press("c".into(), 0x63);
+        assert_eq!(
+            ledger.mac_modifiers(mac(false, false, false, false), true),
+            ["ku,99", "ku,65507"]
+        );
+        assert_eq!(ledger.release("a"), ["ku,97"]);
+        assert!(ledger.is_empty());
     }
 
     #[test]
