@@ -8,6 +8,7 @@ use crate::audio::{OutputProblem, OutputStatus};
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
 use crate::persist::WriteQueue;
+use crate::print_jobs::{self, JobState, PrintJobs};
 use crate::settings::{AudioBitrate, ControlsSections};
 use crate::shortcuts;
 use crate::stats;
@@ -30,9 +31,10 @@ use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
     self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem, ClipboardProps,
     CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps, PadRow, PadStatus,
-    ScreenProps, Section, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps,
-    VideoSettingControl, VideoSettingRow,
+    PrintJobRow, PrintRowKind, PrintingProps, ScreenProps, Section, ShortcutRow, ShortcutsProps,
+    SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
+use skerry_ui::session::PrintJobAction;
 use std::rc::Rc;
 
 #[derive(Clone)]
@@ -53,6 +55,8 @@ pub(super) struct ControlPanel {
     /// The scroll offset kept while the panel's content is incomplete (a reconnect), to
     /// restore once it has refilled.
     scroll_saved: Option<Point<Pixels>>,
+    /// The session's `print_reveal` this panel has acted on (`ARCH-033`).
+    print_reveal_seen: u64,
 }
 
 #[derive(Clone)]
@@ -85,6 +89,8 @@ enum Command {
     CapturePointer,
     GamepadInput(bool),
     GamepadRumble(bool),
+    AutoPrint(bool),
+    PrintJob(u64, PrintJobAction),
 }
 
 impl ControlPanel {
@@ -106,7 +112,15 @@ impl ControlPanel {
             let server = session.read(cx).server().to_string();
             cx.global::<WriteQueue>().read(&server).controls
         };
-        let ui = ControlsUiState::default().with_sections(sections.to_array());
+        let mut ui = ControlsUiState::default().with_sections(sections.to_array());
+        // "+N more in Session Controls › Printing" opened this panel (`ARCH-033`).
+        let (reveal, print_reveal_seen) = session.update(cx, |session, _| {
+            (
+                std::mem::take(&mut session.print_reveal_on_open),
+                session.print_reveal,
+            )
+        });
+        ui.printing_open |= reveal;
         let bounds = window.bounds();
         let panel_size = size(px(388.), px(680.));
         let display = window.display(cx);
@@ -216,8 +230,12 @@ impl ControlPanel {
                         height,
                         copied: None,
                         scroll_saved: None,
+                        print_reveal_seen,
                     }
                 });
+                if reveal {
+                    panel.update(cx, |panel, cx| panel.remember_sections(cx));
+                }
                 if sections.stats {
                     // A restored open Stats section subscribes, as a click on it would.
                     Self::send(owner.clone(), Command::Stats(true), cx);
@@ -320,6 +338,10 @@ impl ControlPanel {
                         Command::CapturePointer => session.request_capture(window, cx),
                         Command::GamepadInput(on) => session.change_gamepad_input(on, cx),
                         Command::GamepadRumble(on) => session.change_gamepad_rumble(on, cx),
+                        Command::AutoPrint(on) => session.set_auto_print(on, cx),
+                        Command::PrintJob(id, action) => {
+                            session.print_action(id, action, window, cx)
+                        }
                         Command::Chord(chord) => {
                             session.close_controls(window, cx);
                             if let Some(stream) = &session.current {
@@ -494,6 +516,12 @@ impl ControlPanel {
             ControlsAction::SetGamepadRumble(on) => {
                 Self::send(self.owner.clone(), Command::GamepadRumble(on), cx)
             }
+            ControlsAction::SetAutoPrint(on) => {
+                Self::send(self.owner.clone(), Command::AutoPrint(on), cx)
+            }
+            ControlsAction::PrintJob(id, action) => {
+                Self::send(self.owner.clone(), Command::PrintJob(id, action), cx)
+            }
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -628,6 +656,13 @@ impl ControlPanel {
                 session.pointer_captured(cx),
             ),
             gamepads: gamepads_props(session, cx),
+            printing: (session.print_policy == Some(true)).then(|| {
+                printing_props(
+                    &session.print_jobs,
+                    session.preferences.printing.auto_print,
+                    std::time::Instant::now(),
+                )
+            }),
         }
     }
 }
@@ -688,6 +723,72 @@ fn capture_props(available: bool, captured: bool) -> CaptureProps {
         captured,
         modifiers,
         key,
+    }
+}
+
+/// The Printing card (`ARCH-033`): the switch and this window's jobs, newest first.
+fn printing_props(jobs: &PrintJobs, auto_print: bool, now: std::time::Instant) -> PrintingProps {
+    let rows =
+        jobs.jobs()
+            .iter()
+            .rev()
+            .map(|job| {
+                let size = skerry_ui::session::size_label(job.size);
+                let age = print_jobs::age_label(now.saturating_duration_since(job.arrived));
+                let (kind, state) = match &job.state {
+                    JobState::Receiving => {
+                        let received = job.received.load(std::sync::atomic::Ordering::Relaxed);
+                        let fraction =
+                            (job.size > 0).then(|| (received as f32 / job.size as f32).min(1.));
+                        let meta = if job.size > 0 {
+                            format!("{} of {size}", skerry_ui::session::size_label(received))
+                        } else {
+                            skerry_ui::session::size_label(received)
+                        };
+                        (PrintRowKind::Receiving { fraction }, Some(meta))
+                    }
+                    JobState::Ready => (PrintRowKind::Ready, None),
+                    JobState::Unreadable => (PrintRowKind::Unreadable, None),
+                    JobState::Failed(print_jobs::FetchFailure::TooLarge(_))
+                    | JobState::TooLarge => (PrintRowKind::TooLarge, None),
+                    JobState::Failed(_) => (PrintRowKind::Failed, None),
+                    JobState::Missing => (PrintRowKind::Missing, None),
+                };
+                let note = if job.busy {
+                    Some("Finish the open print dialog first")
+                } else if job.save_failed {
+                    Some("Couldn’t save a copy")
+                } else {
+                    match kind {
+                        PrintRowKind::Unreadable => Some("Can’t print here"),
+                        PrintRowKind::Failed => Some("Couldn’t receive"),
+                        PrintRowKind::TooLarge => Some("Too large to receive"),
+                        PrintRowKind::Missing => Some("No longer on this Mac"),
+                        _ => None,
+                    }
+                };
+                let meta = state.unwrap_or_else(|| match note {
+                    Some(note) => format!("{size} · {age} · {note}"),
+                    None => format!("{size} · {age}"),
+                });
+                PrintJobRow {
+                    id: job.id,
+                    name: job.name.clone(),
+                    meta,
+                    kind,
+                    saved_to: job
+                        .saved_to
+                        .as_deref()
+                        .filter(|_| !job.save_failed)
+                        .map(super::session_window::saved_label),
+                    opened: job.opened,
+                }
+            })
+            .collect::<Vec<_>>();
+    PrintingProps {
+        auto_print,
+        at_cap: rows.len() >= print_jobs::JOBS_CAP,
+        jobs: rows,
     }
 }
 
@@ -1007,6 +1108,15 @@ impl Render for ControlPanel {
                 Self::send(capture_owner.clone(), Command::CapturePointer, cx)
             });
 
+        // "+N more" while the panel is open: show the Printing card (`ARCH-033`).
+        let reveal = owner.session.read(cx).print_reveal;
+        if reveal != self.print_reveal_seen {
+            self.print_reveal_seen = reveal;
+            if !self.ui.printing_open {
+                self.ui.printing_open = true;
+                self.remember_sections(cx);
+            }
+        }
         let session = owner.session.read(cx);
         // A reconnect empties the panel for a moment (no stream, then no settings), and GPUI
         // would clamp the offset to the short content. Keep it, and put it back as the
@@ -1076,6 +1186,51 @@ fn next_scroll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printing_props_list_jobs_newest_first() {
+        use crate::print_jobs::{Announced, Announcement, FetchFailure, Fetched};
+        use std::time::{Duration, Instant, SystemTime};
+        let mut jobs = PrintJobs::new("/cache/Print/w".into());
+        let (start, wall) = (Instant::now(), SystemTime::now());
+        let mut ids = Vec::new();
+        for name in ["old.pdf", "mid.pdf", "new.pdf"] {
+            let announced = jobs.announce(
+                Announcement {
+                    name: name.into(),
+                    size: 3_400_000,
+                    too_large: false,
+                },
+                false,
+                start,
+                wall,
+            );
+            let Announced::Fetch { id, .. } = announced else {
+                panic!("fetch");
+            };
+            ids.push(id);
+        }
+        let fetched = Fetched {
+            bytes: 3_400_000,
+            printed_at: None,
+        };
+        jobs.finished(ids[0], Ok(fetched), start);
+        jobs.finished(ids[1], Err(FetchFailure::NotPdf), start);
+        jobs.mark_opened(ids[0]);
+        let props = printing_props(&jobs, false, start + Duration::from_secs(120));
+        assert!(!props.auto_print && !props.at_cap);
+        let names: Vec<_> = props.jobs.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["new.pdf", "mid.pdf", "old.pdf"]);
+        assert_eq!(
+            props.jobs[0].kind,
+            PrintRowKind::Receiving { fraction: Some(0.) }
+        );
+        assert_eq!(props.jobs[0].meta, "0 bytes of 3.4 MB");
+        assert_eq!(props.jobs[1].kind, PrintRowKind::Failed);
+        assert_eq!(props.jobs[1].meta, "3.4 MB · 2 min ago · Couldn’t receive");
+        assert_eq!(props.jobs[2].meta, "3.4 MB · 2 min ago");
+        assert!(props.jobs[2].opened);
+    }
     use crate::audio::OutputDevice;
     use gpui_kit::px;
 

@@ -29,6 +29,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
   - `settings.rs`: server setting ranges/locks intersection, `ScreenPolicy`, and per-server JSON preferences in `~/Library/Application Support/SealSkin Native/`, loaded field by field so a newer build's keys survive (`ARCH-026`).
   - `persist.rs`: the single FIFO write queue on Tokio for preferences and the key. Its in-memory copy serves every read, and it flushes within 1 s on quit (`ARCH-026`).
   - `view/keys.rs`: `KeyLedger`, the pure held-key bookkeeping that releases keys before close, on blur, and before child windows (`ARCH-026`).
+  - `shortcuts.rs`: `CHORDS` and the single ordered `key_bindings()`, with the `NoAction` suppression layer last under `SessionDesktop` (`ARCH-031`).
   - `clipboard.rs` & `pasteboard.rs`: Selkies clipboard protocol (`encode`, `Receiver`, `Policy` / `ClipboardSettings` / `Effective`) and the general `NSPasteboard` bridge (`change_count`, `read`, `write`, concealed secrets) (`ARCH-017`).
   - `input.rs`: `InputSettings` (Command sends Control, Remote Cursor, Smooth Trackpad Scrolling, Use Mac Input Method) and `RemoteChord` (Alt+Tab, Ctrl+Alt+Delete).
   - `audio.rs`: 48 kHz stereo f32 Opus playback on a per-session `skerry-audio` thread (the only place cpal/Core Audio is called), which follows the default or a chosen output device and recovers with backoff. The latency queue is bounded at `48000 * 2 / 8` samples (`ARCH-030`).
