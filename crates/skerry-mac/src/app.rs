@@ -11,7 +11,7 @@ use crate::sealskin::{
     Credential, KeySource, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession,
     SealSkinClient,
 };
-use crate::settings::{self, Preferences};
+use crate::settings::Preferences;
 use crate::transport::{DisplayRequest, Resolution};
 use gpui_kit::component::{
     input::{InputEvent, InputState},
@@ -262,8 +262,8 @@ struct Launcher {
     /// Every session locale with the Mac's name for it; built on the first Launch Dialog.
     language_options: Option<Vec<LaunchOption>>,
     pending_stop: Option<RemoteSession>,
-    /// The Sign Out confirmation is showing.
-    pending_sign_out: bool,
+    /// The Sign Out confirmation is showing, with what it says about the key.
+    pending_sign_out: Option<KeySourceLabel>,
     /// Where the signed-in key came from, which decides what Sign Out removes.
     signed_in: Option<SignedInKey>,
     /// Bumped whenever the Launcher leaves a server, so a load, launch or stop still in
@@ -328,7 +328,7 @@ impl Launcher {
             launch_dialog: None,
             language_options: None,
             pending_stop: None,
-            pending_sign_out: false,
+            pending_sign_out: None,
             signed_in: None,
             server_generation: 0,
             toast: None,
@@ -359,6 +359,18 @@ impl Launcher {
             }
             true
         });
+        // Back on screen: fresh "Started … ago" labels, and the render restarts the age tick.
+        let this = cx.weak_entity();
+        window
+            .observe_window_visibility(move |visibility, _, cx| {
+                if visibility.is_visible() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.items.invalidate();
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
         Theme::sync_system_appearance(Some(window), cx);
         cx.observe_window_appearance(window, |_, window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
@@ -476,7 +488,8 @@ impl Launcher {
                         this.startup_credential = None;
                         this.retry_api = None;
                         // Launch options remembered per app live with the other preferences.
-                        this.preferences = settings::load(api.server());
+                        // Through the queue's copy, which includes writes not yet on disk.
+                        this.preferences = cx.global::<WriteQueue>().read(api.server());
                         this.api = Some(api.clone());
                         this.set_library(Some(library));
                         if let Some(credential) = save {
@@ -585,23 +598,36 @@ impl Launcher {
         }
     }
 
-    /// Signs out after the confirmation: back to Connect, removing the saved key when
-    /// Skerry saved it. Open session windows keep streaming (`ARCH-022`).
+    /// What the Sign Out confirmation says about the key: saved whenever config.toml holds
+    /// it (whichever way it got there, a retry included), unless it comes from the
+    /// environment or `.env`.
+    fn sign_out_label(&self) -> KeySourceLabel {
+        SignedInKey::label(self.signed_in, || {
+            self.api
+                .as_ref()
+                .is_some_and(|api| crate::sealskin::saved_key_is(api.raw_key()))
+        })
+    }
+
+    /// Signs out after the confirmation: back to Connect, removing the key from config.toml
+    /// whenever it is saved there. Open session windows keep streaming (`ARCH-022`).
     fn sign_out(&mut self, cx: &mut Context<Self>) {
-        self.pending_sign_out = false;
+        self.pending_sign_out = None;
         self.status = None;
-        // An in-flight load, launch or stop is dropped by the generation bump below.
+        // An in-flight load, launch or stop is ignored once the generation is bumped below
+        // (see `LoadGate`); a launched session shows in the Library at the next sign-in.
         self.busy = None;
-        if self.signed_in.is_some_and(SignedInKey::removable) {
-            // Queued after any pending save of this key, so the removal wins.
-            let done = cx.global::<WriteQueue>().forget_key();
+        let from_environment = matches!(
+            self.signed_in,
+            Some(SignedInKey::Environment | SignedInKey::DotEnv)
+        );
+        if let Some(api) = self.api.as_ref().filter(|_| !from_environment) {
+            // Removes the key only if config.toml holds this one. Queued after any pending
+            // save of it, so the removal wins.
+            let done = cx.global::<WriteQueue>().forget_key(api.raw_key());
             self.on_written(
                 done,
-                |this, error| {
-                    this.status = Some(format!(
-                        "Signed out, but Skerry couldn’t remove the saved key: {error}"
-                    ))
-                },
+                |this, error| this.status = Some(format!("Signed out. {error}")),
                 cx,
             );
         }
@@ -689,19 +715,20 @@ impl Launcher {
         cx.notify();
     }
 
-    /// Starts the 30 s "Started … ago" refresh when the Library shows sessions. It stops
-    /// itself once there are none, and on sign-out.
-    fn ensure_age_tick(&mut self, cx: &mut Context<Self>) {
-        if self.age_tick.is_some() || !self.has_sessions() {
+    /// Starts the 30 s "Started … ago" refresh while the Library is on screen and shows
+    /// sessions. It stops itself once there are none or the window is hidden (minimized,
+    /// covered, asleep), and on sign-out; closing the window drops it. A render restarts it.
+    fn ensure_age_tick(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.age_tick.is_some() || !visible || !self.has_sessions() {
             return;
         }
         let window = self.window;
         self.age_tick = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(AGE_TICK).await;
             let keep = window
-                .update(cx, |_, _, cx| {
+                .update(cx, |_, window, cx| {
                     this.update(cx, |this, cx| {
-                        if this.has_sessions() {
+                        if this.has_sessions() && window.is_visible() {
                             this.items.invalidate();
                             cx.notify();
                             true
@@ -776,8 +803,10 @@ impl Launcher {
         self.media_generation += 1;
         self.server_generation += 1;
         self.signed_in = None;
-        self.pending_sign_out = false;
+        self.pending_sign_out = None;
         self.age_tick = None;
+        self.toast = None;
+        self.toast_task = None;
         let images: Vec<_> = self
             .app_icons
             .drain()
@@ -1066,7 +1095,7 @@ impl Launcher {
         let done = cx
             .global::<WriteQueue>()
             .preferences(api.server(), move |p| {
-                p.launch.insert(app_id, memory);
+                p.launch.insert(app_id.clone(), memory.clone());
             });
         self.on_written(
             done,
@@ -1239,12 +1268,8 @@ impl Render for Launcher {
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
         let theme = cx.theme().clone();
-        let server = self
-            .api
-            .as_ref()
-            .filter(|_| self.library.is_some())
-            .map(|api| api.server().to_string());
-        let Some(server) = server else {
+        self.ensure_age_tick(window.is_visible(), cx);
+        let (Some(api), Some(library)) = (&self.api, &self.library) else {
             let props = ConnectProps {
                 status: self.status.clone(),
                 busy: self.busy.clone(),
@@ -1257,10 +1282,7 @@ impl Render for Launcher {
             );
         };
 
-        self.ensure_age_tick(cx);
-        let Some(library) = &self.library else {
-            unreachable!("the Connect screen shows without a Library");
-        };
+        let server = api.server().to_string();
         // Built after the retired textures were dropped above and before any element uses
         // them, so no cached item hands a freed texture to `img` (`ARCH-014`).
         let (apps, sessions) = self.items.get(|| {
@@ -1296,11 +1318,11 @@ impl Render for Launcher {
                 if event.keystroke.key == "escape"
                     && (this.launch_dialog.is_some()
                         || this.pending_stop.is_some()
-                        || this.pending_sign_out)
+                        || this.pending_sign_out.is_some())
                 {
                     this.launch_dialog = None;
                     this.pending_stop = None;
-                    this.pending_sign_out = false;
+                    this.pending_sign_out = None;
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1312,7 +1334,7 @@ impl Render for Launcher {
                 LibraryHandlers {
                     on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(true, cx))),
                     on_sign_out: Box::new(cx.listener(|this, _, window, cx| {
-                        this.pending_sign_out = true;
+                        this.pending_sign_out = Some(this.sign_out_label());
                         // Focus the Launcher so Escape reaches the confirmation.
                         window.focus(&this.focus_handle, cx);
                         cx.notify();
@@ -1374,16 +1396,13 @@ impl Render for Launcher {
                     }),
                 ))
             })
-            .when(self.pending_sign_out, |view| {
-                let source = self
-                    .signed_in
-                    .map_or(KeySourceLabel::ThisRunOnly, SignedInKey::label);
+            .when_some(self.pending_sign_out, |view, source| {
                 view.child(session::sign_out_confirm_modal(
                     &theme,
                     &server,
                     source,
                     cx.listener(|this, _, _, cx| {
-                        this.pending_sign_out = false;
+                        this.pending_sign_out = None;
                         cx.notify();
                     }),
                     cx.listener(|this, _, _, cx| this.sign_out(cx)),
@@ -1443,17 +1462,15 @@ impl SignedInKey {
         }
     }
 
-    /// Whether Sign Out removes a saved key.
-    fn removable(self) -> bool {
-        matches!(self, Self::Saved | Self::Saving)
-    }
-
-    fn label(self) -> KeySourceLabel {
-        match self {
-            Self::Saved | Self::Saving => KeySourceLabel::SavedFile,
-            Self::Environment => KeySourceLabel::Environment,
-            Self::DotEnv => KeySourceLabel::DotEnv,
-            Self::Unsaved => KeySourceLabel::ThisRunOnly,
+    /// What Sign Out says about the key. `in_config`: config.toml holds this key now, which
+    /// makes it saved whatever way it connected (a paste saved, then a Refused retry).
+    fn label(signed_in: Option<Self>, in_config: impl FnOnce() -> bool) -> KeySourceLabel {
+        match signed_in {
+            Some(Self::Environment) => KeySourceLabel::Environment,
+            Some(Self::DotEnv) => KeySourceLabel::DotEnv,
+            Some(Self::Saved | Self::Saving) => KeySourceLabel::SavedFile,
+            _ if in_config() => KeySourceLabel::SavedFile,
+            _ => KeySourceLabel::ThisRunOnly,
         }
     }
 }
@@ -1718,19 +1735,20 @@ mod tests {
             SignedInKey::of(KeySource::Typed, false),
             SignedInKey::Unsaved
         );
-        assert!(SignedInKey::Saved.removable() && SignedInKey::Saving.removable());
-        for kept in [
-            SignedInKey::Environment,
-            SignedInKey::DotEnv,
-            SignedInKey::Unsaved,
-        ] {
-            assert!(!kept.removable());
-        }
-        assert_eq!(SignedInKey::Saving.label(), KeySourceLabel::SavedFile);
-        assert_eq!(SignedInKey::Unsaved.label(), KeySourceLabel::ThisRunOnly);
+        let label = |key, in_config| SignedInKey::label(Some(key), move || in_config);
+        assert_eq!(label(SignedInKey::Saving, false), KeySourceLabel::SavedFile);
         assert_eq!(
-            SignedInKey::of(KeySource::DotEnv, false).label(),
-            KeySourceLabel::DotEnv
+            label(SignedInKey::Unsaved, false),
+            KeySourceLabel::ThisRunOnly
+        );
+        // Pasted and saved, then a Refused Refresh and a retry: the client still says
+        // Typed, but config.toml holds the key, so Sign Out removes it.
+        assert_eq!(label(SignedInKey::Unsaved, true), KeySourceLabel::SavedFile);
+        // An environment or .env key is never removed, even if the file has the same key.
+        assert_eq!(label(SignedInKey::DotEnv, true), KeySourceLabel::DotEnv);
+        assert_eq!(
+            label(SignedInKey::Environment, true),
+            KeySourceLabel::Environment
         );
     }
 

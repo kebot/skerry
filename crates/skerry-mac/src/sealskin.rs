@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 const KEY_VARIABLE: &str = "SEALSKIN_APPLICATION_KEY";
@@ -126,11 +127,23 @@ pub(crate) fn save_key_at(path: &Path, raw: &str) -> Result<(), String> {
         })
 }
 
-/// Removes `application_key` from the config file at `path`. Blocking: only `persist`'s
-/// write queue calls it.
-pub(crate) fn forget_key_at(path: &Path) -> Result<(), String> {
-    write_saved_key(path, None)
-        .map_err(|_| format!("Couldn’t remove the saved application key from {CONFIG_DISPLAY}."))
+/// Whether config.toml holds `raw` as the saved key. A small synchronous read.
+pub(crate) fn saved_key_is(raw: &str) -> bool {
+    config_file()
+        .and_then(|path| read_saved_key(&path))
+        .is_ok_and(|saved| saved.as_deref() == Some(raw.trim()))
+}
+
+/// Removes `application_key` from the config file at `path` when it holds `raw` (the key
+/// being signed out); another saved key is left alone. Blocking: only `persist`'s write
+/// queue calls it.
+pub(crate) fn forget_key_at(path: &Path, raw: &str) -> Result<(), String> {
+    let failed = || format!("Couldn’t remove the saved application key from {CONFIG_DISPLAY}.");
+    match read_saved_key(path) {
+        Ok(Some(saved)) if saved == raw.trim() => write_saved_key(path, None).map_err(|_| failed()),
+        Ok(_) => Ok(()),
+        Err(_) => Err(failed()),
+    }
 }
 
 const CONFIG_DISPLAY: &str = "~/.config/skerry/config.toml";
@@ -215,6 +228,8 @@ fn write_saved_key(path: &Path, raw: Option<&str>) -> io::Result<()> {
     file.write_all(document.to_string().as_bytes())?;
     file.as_file().sync_all()?;
     file.persist(path)?;
+    // The rename is durable only once the folder is synced.
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -451,6 +466,8 @@ pub struct SealSkinClient {
     public: Client,
     base: Url,
     key_source: KeySource,
+    /// The key as pasted, so Sign Out can remove it from config.toml if it is saved there.
+    raw_key: Arc<str>,
 }
 
 impl SealSkinClient {
@@ -474,6 +491,7 @@ impl SealSkinClient {
             public: build(None)?,
             base: credential.base.clone(),
             key_source: credential.source,
+            raw_key: credential.raw.as_str().into(),
         })
     }
 
@@ -489,6 +507,11 @@ impl SealSkinClient {
     /// Where the key this client uses came from.
     pub fn key_source(&self) -> KeySource {
         self.key_source
+    }
+
+    /// The key this client uses, as pasted.
+    pub(crate) fn raw_key(&self) -> &str {
+        &self.raw_key
     }
 
     pub fn server(&self) -> &str {
@@ -519,9 +542,12 @@ impl SealSkinClient {
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         let mut url = self.base.clone();
         url.set_path(path);
-        let keyed = requires_key(url.path());
-        debug_assert!(keyed, "{path} is not a companion API path");
-        if keyed { &self.authed } else { &self.public }.request(method, url)
+        if requires_key(url.path()) {
+            &self.authed
+        } else {
+            &self.public
+        }
+        .request(method, url)
     }
 
     /// Refuses any SealSkin server whose `GET /companion/api/ui/version` is older than

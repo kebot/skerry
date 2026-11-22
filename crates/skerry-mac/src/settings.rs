@@ -319,7 +319,7 @@ impl ControlsSections {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Preferences {
     #[serde(default)]
     pub codec: Codec,
@@ -337,9 +337,8 @@ pub struct Preferences {
     pub video: VideoSettings,
 }
 
-/// Reads the flattened video map, skipping keys this build doesn't know. A file written by a
-/// newer build (another top-level preference) must not fail to load, or the next write would
-/// replace every preference with the defaults.
+/// Reads the flattened video map, skipping keys this build doesn't know. (Files are read
+/// field by field in `read_file`; this keeps `Preferences`' own `Deserialize` lenient too.)
 fn lenient_video<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<VideoSettings, D::Error> {
@@ -362,35 +361,110 @@ pub(crate) fn path(server: &str) -> Option<PathBuf> {
     )
 }
 
-pub fn load(server: &str) -> Preferences {
-    path(server)
-        .map(|path| load_from(&path))
-        .unwrap_or_default()
-}
-
 /// Re-reads the saved preferences, applies `change`, and saves them, so that windows
 /// changing different preferences never overwrite each other's (`ARCH-022`). Blocking:
 /// only `persist`'s write queue calls it, so writes never race each other.
+///
+/// Top-level keys this build doesn't know (a newer build's) are written back unchanged. A
+/// file that doesn't parse, or holds a value this build can't read, is first copied to
+/// `<file>.bak-<unix seconds>`, so the defaults that replace the bad values lose nothing.
 pub(crate) fn update_at(path: &Path, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
-    let mut preferences = load_from(path);
+    let Loaded {
+        mut preferences,
+        extra,
+        damaged,
+    } = read_file(path);
+    if damaged && path.exists() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        std::fs::copy(path, format!("{}.bak-{stamp}", path.display()))?;
+    }
     change(&mut preferences);
-    save_to(path, &preferences)
+    let mut saved = match serde_json::to_value(&preferences)? {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    };
+    for (name, value) in extra {
+        saved.entry(name).or_insert(value);
+    }
+    save_to(path, &Value::Object(saved))
 }
 
-fn load_from(path: &Path) -> Preferences {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// The saved preferences at `path`; defaults for whatever is missing or unreadable.
+pub(crate) fn load_at(path: &Path) -> Preferences {
+    read_file(path).preferences
 }
 
-fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
+/// A preferences file as this build reads it.
+struct Loaded {
+    preferences: Preferences,
+    /// Top-level keys this build doesn't know, kept to write back.
+    extra: serde_json::Map<String, Value>,
+    /// The file exists but didn't parse, or a value in it couldn't be read.
+    damaged: bool,
+}
+
+/// Reads the file field by field, so one bad value costs only that value.
+fn read_file(path: &Path) -> Loaded {
+    let mut loaded = Loaded {
+        preferences: Preferences::default(),
+        extra: serde_json::Map::new(),
+        damaged: false,
+    };
+    let map = match std::fs::read(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return loaded,
+        Err(_) => None,
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(map)) => Some(map),
+            _ => None,
+        },
+    };
+    let Some(map) = map else {
+        loaded.damaged = true;
+        return loaded;
+    };
+    let prefs = &mut loaded.preferences;
+    for (name, value) in map {
+        let read = match name.as_str() {
+            "codec" => field(value, &mut prefs.codec),
+            "input" => field(value, &mut prefs.input),
+            "clipboard" => field(value, &mut prefs.clipboard),
+            "launch" => field(value, &mut prefs.launch),
+            "controls" => field(value, &mut prefs.controls),
+            _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
+                Ok(key) => serde_json::from_value::<u32>(value)
+                    .map(|number| {
+                        prefs.video.insert(key, number);
+                    })
+                    .is_ok(),
+                Err(_) => {
+                    loaded.extra.insert(name, value);
+                    true
+                }
+            },
+        };
+        loaded.damaged |= !read;
+    }
+    loaded
+}
+
+/// Reads one field into `slot`; `false` (and the default kept) when it can't be read.
+fn field<T: serde::de::DeserializeOwned>(value: Value, slot: &mut T) -> bool {
+    serde_json::from_value(value)
+        .map(|read| *slot = read)
+        .is_ok()
+}
+
+fn save_to(path: &Path, preferences: &Value) -> io::Result<()> {
     let dir = path.parent().expect("preferences directory");
     std::fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer(&mut file, preferences)?;
     file.as_file().sync_all()?;
     file.persist(path)?;
+    // The rename is durable only once the folder is synced.
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -431,6 +505,59 @@ mod tests {
     }
 
     #[test]
+    fn unknown_top_level_keys_survive_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"jpeg": 45, "library": {"favorites": ["zen"]}}"#).unwrap();
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["library"], json!({"favorites": ["zen"]}));
+        assert_eq!(saved["jpeg"], json!(45));
+        assert_eq!(saved["codec"], json!("hevc"));
+        // A clean file leaves no backup.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_value_is_backed_up_and_the_rest_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        let original = r#"{"codec": "h266", "jpeg": 45, "launch": {"zen": {"gpu": "intel-gpu"}}}"#;
+        std::fs::write(&path, original).unwrap();
+        update_at(&path, |p| p.controls.video = true).unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.codec, Codec::default());
+        assert_eq!(saved.video.get(&Key::Jpeg), Some(&45));
+        assert!(saved.launch.contains_key("zen"));
+        assert!(saved.controls.video);
+        let backups: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("server.json.bak-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(backups[0].path()).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn a_file_that_doesnt_parse_is_backed_up_before_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"codec": "hevc", "jpe"#).unwrap();
+        update_at(&path, |p| p.codec = Codec::Av1).unwrap();
+        assert_eq!(load_at(&path).codec, Codec::Av1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
     fn updates_keep_what_other_windows_saved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.json");
@@ -439,7 +566,7 @@ mod tests {
             p.video.insert(Key::Fps, 30);
         })
         .unwrap();
-        let saved = load_from(&path);
+        let saved = load_at(&path);
         assert_eq!(saved.codec, Codec::Hevc);
         assert_eq!(saved.video.get(&Key::Fps), Some(&30));
     }

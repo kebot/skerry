@@ -19,7 +19,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context, Entity,
-    FocusHandle, Global, Pixels, Point, Task, TitlebarOptions, Window, WindowBounds, WindowKind,
+    FocusHandle, Pixels, Point, Task, TitlebarOptions, Window, WindowBounds, WindowKind,
     WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
@@ -27,16 +27,7 @@ use skerry_ui::controls::{
     self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
     ScreenProps, Section, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
-use std::collections::HashMap;
 use std::rc::Rc;
-
-/// Which Session Controls sections were open last, per server. The read cache of the saved
-/// preference: filled from a session window's preferences on a miss, and updated on every
-/// toggle before the write is queued.
-#[derive(Default)]
-struct SectionMemory(HashMap<String, ControlsSections>);
-
-impl Global for SectionMemory {}
 
 #[derive(Clone)]
 struct Owner {
@@ -95,14 +86,11 @@ impl ControlPanel {
         };
         let parent = native_window(window);
         let fullscreen = window.is_fullscreen();
+        // The queue's copy of this server's preferences already has every toggle queued
+        // from any window.
         let sections = {
-            let session = session.read(cx);
-            let server = session.server().to_string();
-            let saved = session.preferences.controls;
-            *cx.default_global::<SectionMemory>()
-                .0
-                .entry(server)
-                .or_insert(saved)
+            let server = session.read(cx).server().to_string();
+            cx.global::<WriteQueue>().read(&server).controls
         };
         let ui = ControlsUiState::default().with_sections(sections.to_array());
         let bounds = window.bounds();
@@ -483,14 +471,11 @@ impl ControlPanel {
         }
     }
 
-    /// Keeps the open sections for this server: in memory now, on disk through the write
-    /// queue. A failed save shows in the session window's banner.
+    /// Keeps the open sections for this server through the write queue (its in-memory copy
+    /// at once, the file after). A failed save shows in the session window's banner.
     fn remember_sections(&self, cx: &mut Context<Self>) {
         let sections = ControlsSections::from_array(self.ui.sections());
         let server = self.owner.session.read(cx).server().to_string();
-        cx.default_global::<SectionMemory>()
-            .0
-            .insert(server.clone(), sections);
         let done = cx
             .global::<WriteQueue>()
             .preferences(&server, move |p| p.controls = sections);

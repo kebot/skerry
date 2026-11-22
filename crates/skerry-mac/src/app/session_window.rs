@@ -13,9 +13,7 @@ use super::{
 use crate::input::InputFeature;
 use crate::persist::WriteQueue;
 use crate::sealskin::{RemoteSession, SealSkinClient};
-use crate::settings::{
-    self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
-};
+use crate::settings::{Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings};
 use crate::stats;
 use crate::transport::{DisplayRequest, SessionEvent, SessionOptions, StreamInfo, StreamSample};
 use crate::video::Codec;
@@ -130,7 +128,8 @@ impl SessionWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let preferences = settings::load(api.server());
+        // The queue's copy includes changes another window queued that aren't on disk yet.
+        let preferences = cx.global::<WriteQueue>().read(api.server());
         let mut this = Self {
             window: Window::window_handle(window),
             rt,
@@ -338,7 +337,7 @@ impl SessionWindow {
     fn save(
         &self,
         what: &'static str,
-        change: impl FnOnce(&mut Preferences) + Send + 'static,
+        change: impl Fn(&mut Preferences) + Send + Sync + 'static,
         cx: &mut Context<Self>,
     ) {
         let done = cx
@@ -451,7 +450,11 @@ impl SessionWindow {
             .filter_map(|key| self.preferences.video.get(key).map(|&value| (*key, value)))
             .collect();
         if !chosen.is_empty() {
-            self.save("video preferences", move |p| p.video.extend(chosen), cx);
+            self.save(
+                "video preferences",
+                move |p| p.video.extend(chosen.iter().copied()),
+                cx,
+            );
         }
     }
 

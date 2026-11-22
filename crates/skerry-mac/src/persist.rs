@@ -9,13 +9,17 @@
 use crate::sealskin::{self, Credential};
 use crate::settings::{self, Preferences};
 use gpui_kit::Global;
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
-type Change = Box<dyn FnOnce(&mut Preferences) + Send>;
+/// A preference change. It runs twice: on the in-memory copy when queued (so reads see it
+/// at once), and on the re-read file when its job runs.
+type Change = Arc<dyn Fn(&mut Preferences) + Send + Sync>;
 
 enum Job {
     Preferences {
@@ -23,12 +27,17 @@ enum Job {
         change: Change,
         done: oneshot::Sender<io::Result<()>>,
     },
-    /// Save (`Some`) or remove (`None`) the application key.
     Key {
-        raw: Option<String>,
+        raw: KeyWrite,
         done: oneshot::Sender<Result<(), String>>,
     },
     Flush(oneshot::Sender<()>),
+}
+
+enum KeyWrite {
+    Save(String),
+    /// Remove the saved key if it is this one.
+    Forget(String),
 }
 
 /// Where the files live: the real locations, or a test folder.
@@ -57,6 +66,12 @@ impl Root {
             Self::Under(root) => Ok(sealskin::config_file_in(root)),
         }
     }
+
+    fn load(&self, server: &str) -> Preferences {
+        self.preferences(server)
+            .map(|path| settings::load_at(&path))
+            .unwrap_or_default()
+    }
 }
 
 impl Job {
@@ -69,13 +84,13 @@ impl Job {
             } => {
                 let result = root
                     .preferences(&server)
-                    .and_then(|path| settings::update_at(&path, change));
+                    .and_then(|path| settings::update_at(&path, |p| change(p)));
                 let _ = done.send(result);
             }
             Self::Key { raw, done } => {
-                let result = root.key().and_then(|path| match &raw {
-                    Some(raw) => sealskin::save_key_at(&path, raw),
-                    None => sealskin::forget_key_at(&path),
+                let result = root.key().and_then(|path| match raw {
+                    KeyWrite::Save(raw) => sealskin::save_key_at(&path, &raw),
+                    KeyWrite::Forget(raw) => sealskin::forget_key_at(&path, &raw),
                 });
                 let _ = done.send(result);
             }
@@ -91,6 +106,10 @@ impl Job {
 pub struct WriteQueue {
     tx: mpsc::UnboundedSender<Job>,
     rt: Handle,
+    root: Root,
+    /// Each server's preferences with every queued change applied: what reads return, so
+    /// they never miss a write still in the queue.
+    cache: Arc<Mutex<HashMap<String, Preferences>>>,
 }
 
 impl Global for WriteQueue {}
@@ -101,40 +120,67 @@ pub fn start(rt: &Handle) -> WriteQueue {
 
 fn start_at(rt: &Handle, root: Root) -> WriteQueue {
     let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+    let consumer_root = root.clone();
     rt.spawn(async move {
         while let Some(job) = rx.recv().await {
-            let root = root.clone();
+            let root = consumer_root.clone();
             let _ = tokio::task::spawn_blocking(move || job.run(&root)).await;
         }
     });
-    WriteQueue { tx, rt: rt.clone() }
+    WriteQueue {
+        tx,
+        rt: rt.clone(),
+        root,
+        cache: Arc::default(),
+    }
 }
 
 impl WriteQueue {
-    /// Re-reads `server`'s preferences, applies `change`, and saves them.
+    /// `server`'s preferences, including every change still queued. Reads the file only the
+    /// first time a server is asked for.
+    pub fn read(&self, server: &str) -> Preferences {
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        cache
+            .entry(server.to_string())
+            .or_insert_with(|| self.root.load(server))
+            .clone()
+    }
+
+    /// Applies `change` to `server`'s preferences now (for reads), then queues the write:
+    /// re-read the file, apply `change`, save.
     pub fn preferences(
         &self,
         server: &str,
-        change: impl FnOnce(&mut Preferences) + Send + 'static,
+        change: impl Fn(&mut Preferences) + Send + Sync + 'static,
     ) -> oneshot::Receiver<io::Result<()>> {
+        let change: Change = Arc::new(change);
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+            change(
+                cache
+                    .entry(server.to_string())
+                    .or_insert_with(|| self.root.load(server)),
+            );
+        }
         let (done, result) = oneshot::channel();
         self.send(Job::Preferences {
             server: server.to_string(),
-            change: Box::new(change),
+            change,
             done,
         });
         result
     }
 
     pub fn save_key(&self, credential: &Credential) -> oneshot::Receiver<Result<(), String>> {
-        self.key(Some(credential.raw().to_string()))
+        self.key(KeyWrite::Save(credential.raw().to_string()))
     }
 
-    pub fn forget_key(&self) -> oneshot::Receiver<Result<(), String>> {
-        self.key(None)
+    /// Removes `application_key` from config.toml if it holds this key (`raw`).
+    pub fn forget_key(&self, raw: &str) -> oneshot::Receiver<Result<(), String>> {
+        self.key(KeyWrite::Forget(raw.to_string()))
     }
 
-    fn key(&self, raw: Option<String>) -> oneshot::Receiver<Result<(), String>> {
+    fn key(&self, raw: KeyWrite) -> oneshot::Receiver<Result<(), String>> {
         let (done, result) = oneshot::channel();
         self.send(Job::Key { raw, done });
         result
@@ -233,13 +279,41 @@ mod tests {
         let queue = start_at(rt.handle(), Root::Under(dir.path().into()));
         let credential = Credential::parse("ssk_id_secret@seal.example").unwrap();
         let saved = queue.save_key(&credential);
-        let forgotten = queue.forget_key();
+        let forgotten = queue.forget_key(credential.raw());
         rt.block_on(async {
             saved.await.unwrap().unwrap();
             forgotten.await.unwrap().unwrap();
         });
         let config = std::fs::read_to_string(sealskin::config_file_in(dir.path())).unwrap();
         assert!(!config.contains("application_key"), "{config}");
+    }
+
+    #[test]
+    fn signing_out_leaves_a_different_saved_key_alone() {
+        let rt = runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let queue = start_at(rt.handle(), Root::Under(dir.path().into()));
+        let saved = Credential::parse("ssk_id_secret@seal.example").unwrap();
+        drop(queue.save_key(&saved));
+        let forgotten = queue.forget_key("ssk_other_key@seal.example");
+        rt.block_on(async { forgotten.await.unwrap().unwrap() });
+        let config = std::fs::read_to_string(sealskin::config_file_in(dir.path())).unwrap();
+        assert!(config.contains("ssk_id_secret"), "{config}");
+    }
+
+    #[test]
+    fn reads_see_writes_still_in_the_queue() {
+        let rt = runtime();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("seal.json"), r#"{"jpeg": 45}"#).unwrap();
+        let queue = start_at(rt.handle(), Root::Under(dir.path().into()));
+        // Nothing has been awaited: the job may not have run yet.
+        drop(queue.preferences("seal", |p| p.codec = Codec::Hevc));
+        let read = queue.read("seal");
+        assert_eq!(read.codec, Codec::Hevc);
+        assert_eq!(read.video.get(&settings::Key::Jpeg), Some(&45));
+        queue.flush_blocking(Duration::from_secs(5));
+        assert_eq!(saved(dir.path(), "seal").codec, Codec::Hevc);
     }
 
     /// The queue is the only writer: nothing outside it calls the blocking writers. Later
