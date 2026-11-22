@@ -24,8 +24,11 @@ pub const CONSOLE_LINES: usize = 200;
 /// The catalog document's byte cap and fetch timeout.
 pub const CATALOG_CAP: usize = 2 * 1024 * 1024;
 pub const CATALOG_TIMEOUT: Duration = Duration::from_secs(10);
-/// One icon's byte cap and fetch timeout.
-pub const ICON_CAP: usize = 512 * 1024;
+/// One icon's byte cap and fetch timeout. 1 MiB: the real `handbrake.svg` is 729 KB; the
+/// SVG cost checks bound the work, not the bytes.
+pub const ICON_CAP: usize = 1024 * 1024;
+/// A raster icon's byte cap, under [`ICON_CAP`].
+pub const RASTER_ICON_CAP: usize = 512 * 1024;
 pub const ICON_TIMEOUT: Duration = Duration::from_secs(5);
 /// Icons are rasterized or downscaled into a box this many pixels on the long edge.
 pub const ICON_EDGE: u32 = 128;
@@ -50,6 +53,18 @@ const SVG_MAX_EXPANDED: u64 = 50_000;
 const SVG_MAX_DEPTH: usize = 64;
 /// A width, height or viewBox larger than this (or not finite, or not positive) is absurd.
 const SVG_MAX_SIZE: f32 = 100_000.;
+/// Uses of masks, clip paths and patterns an icon may make. None may reach another: each
+/// level of nesting multiplies the render work.
+const SVG_MAX_PAINT_REFS: usize = 512;
+/// Masks, clip paths and patterns an icon may define.
+const SVG_MAX_PAINT_SERVERS: usize = 64;
+/// The elements whose content renders once per use, so nesting them multiplies.
+const SVG_NESTING: [&str; 3] = ["mask", "clipPath", "pattern"];
+/// Refused outright: `<marker>` renders its content once per path vertex, `<filter>` chains
+/// have no cheap bound. App icons use neither.
+const SVG_REFUSED: [&str; 2] = ["marker", "filter"];
+/// How long the apps support probe waits for `apps_state` after `list`.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A port of Selkies' `valid_app_name` (`app_jobs.rs`): 1–200 bytes of `[A-Za-z0-9._/:-]`,
 /// not `all`, not starting with `-`. A name that fails is never offered or sent.
@@ -135,12 +150,10 @@ pub fn can_send(connected: bool, policy: Option<Policy>) -> bool {
     connected && policy.is_some_and(|policy| policy.allowed)
 }
 
-/// The Apps window's view of the stream: its policy (`None` while disconnected) and whether
-/// this stream has been asked for `list` yet.
+/// The Apps window's view of the stream: its policy (`None` while disconnected).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Link {
     policy: Option<Policy>,
-    listed: bool,
 }
 
 /// What a policy changed for the window.
@@ -150,8 +163,6 @@ pub struct PolicyChange {
     pub changed: bool,
     /// The catalog source moved between GitHub and the session.
     pub source_changed: bool,
-    /// Send `list` now: the first allowed policy of this stream.
-    pub list: bool,
 }
 
 impl Link {
@@ -167,19 +178,95 @@ impl Link {
     pub fn on_policy(&mut self, policy: Policy) -> PolicyChange {
         let before = self.policy;
         self.policy = Some(policy);
-        let list = policy.allowed && !self.listed;
-        self.listed |= list;
         PolicyChange {
             changed: before != Some(policy),
             source_changed: before.is_some_and(|before| before.local_repo != policy.local_repo),
-            list,
         }
     }
 
     /// The stream ended: nothing may be sent until the next stream says its policy.
     pub fn on_disconnect(&mut self) {
         self.policy = None;
-        self.listed = false;
+    }
+}
+
+/// Whether the session's Selkies speaks the apps protocol. Selkies before `c72a9ef7` drops
+/// `apps,` silently (its panel ran `cmd,selkies-proot …`), so each stream sends `list` once
+/// on its first allowed policy and waits [`PROBE_TIMEOUT`] for `apps_state`. Apps shows only
+/// once supported; the old protocol is not spoken. A reconnect starts over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Support {
+    #[default]
+    Unknown,
+    Probing {
+        since: Instant,
+        /// Bumped by every probe, so a stale timeout is ignored.
+        generation: u64,
+    },
+    Supported,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Probe {
+    support: Support,
+    generation: u64,
+}
+
+impl Probe {
+    #[cfg(test)]
+    pub fn support(&self) -> Support {
+        self.support
+    }
+
+    pub fn supported(&self) -> bool {
+        self.support == Support::Supported
+    }
+
+    pub fn unsupported(&self) -> bool {
+        self.support == Support::Unsupported
+    }
+
+    /// A policy arrived: `Some(generation)` when `list` should go out now and a timeout be
+    /// armed for that generation (the first allowed policy of the stream).
+    pub fn on_policy(&mut self, policy: Policy, now: Instant) -> Option<u64> {
+        if !policy.allowed || self.support != Support::Unknown {
+            return None;
+        }
+        self.generation += 1;
+        self.support = Support::Probing {
+            since: now,
+            generation: self.generation,
+        };
+        Some(self.generation)
+    }
+
+    /// An apps event came back: the server speaks the protocol. `true` when that is news.
+    pub fn on_answer(&mut self) -> bool {
+        let news = self.support != Support::Supported;
+        self.support = Support::Supported;
+        news
+    }
+
+    /// The probe's timer for `generation` fired: `true` when the session is now known to be
+    /// unsupported.
+    pub fn on_timeout(&mut self, generation: u64, now: Instant) -> bool {
+        match self.support {
+            Support::Probing {
+                since,
+                generation: probing,
+            } if probing == generation && now.saturating_duration_since(since) >= PROBE_TIMEOUT => {
+                self.support = Support::Unsupported;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The stream ended: the next one probes again.
+    pub fn reset(&mut self) {
+        self.support = Support::Unknown;
+        self.generation += 1;
     }
 }
 
@@ -755,11 +842,13 @@ pub fn remote_icon_url(path: &str) -> Option<Url> {
 
 /// The client for GitHub's catalog and icons: no default headers, no cookies, no keys, HTTPS
 /// only, and at most 3 redirects, each to HTTPS. Never used for SealSkin or the session.
-pub fn plain_client() -> reqwest::Client {
+/// `None` if the builder fails: the catalog then fails to load rather than falling back to an
+/// unrestricted client.
+pub fn plain_client() -> Option<reqwest::Client> {
     plain_client_with(true)
 }
 
-fn plain_client_with(https_only: bool) -> reqwest::Client {
+fn plain_client_with(https_only: bool) -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .https_only(https_only)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -773,7 +862,7 @@ fn plain_client_with(https_only: bool) -> reqwest::Client {
         }))
         .connect_timeout(Duration::from_secs(10))
         .build()
-        .unwrap_or_default()
+        .ok()
 }
 
 /// GETs `url`, giving up past `cap` bytes or after `timeout` in all.
@@ -872,8 +961,10 @@ pub fn decode_icon(bytes: &[u8], svg: bool) -> Option<IconPixels> {
     }
     if svg {
         decode_svg(bytes)
-    } else {
+    } else if bytes.len() <= RASTER_ICON_CAP {
         decode_raster(bytes, ICON_EDGE, ICON_RASTER_LIMITS)
+    } else {
+        None
     }
 }
 
@@ -985,9 +1076,220 @@ fn svg_cost_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
     true
 }
 
+/// Refuses, before usvg converts anything, the elements whose cost has no cheap bound:
+/// `<marker>` (usvg copies its content once per path vertex while converting) and `<filter>`
+/// (primitive chains). App icons with a filter (drop shadows) fall back to their initial.
+fn svg_elements_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
+    !doc.descendants()
+        .any(|n| n.is_element() && SVG_REFUSED.contains(&n.tag_name().name()))
+}
+
+/// The `#id`s `url(...)` references in `text` name.
+fn url_ids(text: &str) -> Vec<&str> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("url(") {
+        rest = &rest[at + 4..];
+        let inner = rest.trim_start_matches([' ', '"', '\'', '\t', '\n']);
+        if let Some(id) = inner.strip_prefix('#') {
+            let end = id.find([')', '"', '\'', ' ']).unwrap_or(id.len());
+            ids.push(&id[..end]);
+        }
+    }
+    ids
+}
+
+/// The classes whose stylesheet rules reference one of `servers`, and whether a rule without a
+/// class selector (`rect`, `*`) does, which then reaches every element.
+fn css_server_classes(stylesheet: &str, servers: &HashMap<&str, ()>) -> (HashSet<String>, bool) {
+    let mut classes = HashSet::new();
+    let mut every = false;
+    for rule in stylesheet.split('}') {
+        let Some((selectors, body)) = rule.split_once('{') else {
+            continue;
+        };
+        if !url_ids(body).iter().any(|id| servers.contains_key(id)) {
+            continue;
+        }
+        for selector in selectors.split(',') {
+            let mut named = false;
+            for part in selector.split('.').skip(1) {
+                let name: String = part
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+                    .collect();
+                if !name.is_empty() {
+                    named = true;
+                    classes.insert(name);
+                }
+            }
+            every |= !named && !selector.trim().is_empty();
+        }
+    }
+    (classes, every)
+}
+
+/// Refuses, before usvg converts anything (its conversion of nested masks and clip paths is
+/// itself exponential), a mask, clip path or pattern that reaches another: through its own
+/// attributes, its content, a `<use>` inside it, a stylesheet rule, or what its ancestors
+/// pass down (an inherited `fill: url(#p)`). Also bounds how many there are.
+fn svg_nesting_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
+    use resvg::usvg::roxmltree::{Node, NodeId};
+    let xlink = "http://www.w3.org/1999/xlink";
+    let mut servers: HashMap<&str, ()> = HashMap::new();
+    let mut roots: Vec<NodeId> = Vec::new();
+    let mut ids: HashMap<&str, NodeId> = HashMap::new();
+    let mut stylesheet = String::new();
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        let tag = node.tag_name().name();
+        if tag == "style" {
+            stylesheet.extend(node.descendants().filter_map(|n| n.text()));
+        }
+        if let Some(id) = node.attribute("id") {
+            ids.entry(id).or_insert(node.id());
+            if SVG_NESTING.contains(&tag) {
+                servers.insert(id, ());
+                roots.push(node.id());
+            }
+        }
+    }
+    if roots.len() > SVG_MAX_PAINT_SERVERS {
+        return false;
+    }
+    if roots.is_empty() {
+        return true;
+    }
+    let (classes, every) = css_server_classes(&stylesheet, &servers);
+    let href = |node: Node| -> Option<NodeId> {
+        let target = node
+            .attribute("href")
+            .or_else(|| node.attribute((xlink, "href")))?
+            .strip_prefix('#')?;
+        ids.get(target).copied()
+    };
+    let reaches = |node: Node| -> bool {
+        every
+            || node
+                .attributes()
+                .any(|a| url_ids(a.value()).iter().any(|id| servers.contains_key(id)))
+            || node
+                .attribute("class")
+                .is_some_and(|names| names.split_whitespace().any(|n| classes.contains(n)))
+            || href(node).is_some_and(|target| {
+                doc.get_node(target)
+                    .is_some_and(|t| SVG_NESTING.contains(&t.tag_name().name()))
+            })
+    };
+    for &root in &roots {
+        let Some(server) = doc.get_node(root) else {
+            continue;
+        };
+        if server
+            .ancestors()
+            .skip(1)
+            .filter(|n| n.is_element())
+            .any(|n| {
+                n.attributes().any(|a| {
+                    matches!(a.name(), "fill" | "stroke" | "style")
+                        && url_ids(a.value()).iter().any(|id| servers.contains_key(id))
+                })
+            })
+        {
+            return false;
+        }
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if seen.len() > SVG_MAX_EXPANDED as usize {
+                return false;
+            }
+            let Some(node) = doc.get_node(id) else {
+                continue;
+            };
+            if id != root && SVG_NESTING.contains(&node.tag_name().name()) {
+                return false;
+            }
+            if reaches(node) {
+                return false;
+            }
+            stack.extend(node.children().filter(|c| c.is_element()).map(|c| c.id()));
+            if node.tag_name().name() == "use" {
+                stack.extend(href(node));
+            }
+        }
+    }
+    true
+}
+
+/// Bounds the render work in the converted tree, which resvg can't be stopped in once it
+/// starts: no filter survived, at most [`SVG_MAX_PAINT_REFS`] uses of masks, clip paths and
+/// patterns, and none of them reaches another (a clip on a clip, a mask on a mask, or anything
+/// inside one that is itself clipped, masked or pattern-filled). Each nesting level multiplies
+/// the work, so a few KB would otherwise burn a core for minutes. usvg has already resolved
+/// stylesheets, inheritance and `<use>`, so this reads what will actually render.
+fn svg_tree_ok(tree: &resvg::usvg::Tree) -> bool {
+    use resvg::usvg::{Group, Node};
+    if !tree.filters().is_empty() {
+        return false;
+    }
+    /// Every node under `group`, its sub-roots not included.
+    fn each(group: &Group, f: &mut dyn FnMut(&Node) -> bool) -> bool {
+        let mut stack = vec![group];
+        while let Some(group) = stack.pop() {
+            for node in group.children() {
+                if !f(node) {
+                    return false;
+                }
+                if let Node::Group(child) = node {
+                    stack.push(child);
+                }
+            }
+        }
+        true
+    }
+    let nests = |node: &Node| -> bool {
+        let mut any = false;
+        node.subroots(|_| any = true);
+        if let Node::Group(group) = node {
+            any |= group
+                .clip_path()
+                .is_some_and(|clip| clip.clip_path().is_some())
+                || group.mask().is_some_and(|mask| mask.mask().is_some());
+        }
+        any
+    };
+    let mut uses = 0usize;
+    let mut checked: HashSet<*const Group> = HashSet::new();
+    each(tree.root(), &mut |node| {
+        if let Node::Group(group) = node {
+            if group
+                .clip_path()
+                .is_some_and(|clip| clip.clip_path().is_some())
+                || group.mask().is_some_and(|mask| mask.mask().is_some())
+            {
+                return false;
+            }
+        }
+        let mut fine = true;
+        node.subroots(|sub| {
+            uses += 1;
+            if uses > SVG_MAX_PAINT_REFS {
+                fine = false;
+            }
+            if fine && checked.insert(sub as *const Group) {
+                fine = each(sub, &mut |inner| !nests(inner));
+            }
+        });
+        fine
+    })
+}
+
 /// Rasterizes an SVG icon into a box [`ICON_EDGE`] pixels on the long edge, with no external
-/// resources ([`svg_options`]), after [`svg_cost_ok`]. Gzip (SVGZ) is refused: its expansion
-/// would escape the byte cap.
+/// resources ([`svg_options`]), after [`svg_cost_ok`], [`svg_elements_ok`] and [`svg_tree_ok`]. Gzip (SVGZ) and any
+/// DTD are refused: their expansion would escape the byte cap.
 pub fn decode_svg(bytes: &[u8]) -> Option<IconPixels> {
     use resvg::tiny_skia::{Pixmap, Transform};
     use resvg::usvg::roxmltree;
@@ -995,16 +1297,24 @@ pub fn decode_svg(bytes: &[u8]) -> Option<IconPixels> {
         return None;
     }
     let text = std::str::from_utf8(bytes).ok()?;
+    // No DTD at all: entities expand without bound before any other check runs.
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("<!doctype") || lower.contains("<!entity") {
+        return None;
+    }
     let parsing = roxmltree::ParsingOptions {
-        allow_dtd: true,
+        allow_dtd: false,
         nodes_limit: SVG_MAX_NODES,
         entity_resolver: None,
     };
     let doc = roxmltree::Document::parse_with_options(text, parsing).ok()?;
-    if !svg_cost_ok(&doc) {
+    if !svg_cost_ok(&doc) || !svg_elements_ok(&doc) || !svg_nesting_ok(&doc) {
         return None;
     }
     let tree = resvg::usvg::Tree::from_xmltree(&doc, &svg_options()).ok()?;
+    if !svg_tree_ok(&tree) {
+        return None;
+    }
     let size = tree.size();
     let (width, height) = (size.width(), size.height());
     let sane = |v: f32| v.is_finite() && v > 0. && v <= SVG_MAX_SIZE;
@@ -1047,6 +1357,9 @@ pub struct IconQueue {
     queued: VecDeque<String>,
     seen: HashSet<String>,
     in_flight: usize,
+    /// Loads of earlier generations still running: they keep their fetch slots until they
+    /// land, so a reset never lets more than [`ICON_FETCHES`] run.
+    stale: usize,
 }
 
 impl IconQueue {
@@ -1061,7 +1374,7 @@ impl IconQueue {
 
     /// The next icon to fetch, with its generation, while a fetch slot is free.
     pub fn next(&mut self) -> Option<(String, u64)> {
-        if self.in_flight >= ICON_FETCHES {
+        if self.in_flight + self.stale >= ICON_FETCHES {
             return None;
         }
         let icon = self.queued.pop_front()?;
@@ -1072,10 +1385,16 @@ impl IconQueue {
     /// A load of `generation` ended; `true` when its result is still wanted.
     pub fn finished(&mut self, generation: u64) -> bool {
         if generation != self.generation {
+            self.stale = self.stale.saturating_sub(1);
             return false;
         }
         self.in_flight = self.in_flight.saturating_sub(1);
         true
+    }
+
+    /// Lets `icon` be asked for again (a load that failed only for want of the session).
+    pub fn forget(&mut self, icon: &str) {
+        self.seen.remove(icon);
     }
 
     /// The source changed or Retry was pressed: everything in flight is stale.
@@ -1083,6 +1402,7 @@ impl IconQueue {
         self.generation += 1;
         self.queued.clear();
         self.seen.clear();
+        self.stale += self.in_flight;
         self.in_flight = 0;
     }
 }
@@ -1195,39 +1515,89 @@ mod tests {
     }
 
     #[test]
-    fn one_list_per_stream_on_its_first_allowed_policy() {
+    fn the_source_moves_when_the_local_repository_flips() {
         let on = Policy {
             allowed: true,
             local_repo: false,
         };
         let mut link = Link::default();
-        let first = link.on_policy(on);
-        assert!(first.list && first.changed);
-        // A re-broadcast `server_settings` (an encoder change) lists nothing and changes nothing.
-        let again = link.on_policy(on);
-        assert!(!again.list && !again.changed);
-        // Reconnect: exactly one list again.
-        link.on_disconnect();
-        assert!(link.on_policy(on).list);
-        assert!(!link.on_policy(on).list);
-        // Turned off and back on within a stream: already listed.
-        let off = Policy {
-            allowed: false,
-            ..on
-        };
-        assert!(!link.on_policy(off).list);
-        assert!(!link.on_policy(on).list);
-        // A stream that starts disallowed lists once it is allowed.
-        link.on_disconnect();
-        assert!(!link.on_policy(off).list);
-        assert!(link.on_policy(on).list);
-        // The source moves when the local repository flips.
+        assert!(link.on_policy(on).changed);
+        assert!(
+            !link.on_policy(on).changed,
+            "a re-broadcast changes nothing"
+        );
         let local = Policy {
             local_repo: true,
             ..on
         };
         assert!(link.on_policy(local).source_changed);
         assert!(!link.on_policy(local).source_changed);
+    }
+
+    #[test]
+    fn one_probe_list_per_stream_on_its_first_allowed_policy() {
+        let on = Policy {
+            allowed: true,
+            local_repo: false,
+        };
+        let off = Policy {
+            allowed: false,
+            ..on
+        };
+        let now = Instant::now();
+        let mut probe = Probe::default();
+        assert_eq!(probe.on_policy(off, now), None, "not allowed: no list");
+        let first = probe
+            .on_policy(on, now)
+            .expect("the first allowed policy lists");
+        // A re-broadcast `server_settings` (an encoder change) lists nothing.
+        assert_eq!(probe.on_policy(on, now), None);
+        assert!(!probe.supported() && !probe.unsupported(), "probing");
+        assert!(probe.on_answer());
+        assert!(probe.supported());
+        assert!(
+            !probe.on_timeout(first, now + PROBE_TIMEOUT),
+            "answered in time"
+        );
+        assert_eq!(probe.on_policy(on, now), None);
+        // Reconnect: exactly one list again.
+        probe.reset();
+        assert!(!probe.supported());
+        assert!(probe.on_policy(on, now).is_some());
+        assert_eq!(probe.on_policy(on, now), None);
+    }
+
+    #[test]
+    fn a_selkies_that_never_answers_list_is_unsupported() {
+        let on = Policy {
+            allowed: true,
+            local_repo: false,
+        };
+        let now = Instant::now();
+        let mut probe = Probe::default();
+        let generation = probe.on_policy(on, now).unwrap();
+        assert!(!probe.on_timeout(generation, now + Duration::from_millis(4_999)));
+        assert!(probe.on_timeout(generation, now + PROBE_TIMEOUT));
+        assert!(probe.unsupported() && !probe.supported());
+        assert!(!probe.on_timeout(generation, now + PROBE_TIMEOUT), "once");
+        // A late answer still counts.
+        assert!(probe.on_answer());
+        assert!(probe.supported());
+        // A timer from before a reconnect never marks the new stream.
+        probe.reset();
+        let fresh = probe.on_policy(on, now + PROBE_TIMEOUT).unwrap();
+        assert!(!probe.on_timeout(generation, now + PROBE_TIMEOUT * 3));
+        assert_eq!(
+            probe.support(),
+            Support::Probing {
+                since: now + PROBE_TIMEOUT,
+                generation: fresh
+            }
+        );
+        // Detection resets on reconnect, unsupported included.
+        assert!(probe.on_timeout(fresh, now + PROBE_TIMEOUT * 2));
+        probe.reset();
+        assert_eq!(probe.support(), Support::Unknown);
     }
 
     #[test]
@@ -1754,7 +2124,8 @@ include:
         let raster = decode_icon(&png(300, 150), false).unwrap();
         assert_eq!((raster.width, raster.height), (128, 64));
         assert_eq!(&raster.bgra[..4], &[0, 0, 255, 255], "red as BGRA");
-        assert!(decode_icon(&vec![b' '; 600 * 1024], true).is_none());
+        assert!(decode_icon(&vec![b' '; ICON_CAP + 1], true).is_none());
+        assert!(decode_icon(&vec![0; RASTER_ICON_CAP + 1], false).is_none());
         assert!(decode_icon(b"garbage", false).is_none());
         assert!(decode_icon(b"<svg", true).is_none());
         assert!(decode_icon(&[0x1f, 0x8b, 8, 0, 0], true).is_none(), "svgz");
@@ -1773,7 +2144,7 @@ include:
                 image::ImageFormat::Png,
             )
             .unwrap();
-        assert!(bytes.len() <= ICON_CAP, "{} bytes", bytes.len());
+        assert!(bytes.len() <= RASTER_ICON_CAP, "{} bytes", bytes.len());
         assert!(decode_icon(&bytes, false).is_none());
         assert!(decode_raster(&png(2048, 16), ICON_EDGE, ICON_RASTER_LIMITS).is_some());
     }
@@ -1841,6 +2212,162 @@ include:
     }
 
     #[test]
+    fn an_entity_bomb_svg_is_refused() {
+        let b = "x".repeat(1000);
+        let a = "&b;".repeat(250);
+        let svg = format!(
+            r#"<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY b "{b}"><!ENTITY a "{a}">]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><text>{}</text></svg>"#,
+            "&a;".repeat(400)
+        );
+        let started = Instant::now();
+        assert!(decode_svg(svg.as_bytes()).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50));
+        // Any DTD, even a harmless one, is refused, and so is a bare ENTITY.
+        let doctype = r#"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+        assert!(decode_svg(doctype.as_bytes()).is_none());
+        assert!(decode_svg(b"<svg><!ENTITY a 'b'></svg>").is_none());
+    }
+
+    /// The nested paint-server bombs QA timed at seconds to hours (`J-QA-2`), plus markers and
+    /// filters.
+    fn nested(tag: &str, attribute: &str, levels: usize, fan: usize) -> String {
+        let (open, close) = match tag {
+            "pattern" => (
+                r#" width="10" height="10" patternUnits="userSpaceOnUse""#,
+                "",
+            ),
+            _ => ("", ""),
+        };
+        let mut svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><defs><{tag} id="n0"{open}><rect width="64" height="64" fill="white"/></{tag}>"#
+        );
+        for level in 1..levels {
+            svg.push_str(&format!(r#"<{tag} id="n{level}"{open}>"#));
+            for _ in 0..fan {
+                svg.push_str(&format!(
+                    r#"<rect width="64" height="64" fill="white" {attribute}="url(#n{})"/>"#,
+                    level - 1
+                ));
+            }
+            svg.push_str(&format!("</{tag}>{close}"));
+        }
+        svg.push_str(&format!(
+            r#"</defs><rect width="64" height="64" {attribute}="url(#n{})"/></svg>"#,
+            levels - 1
+        ));
+        svg
+    }
+
+    fn refused_fast(svg: &str) {
+        let started = Instant::now();
+        assert!(
+            decode_svg(svg.as_bytes()).is_none(),
+            "{}",
+            &svg[..svg.len().min(200)]
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "{:?} {} bytes: {}",
+            started.elapsed(),
+            svg.len(),
+            &svg[..svg.len().min(120)]
+        );
+    }
+
+    #[test]
+    fn nested_masks_clips_patterns_filters_and_markers_are_refused_quickly() {
+        for levels in [2, 4, 5, 6, 7] {
+            refused_fast(&nested("mask", "mask", levels, 10));
+            refused_fast(&nested("clipPath", "clip-path", levels, 10));
+            refused_fast(&nested("pattern", "fill", levels, 10));
+        }
+        // Through a style attribute, a stylesheet class, a `<use>`, an inherited fill, and a
+        // mask on the mask itself.
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><mask id="a"><rect width="9" height="9"/></mask><mask id="b"><rect width="9" height="9" style="mask:url(#a)"/></mask><rect width="9" height="9" mask="url(#b)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><style>.c{clip-path:url(#a)}</style><clipPath id="a"><rect width="9" height="9"/></clipPath><clipPath id="b"><rect class="c" width="9" height="9"/></clipPath><rect width="9" height="9" clip-path="url(#b)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><defs><g id="g"><rect width="9" height="9" mask="url(#a)"/></g><mask id="a"><rect width="9" height="9"/></mask><mask id="b"><use href="#g"/></mask></defs><rect width="9" height="9" mask="url(#b)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><pattern id="a" width="2" height="2"><rect width="1" height="1"/></pattern><g fill="url(#a)"><pattern id="b" width="3" height="3"><rect width="1" height="1"/></pattern></g><rect width="9" height="9" fill="url(#b)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><clipPath id="a"><rect width="9" height="9"/></clipPath><clipPath id="b" clip-path="url(#a)"><rect width="9" height="9"/></clipPath><rect width="9" height="9" clip-path="url(#b)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><pattern id="a" width="2" height="2"><rect width="1" height="1"/></pattern><pattern id="b" href="#a"/><rect width="9" height="9" fill="url(#b)"/></svg>"##,
+        );
+        // Filters and markers, by element, attribute, or stylesheet.
+        let blurs: String = (0..200)
+            .map(|i| {
+                format!(
+                    r#"<feGaussianBlur in="b{i}" result="b{}" stdDeviation="5"/>"#,
+                    i + 1
+                )
+            })
+            .collect();
+        refused_fast(&format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><filter id="f">{blurs}</filter><rect width="9" height="9" filter="url(#f)"/></svg>"#
+        ));
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><marker id="m"><rect width="1" height="1"/></marker><path d="M0 0L9 9" marker-mid="url(#m)"/></svg>"##,
+        );
+        // Too many uses of one mask.
+        let uses = r#"<rect width="1" height="1" mask="url(#m)"/>"#.repeat(SVG_MAX_PAINT_REFS + 1);
+        refused_fast(&format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><mask id="m"><rect width="1" height="1" fill="white"/></mask>{uses}</svg>"#
+        ));
+        // Inkscape's `marker:none` styles, with no `<marker>`, are harmless.
+        assert!(decode_svg(br##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><rect width="9" height="9" style="marker:none;marker-end:none"/></svg>"##).is_some());
+        // QA's own cases, when they are on this Mac.
+        if let Ok(dir) = std::env::var("SKERRY_SVG_CASES") {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                refused_fast(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn plain_masks_clips_patterns_and_gradients_still_render() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><defs><linearGradient id="g0"><stop offset="0" stop-color="red"/></linearGradient><linearGradient id="g" href="#g0"/><style>.a{fill:url(#g)}</style><clipPath id="c"><circle cx="32" cy="32" r="30"/></clipPath><mask id="m"><rect width="64" height="64" fill="white"/></mask><pattern id="p" width="4" height="4" patternUnits="userSpaceOnUse"><rect width="2" height="2" fill="url(#g)"/></pattern></defs><g clip-path="url(#c)" mask="url(#m)"><rect class="a" width="64" height="32"/><rect y="32" width="64" height="32" fill="url(#p)"/></g></svg>"##;
+        let icon = decode_svg(svg.as_bytes()).unwrap();
+        assert!(icon.bgra.chunks(4).any(|p| p[3] > 0));
+    }
+
+    #[test]
+    fn the_real_catalog_icons_still_decode() {
+        // `SKERRY_SVG_REAL=<folder of proot-apps metadata/img/*.svg>` checks no real icon is
+        // refused by the limits.
+        let Ok(dir) = std::env::var("SKERRY_SVG_REAL") else {
+            return;
+        };
+        let mut refused = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "svg") {
+                let bytes = std::fs::read(&path).unwrap();
+                // Filters and DTDs are refused on purpose (drop shadows fall back to the
+                // initial); anything else refused is a false positive.
+                let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                let expected = text.contains("<filter") || text.contains("<!doctype");
+                if fetch_ok(&bytes) && !expected && decode_icon(&bytes, true).is_none() {
+                    refused.push(path.display().to_string());
+                }
+            }
+        }
+        assert!(refused.is_empty(), "{refused:?}");
+    }
+
+    fn fetch_ok(bytes: &[u8]) -> bool {
+        bytes.len() <= ICON_CAP
+    }
+
+    #[test]
     fn late_icon_loads_are_dropped_after_a_reset() {
         let mut queue = IconQueue::default();
         for i in 0..8 {
@@ -1853,9 +2380,21 @@ include:
         assert!(queue.finished(old));
         assert!(queue.next().is_some(), "a slot freed");
         queue.reset();
-        assert!(!queue.finished(old), "a stale result is dropped");
         assert!(queue.want("0.svg"), "asked for again in the new generation");
-        assert_eq!(queue.next().map(|(_, g)| g), Some(old + 1));
+        assert_eq!(queue.next(), None, "the stale loads still hold every slot");
+        assert!(!queue.finished(old), "a stale result is dropped");
+        assert_eq!(
+            queue.next().map(|(_, g)| g),
+            Some(old + 1),
+            "and frees its slot"
+        );
+        assert!(queue.want("1.svg"));
+        assert_eq!(queue.next(), None, "never more than ICON_FETCHES in all");
+        queue.forget("1.svg");
+        assert!(
+            queue.want("1.svg"),
+            "a forgotten icon may be asked for again"
+        );
     }
 
     #[test]
@@ -1916,7 +2455,7 @@ include:
         async fn capped_fetch_stops_past_the_cap() {
             let big = vec![b'x'; 3 * 1024 * 1024];
             let (url, _) = serve(move |_| ok(&big)).await;
-            let client = plain_client_with(false);
+            let client = plain_client_with(false).unwrap();
             let result = fetch_capped(&client, url.clone(), CATALOG_CAP, CATALOG_TIMEOUT).await;
             assert!(result.is_err());
             // No length header: the stream is cut at the cap.
@@ -1941,7 +2480,7 @@ include:
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn the_catalog_client_sends_no_credentials() {
             let (url, seen) = serve(|_| ok(b"include: []")).await;
-            let client = plain_client_with(false);
+            let client = plain_client_with(false).unwrap();
             fetch_capped(&client, url, CATALOG_CAP, CATALOG_TIMEOUT)
                 .await
                 .unwrap();
@@ -1965,7 +2504,7 @@ include:
                 }
             })
             .await;
-            let client = plain_client_with(false);
+            let client = plain_client_with(false).unwrap();
             assert!(fetch_capped(&client, url, CATALOG_CAP, CATALOG_TIMEOUT)
                 .await
                 .is_err());
@@ -1977,7 +2516,7 @@ include:
             // The real client refuses plain HTTP outright.
             let (url, seen) = serve(|_| ok(b"include: []")).await;
             assert!(
-                fetch_capped(&plain_client(), url, CATALOG_CAP, CATALOG_TIMEOUT)
+                fetch_capped(&plain_client().unwrap(), url, CATALOG_CAP, CATALOG_TIMEOUT)
                     .await
                     .is_err()
             );
