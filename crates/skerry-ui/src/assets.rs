@@ -38,6 +38,7 @@ gpui_kit::assets::icon_assets!(
         Clapperboard,
         Sparkles,
         Shapes,
+        Video,
         FolderHeart,
         X
     ]
@@ -48,7 +49,7 @@ gpui_kit::assets::icon_assets!(
 /// chooser’s Link, FileUp, FolderUp, Ban and Info (`ARCH-028`), and printing’s Printer,
 /// Download and FileX (`ARCH-033`), and the Apps window's category, badge and empty-state
 /// icons (`ARCH-035`), and direct Selkies' Lock, LockOpen, KeyRound, ShieldAlert, Monitor and
-/// Server (`ARCH-036`).
+/// Server (`ARCH-036`), and the capture badge's Video (`ARCH-038`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SkerryAssets;
 
@@ -107,6 +108,7 @@ mod tests {
             gpui_kit::assets::IconName::Clapperboard,
             gpui_kit::assets::IconName::Sparkles,
             gpui_kit::assets::IconName::Shapes,
+            gpui_kit::assets::IconName::Video,
             gpui_kit::assets::IconName::FolderHeart,
             gpui_kit::assets::IconName::HardDrive,
             gpui_kit::assets::IconName::X,

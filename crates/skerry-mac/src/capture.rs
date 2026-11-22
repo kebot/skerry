@@ -13,8 +13,8 @@
 //! Every macOS permission answer carries a ticket (stream generation and request id); a late
 //! answer that no longer matches starts nothing.
 //!
-//! M1 ships the microphone only. Each device has its own [`DeviceState`] and
-//! [`DevicePolicy`], so the camera adds one more of each.
+//! The microphone and the camera each have their own [`DeviceState`] and [`DevicePolicy`];
+//! the rules are the same for both.
 
 use serde_json::Value;
 
@@ -22,13 +22,17 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Subject {
     Microphone,
+    Camera,
 }
 
 impl Subject {
+    pub const ALL: [Self; 2] = [Self::Microphone, Self::Camera];
+
     /// The name in `CAPTURE_DEMAND`.
     pub fn wire(self) -> &'static str {
         match self {
             Self::Microphone => "microphone",
+            Self::Camera => "webcam",
         }
     }
 }
@@ -46,10 +50,29 @@ pub struct DevicePolicy {
     pub on_demand: bool,
 }
 
+/// The camera size the server asks for when it says nothing.
+pub const DEFAULT_CAM_SIZE: (u32, u32) = (1280, 720);
+
 /// The capture part of `server_settings`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapturePolicy {
     pub mic: DevicePolicy,
+    pub cam: DevicePolicy,
+    /// `ui_sidebar_show_webcam`: the camera is offered at all. Hidden means not permitted.
+    pub cam_shown: bool,
+    /// `webcam_width` × `webcam_height`, clamped to 160..=3840.
+    pub cam_size: (u32, u32),
+}
+
+impl Default for CapturePolicy {
+    fn default() -> Self {
+        Self {
+            mic: DevicePolicy::default(),
+            cam: DevicePolicy::default(),
+            cam_shown: true,
+            cam_size: DEFAULT_CAM_SIZE,
+        }
+    }
 }
 
 /// `{value: true}`, `{value: "true"}` or a bare `true`.
@@ -58,27 +81,79 @@ fn truthy(setting: &Value) -> bool {
     value.as_bool() == Some(true) || value.as_str() == Some("true")
 }
 
+/// `{value: false}`, `{value: "false"}` or a bare `false`.
+fn falsy(setting: &Value) -> bool {
+    let value = setting.get("value").unwrap_or(setting);
+    value.as_bool() == Some(false) || value.as_str() == Some("false")
+}
+
+/// A whole number setting, `{value: 720}`, `{value: "720"}` or a bare `720`.
+fn number(setting: &Value) -> Option<u64> {
+    let value = setting.get("value").unwrap_or(setting);
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().filter(|n| *n >= 0.0).map(|n| n as u64))
+        .or_else(|| value.as_str()?.trim().parse().ok())
+}
+
+/// One device's start settings: `*_on_start` (a bool, or the raw "demand") and
+/// `*_on_demand`.
+fn start_rules(settings: &Value, wire: &str) -> (bool, bool) {
+    let start = &settings[format!("{wire}_on_start")];
+    let on_demand =
+        truthy(&settings[format!("{wire}_on_demand")]) || start["value"].as_str() == Some("demand");
+    (truthy(start), on_demand)
+}
+
 impl CapturePolicy {
-    /// From `server_settings.settings`. The server's own gate: microphone frames are refused
-    /// only when `!(audio_enabled && (microphone_enabled || !locked))`, so an unlocked false
-    /// still accepts frames; it only means "not on by default".
+    /// From `server_settings.settings`. The server's own gates:
+    /// - microphone frames are refused only when `!(audio_enabled && (microphone_enabled ||
+    ///   !locked))`, so an unlocked false still accepts frames; it only means "not on by
+    ///   default";
+    /// - camera frames are refused only when `webcam_enabled` is locked off (`webcam/mod.rs`).
     pub fn from_server(settings: &Value) -> Self {
         let enabled = &settings["microphone_enabled"];
         let locked = enabled["locked"].as_bool() == Some(true);
         let on = truthy(enabled);
-        let audio = &settings["audio_enabled"];
-        let audio = audio.get("value").unwrap_or(audio);
-        let audio_off = audio.as_bool() == Some(false) || audio.as_str() == Some("false");
-        let start = &settings["microphone_on_start"];
+        let audio_off = falsy(&settings["audio_enabled"]);
+        let (on_start, on_demand) = start_rules(settings, "microphone");
+        let mic = DevicePolicy {
+            permitted: !audio_off && (on || !locked),
+            locked,
+            audio_off,
+            on_start,
+            on_demand,
+        };
+        let shown = !falsy(&settings["ui_sidebar_show_webcam"]);
+        let enabled = &settings["webcam_enabled"];
+        let locked = enabled["locked"].as_bool() == Some(true);
+        let on = truthy(enabled);
+        let (on_start, on_demand) = start_rules(settings, "webcam");
+        let cam = DevicePolicy {
+            permitted: shown && !(locked && !on),
+            locked,
+            audio_off: false,
+            on_start,
+            on_demand,
+        };
+        let side = |key: &str, default: u32| {
+            number(&settings[key]).map_or(default, |n| n.clamp(160, 3840) as u32)
+        };
         Self {
-            mic: DevicePolicy {
-                permitted: !audio_off && (on || !locked),
-                locked,
-                audio_off,
-                on_start: truthy(start),
-                on_demand: truthy(&settings["microphone_on_demand"])
-                    || start["value"].as_str() == Some("demand"),
-            },
+            mic,
+            cam,
+            cam_shown: shown,
+            cam_size: (
+                side("webcam_width", DEFAULT_CAM_SIZE.0),
+                side("webcam_height", DEFAULT_CAM_SIZE.1),
+            ),
+        }
+    }
+
+    pub fn device(&self, subject: Subject) -> DevicePolicy {
+        match subject {
+            Subject::Microphone => self.mic,
+            Subject::Camera => self.cam,
         }
     }
 }
@@ -86,20 +161,35 @@ impl CapturePolicy {
 /// A capture reply from the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
-    /// `MICROPHONE_DISABLED`: the server refused the frames.
+    /// `MICROPHONE_DISABLED` / `WEBCAM_DISABLED`: the server refused the frames.
     Disabled(Subject),
     /// `CAPTURE_DEMAND <subject> <0|1>`: an app in the session opened or closed the device.
     Demand(Subject, bool),
+    /// `WEBCAM_KEYFRAME`: the server's camera decoder needs a keyframe.
+    Keyframe,
+}
+
+impl Reply {
+    /// The device the reply is about, when it changes the policy.
+    pub fn subject(self) -> Option<Subject> {
+        match self {
+            Self::Disabled(subject) | Self::Demand(subject, _) => Some(subject),
+            Self::Keyframe => None,
+        }
+    }
 }
 
 /// The exact literals; anything else is not a capture reply.
 pub fn server_reply(text: &str) -> Option<Reply> {
-    if text == "MICROPHONE_DISABLED" {
-        return Some(Reply::Disabled(Subject::Microphone));
+    match text {
+        "MICROPHONE_DISABLED" => return Some(Reply::Disabled(Subject::Microphone)),
+        "WEBCAM_DISABLED" => return Some(Reply::Disabled(Subject::Camera)),
+        "WEBCAM_KEYFRAME" => return Some(Reply::Keyframe),
+        _ => {}
     }
     let rest = text.strip_prefix("CAPTURE_DEMAND ")?;
     let (subject, value) = rest.split_once(' ')?;
-    let subject = [Subject::Microphone]
+    let subject = Subject::ALL
         .into_iter()
         .find(|known| known.wire() == subject)?;
     Some(Reply::Demand(subject, value == "1"))
@@ -112,6 +202,31 @@ pub enum Auth {
     /// Denied or Restricted.
     Denied,
     Authorized,
+}
+
+/// macOS's answers for both devices; one [`Auth`] stands for both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Auths {
+    pub mic: Auth,
+    pub cam: Auth,
+}
+
+impl From<Auth> for Auths {
+    fn from(auth: Auth) -> Self {
+        Self {
+            mic: auth,
+            cam: auth,
+        }
+    }
+}
+
+impl Auths {
+    pub fn get(self, subject: Subject) -> Auth {
+        match subject {
+            Subject::Microphone => self.mic,
+            Subject::Camera => self.cam,
+        }
+    }
 }
 
 /// Where a device is, as the window drives it.
@@ -166,6 +281,7 @@ pub struct DeviceState {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureState {
     pub mic: DeviceState,
+    pub cam: DeviceState,
     pub policy: Option<CapturePolicy>,
     generation: u64,
 }
@@ -174,23 +290,27 @@ impl CaptureState {
     fn device(&mut self, subject: Subject) -> &mut DeviceState {
         match subject {
             Subject::Microphone => &mut self.mic,
+            Subject::Camera => &mut self.cam,
+        }
+    }
+
+    /// One device's state.
+    pub fn state(&self, subject: Subject) -> &DeviceState {
+        match subject {
+            Subject::Microphone => &self.mic,
+            Subject::Camera => &self.cam,
         }
     }
 
     fn device_policy(&self, subject: Subject) -> Option<DevicePolicy> {
-        self.policy.map(|policy| match subject {
-            Subject::Microphone => policy.mic,
-        })
+        self.policy.map(|policy| policy.device(subject))
     }
 
     /// The server accepts this device now.
     pub fn permitted(&self, subject: Subject) -> bool {
-        let state = match subject {
-            Subject::Microphone => &self.mic,
-        };
         self.device_policy(subject)
             .is_some_and(|policy| policy.permitted)
-            && !state.server_disabled
+            && !self.state(subject).server_disabled
     }
 
     /// Turns the device on, or asks first.
@@ -223,7 +343,7 @@ impl CaptureState {
 
     /// Turns the device off. It clears `wanted` on purpose, whatever turned it off (a toggle,
     /// a lock, `*_DISABLED`, demand 0): a person's "on" is never restored by itself after the
-    /// server takes the microphone away and gives it back. They flip the switch again
+    /// server takes the device away and gives it back. They flip the switch again
     /// (the safe direction, as the web client; M-QA-4).
     fn stop(&mut self, subject: Subject) -> Vec<Effect> {
         let device = self.device(subject);
@@ -239,32 +359,42 @@ impl CaptureState {
 
     /// A primary `server_settings`. The start rule runs only on the stream's first; later
     /// ones apply locks only. A person's choice carried over a Reconnect starts again here.
-    pub fn on_policy(&mut self, policy: CapturePolicy, mic_auth: Auth) -> Vec<Effect> {
+    pub fn on_policy(&mut self, policy: CapturePolicy, auth: impl Into<Auths>) -> Vec<Effect> {
+        let auths = auth.into();
         let first = self.policy.is_none();
         self.policy = Some(policy);
-        self.mic.server_disabled = false;
-        let subject = Subject::Microphone;
-        let device = self.mic;
-        let rules = policy.mic;
+        let mut effects = Vec::new();
+        for subject in Subject::ALL {
+            self.device(subject).server_disabled = false;
+            effects.extend(self.apply_policy(subject, first, auths.get(subject)));
+        }
+        effects
+    }
+
+    fn apply_policy(&mut self, subject: Subject, first: bool, auth: Auth) -> Vec<Effect> {
+        let device = *self.state(subject);
+        let Some(rules) = self.device_policy(subject) else {
+            return Vec::new();
+        };
         if !self.permitted(subject) {
             return self.stop(subject);
         }
         // Locked on counts as on_start true, on every settings (M-QA-3): it starts after the
         // permission, and the switch shows on and disabled. A refused prompt stays latched.
         if rules.locked && device.phase == Phase::Off && !device.refused && !device.denied {
-            return self.start(subject, true, mic_auth);
+            return self.start(subject, true, auth);
         }
         if !first || device.phase != Phase::Off {
             return Vec::new();
         }
         if device.touched {
             if device.wanted {
-                return self.start(subject, false, mic_auth);
+                return self.start(subject, false, auth);
             }
             return Vec::new();
         }
         if rules.on_start && !rules.on_demand {
-            return self.start(subject, true, mic_auth);
+            return self.start(subject, true, auth);
         }
         Vec::new()
     }
@@ -292,6 +422,8 @@ impl CaptureState {
         self.start(subject, false, auth)
     }
 
+    /// A capture reply; `auth` is macOS's answer for the reply's device. A keyframe request
+    /// changes no state (the window hands it to the camera).
     pub fn on_reply(&mut self, reply: Reply, auth: Auth) -> Vec<Effect> {
         match reply {
             Reply::Disabled(subject) => {
@@ -316,6 +448,7 @@ impl CaptureState {
                 }
                 self.stop(subject)
             }
+            Reply::Keyframe => Vec::new(),
         }
     }
 
@@ -358,19 +491,21 @@ impl CaptureState {
     pub fn on_stream_end(&mut self) -> Vec<Effect> {
         self.generation += 1;
         self.policy = None;
-        let device = &mut self.mic;
-        let was = std::mem::take(&mut device.phase);
-        device.server_disabled = false;
-        device.refused = false;
-        if device.by_server {
-            device.wanted = false;
-            device.by_server = false;
+        let mut effects = Vec::new();
+        for subject in Subject::ALL {
+            let device = self.device(subject);
+            let was = std::mem::take(&mut device.phase);
+            device.server_disabled = false;
+            device.refused = false;
+            if device.by_server {
+                device.wanted = false;
+                device.by_server = false;
+            }
+            if was == Phase::On {
+                effects.push(Effect::Stop(subject));
+            }
         }
-        if was == Phase::On {
-            vec![Effect::Stop(Subject::Microphone)]
-        } else {
-            Vec::new()
-        }
+        effects
     }
 }
 
@@ -398,9 +533,37 @@ pub fn mic_frame(packet: &[u8]) -> Vec<u8> {
 /// Microphone frames waiting for the socket: 200 ms. A full queue drops the packet.
 pub const MIC_QUEUE: usize = 10;
 
-/// The in-window badge: `Some(microphone)` only while a device is open.
-pub fn badge(mic_open: bool) -> Option<bool> {
-    mic_open.then_some(true)
+/// The camera's opcode, and its codec id for H.264 (`webcam/mod.rs`).
+pub const WEBCAM_OPCODE: u8 = 0x06;
+pub const WEBCAM_H264: u8 = 1;
+/// Bit 0 of the flags byte: the frame is a keyframe. No rotation or flip bits: a Mac camera
+/// is upright landscape.
+pub const WEBCAM_KEY: u8 = 0x01;
+
+/// A camera uplink frame: `0x06`, the codec (H.264), the flags, then one Annex B access unit.
+pub fn webcam_frame(keyframe: bool, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(payload.len() + 3);
+    frame.extend_from_slice(&[
+        WEBCAM_OPCODE,
+        WEBCAM_H264,
+        if keyframe { WEBCAM_KEY } else { 0 },
+    ]);
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Whether a camera frame (as [`webcam_frame`] built it) is a keyframe.
+pub fn webcam_keyframe(frame: &[u8]) -> bool {
+    frame.get(2).is_some_and(|flags| flags & WEBCAM_KEY != 0)
+}
+
+/// Camera frames waiting for the transport: about 100 ms. A full queue drops the frame and
+/// forces the next keyframe.
+pub const CAM_QUEUE: usize = 3;
+
+/// The in-window badge: `Some((microphone, camera))` only while a device is open.
+pub fn badge(mic_open: bool, cam_open: bool) -> Option<(bool, bool)> {
+    (mic_open || cam_open).then_some((mic_open, cam_open))
 }
 
 #[cfg(test)]
@@ -409,6 +572,7 @@ mod tests {
     use serde_json::json;
 
     const MIC: Subject = Subject::Microphone;
+    const CAM: Subject = Subject::Camera;
 
     fn policy(on_start: bool, on_demand: bool) -> CapturePolicy {
         CapturePolicy {
@@ -419,6 +583,7 @@ mod tests {
                 on_start,
                 on_demand,
             },
+            ..CapturePolicy::default()
         }
     }
 
@@ -429,6 +594,7 @@ mod tests {
                 locked: true,
                 ..DevicePolicy::default()
             },
+            ..CapturePolicy::default()
         }
     }
 
@@ -551,12 +717,17 @@ mod tests {
             server_reply("CAPTURE_DEMAND microphone yes"),
             Some(Reply::Demand(MIC, false))
         );
-        // The camera is not built yet (M2): its replies are not ours.
-        assert_eq!(server_reply("CAPTURE_DEMAND webcam 1"), None);
+        assert_eq!(
+            server_reply("CAPTURE_DEMAND webcam 1"),
+            Some(Reply::Demand(CAM, true))
+        );
+        assert_eq!(server_reply("WEBCAM_DISABLED"), Some(Reply::Disabled(CAM)));
+        assert_eq!(server_reply("WEBCAM_KEYFRAME"), Some(Reply::Keyframe));
+        assert_eq!(server_reply("WEBCAM_KEYFRAME 1"), None);
+        assert_eq!(server_reply("CAPTURE_DEMAND camera 1"), None);
         assert_eq!(server_reply("CAPTURE_DEMAND speaker 1"), None);
         assert_eq!(server_reply("CAPTURE_DEMAND_X microphone 1"), None);
         assert_eq!(server_reply("MICROPHONE_DISABLED "), None);
-        assert_eq!(server_reply("WEBCAM_KEYFRAME"), None);
     }
 
     #[test]
@@ -862,7 +1033,168 @@ mod tests {
     #[test]
     fn badge_shows_while_starting() {
         // The badge follows the open device, not delivered packets.
-        assert_eq!(badge(true), Some(true));
-        assert_eq!(badge(false), None);
+        assert_eq!(badge(true, false), Some((true, false)));
+        assert_eq!(badge(false, true), Some((false, true)));
+        assert_eq!(badge(true, true), Some((true, true)));
+        assert_eq!(badge(false, false), None);
+    }
+
+    fn cam_policy(on_start: bool, on_demand: bool) -> CapturePolicy {
+        CapturePolicy {
+            cam: DevicePolicy {
+                permitted: true,
+                on_start,
+                on_demand,
+                ..DevicePolicy::default()
+            },
+            ..CapturePolicy::default()
+        }
+    }
+
+    #[test]
+    fn webcam_policy_reads_selkies_payload_shape() {
+        let policy = CapturePolicy::from_server(&json!({
+            "webcam_enabled": {"value": false, "locked": false},
+            "webcam_on_start": {"value": true},
+            "webcam_on_demand": {"value": false},
+            "audio_enabled": {"value": false}
+        }));
+        // Unlocked false still permits, and session audio has nothing to do with the camera.
+        assert!(policy.cam.permitted && policy.cam.on_start && !policy.cam.on_demand);
+        let policy = CapturePolicy::from_server(&json!({
+            "webcam_enabled": {"value": false, "locked": true},
+            "webcam_on_start": {"value": "demand"}
+        }));
+        assert!(!policy.cam.permitted && policy.cam.locked && policy.cam.on_demand);
+        let policy = CapturePolicy::from_server(&json!({
+            "webcam_enabled": {"value": true, "locked": true}
+        }));
+        assert!(policy.cam.permitted && policy.cam.locked);
+    }
+
+    #[test]
+    fn webcam_hidden_by_sidebar_setting() {
+        let policy = CapturePolicy::from_server(&json!({
+            "webcam_enabled": {"value": true, "locked": false},
+            "ui_sidebar_show_webcam": {"value": false}
+        }));
+        assert!(!policy.cam_shown && !policy.cam.permitted);
+        assert!(CapturePolicy::from_server(&json!({})).cam_shown);
+        // Hidden: on_start never starts it.
+        let mut state = CaptureState::default();
+        let mut hidden = cam_policy(true, false);
+        hidden.cam.permitted = false;
+        hidden.cam_shown = false;
+        assert!(state.on_policy(hidden, Auth::Authorized).is_empty());
+    }
+
+    #[test]
+    fn webcam_size_defaults_and_clamps() {
+        assert_eq!(CapturePolicy::from_server(&json!({})).cam_size, (1280, 720));
+        let policy = CapturePolicy::from_server(&json!({
+            "webcam_width": {"value": 640},
+            "webcam_height": {"value": "480"}
+        }));
+        assert_eq!(policy.cam_size, (640, 480));
+        let policy = CapturePolicy::from_server(&json!({
+            "webcam_width": {"value": 10_000},
+            "webcam_height": {"value": 12}
+        }));
+        assert_eq!(policy.cam_size, (3840, 160));
+        let policy = CapturePolicy::from_server(&json!({"webcam_width": {"value": "wide"}}));
+        assert_eq!(policy.cam_size, (1280, 720));
+    }
+
+    #[test]
+    fn audio_enabled_string_forms_read_as_off() {
+        for off in [
+            json!(false),
+            json!({"value": "false"}),
+            json!({"value": false}),
+        ] {
+            let policy = CapturePolicy::from_server(&json!({"audio_enabled": off}));
+            assert!(policy.mic.audio_off, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn webcam_frame_header_is_06_01_flags() {
+        assert_eq!(
+            webcam_frame(true, &[0, 0, 0, 1, 0x65]),
+            [6, 1, 1, 0, 0, 0, 1, 0x65]
+        );
+        assert_eq!(
+            webcam_frame(false, &[0, 0, 0, 1, 0x41]),
+            [6, 1, 0, 0, 0, 0, 1, 0x41]
+        );
+        assert!(webcam_keyframe(&webcam_frame(true, &[1])));
+        assert!(!webcam_keyframe(&webcam_frame(false, &[1])));
+        assert!(!webcam_keyframe(&[6]));
+    }
+
+    #[test]
+    fn camera_follows_its_own_rules() {
+        // Camera on_start, microphone not: only the camera starts.
+        let mut state = CaptureState::default();
+        let mut both = cam_policy(true, false);
+        both.mic = policy(false, false).mic;
+        assert_eq!(
+            state.on_policy(both, Auth::Authorized),
+            [Effect::Start(CAM)]
+        );
+        // Each device is asked with its own answer.
+        let mut state = CaptureState::default();
+        let mut both = cam_policy(true, false);
+        both.mic = policy(true, false).mic;
+        let effects = state.on_policy(
+            both,
+            Auths {
+                mic: Auth::Authorized,
+                cam: Auth::NotDetermined,
+            },
+        );
+        assert_eq!(effects[0], Effect::Start(MIC));
+        assert!(matches!(effects[1], Effect::AskPermission(t) if t.subject == CAM));
+        // WEBCAM_DISABLED stops the camera only.
+        assert!(state
+            .on_reply(Reply::Disabled(CAM), Auth::Authorized)
+            .is_empty());
+        assert_eq!(state.mic.phase, Phase::On);
+        assert!(!state.permitted(CAM) && state.permitted(MIC));
+        // The stream's end stops both.
+        let mut state = CaptureState::default();
+        let mut both = cam_policy(true, false);
+        both.mic = policy(true, false).mic;
+        state.on_policy(both, Auth::Authorized);
+        assert_eq!(
+            state.on_stream_end(),
+            [Effect::Stop(MIC), Effect::Stop(CAM)]
+        );
+    }
+
+    #[test]
+    fn camera_demand_starts_and_stops() {
+        let mut state = CaptureState::default();
+        state.on_policy(cam_policy(false, true), Auth::Authorized);
+        assert_eq!(
+            state.on_reply(Reply::Demand(CAM, true), Auth::Authorized),
+            [Effect::Start(CAM)]
+        );
+        assert_eq!(state.mic.phase, Phase::Off);
+        assert_eq!(
+            state.on_reply(Reply::Demand(CAM, false), Auth::Authorized),
+            [Effect::Stop(CAM)]
+        );
+    }
+
+    #[test]
+    fn keyframe_reply_changes_no_state() {
+        let mut state = CaptureState::default();
+        state.on_policy(cam_policy(true, false), Auth::Authorized);
+        let before = state.clone();
+        assert!(state.on_reply(Reply::Keyframe, Auth::Authorized).is_empty());
+        assert_eq!(state, before);
+        assert_eq!(Reply::Keyframe.subject(), None);
+        assert_eq!(Reply::Disabled(CAM).subject(), Some(CAM));
     }
 }

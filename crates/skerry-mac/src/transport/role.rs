@@ -8,9 +8,11 @@
 //! skips the stamp does not compile.
 
 use super::Resolution;
-use futures_util::SinkExt;
+use crate::camera::Feedback;
+use crate::socket_writer::{socket_fd, Backlog, NoBacklog, SocketBacklog, SplitSocket};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
@@ -130,19 +132,41 @@ impl StreamRole {
     }
 }
 
-/// The stream's socket. Its only text send is [`Wire::send`], which stamps, and its only
-/// binary send is the RTT ping: there is no way to write an unstamped frame.
+/// The stream's socket. Its only text send is [`Wire::send`], which stamps; its binary
+/// sends (the microphone's `0x02`, the camera's `0x06`) go out on the primary only. Every
+/// write goes through the socket's writer task (`socket_writer`, `ARCH-038`), so Wire sits in
+/// front of it: nothing reaches the writer unstamped.
 pub(super) struct Wire {
-    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    socket: SplitSocket<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     role: StreamRole,
 }
 
 impl Wire {
+    /// A stream without a camera.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn new(
         socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
         role: StreamRole,
     ) -> Self {
-        Self { socket, role }
+        Self::with_camera(socket, role, Arc::default())
+    }
+
+    /// `feedback` is the camera's: the writer asks it for keyframes and tells it the bitrate
+    /// and frame size the uplink carries.
+    pub(super) fn with_camera(
+        socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        role: StreamRole,
+        feedback: Arc<Feedback>,
+    ) -> Self {
+        let backlog: Box<dyn Backlog> =
+            match socket_fd(socket.get_ref()).and_then(SocketBacklog::new) {
+                Some(backlog) => Box::new(backlog),
+                None => Box::new(NoBacklog),
+            };
+        Self {
+            socket: SplitSocket::new(socket, feedback, backlog),
+            role,
+        }
     }
 
     pub(super) fn role(&self) -> StreamRole {
@@ -169,6 +193,24 @@ impl Wire {
             return Ok(());
         }
         self.socket.send(Message::binary(data)).await
+    }
+
+    /// Offers one camera frame (`0x06`) to the writer's camera queue, on the primary only.
+    pub(super) fn send_camera(&self, frame: Vec<u8>) {
+        if self.role.is_primary() {
+            self.socket.send_camera(frame);
+        }
+    }
+
+    /// Whether the writer takes another microphone frame now (bounded, so a stalled uplink
+    /// fills the microphone's own channel and its stall stop fires).
+    pub(super) fn mic_room(&self) -> bool {
+        self.socket.mic_room()
+    }
+
+    /// Whether the writer takes another camera frame now.
+    pub(super) fn camera_room(&self) -> bool {
+        self.socket.camera_room()
     }
 
     pub(super) async fn ping(&mut self, payload: &'static [u8]) -> Result<(), tungstenite::Error> {

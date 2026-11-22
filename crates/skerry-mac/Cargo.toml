@@ -17,18 +17,20 @@ gpui-kit = "0.10.0"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 objc2 = "0.6"
-# Microphone uplink (`ARCH-038`): the Opus encoder is AudioToolbox's own `AudioConverter`, and
-# the permission prompt is `AVCaptureDevice`'s. The first and third are already locked through cpal.
+# Microphone and camera uplink (`ARCH-038`): the Opus encoder is AudioToolbox's own
+# `AudioConverter`, the permission prompt is `AVCaptureDevice`'s, and the camera is an
+# `AVCaptureSession` feeding VideoToolbox. The audio crates are already locked through cpal.
 objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types"] }
-objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "dispatch2", "objc2-core-media", "objc2-core-video", "AVCaptureDevice", "AVCaptureInput", "AVCaptureOutputBase", "AVCaptureSession", "AVCaptureVideoDataOutput", "AVMediaFormat"] }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std", "block2", "objc2"] }
 objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSView", "NSWindow", "NSWorkspace", "block2", "objc2-uniform-type-identifiers"] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "CFString", "objc2"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFArray", "CFDictionary", "CFNumber", "CFString", "objc2"] }
 # Input devices from plain properties, so listing never asks TCC (`ARCH-038`).
 objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGRemoteOperation", "libc"] }
 objc2-core-haptics = { version = "0.3.2", default-features = false, features = ["std", "block2", "CHHapticEngine", "CHHapticEvent", "CHHapticParameter", "CHHapticPattern", "CHHapticPatternPlayer"] }
-objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
+objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2", "objc2-core-video"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "objc2", "objc2-io-surface"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSLocale", "NSNotification", "NSOperation", "NSProcessInfo", "NSSet", "NSString", "block2", "NSTimeZone", "NSURL", "NSUserDefaults", "NSValue"] }
 objc2-game-controller = { version = "0.3.2", default-features = false, features = ["std", "block2", "GCController", "GCControllerAxisInput", "GCControllerButtonInput", "GCControllerDirectionPad", "GCControllerElement", "GCDevice", "GCDeviceHaptics", "GCExtendedGamepad", "GCPhysicalInputProfile"] }
@@ -36,7 +38,7 @@ objc2-game-controller = { version = "0.3.2", default-features = false, features 
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["UTType"] }
 objc2-pdf-kit = { version = "0.3.2", default-features = false, features = ["std", "PDFDocument", "objc2-app-kit"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation"] }
-objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "objc2", "objc2-core-media", "objc2-core-video"] }
+objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["VTCompressionProperties", "VTCompressionSession", "VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "VTSession", "objc2", "objc2-core-media", "objc2-core-video"] }
 opus-decoder = "0.1.1"
 percent-encoding = "2.3"
 raw-window-handle = "0.6"

@@ -5,6 +5,8 @@ mod apps;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod camera;
+#[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
 mod clipboard;
@@ -44,6 +46,8 @@ mod selkies;
 mod settings;
 #[cfg(target_os = "macos")]
 mod shortcuts;
+#[cfg(target_os = "macos")]
+mod socket_writer;
 mod stats;
 #[cfg(target_os = "macos")]
 mod storage;

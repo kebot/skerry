@@ -569,6 +569,25 @@ impl AudioPreferences {
     }
 }
 
+/// The camera choice saved for a server (`ARCH-038`). Whether the camera is on is never
+/// saved.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CameraPreferences {
+    /// The chosen camera's `AVCaptureDevice.uniqueID`; `None` follows the Mac's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    /// The chosen camera's last-seen name, to label it while it isn't connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+impl CameraPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// The Gamepads card's switches, saved for a server (`ARCH-032`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -654,6 +673,13 @@ pub struct Preferences {
     pub library: LibraryOrganization,
     #[serde(default, skip_serializing_if = "AudioPreferences::is_default")]
     pub audio: AudioPreferences,
+    /// The chosen camera (`ARCH-038`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "CameraPreferences::is_default"
+    )]
+    pub camera: CameraPreferences,
     /// **Mac shortcuts active** as the person set it; `None` follows the server (`ARCH-031`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_shortcuts: Option<bool>,
@@ -795,6 +821,7 @@ fn read_file(path: &Path) -> Loaded {
             "gamepads" => field(value, &mut prefs.gamepads),
             "printing" => field(value, &mut prefs.printing),
             "apps_category" => field(value, &mut prefs.apps_category),
+            "camera" => field(value, &mut prefs.camera),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
                     .map(|number| {
@@ -1102,6 +1129,42 @@ mod tests {
             .collect();
         keys.sort();
         assert_eq!(keys, ["input_device", "input_device_name", "output_device"]);
+    }
+
+    #[test]
+    fn camera_preferences_default_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.stats_strip = true).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(written.get("camera").is_none(), "{written}");
+        update_at(&path, |p| {
+            p.camera.device = Some("0x1420000005ac8600".into());
+            p.camera.device_name = Some("FaceTime HD Camera".into());
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.camera.device.as_deref(), Some("0x1420000005ac8600"));
+        assert_eq!(
+            saved.camera.device_name.as_deref(),
+            Some("FaceTime HD Camera")
+        );
+        // Only the choice: no on/off state.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut keys: Vec<_> = written["camera"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["device", "device_name"]);
+        // A bad shape reads as the default without failing the file.
+        std::fs::write(&path, r#"{"camera": 7, "stats_strip": true}"#).unwrap();
+        let loaded = load_at(&path);
+        assert!(loaded.camera.is_default() && loaded.stats_strip);
     }
 
     #[test]

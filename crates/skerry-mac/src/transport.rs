@@ -620,7 +620,8 @@ pub enum SessionEvent {
     Rumble(crate::gamepad::Rumble),
     /// The capture part of a primary `server_settings` (`ARCH-038`).
     CapturePolicy(capture::CapturePolicy),
-    /// `MICROPHONE_DISABLED` or `CAPTURE_DEMAND` (`ARCH-038`).
+    /// `MICROPHONE_DISABLED`, `WEBCAM_DISABLED`, `WEBCAM_KEYFRAME` or `CAPTURE_DEMAND`
+    /// (`ARCH-038`).
     Capture(capture::Reply),
     /// A status from the window's `skerry-mic` thread, tagged with that thread's id so a
     /// late one from a thread already stopped is ignored. Raised by the window, not the
@@ -629,6 +630,10 @@ pub enum SessionEvent {
     /// The card's input list, from plain CoreAudio properties, tagged with its stream.
     /// Raised by the window.
     MicInputs(u64, crate::input_devices::InputList),
+    /// A status from the window's `skerry-camera` thread, tagged like `MicStatus`.
+    CamStatus(u64, crate::camera::CamStatus),
+    /// The card's camera list (only once macOS granted the camera), tagged with its stream.
+    CamInputs(u64, crate::input_devices::InputList),
     /// An Apps window event: `apps_state`, `apps_job`, `command_error` (`ARCH-035`).
     Apps(crate::apps::Event),
     /// What `server_settings` allows the Apps window (`ARCH-035`).
@@ -668,6 +673,11 @@ fn capture_event(text: &str) -> Option<SessionEvent> {
 /// An uplink frame as sent (binary, through [`Wire::send_binary`], primary only), and only
 /// once the session is ready.
 fn uplink_message(ready: bool, frame: Vec<u8>) -> Option<Vec<u8>> {
+    ready.then_some(frame)
+}
+
+/// A camera frame for the writer's camera slot, only once the session is ready.
+fn camera_uplink(ready: bool, frame: Vec<u8>) -> Option<Vec<u8>> {
     ready.then_some(frame)
 }
 
@@ -926,6 +936,15 @@ pub struct SessionOptions {
     /// `0x02` microphone frames from the window's `skerry-mic` thread (`ARCH-038`). Dropping
     /// it when the stream ends stops that thread's capture. Always `None` for Display 2.
     pub mic: Option<mpsc::Receiver<Vec<u8>>>,
+    /// `0x06` camera frames from the window's `skerry-camera` thread (`ARCH-038`).
+    pub camera: Option<CameraFrames>,
+}
+
+/// The camera's frame channel and its feedback, which the socket writer sets
+/// when it drops a frame.
+pub struct CameraFrames {
+    pub frames: mpsc::Receiver<Vec<u8>>,
+    pub feedback: Arc<crate::camera::Feedback>,
 }
 
 /// Why a stream ended with an error.
@@ -1162,7 +1181,16 @@ pub async fn run(
             Retry::Fail => return Err("Couldn’t connect to the Selkies WebSocket.".into()),
         }
     };
-    let socket = Wire::new(socket, options.role);
+    // Writes go through Wire's writer task, so a camera keyframe never holds the stream's
+    // loop; camera frames wait while the kernel holds unsent bytes (`socket_writer`,
+    // `ARCH-038`). The camera, like the microphone, is the primary's (`ARCH-039`).
+    let mut options = options;
+    options.camera = options.camera.take().filter(|_| options.role.is_primary());
+    let feedback = options
+        .camera
+        .as_ref()
+        .map_or_else(Arc::default, |camera| camera.feedback.clone());
+    let socket = Wire::with_camera(socket, options.role, feedback);
     stream(
         socket, direct, frames, input, pointer, options, events, cancel,
     )
@@ -1184,6 +1212,11 @@ async fn stream(
 ) -> Result<(), RunError> {
     // The microphone is the primary's (`ARCH-038`, `ARCH-039`).
     let mut mic_frames = options.mic.take().filter(|_| options.role.is_primary());
+    let mut cam_frames = options
+        .camera
+        .take()
+        .filter(|_| options.role.is_primary())
+        .map(|camera| camera.frames);
     let mut codec = if options.codec.supported() {
         options.codec
     } else {
@@ -1264,6 +1297,8 @@ async fn stream(
     pad_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clipboard_in = clipboard::Receiver::default();
     let mut clipboard_transfer = 0u64;
+    let mut uplink_retry = tokio::time::interval(Duration::from_millis(20));
+    uplink_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1417,10 +1452,20 @@ async fn stream(
                 socket.send(text).await.map_err(|_| disconnected)?;
             }
             // About 80 B every 20 ms: inline after input, before anything received
-            // (`ARCH-038`). Frames before the session is ready are dropped.
-            frame = uplink(&mut mic_frames) => {
+            // (`ARCH-038`). Frames before the session is ready are dropped. Taken only while
+            // the writer has room, so a stalled uplink fills the microphone's own channel and
+            // its 2 s stall stop fires (M-QA-2).
+            frame = uplink(&mut mic_frames), if socket.mic_room() => {
                 if let Some(frame) = uplink_message(ready, frame) {
                     socket.send_binary(frame).await.map_err(|_| disconnected)?;
+                }
+            }
+            // Camera frames go to the writer's camera queue, behind every queued command and
+            // microphone frame; frames before the session is ready are dropped. Bounded like
+            // the microphone's.
+            frame = uplink(&mut cam_frames), if socket.camera_room() => {
+                if let Some(frame) = camera_uplink(ready, frame) {
+                    socket.send_camera(frame);
                 }
             }
             incoming = inbound(&mut socket, &mut last_inbound) => match incoming {
@@ -1728,6 +1773,8 @@ async fn stream(
                 }
                 .into());
             }
+            // Last: wakes the loop to look again at an uplink held back for a full writer.
+            _ = uplink_retry.tick(), if !socket.mic_room() || !socket.camera_room() => {}
         }
     }
 }
@@ -2006,6 +2053,7 @@ mod tests {
             audio_bitrate: None,
             role: StreamRole::Primary,
             mic: None,
+            camera: None,
         }
     }
 
@@ -2459,6 +2507,70 @@ mod tests {
     #[test]
     fn uplink_dropped_before_ready() {
         assert!(uplink_message(false, capture::mic_frame(&[1])).is_none());
+        assert!(camera_uplink(false, capture::webcam_frame(true, &[1])).is_none());
+    }
+
+    type Drive =
+        Box<dyn FnOnce(&mut Wire) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + '_>>>;
+
+    /// Everything a fake server receives on one Wire with `role`, after `drive` wrote and a
+    /// final `kd,65`.
+    async fn received_on(role: StreamRole, drive: Drive) -> Vec<Vec<u8>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Binary(data) => seen.push(data.to_vec()),
+                    Message::Text(text) => seen.push(text.as_bytes().to_vec()),
+                    _ => {}
+                }
+            }
+            seen
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let mut wire = Wire::with_camera(socket, role, Arc::default());
+        drive(&mut wire).await;
+        // Let the writer take any camera frame before the close is queued.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        wire.send("kd,65".into()).await.unwrap();
+        wire.close(None).await.unwrap();
+        server.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn uplink_cam_frames_sent_as_binary_after_ready() {
+        let key = capture::webcam_frame(true, &[0, 0, 0, 1, 0x65, 9]);
+        assert!(camera_uplink(false, key.clone()).is_none());
+        let frame = camera_uplink(true, key.clone()).unwrap();
+        let seen = received_on(
+            StreamRole::Primary,
+            Box::new(|wire| Box::pin(async move { wire.send_camera(frame) })),
+        )
+        .await;
+        assert_eq!(seen, [key, b"kd,65".to_vec()]);
+        assert_eq!(&seen[0][..3], [0x06, 0x01, 0x01]);
+    }
+
+    #[tokio::test]
+    async fn camera_and_mic_frames_never_go_on_display_2() {
+        let seen = received_on(
+            StreamRole::Secondary(Side::Right),
+            Box::new(|wire| {
+                Box::pin(async move {
+                    wire.send_camera(capture::webcam_frame(true, &[0, 0, 0, 1, 0x65]));
+                    wire.send_binary(capture::mic_frame(&[0x68])).await.unwrap();
+                })
+            }),
+        )
+        .await;
+        // Only the text frame: no 0x06 and no 0x02 on Display 2's socket.
+        assert_eq!(seen, [b"kd,65".to_vec()]);
     }
 
     #[tokio::test]
@@ -2490,6 +2602,23 @@ mod tests {
             Some(SessionEvent::Capture(capture::Reply::Demand(
                 capture::Subject::Microphone,
                 true
+            )))
+        ));
+        assert!(matches!(
+            capture_event("WEBCAM_DISABLED"),
+            Some(SessionEvent::Capture(capture::Reply::Disabled(
+                capture::Subject::Camera
+            )))
+        ));
+        assert!(matches!(
+            capture_event("WEBCAM_KEYFRAME"),
+            Some(SessionEvent::Capture(capture::Reply::Keyframe))
+        ));
+        assert!(matches!(
+            capture_event("CAPTURE_DEMAND webcam 0"),
+            Some(SessionEvent::Capture(capture::Reply::Demand(
+                capture::Subject::Camera,
+                false
             )))
         ));
         assert!(capture_event("VIDEO_STARTED").is_none());

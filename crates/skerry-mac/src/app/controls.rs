@@ -5,7 +5,8 @@ use super::{
     ToggleSessionControls, ToggleStatsStrip,
 };
 use crate::audio::{OutputProblem, OutputStatus};
-use crate::capture::{CapturePolicy, DeviceState, Phase, Subject};
+use crate::camera::{CamProblem, CamStatus};
+use crate::capture::{CapturePolicy, DevicePolicy, DeviceState, Phase, Subject};
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
 use crate::microphone::{MicProblem, MicStatus};
@@ -99,6 +100,8 @@ enum Command {
     SecondDisplay,
     Microphone(bool),
     InputDevice(Option<String>),
+    Camera(bool),
+    CameraDevice(Option<String>),
     PrivacySettings(Subject),
 }
 
@@ -352,6 +355,8 @@ impl ControlPanel {
                         Command::AutoPrint(on) => session.set_auto_print(on, cx),
                         Command::Microphone(on) => session.set_microphone(on, cx),
                         Command::InputDevice(uid) => session.change_input_device(uid, cx),
+                        Command::Camera(on) => session.set_camera(on, cx),
+                        Command::CameraDevice(uid) => session.change_camera_device(uid, cx),
                         Command::PrivacySettings(subject) => {
                             session.open_privacy_settings(subject, cx)
                         }
@@ -548,9 +553,18 @@ impl ControlPanel {
             ControlsAction::SelectInputDevice(uid) => {
                 Self::send(self.owner.clone(), Command::InputDevice(uid), cx)
             }
-            ControlsAction::OpenPrivacySettings(CaptureSubject::Microphone) => Self::send(
+            ControlsAction::SetCamera(on) => {
+                Self::send(self.owner.clone(), Command::Camera(on), cx)
+            }
+            ControlsAction::SelectCamera(uid) => {
+                Self::send(self.owner.clone(), Command::CameraDevice(uid), cx)
+            }
+            ControlsAction::OpenPrivacySettings(subject) => Self::send(
                 self.owner.clone(),
-                Command::PrivacySettings(Subject::Microphone),
+                Command::PrivacySettings(match subject {
+                    CaptureSubject::Microphone => Subject::Microphone,
+                    CaptureSubject::Camera => Subject::Camera,
+                }),
                 cx,
             ),
             ControlsAction::CopyStats => {
@@ -673,7 +687,7 @@ impl ControlPanel {
         // (the thread exists only while capturing, `ARCH-038`).
         let mic_card_status = session.capture.mic_status.clone().or_else(|| {
             let (devices, default_uid) = session.capture.devices();
-            (session.capture.inputs.is_some() || session.capture.encoder_unavailable).then(|| {
+            (session.capture.inputs().is_some() || session.capture.encoder_unavailable).then(|| {
                 MicStatus {
                     devices,
                     default_uid,
@@ -684,6 +698,20 @@ impl ControlPanel {
                         .then_some(MicProblem::EncoderUnavailable),
                     ..MicStatus::default()
                 }
+            })
+        });
+
+        let cam_card_status = session.capture.cam_status.clone().or_else(|| {
+            let (devices, default_uid) = session.capture.cameras();
+            (!devices.is_empty() || session.capture.cam_encoder_unavailable).then(|| CamStatus {
+                devices,
+                default_uid,
+                chosen: session.preferences.camera.device.clone(),
+                problem: session
+                    .capture
+                    .cam_encoder_unavailable
+                    .then_some(CamProblem::EncoderUnavailable),
+                ..CamStatus::default()
             })
         });
 
@@ -715,13 +743,21 @@ impl ControlPanel {
                     std::time::Instant::now(),
                 )
             }),
-            media_capture: media_capture_props(&MicInputs {
-                policy: session.capture.state.policy,
-                state: session.capture.state.mic,
-                status: mic_card_status.as_ref(),
-                chosen: session.preferences.audio.input_device.as_deref(),
-                saved_name: session.preferences.audio.input_device_name.as_deref(),
-            }),
+            media_capture: media_capture_props(
+                &MicInputs {
+                    policy: session.capture.state.policy,
+                    state: session.capture.state.mic,
+                    status: mic_card_status.as_ref(),
+                    chosen: session.preferences.audio.input_device.as_deref(),
+                    saved_name: session.preferences.audio.input_device_name.as_deref(),
+                },
+                Some(&CamInputs {
+                    state: session.capture.state.cam,
+                    status: cam_card_status.as_ref(),
+                    chosen: session.preferences.camera.device.as_deref(),
+                    saved_name: session.preferences.camera.device_name.as_deref(),
+                }),
+            ),
             apps_available: session.apps_available(),
         }
     }
@@ -738,14 +774,124 @@ struct MicInputs<'a> {
     saved_name: Option<&'a str>,
 }
 
-/// The Microphone & Camera card: hidden until the server's settings arrive.
-fn media_capture_props(mic: &MicInputs) -> Option<MediaCaptureProps> {
-    let policy = mic.policy?.mic;
-    let permitted = policy.permitted && !mic.state.server_disabled;
-    let status = mic.status.filter(|_| permitted);
-    let live = status.is_some_and(|status| status.live);
-    let problem = status.and_then(|status| status.problem);
-    let state = mic.state;
+/// What the card's camera group is drawn from.
+struct CamInputs<'a> {
+    state: DeviceState,
+    status: Option<&'a CamStatus>,
+    /// The saved choice (its unique ID); `None` is System Default.
+    chosen: Option<&'a str>,
+    saved_name: Option<&'a str>,
+}
+
+/// A device problem, as the card words it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Trouble {
+    NoDevice,
+    Failed,
+    EncoderUnavailable,
+    /// Shown elsewhere (the missing-device note).
+    Other,
+}
+
+/// One device's thread status, whichever device.
+struct StatusView<'a> {
+    devices: &'a [crate::audio::OutputDevice],
+    default: Option<&'a crate::audio::OutputDevice>,
+    active: Option<&'a crate::audio::OutputDevice>,
+    problem: Option<Trouble>,
+    live: bool,
+    level: u8,
+}
+
+impl<'a> StatusView<'a> {
+    fn device(&self, uid: &str) -> Option<&'a crate::audio::OutputDevice> {
+        self.devices.iter().find(|device| device.uid == uid)
+    }
+
+    fn mic(status: &'a MicStatus) -> Self {
+        Self {
+            devices: &status.devices,
+            default: status.default_device(),
+            active: status.active.as_ref(),
+            problem: status.problem.map(|problem| match problem {
+                MicProblem::NoDevice => Trouble::NoDevice,
+                MicProblem::Failed => Trouble::Failed,
+                MicProblem::EncoderUnavailable => Trouble::EncoderUnavailable,
+                MicProblem::ChosenMissing => Trouble::Other,
+            }),
+            live: status.live,
+            level: status.level,
+        }
+    }
+
+    fn cam(status: &'a CamStatus) -> Self {
+        Self {
+            devices: &status.devices,
+            default: status
+                .default_uid
+                .as_deref()
+                .and_then(|uid| status.device(uid)),
+            active: status.active.as_ref(),
+            problem: status.problem.map(|problem| match problem {
+                CamProblem::NoDevice => Trouble::NoDevice,
+                CamProblem::InUse | CamProblem::Failed => Trouble::Failed,
+                CamProblem::EncoderUnavailable => Trouble::EncoderUnavailable,
+                CamProblem::ChosenMissing => Trouble::Other,
+            }),
+            live: status.live,
+            level: 0,
+        }
+    }
+}
+
+/// The words that differ between the two groups.
+struct Words {
+    denied: &'static str,
+    demand: &'static str,
+    no_device: &'static str,
+    failed: &'static str,
+    encoder: &'static str,
+    saved: &'static str,
+    your_saved: &'static str,
+    none_other: &'static str,
+}
+
+const MIC_WORDS: Words = Words {
+    denied: "SealSkin Native isn’t allowed to use the microphone.",
+    demand: "Starts when an app in the session listens",
+    no_device: "No microphone found.",
+    failed: "The microphone stopped. Trying again…",
+    encoder: "This Mac can’t encode microphone audio.",
+    saved: "Saved Microphone",
+    your_saved: "Your saved microphone",
+    none_other: "no other microphone is available",
+};
+
+const CAM_WORDS: Words = Words {
+    denied: "SealSkin Native isn’t allowed to use the camera.",
+    demand: "Starts when an app in the session uses the camera",
+    no_device: "No camera found.",
+    failed: "The camera is in use by another app or stopped. Trying again…",
+    encoder: "This Mac can’t encode camera video.",
+    saved: "Saved Camera",
+    your_saved: "Your saved camera",
+    none_other: "no other camera is available",
+};
+
+/// One device's group in the card.
+fn device_props(
+    words: &Words,
+    policy: DevicePolicy,
+    state: DeviceState,
+    status: Option<StatusView<'_>>,
+    chosen: Option<&str>,
+    saved_name: Option<&str>,
+    meter: bool,
+) -> CaptureDeviceProps {
+    let permitted = policy.permitted && !state.server_disabled;
+    let status = status.filter(|_| permitted);
+    let live = status.as_ref().is_some_and(|status| status.live);
+    let problem = status.as_ref().and_then(|status| status.problem);
     let detail = if !permitted {
         Some(if policy.audio_off {
             "Unavailable while session audio is off"
@@ -755,49 +901,48 @@ fn media_capture_props(mic: &MicInputs) -> Option<MediaCaptureProps> {
     } else if live {
         Some("Sending to the session")
     } else if state.denied {
-        Some("SealSkin Native isn’t allowed to use the microphone.")
+        Some(words.denied)
     } else {
         match state.phase {
             Phase::Asking => Some("Waiting for permission…"),
             Phase::On => Some(match problem {
-                Some(MicProblem::NoDevice) => "No microphone found.",
-                Some(MicProblem::Failed) => "The microphone stopped. Trying again…",
+                Some(Trouble::NoDevice) => words.no_device,
+                Some(Trouble::Failed) => words.failed,
                 _ => "Starting…",
             }),
             Phase::Off => match problem {
-                Some(MicProblem::EncoderUnavailable) => {
-                    Some("This Mac can’t encode microphone audio.")
-                }
-                _ if !state.touched && policy.on_demand && !state.refused => {
-                    Some("Starts when an app in the session listens")
-                }
+                Some(Trouble::EncoderUnavailable) => Some(words.encoder),
+                _ if !state.touched && policy.on_demand && !state.refused => Some(words.demand),
                 _ if policy.locked => Some("Set by the server"),
                 _ => None,
             },
         }
     };
     // The menu, as E's Output Device menu.
-    let default_label = status.and_then(MicStatus::default_device).map_or_else(
-        || "System Default".to_string(),
-        |device| format!("System Default ({})", device.name),
-    );
+    let default_label = status
+        .as_ref()
+        .and_then(|status| status.default)
+        .map_or_else(
+            || "System Default".to_string(),
+            |device| format!("System Default ({})", device.name),
+        );
     let mut devices = vec![AudioOutputItem {
         uid: None,
         label: default_label.clone(),
-        checked: mic.chosen.is_none() || status.is_none(),
+        checked: chosen.is_none() || status.is_none(),
         connected: true,
     }];
     let mut device_label = default_label;
     let mut note = None;
-    if let Some(status) = status {
+    if let Some(status) = &status {
         devices.extend(status.devices.iter().map(|device| AudioOutputItem {
             uid: Some(device.uid.clone()),
             label: device.name.clone(),
-            checked: mic.chosen == Some(device.uid.as_str()),
+            checked: chosen == Some(device.uid.as_str()),
             connected: true,
         }));
-        let saved = mic.saved_name.unwrap_or("Saved Microphone");
-        match mic.chosen {
+        let saved = saved_name.unwrap_or(words.saved);
+        match chosen {
             Some(uid) if status.device(uid).is_none() => {
                 let missing = format!("{saved} (not connected)");
                 devices.push(AudioOutputItem {
@@ -807,22 +952,17 @@ fn media_capture_props(mic: &MicInputs) -> Option<MediaCaptureProps> {
                     connected: false,
                 });
                 device_label = missing;
-                let subject = mic
-                    .saved_name
-                    .map_or_else(|| "Your saved microphone".to_string(), str::to_string);
+                let subject = saved_name.unwrap_or(words.your_saved);
                 let using = status
                     .active
-                    .as_ref()
-                    .or_else(|| status.default_device())
+                    .or(status.default)
                     .or_else(|| status.devices.first());
                 note = Some(match using {
                     Some(device) => format!(
                         "{subject} isn’t connected. Using {} until it’s back.",
                         device.name
                     ),
-                    None => {
-                        format!("{subject} isn’t connected, and no other microphone is available.")
-                    }
+                    None => format!("{subject} isn’t connected, and {}.", words.none_other),
                 });
             }
             Some(uid) => {
@@ -833,20 +973,47 @@ fn media_capture_props(mic: &MicInputs) -> Option<MediaCaptureProps> {
             None => {}
         }
     }
+    CaptureDeviceProps {
+        on: permitted && (state.wanted || live),
+        locked: !permitted || policy.locked,
+        picker_locked: !permitted,
+        live,
+        detail: detail.map(str::to_string),
+        denied: permitted && state.denied && !live,
+        device_label,
+        devices,
+        note,
+        level: (meter && (live || state.phase == Phase::On))
+            .then(|| status.as_ref().map_or(0, |status| status.level)),
+    }
+}
+
+/// The Microphone & Camera card: hidden until the server's settings arrive. The camera
+/// group is left out while the server hides the camera.
+fn media_capture_props(mic: &MicInputs, cam: Option<&CamInputs>) -> Option<MediaCaptureProps> {
+    let policy = mic.policy?;
+    let camera = cam.filter(|_| policy.cam_shown).map(|cam| {
+        device_props(
+            &CAM_WORDS,
+            policy.cam,
+            cam.state,
+            cam.status.map(StatusView::cam),
+            cam.chosen,
+            cam.saved_name,
+            false,
+        )
+    });
     Some(MediaCaptureProps {
-        mic: CaptureDeviceProps {
-            on: permitted && (state.wanted || live),
-            locked: !permitted || policy.locked,
-            picker_locked: !permitted,
-            live,
-            detail: detail.map(str::to_string),
-            denied: permitted && state.denied && !live,
-            device_label,
-            devices,
-            note,
-            level: (live || state.phase == Phase::On)
-                .then(|| status.map_or(0, |status| status.level)),
-        },
+        mic: device_props(
+            &MIC_WORDS,
+            policy.mic,
+            mic.state,
+            mic.status.map(StatusView::mic),
+            mic.chosen,
+            mic.saved_name,
+            true,
+        ),
+        camera,
     })
 }
 
@@ -1691,6 +1858,7 @@ mod tests {
                 locked,
                 ..Default::default()
             },
+            ..CapturePolicy::default()
         }
     }
 
@@ -1721,10 +1889,13 @@ mod tests {
     #[test]
     fn media_capture_props_hidden_until_policy() {
         let status = mic_status(false);
-        assert!(media_capture_props(&mic_inputs(None, Some(&status))).is_none());
-        let props = media_capture_props(&mic_inputs(Some(mic_policy(true, false)), Some(&status)))
-            .unwrap()
-            .mic;
+        assert!(media_capture_props(&mic_inputs(None, Some(&status)), None).is_none());
+        let props = media_capture_props(
+            &mic_inputs(Some(mic_policy(true, false)), Some(&status)),
+            None,
+        )
+        .unwrap()
+        .mic;
         assert!(!props.on && !props.locked && !props.live);
         assert_eq!(props.detail, None, "plain Off says nothing more");
         assert_eq!(
@@ -1737,7 +1908,7 @@ mod tests {
 
     #[test]
     fn media_capture_props_locked_off_disabled_with_note() {
-        let props = media_capture_props(&mic_inputs(Some(mic_policy(false, true)), None))
+        let props = media_capture_props(&mic_inputs(Some(mic_policy(false, true)), None), None)
             .unwrap()
             .mic;
         assert!(props.locked && props.picker_locked && !props.on);
@@ -1745,7 +1916,7 @@ mod tests {
         assert_eq!(props.device_label, "System Default");
         let mut audio_off = mic_policy(false, false);
         audio_off.mic.audio_off = true;
-        let props = media_capture_props(&mic_inputs(Some(audio_off), None))
+        let props = media_capture_props(&mic_inputs(Some(audio_off), None), None)
             .unwrap()
             .mic;
         assert_eq!(
@@ -1755,7 +1926,7 @@ mod tests {
         // MICROPHONE_DISABLED reads the same.
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), None);
         inputs.state.server_disabled = true;
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(props.locked);
         assert_eq!(props.detail.as_deref(), Some("Turned off by the server"));
     }
@@ -1763,16 +1934,19 @@ mod tests {
     #[test]
     fn locked_on_mic_switch_disabled_but_picker_works() {
         let status = mic_status(false);
-        let props = media_capture_props(&mic_inputs(Some(mic_policy(true, true)), Some(&status)))
-            .unwrap()
-            .mic;
+        let props = media_capture_props(
+            &mic_inputs(Some(mic_policy(true, true)), Some(&status)),
+            None,
+        )
+        .unwrap()
+        .mic;
         assert!(props.locked && !props.picker_locked);
         // Locked on starts like on_start (M-QA-3): the switch shows on, and disabled.
         let status = mic_status(true);
         let mut inputs = mic_inputs(Some(mic_policy(true, true)), Some(&status));
         inputs.state.wanted = true;
         inputs.state.phase = Phase::On;
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(props.on && props.locked && props.live);
     }
 
@@ -1781,7 +1955,7 @@ mod tests {
         let status = mic_status(false);
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
         inputs.state.denied = true;
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(props.denied && !props.on && !props.locked);
         assert_eq!(
             props.detail.as_deref(),
@@ -1790,7 +1964,7 @@ mod tests {
         // A refusal of a start the server asked for stays silent.
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
         inputs.state.refused = true;
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(!props.denied && props.detail.is_none());
     }
 
@@ -1804,7 +1978,7 @@ mod tests {
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
         inputs.chosen = Some("USB");
         inputs.saved_name = Some("USB Mic");
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         let last = props.devices.last().unwrap();
         assert_eq!(last.label, "USB Mic (not connected)");
         assert!(last.checked && !last.connected);
@@ -1820,7 +1994,7 @@ mod tests {
         };
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&empty));
         inputs.chosen = Some("USB");
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert_eq!(
             props.note.as_deref(),
             Some("Your saved microphone isn’t connected, and no other microphone is available.")
@@ -1834,24 +2008,27 @@ mod tests {
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
         inputs.state.wanted = true;
         inputs.state.phase = Phase::On;
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(props.on && !props.live);
         assert_eq!(props.detail.as_deref(), Some("Starting…"));
         assert_eq!(props.level, Some(3));
         // Open: the dot and "Sending to the session", even before packets are delivered.
         let status = mic_status(true);
         inputs.status = Some(&status);
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(props.live);
         assert_eq!(props.detail.as_deref(), Some("Sending to the session"));
         assert_eq!(
-            skerry_ui::controls::media_capture_header(&MediaCaptureProps { mic: props }),
+            skerry_ui::controls::media_capture_header(&MediaCaptureProps {
+                mic: props,
+                camera: None
+            }),
             Some("Microphone on")
         );
         // Demand, untouched: says when it starts.
         let mut demand = mic_policy(true, false);
         demand.mic.on_demand = true;
-        let props = media_capture_props(&mic_inputs(Some(demand), None))
+        let props = media_capture_props(&mic_inputs(Some(demand), None), None)
             .unwrap()
             .mic;
         assert_eq!(
@@ -1862,8 +2039,133 @@ mod tests {
         let mut inputs = mic_inputs(Some(mic_policy(true, false)), None);
         inputs.state.wanted = true;
         inputs.state.phase = Phase::Asking;
-        let props = media_capture_props(&inputs).unwrap().mic;
+        let props = media_capture_props(&inputs, None).unwrap().mic;
         assert!(props.on);
         assert_eq!(props.detail.as_deref(), Some("Waiting for permission…"));
+    }
+
+    fn cam_status(live: bool) -> CamStatus {
+        CamStatus {
+            devices: vec![
+                device("FaceTime", "FaceTime HD Camera"),
+                device("iPhone", "iPhone Camera"),
+            ],
+            default_uid: Some("FaceTime".into()),
+            active: live.then(|| device("FaceTime", "FaceTime HD Camera")),
+            live,
+            ..CamStatus::default()
+        }
+    }
+
+    fn cam_inputs(status: Option<&CamStatus>) -> CamInputs<'_> {
+        CamInputs {
+            state: DeviceState::default(),
+            status,
+            chosen: None,
+            saved_name: None,
+        }
+    }
+
+    fn both_policy() -> CapturePolicy {
+        let mut policy = mic_policy(true, false);
+        policy.cam.permitted = true;
+        policy
+    }
+
+    #[test]
+    fn media_capture_props_camera_group() {
+        let status = cam_status(true);
+        let mic = mic_inputs(Some(both_policy()), None);
+        let mut cam = cam_inputs(Some(&status));
+        cam.state.wanted = true;
+        cam.state.phase = Phase::On;
+        let props = media_capture_props(&mic, Some(&cam)).unwrap();
+        let camera = props.camera.clone().unwrap();
+        assert!(
+            camera.on && camera.live && camera.level.is_none(),
+            "no meter"
+        );
+        assert_eq!(camera.device_label, "System Default (FaceTime HD Camera)");
+        assert_eq!(camera.detail.as_deref(), Some("Sending to the session"));
+        assert_eq!(
+            skerry_ui::controls::media_capture_header(&props),
+            Some("Camera on")
+        );
+        // Another app holds it.
+        let in_use = CamStatus {
+            problem: Some(CamProblem::InUse),
+            ..cam_status(false)
+        };
+        cam.status = Some(&in_use);
+        let camera = media_capture_props(&mic, Some(&cam))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("The camera is in use by another app or stopped. Trying again…")
+        );
+        // Demand, untouched.
+        let mut demand = both_policy();
+        demand.cam.on_demand = true;
+        let camera = media_capture_props(&mic_inputs(Some(demand), None), Some(&cam_inputs(None)))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("Starts when an app in the session uses the camera")
+        );
+        // Denied: the camera's own words and the privacy button.
+        let mut denied = cam_inputs(None);
+        denied.state.denied = true;
+        let camera = media_capture_props(&mic, Some(&denied))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert!(camera.denied);
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("SealSkin Native isn’t allowed to use the camera.")
+        );
+        // WEBCAM_DISABLED.
+        let mut disabled = cam_inputs(None);
+        disabled.state.server_disabled = true;
+        let camera = media_capture_props(&mic, Some(&disabled))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert!(camera.locked && camera.picker_locked);
+        assert_eq!(camera.detail.as_deref(), Some("Turned off by the server"));
+    }
+
+    #[test]
+    fn media_capture_props_camera_hidden_by_server() {
+        let mut hidden = both_policy();
+        hidden.cam_shown = false;
+        hidden.cam.permitted = false;
+        let props =
+            media_capture_props(&mic_inputs(Some(hidden), None), Some(&cam_inputs(None))).unwrap();
+        assert!(props.camera.is_none());
+    }
+
+    #[test]
+    fn media_capture_props_missing_camera_greyed() {
+        let status = CamStatus {
+            chosen: Some("Gone".into()),
+            problem: Some(CamProblem::ChosenMissing),
+            ..cam_status(true)
+        };
+        let mut cam = cam_inputs(Some(&status));
+        cam.chosen = Some("Gone");
+        let camera = media_capture_props(&mic_inputs(Some(both_policy()), None), Some(&cam))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(camera.device_label, "Saved Camera (not connected)");
+        assert_eq!(
+            camera.note.as_deref(),
+            Some("Your saved camera isn’t connected. Using FaceTime HD Camera until it’s back.")
+        );
     }
 }

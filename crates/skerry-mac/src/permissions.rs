@@ -5,13 +5,17 @@
 use crate::capture::{Auth, Subject};
 use block2::RcBlock;
 use objc2::runtime::Bool;
-use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaType, AVMediaTypeAudio};
+use objc2_av_foundation::{
+    AVAuthorizationStatus, AVCaptureDevice, AVMediaType, AVMediaTypeAudio, AVMediaTypeVideo,
+};
 use std::sync::Mutex;
 
 fn media_type(subject: Subject) -> Option<&'static AVMediaType> {
     match subject {
         // SAFETY: an immutable framework constant (macOS 10.7+).
         Subject::Microphone => unsafe { AVMediaTypeAudio },
+        // SAFETY: as above.
+        Subject::Camera => unsafe { AVMediaTypeVideo },
     }
 }
 
@@ -20,7 +24,7 @@ pub fn authorization(subject: Subject) -> Auth {
     let Some(media) = media_type(subject) else {
         return Auth::Denied;
     };
-    // SAFETY: an audio media type, the only kind this call accepts besides video.
+    // SAFETY: an audio or video media type, the only kinds this call accepts.
     let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(media) };
     match status {
         AVAuthorizationStatus::Authorized => Auth::Authorized,
@@ -42,7 +46,7 @@ pub fn request(subject: Subject) -> tokio::sync::oneshot::Receiver<bool> {
             let _ = answer.send(granted.as_bool());
         }
     });
-    // SAFETY: an audio media type and a block that only sends on a channel.
+    // SAFETY: an audio or video media type and a block that only sends on a channel.
     unsafe { AVCaptureDevice::requestAccessForMediaType_completionHandler(media, &handler) };
     answered
 }
@@ -53,6 +57,7 @@ pub fn privacy_settings_url(subject: Subject) -> &'static str {
         Subject::Microphone => {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         }
+        Subject::Camera => "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera",
     }
 }
 
@@ -63,11 +68,13 @@ mod tests {
     #[test]
     fn privacy_url_opens_the_microphone_pane() {
         assert!(privacy_settings_url(Subject::Microphone).ends_with("?Privacy_Microphone"));
+        assert!(privacy_settings_url(Subject::Camera).ends_with("?Privacy_Camera"));
     }
 
     #[test]
     fn authorization_reads_without_prompting() {
         // Any answer is fine; reading must not block or prompt.
         let _ = authorization(Subject::Microphone);
+        let _ = authorization(Subject::Camera);
     }
 }

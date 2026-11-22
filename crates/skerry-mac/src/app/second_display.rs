@@ -826,6 +826,8 @@ impl DisplayWindow {
                 role: StreamRole::Secondary(self.side),
                 // The microphone is the primary's (`ARCH-038`).
                 mic: None,
+                // The camera, like the microphone, is the primary's (`ARCH-038`, `ARCH-039`).
+                camera: None,
             },
             events,
         );

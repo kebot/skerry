@@ -461,8 +461,8 @@ impl SessionWindow {
             .map(|(&key, &value)| (key, value))
             .collect();
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-        // A fresh frame channel for this stream's microphone (`ARCH-038`).
-        let mic = self.capture.begin_stream(events.clone());
+        // Fresh frame channels for this stream's microphone and camera (`ARCH-038`).
+        let (mic, camera) = self.capture.begin_stream(events.clone());
         let stream = self.api.target(&self.remote).map(|url| {
             NativeSession::open(
                 url,
@@ -489,6 +489,7 @@ impl SessionWindow {
                     audio_bitrate: self.preferences.audio.bitrate,
                     role: StreamRole::Primary,
                     mic: Some(mic),
+                    camera: Some(camera),
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -692,14 +693,21 @@ impl SessionWindow {
             }
             SessionEvent::DisplayLayout(config) => self.second.set_layout(config),
             SessionEvent::CapturePolicy(policy) => {
-                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                use crate::capture::{Auths, Subject};
+                let auth = Auths {
+                    mic: crate::permissions::authorization(Subject::Microphone),
+                    cam: crate::permissions::authorization(Subject::Camera),
+                };
                 let effects = self.capture.on_policy(policy, auth);
                 self.apply_capture(effects, cx);
-                self.ensure_input_ticker(cx);
+                self.ensure_capture_ticker(cx);
             }
             SessionEvent::Capture(reply) => {
-                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
-                let effects = self.capture.state.on_reply(reply, auth);
+                let auth = reply.subject().map_or(
+                    crate::capture::Auth::Denied,
+                    crate::permissions::authorization,
+                );
+                let effects = self.capture.on_reply(reply, auth);
                 self.apply_capture(effects, cx);
             }
             SessionEvent::MicStatus(id, status) => {
@@ -710,6 +718,15 @@ impl SessionWindow {
             SessionEvent::MicInputs(id, inputs) => {
                 self.capture.on_inputs(id, inputs);
                 self.remember_input_name(cx);
+            }
+            SessionEvent::CamStatus(id, status) => {
+                let effects = self.capture.on_cam_status(id, status);
+                self.apply_capture(effects, cx);
+                self.remember_camera_name(cx);
+            }
+            SessionEvent::CamInputs(id, cameras) => {
+                self.capture.on_cameras(id, cameras);
+                self.remember_camera_name(cx);
             }
             SessionEvent::Error(error) => {
                 // The capture ends with the stream; the banner explains, so no hint.
@@ -892,8 +909,14 @@ impl SessionWindow {
     /// Runs capture effects; a permission prompt answers back through this window's handle,
     /// and an answer that no longer matches its request starts nothing (`ARCH-038`).
     fn apply_capture(&mut self, effects: Vec<crate::capture::Effect>, cx: &mut Context<Self>) {
-        let chosen = self.preferences.audio.input_device.clone();
-        for ticket in self.capture.apply(effects, chosen) {
+        let mic = self.preferences.audio.input_device.clone();
+        let cam = self.preferences.camera.device.clone();
+        let asks = self.capture.apply(effects, mic, cam);
+        // A start held back behind an exiting thread is retried by the ticker.
+        if self.capture.has_pending() {
+            self.ensure_capture_ticker(cx);
+        }
+        for ticket in asks {
             let answer = crate::permissions::request(ticket.subject);
             let handle = self.window;
             cx.spawn(async move |this, cx| {
@@ -910,20 +933,31 @@ impl SessionWindow {
         }
     }
 
-    /// Lists inputs for the card once a second while the server allows the microphone, from
-    /// plain CoreAudio properties: never the microphone itself (M-QA-1).
-    fn ensure_input_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.capture.ticker.is_some() || !self.capture.wants_inputs() {
+    /// Once a second while the stream lives and the server allows a device: lists inputs
+    /// for the card from plain CoreAudio properties (never the microphone itself, M-QA-1),
+    /// lists cameras once macOS granted the camera, and retries a start that waited for a
+    /// previous capture thread to end.
+    fn ensure_capture_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.capture.ticker.is_some() || !self.capture.wants_ticks() {
             return;
         }
         let handle = self.window;
         self.capture.ticker = Some(cx.spawn(async move |this, cx| loop {
             let keep = handle
                 .update(cx, |_, _, cx| {
-                    this.update(cx, |this, _| {
-                        let wanted = this.capture.wants_inputs();
-                        if wanted {
+                    this.update(cx, |this, cx| {
+                        let wanted = this.capture.wants_ticks();
+                        if this.capture.wants_inputs() {
                             this.capture.refresh_inputs();
+                        }
+                        if this.capture.cameras_due() {
+                            this.capture.refresh_cameras();
+                        }
+                        if this.capture.has_pending() {
+                            let mic = this.preferences.audio.input_device.clone();
+                            let cam = this.preferences.camera.device.clone();
+                            this.capture.retry_pending(mic, cam);
+                            cx.notify();
                         }
                         wanted
                     })
@@ -972,6 +1006,58 @@ impl SessionWindow {
         self.capture
             .set_input(self.preferences.audio.input_device.clone());
         cx.notify();
+    }
+
+    /// The **Camera** switch (`ARCH-038`). Never saved, as the microphone's.
+    pub(super) fn set_camera(&mut self, on: bool, cx: &mut Context<Self>) {
+        let subject = crate::capture::Subject::Camera;
+        let auth = crate::permissions::authorization(subject);
+        let effects = self.capture.state.on_toggle(subject, on, auth);
+        self.apply_capture(effects, cx);
+        cx.notify();
+    }
+
+    /// Captures from camera `uid` (`None` follows the Mac) and saves the choice with its name.
+    pub(super) fn change_camera_device(&mut self, uid: Option<String>, cx: &mut Context<Self>) {
+        let name = uid.as_deref().and_then(|uid| {
+            self.capture
+                .cameras()
+                .0
+                .into_iter()
+                .find(|device| device.uid == uid)
+                .map(|device| device.name)
+        });
+        let camera = &mut self.preferences.camera;
+        camera.device = uid.clone();
+        camera.device_name = name.clone();
+        self.save(
+            "the camera",
+            move |p| {
+                p.camera.device = uid.clone();
+                p.camera.device_name = name.clone();
+            },
+            cx,
+        );
+        self.capture
+            .set_camera_device(self.preferences.camera.device.clone());
+        cx.notify();
+    }
+
+    fn remember_camera_name(&mut self, cx: &mut Context<Self>) {
+        let camera = &self.preferences.camera;
+        let Some(name) = media_capture::input_name_to_save(
+            camera.device.as_deref(),
+            camera.device_name.as_deref(),
+            &self.capture.cameras().0,
+        ) else {
+            return;
+        };
+        self.preferences.camera.device_name = Some(name.clone());
+        self.save(
+            "the camera",
+            move |p| p.camera.device_name = Some(name.clone()),
+            cx,
+        );
     }
 
     /// **Open Privacy Settings** after macOS refused the device.
@@ -2286,8 +2372,8 @@ impl Render for SessionWindow {
             })
             // Top left below the traffic lights while the microphone is open, no hitbox
             // (`ARCH-038`).
-            .when_some(self.capture.badge(), |root, mic| {
-                root.child(session::capture_badge(mic, print_top))
+            .when_some(self.capture.badge(), |root, (mic, cam)| {
+                root.child(session::capture_badge(mic, cam, print_top))
             })
             // Bottom-centre with no hitbox, above a bottom banner when one shows (`ARCH-032`).
             .when_some(self.capture_hint, |root, (hint, generation, fading)| {
