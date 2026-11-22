@@ -31,6 +31,30 @@ pub fn status_banner_with_actions(
     on_reconnect: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_disconnect: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui_kit::Stateful<Div> {
+    status_banner_labeled(
+        theme,
+        status,
+        ("Reconnect", Box::new(on_reconnect)),
+        ("Disconnect", Box::new(on_disconnect)),
+    )
+}
+
+/// A banner button's label and click handler.
+pub type BannerAction = (
+    &'static str,
+    Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
+);
+
+/// The status banner with its own two buttons: Display 2's "Try Again" / "Close"
+/// (`ARCH-039`). The text wraps, and the banner grows with it.
+pub fn status_banner_labeled(
+    theme: &Theme,
+    status: impl Into<String>,
+    primary: BannerAction,
+    secondary: BannerAction,
+) -> gpui_kit::Stateful<Div> {
+    let (primary_label, on_primary) = primary;
+    let (secondary_label, on_secondary) = secondary;
     div()
         .id("session-status-banner")
         .absolute()
@@ -52,15 +76,213 @@ pub fn status_banner_with_actions(
             Button::new("session-banner-reconnect")
                 .primary()
                 .small()
-                .label("Reconnect")
-                .on_click(on_reconnect),
+                .label(primary_label)
+                .on_click(on_primary),
         )
         .child(
             Button::new("session-banner-disconnect")
                 .outline()
                 .small()
-                .label("Disconnect")
-                .on_click(on_disconnect),
+                .label(secondary_label)
+                .on_click(on_secondary),
+        )
+}
+
+/// The side picker's sides that are offered, with their labels, in `[Left, Right, Above,
+/// Below]` order (`ARCH-039`).
+pub fn offered_sides(sides: [bool; 4]) -> Vec<(usize, &'static str)> {
+    const LABELS: [&str; 4] = ["Left", "Right", "Above", "Below"];
+    (0..4)
+        .filter(|&side| sides[side])
+        .map(|side| (side, LABELS[side]))
+        .collect()
+}
+
+/// The side an arrow key picks, if that side is offered. Other keys and sides do nothing.
+pub fn placement_key(key: &str, sides: [bool; 4]) -> Option<usize> {
+    let side = match key {
+        "left" => 0,
+        "right" => 1,
+        "up" => 2,
+        "down" => 3,
+        _ => return None,
+    };
+    sides[side].then_some(side)
+}
+
+/// A picker callback for one side (its index).
+pub type SideHandler = std::rc::Rc<dyn Fn(usize, &mut Window, &mut App)>;
+
+/// "Where is your second display?" over the session window (`ARCH-039`): a scrim, one
+/// button on each offered edge, and a centre card with the arrangement. A click on the
+/// scrim dismisses; nothing reaches the remote desktop while it is up.
+pub fn screen_placement(
+    theme: &Theme,
+    sides: [bool; 4],
+    hovered: Option<usize>,
+    on_pick: SideHandler,
+    on_hover: std::rc::Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>,
+    on_dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    let icons = [
+        IconName::ChevronLeft,
+        IconName::ChevronRight,
+        IconName::ChevronUp,
+        IconName::ChevronDown,
+    ];
+    let mut scrim = div()
+        .id("screen-placement")
+        .absolute()
+        .inset_0()
+        .bg(rgba(0x00000073))
+        .occlude()
+        .on_click(on_dismiss);
+    for (side, label) in offered_sides(sides) {
+        let pick = on_pick.clone();
+        let hover = on_hover.clone();
+        let button = div()
+            .id(("placement-side", side))
+            .size(px(88.))
+            .rounded(px(16.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(if hovered == Some(side) {
+                theme.secondary_hover
+            } else {
+                theme.secondary
+            })
+            .shadow(crate::components::elevated_shadow(theme))
+            .occlude()
+            .cursor_pointer()
+            .v_flex()
+            .items_center()
+            .justify_center()
+            .gap(px(4.))
+            .child(
+                Icon::new(icons[side].clone())
+                    .size(px(32.))
+                    .text_color(theme.foreground),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .on_hover(move |over, window, cx| hover(over.then_some(side), window, cx))
+            .on_click(move |_, window, cx| pick(side, window, cx));
+        // Centred on its edge, 40 pt in, by a wrapper with no hitbox of its own.
+        let edge = div().absolute().flex().items_center().justify_center();
+        let edge = match side {
+            0 => edge.left(px(40.)).top_0().bottom_0(),
+            1 => edge.right(px(40.)).top_0().bottom_0(),
+            2 => edge.top(px(40.)).left_0().right_0(),
+            _ => edge.bottom(px(40.)).left_0().right_0(),
+        };
+        scrim = scrim.child(edge.child(button));
+    }
+    scrim.child(
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(placement_card(theme, sides, hovered)),
+    )
+}
+
+/// The picker's centre card: the arrangement diagram (the session window as "1", the
+/// offered sides as "2"), the title and the hint.
+fn placement_card(
+    theme: &Theme,
+    sides: [bool; 4],
+    hovered: Option<usize>,
+) -> gpui_kit::Stateful<Div> {
+    // The grid cell of each side: (row, column).
+    const CELLS: [(usize, usize); 4] = [(1, 0), (1, 2), (0, 1), (2, 1)];
+    let cell = |row: usize, column: usize| {
+        let base = div()
+            .w(px(64.))
+            .h(px(40.))
+            .rounded(px(4.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(13.))
+            .font_weight(FontWeight::SEMIBOLD);
+        if (row, column) == (1, 1) {
+            return base
+                .relative()
+                .bg(theme.primary)
+                .text_color(rgb(0xffffff))
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .h(px(3.))
+                        .rounded_t(px(4.))
+                        .bg(rgb(0xffffff)),
+                )
+                .child("1");
+        }
+        let Some(side) = CELLS.iter().position(|&at| at == (row, column)) else {
+            return base;
+        };
+        if !sides[side] {
+            return base;
+        }
+        // Outlined, not filled (the design's solid fallback for a dashed border).
+        if hovered == Some(side) {
+            base.border_1()
+                .border_color(theme.primary)
+                .bg(theme.primary.opacity(0.2))
+                .text_color(theme.foreground)
+                .child("2")
+        } else {
+            base.border_1()
+                .border_color(theme.border)
+                .bg(theme.muted)
+                .text_color(theme.muted_foreground)
+                .child("2")
+        }
+    };
+    let diagram = div().v_flex().gap(px(6.)).children((0..3).map(|row| {
+        div()
+            .h_flex()
+            .gap(px(6.))
+            .children((0..3).map(move |column| cell(row, column)))
+    }));
+    div()
+        .id("placement-card")
+        .w(px(280.))
+        .p(px(20.))
+        .rounded(px(12.))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover)
+        .shadow(crate::components::elevated_shadow(theme))
+        .occlude()
+        .v_flex()
+        .items_center()
+        .gap(px(12.))
+        .child(diagram)
+        .child(
+            div()
+                .text_size(px(15.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child("Where is your second display?"),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .text_center()
+                .child("Choose the side Display 2 sits on. Esc cancels."),
         )
 }
 
@@ -838,6 +1060,23 @@ pub fn capture_hint(
         .child(pill)
 }
 
+/// A one-line notice in the capture hint's place and style (`ARCH-039`): "This session
+/// doesn't allow a second display."
+pub fn notice_pill(
+    text: impl Into<SharedString>,
+    bottom: Pixels,
+    viewport_width: Pixels,
+    fade: HintFade,
+    generation: u64,
+) -> Div {
+    let text = CaptureHintText {
+        lead: text.into(),
+        chord: None,
+        tail: SharedString::default(),
+    };
+    capture_hint(&text, bottom, viewport_width, fade, generation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +1105,24 @@ mod tests {
         assert_eq!(print_notices_top(Some(px(51.))), px(52.));
         assert_eq!(print_notices_top(Some(px(82.))), px(84.));
         assert_eq!(print_notices_top(Some(px(8.))), px(48.));
+    }
+
+    #[test]
+    fn placement_picker_shows_only_offered_sides() {
+        assert_eq!(
+            offered_sides([true, false, true, false]),
+            [(0, "Left"), (2, "Above")]
+        );
+        assert_eq!(offered_sides([true; 4]).len(), 4);
+    }
+
+    #[test]
+    fn placement_picker_arrows_pick_only_offered_sides() {
+        let sides = [false, true, false, true];
+        assert_eq!(placement_key("right", sides), Some(1));
+        assert_eq!(placement_key("down", sides), Some(3));
+        assert_eq!(placement_key("left", sides), None);
+        assert_eq!(placement_key("escape", sides), None);
     }
 
     #[test]

@@ -23,8 +23,9 @@ use skerry_ui::{
     controls::{
         self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem,
         ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps,
-        PadRow, PadStatus, PrintJobRow, PrintRowKind, PrintingProps, ScreenProps, ShortcutRow,
-        ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+        PadRow, PadStatus, PrintJobRow, PrintRowKind, PrintingProps, ScreenProps,
+        SecondScreenProps, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps,
+        VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -152,6 +153,13 @@ enum Story {
     SessionCaptureHintWithBanner,
     SessionCaptureHintNarrow,
     SessionCaptureHintLight,
+    ControlsSecondScreen,
+    ControlsSecondScreenOpen,
+    SessionPlacementAllSides,
+    SessionPlacementTwoSides,
+    SecondDisplayWaiting,
+    SecondDisplayRefused,
+    SessionSupersededPill,
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
@@ -271,6 +279,13 @@ impl Story {
         Story::SessionCaptureHintWithBanner,
         Story::SessionCaptureHintNarrow,
         Story::SessionCaptureHintLight,
+        Story::ControlsSecondScreen,
+        Story::ControlsSecondScreenOpen,
+        Story::SessionPlacementAllSides,
+        Story::SessionPlacementTwoSides,
+        Story::SecondDisplayWaiting,
+        Story::SecondDisplayRefused,
+        Story::SessionSupersededPill,
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
@@ -354,6 +369,8 @@ impl Story {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsSecondScreen
+            | Story::ControlsSecondScreenOpen
             | Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
             | Story::ControlsInputCaptureUnavailable
@@ -389,7 +406,12 @@ impl Story {
             | Story::SessionCaptureHintWithStrip
             | Story::SessionCaptureHintWithBanner
             | Story::SessionCaptureHintNarrow
-            | Story::SessionCaptureHintLight => "Session Overlays",
+            | Story::SessionCaptureHintLight
+            | Story::SessionPlacementAllSides
+            | Story::SessionPlacementTwoSides
+            | Story::SecondDisplayWaiting
+            | Story::SecondDisplayRefused
+            | Story::SessionSupersededPill => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
             Story::PrintNoticeStates
             | Story::PrintNoticeLongName
@@ -504,6 +526,13 @@ impl Story {
             Story::SessionCaptureHintWithBanner => "Capture Hint + Banner",
             Story::SessionCaptureHintNarrow => "Capture Hint · Narrow",
             Story::SessionCaptureHintLight => "Capture Hint · Light",
+            Story::ControlsSecondScreen => "Screen · Add Screen",
+            Story::ControlsSecondScreenOpen => "Screen · Screen 2 Open",
+            Story::SessionPlacementAllSides => "Display 2 Picker · All Sides",
+            Story::SessionPlacementTwoSides => "Display 2 Picker · Two Sides",
+            Story::SecondDisplayWaiting => "Display 2 · Waiting",
+            Story::SecondDisplayRefused => "Display 2 · Refused",
+            Story::SessionSupersededPill => "Superseded + Pill",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
@@ -625,6 +654,13 @@ impl Story {
             Story::SessionCaptureHintWithBanner => "story-session-capture-hint-banner",
             Story::SessionCaptureHintNarrow => "story-session-capture-hint-narrow",
             Story::SessionCaptureHintLight => "story-session-capture-hint-light",
+            Story::ControlsSecondScreen => "story-controls-second-screen",
+            Story::ControlsSecondScreenOpen => "story-controls-second-screen-open",
+            Story::SessionPlacementAllSides => "story-session-placement-all-sides",
+            Story::SessionPlacementTwoSides => "story-session-placement-two-sides",
+            Story::SecondDisplayWaiting => "story-second-display-waiting",
+            Story::SecondDisplayRefused => "story-second-display-refused",
+            Story::SessionSupersededPill => "story-session-superseded-pill",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
@@ -710,6 +746,8 @@ impl Story {
                 | Story::ControlsShortcutsLocked
                 | Story::ControlsStatsStripOn
                 | Story::ControlsStatsWaiting
+                | Story::ControlsSecondScreen
+                | Story::ControlsSecondScreenOpen
                 | Story::ControlsInputCapture
                 | Story::ControlsInputCaptureOn
                 | Story::ControlsInputCaptureUnavailable
@@ -2370,6 +2408,11 @@ impl PreviewApp {
             ControlsAction::ToggleSection(section) => {
                 self.controls_ui.toggle(section);
             }
+            ControlsAction::SecondScreen => {
+                let second = &mut self.controls_props.screen.second_screen;
+                second.open = !second.open;
+                second.note = second.open.then(|| "Screen 2 · Connecting…".into());
+            }
             ControlsAction::SetGamepadInput(on) => {
                 if let Some(gamepads) = self.controls_props.gamepads.as_mut() {
                     gamepads.input = on;
@@ -2609,6 +2652,7 @@ impl PreviewApp {
                     dpi_override: None,
                     preset_label: "Match Window".into(),
                     scale_locally: false,
+                    second_screen: SecondScreenProps::default(),
                 },
                 video_settings: Some(VideoProps {
                     codecs: vec![
@@ -2709,6 +2753,7 @@ impl PreviewApp {
                     dpi_override: None,
                     preset_label: "1280 × 720".into(),
                     scale_locally: true,
+                    second_screen: SecondScreenProps::default(),
                 },
                 video_settings: None,
                 stats: None,
@@ -2775,6 +2820,16 @@ impl PreviewApp {
                 };
                 props
             }
+            Story::ControlsSecondScreen | Story::ControlsSecondScreenOpen => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.screen.second_screen = SecondScreenProps {
+                    available: true,
+                    open: story == Story::ControlsSecondScreenOpen,
+                    note: (story == Story::ControlsSecondScreenOpen)
+                        .then(|| "Screen 2 · Right · 1920 × 1080".into()),
+                };
+                props
+            }
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
                 props.stats_strip = story == Story::ControlsStatsStripOn;
@@ -2808,6 +2863,7 @@ impl PreviewApp {
                     dpi_override: None,
                     preset_label: "Match Window".into(),
                     scale_locally: false,
+                    second_screen: SecondScreenProps::default(),
                 },
                 video_settings: Some(VideoProps {
                     codecs: vec![
@@ -3728,6 +3784,8 @@ impl PreviewApp {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsSecondScreen
+            | Story::ControlsSecondScreenOpen
             | Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
             | Story::ControlsInputCaptureUnavailable
@@ -4024,6 +4082,79 @@ impl PreviewApp {
                     ));
                 }
                 Self::strip_stage(frame.child(Self::capture_hint_overlay(hint, 1280., banner)))
+            }
+            Story::SessionPlacementAllSides | Story::SessionPlacementTwoSides => {
+                let all = self.story == Story::SessionPlacementAllSides;
+                let (width, height) = if all { (1280., 800.) } else { (800., 500.) };
+                let strip = stats::StripProps {
+                    marks: Vec::new(),
+                    figures: Vec::new(),
+                };
+                let sides = if all {
+                    [true; 4]
+                } else {
+                    [true, false, true, false]
+                };
+                let picker = session::screen_placement(
+                    theme,
+                    sides,
+                    all.then_some(1),
+                    Rc::new(move |side, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.record_event(format!("Display 2: Pick side {side}"), cx)
+                        });
+                    }),
+                    Rc::new(|_, _, _| {}),
+                    |_, _, _| {},
+                );
+                Self::strip_stage(Self::session_frame(width, height, &strip).child(picker))
+            }
+            Story::SecondDisplayWaiting | Story::SecondDisplayRefused => {
+                // Display 2 shows no strip and no notices, whatever the session has.
+                let frame = div()
+                    .relative()
+                    .flex_none()
+                    .w(px(1280.))
+                    .h(px(800.))
+                    .bg(rgb(0x000000))
+                    .child(session::controls_trigger(
+                        point(px(1240.), px(8.)),
+                        px(32.),
+                        |_, _, _| {},
+                    ));
+                let frame = if self.story == Story::SecondDisplayWaiting {
+                    frame.child(session::waiting_overlay("Waiting for the main display…"))
+                } else {
+                    frame.child(session::status_banner_labeled(
+                        theme,
+                        "Display 2 isn’t available. The host compositor has a single output, so a second display has nothing to capture.",
+                        ("Try Again", Box::new(|_, _, _| {})),
+                        ("Close", Box::new(|_, _, _| {})),
+                    ))
+                };
+                Self::strip_stage(frame)
+            }
+            Story::SessionSupersededPill => {
+                let strip = stats::StripProps {
+                    marks: Vec::new(),
+                    figures: Vec::new(),
+                };
+                Self::strip_stage(
+                    Self::session_frame(1280., 800., &strip)
+                        .child(session::status_banner_with_actions(
+                            theme,
+                            "This session was opened somewhere else.",
+                            |_, _, _| {},
+                            |_, _, _| {},
+                        ))
+                        .child(session::notice_pill(
+                            "This session doesn’t allow a second display.",
+                            session::capture_hint_bottom(true),
+                            px(1280.),
+                            session::HintFade::None,
+                            0,
+                        )),
+                )
             }
             Story::SessionCaptureHintNarrow => {
                 let strip = stats::StripProps {

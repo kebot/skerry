@@ -196,6 +196,8 @@ pub enum ControlsAction {
     SetAutoPrint(bool),
     /// A Printing card row's button.
     PrintJob(u64, PrintJobAction),
+    /// "Add Screen +" or "Close Screen 2" (`ARCH-039`).
+    SecondScreen,
 }
 
 /// Whether a pad in a slot reaches the session (`ARCH-032`).
@@ -341,6 +343,29 @@ pub struct ScreenProps {
     pub dpi_override: Option<u16>,
     pub preset_label: String,
     pub scale_locally: bool,
+    /// The Screen card's "Add Screen +" row (`ARCH-039`).
+    pub second_screen: SecondScreenProps,
+}
+
+/// Display 2 as the Screen card shows it (`ARCH-039`). `note` is written by the app, so
+/// this crate holds no protocol state.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SecondScreenProps {
+    /// The server allows a second display now.
+    pub available: bool,
+    /// Display 2 is open.
+    pub open: bool,
+    /// The line under the button while open: "Screen 2 · Right · 1920 × 1080".
+    pub note: Option<String>,
+}
+
+/// The Screen card's first row: the button's label, and the note under it. `None` hides
+/// the row: shown while allowed, or while open so it can always be closed.
+pub fn second_screen_row(props: &SecondScreenProps) -> Option<(&'static str, Option<String>)> {
+    if props.open {
+        return Some(("Close Screen 2", props.note.clone()));
+    }
+    props.available.then_some(("Add Screen +", None))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -883,6 +908,23 @@ fn render_screen(
     menus: &MenuContext,
 ) -> Div {
     let mut panel = div().v_flex().gap(px(STACK_GAP));
+    // First, as the web sidebar has it (`ARCH-039`).
+    if let Some((label, note)) = second_screen_row(&screen.second_screen) {
+        panel = panel.child(field_button(
+            "second-screen",
+            label,
+            ControlsAction::SecondScreen,
+            on_action,
+        ));
+        if let Some(note) = note {
+            panel = panel.child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(note),
+            );
+        }
+    }
     if screen.resize_allowed {
         panel = panel.child(switch_row(
             "HiDPI (Pixel Perfect)",
@@ -2114,6 +2156,43 @@ fn switch_row_with_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_card_offers_add_screen_only_when_allowed() {
+        let mut props = SecondScreenProps::default();
+        assert_eq!(second_screen_row(&props), None);
+        props.available = true;
+        assert_eq!(second_screen_row(&props), Some(("Add Screen +", None)));
+    }
+
+    #[test]
+    fn screen_card_shows_close_screen_2_and_its_note_when_open() {
+        let props = SecondScreenProps {
+            available: true,
+            open: true,
+            note: Some("Screen 2 · Right · 1920 × 1080".into()),
+        };
+        assert_eq!(
+            second_screen_row(&props),
+            Some((
+                "Close Screen 2",
+                Some("Screen 2 · Right · 1920 × 1080".into())
+            ))
+        );
+    }
+
+    #[test]
+    fn screen_card_keeps_close_screen_2_when_no_longer_allowed() {
+        let props = SecondScreenProps {
+            available: false,
+            open: true,
+            note: None,
+        };
+        assert_eq!(
+            second_screen_row(&props).map(|row| row.0),
+            Some("Close Screen 2")
+        );
+    }
 
     #[test]
     fn a_menu_is_rebuilt_when_its_items_change() {
