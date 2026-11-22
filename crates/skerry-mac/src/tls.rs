@@ -59,10 +59,7 @@ pub fn fingerprint_text(pin: &Pin) -> String {
 
 /// `AB:CD:…` or 64 hex digits, either case; spaces are ignored.
 pub fn parse_fingerprint(text: &str) -> Option<Pin> {
-    let hex: String = text
-        .chars()
-        .filter(|c| !matches!(c, ':' | ' '))
-        .collect();
+    let hex: String = text.chars().filter(|c| !matches!(c, ':' | ' ')).collect();
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
@@ -356,7 +353,10 @@ mod tests {
         assert_eq!(text.split(':').count(), 32);
         assert!(text.starts_with("00:07:0E"));
         assert_eq!(parse_fingerprint(&text), Some(pin));
-        assert_eq!(parse_fingerprint(&text.to_lowercase().replace(':', "")), Some(pin));
+        assert_eq!(
+            parse_fingerprint(&text.to_lowercase().replace(':', "")),
+            Some(pin)
+        );
         assert_eq!(parse_fingerprint("AB:CD"), None);
         assert_eq!(parse_fingerprint(&"zz".repeat(32)), None);
     }
@@ -366,12 +366,16 @@ mod tests {
         let leaf = self_signed(&["localhost"]);
         let address = serve(vec![leaf.der.clone()], &leaf.key, ok).await;
         let (unpinned, rejected) = client_config_with_roots(roots_of(None), None);
-        assert!(handshake(unpinned, address.port(), "localhost").await.is_err());
+        assert!(handshake(unpinned, address.port(), "localhost")
+            .await
+            .is_err());
         assert_eq!(rejected.take(), Some(fingerprint(&leaf.der)));
         let (pinned, rejected) =
             client_config_with_roots(roots_of(None), Some(fingerprint(&leaf.der)));
         // The name doesn't matter once the exact leaf is pinned.
-        handshake(pinned, address.port(), "desktop.example").await.unwrap();
+        handshake(pinned, address.port(), "desktop.example")
+            .await
+            .unwrap();
         assert_eq!(rejected.take(), None);
     }
 
@@ -382,7 +386,9 @@ mod tests {
         let address = serve(vec![leaf.der.clone()], &leaf.key, ok).await;
         let (config, rejected) =
             client_config_with_roots(roots_of(None), Some(fingerprint(&other.der)));
-        assert!(handshake(config, address.port(), "localhost").await.is_err());
+        assert!(handshake(config, address.port(), "localhost")
+            .await
+            .is_err());
         assert_eq!(rejected.take(), Some(fingerprint(&leaf.der)));
     }
 
@@ -392,13 +398,17 @@ mod tests {
         let leaf = signed_by(&["localhost"], &ca);
         let address = serve(vec![leaf.der.clone()], &leaf.key, ok).await;
         let (config, rejected) = client_config_with_roots(roots_of(Some(&ca)), None);
-        handshake(config, address.port(), "localhost").await.unwrap();
+        handshake(config, address.port(), "localhost")
+            .await
+            .unwrap();
         assert_eq!(rejected.take(), None);
         // A CA-valid certificate passes even when it differs from a pin.
         let other = self_signed(&["localhost"]);
         let (config, _) =
             client_config_with_roots(roots_of(Some(&ca)), Some(fingerprint(&other.der)));
-        handshake(config, address.port(), "localhost").await.unwrap();
+        handshake(config, address.port(), "localhost")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -410,7 +420,9 @@ mod tests {
         let address = serve(vec![leaf.der.clone()], &leaf.key, ok).await;
         let (config, _) =
             client_config_with_roots(roots_of(Some(&ca)), Some(fingerprint(&other.der)));
-        assert!(handshake(config, address.port(), "localhost").await.is_err());
+        assert!(handshake(config, address.port(), "localhost")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -419,16 +431,20 @@ mod tests {
         let impostor = rcgen::KeyPair::generate().unwrap();
         // The pinned certificate, presented by a server holding a different key.
         let address = serve(vec![leaf.der.clone()], &impostor, ok).await;
-        let (config, _) =
-            client_config_with_roots(roots_of(None), Some(fingerprint(&leaf.der)));
-        assert!(handshake(config, address.port(), "localhost").await.is_err());
+        let (config, _) = client_config_with_roots(roots_of(None), Some(fingerprint(&leaf.der)));
+        assert!(handshake(config, address.port(), "localhost")
+            .await
+            .is_err());
     }
 
     #[test]
     fn pins_never_reach_the_sealskin_client() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let sealskin = std::fs::read_to_string(src.join("sealskin.rs")).unwrap();
-        assert!(!sealskin.contains("crate::tls"), "sealskin.rs must not use pins");
+        assert!(
+            !sealskin.contains("crate::tls"),
+            "sealskin.rs must not use pins"
+        );
         assert!(!sealskin.contains("use_preconfigured_tls"));
     }
 

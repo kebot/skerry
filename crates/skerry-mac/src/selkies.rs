@@ -922,7 +922,10 @@ mod tests {
             let local = tempfile::tempdir().unwrap();
             let source = local.path().join("a.txt");
             std::fs::write(&source, b"hi").unwrap();
-            access.upload(&source, "a.txt", &Progress::default()).await.unwrap();
+            access
+                .upload(&source, "a.txt", &Progress::default())
+                .await
+                .unwrap();
             access.mkdir("Folder").await.unwrap();
             access.browse("").await.unwrap();
             access
@@ -935,7 +938,11 @@ mod tests {
             let seen = fake.seen.lock().unwrap();
             assert!(seen.len() >= 5);
             for request in seen.iter() {
-                assert_eq!(request.headers["authorization"], BASIC_VALUE, "{}", request.target);
+                assert_eq!(
+                    request.headers["authorization"], BASIC_VALUE,
+                    "{}",
+                    request.target
+                );
                 assert!(!request.headers.contains_key("cookie"));
                 assert!(!request.headers.contains_key("origin"));
             }

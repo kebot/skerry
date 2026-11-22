@@ -32,7 +32,7 @@ use gpui_kit::{
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use session_window::{OpenSession, OpenWindows, SessionWindow};
+use session_window::{OpenSession, OpenWindows, SessionServer, SessionWindow};
 use skerry_ui::{
     components::{self, Toast, ToastKind, TOAST_DURATION, TOAST_EXIT},
     connect,
@@ -2607,6 +2607,18 @@ impl Launcher {
         let Some(api) = self.api.clone() else {
             return;
         };
+        self.open_session_window(SessionServer::SealSkin(api), session, window, cx);
+    }
+
+    /// The window code both Library kinds share: a SealSkin session, or a direct server's
+    /// desktop (`ARCH-036`).
+    fn open_session_window(
+        &mut self,
+        server: SessionServer,
+        session: RemoteSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let rt = self.rt.clone();
         let library = window.bounds();
         // Opened outside this update: GPUI must not render a new window while the Launcher
@@ -2637,7 +2649,7 @@ impl Launcher {
                     ..Default::default()
                 },
                 cx,
-                move |window, cx| cx.new(|cx| SessionWindow::new(rt, api, session, window, cx)),
+                move |window, cx| cx.new(|cx| SessionWindow::new(rt, server, session, window, cx)),
             );
             if let Ok((window, entity)) = opened {
                 cx.default_global::<OpenWindows>()

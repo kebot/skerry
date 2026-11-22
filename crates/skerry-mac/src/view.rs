@@ -55,7 +55,7 @@ pub struct NativeSession {
 
 impl NativeSession {
     pub fn open(
-        address: Url,
+        address: transport::SessionTarget,
         window: &mut Window,
         cx: &mut App,
         runtime: &Handle,

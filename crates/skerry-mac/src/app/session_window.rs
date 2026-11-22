@@ -123,11 +123,59 @@ fn refresh_library(cx: &mut App) {
     }
 }
 
+/// The server a session window streams from (`ARCH-024`, `ARCH-036`).
+#[derive(Clone)]
+pub(super) enum SessionServer {
+    SealSkin(SealSkinClient),
+    Selkies(crate::direct::SelkiesServer),
+}
+
+impl SessionServer {
+    /// The preferences file's name.
+    pub(super) fn server_key(&self) -> String {
+        match self {
+            Self::SealSkin(api) => api.server().to_string(),
+            Self::Selkies(server) => server.prefs_key(),
+        }
+    }
+
+    pub(super) fn target(
+        &self,
+        remote: &RemoteSession,
+    ) -> Result<crate::transport::SessionTarget, String> {
+        match self {
+            Self::SealSkin(api) => api
+                .session_url(&remote.session_url)
+                .map(crate::transport::SessionTarget::SealSkin),
+            Self::Selkies(server) => Ok(crate::transport::SessionTarget::Selkies(server.clone())),
+        }
+    }
+
+    /// SealSkin's storage routes for Delete; a direct server has none.
+    pub(super) fn storage(&self, remote: &RemoteSession) -> Option<files_window::Storage> {
+        match self {
+            Self::SealSkin(api) => {
+                crate::sealskin::has_storage(&remote.home).then(|| files_window::Storage {
+                    client: api.clone(),
+                    home: remote.home.clone(),
+                })
+            }
+            Self::Selkies(_) => None,
+        }
+    }
+
+    pub(super) fn is_direct(&self) -> bool {
+        matches!(self, Self::Selkies(_))
+    }
+}
+
 pub(super) struct SessionWindow {
     /// This session's own window, for async updates (`ARCH-015`).
     window: AnyWindowHandle,
     rt: Handle,
-    api: SealSkinClient,
+    api: SessionServer,
+    /// `api.server_key()`, the preferences file's name.
+    server_key: String,
     pub(super) remote: RemoteSession,
     pub(super) current: Option<NativeSession>,
     stream_events: Option<Task<()>>,
@@ -216,17 +264,19 @@ const AUTO_PRINT_MAX_BYTES: u64 = 200_000_000;
 impl SessionWindow {
     pub(super) fn new(
         rt: Handle,
-        api: SealSkinClient,
+        api: SessionServer,
         remote: RemoteSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let server_key = api.server_key();
         // The queue's copy includes changes another window queued that aren't on disk yet.
-        let preferences = cx.global::<WriteQueue>().read(api.server());
+        let preferences = cx.global::<WriteQueue>().read(&server_key);
         let mut this = Self {
             window: Window::window_handle(window),
             rt,
             api,
+            server_key,
             remote,
             current: None,
             stream_events: None,
@@ -381,7 +431,7 @@ impl SessionWindow {
             .map(|(&key, &value)| (key, value))
             .collect();
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-        let stream = self.api.session_url(&self.remote.session_url).map(|url| {
+        let stream = self.api.target(&self.remote).map(|url| {
             NativeSession::open(
                 url,
                 window,
@@ -599,7 +649,7 @@ impl SessionWindow {
     ) {
         let done = cx
             .global::<WriteQueue>()
-            .preferences(self.api.server(), change);
+            .preferences(&self.server_key, change);
         let window = self.window;
         cx.spawn(async move |this, cx| {
             if !matches!(done.await, Ok(Ok(()))) {
@@ -851,7 +901,7 @@ impl SessionWindow {
 
     /// The server this session runs on.
     pub(super) fn server(&self) -> &str {
-        self.api.server()
+        &self.server_key
     }
 
     /// Shows `status` in this window's banner.
@@ -921,7 +971,11 @@ impl SessionWindow {
     /// The Selkies session whose slot table this window's pads use: each session has its
     /// own, even on one SealSkin host.
     fn gamepad_session(&self) -> String {
-        format!("{}|{}", self.api.server(), self.remote.session_id)
+        match &self.api {
+            SessionServer::SealSkin(_) => format!("{}|{}", self.server_key, self.remote.session_id),
+            // `selkies|<prefs key>`: one slot table per direct server.
+            SessionServer::Selkies(_) => self.remote.session_id.clone(),
+        }
     }
 
     /// A print sheet is open, opening, or about to open on its own.
@@ -1089,11 +1143,7 @@ impl SessionWindow {
         }
         self.release_keys(cx);
         let title = self.remote.app_name.clone();
-        let storage =
-            crate::sealskin::has_storage(&self.remote.home).then(|| files_window::Storage {
-                client: self.api.clone(),
-                home: self.remote.home.clone(),
-            });
+        let storage = self.api.storage(&self.remote);
         let rt = self.rt.clone();
         let owner_window = Window::window_handle(window);
         let session = cx.entity();
@@ -1796,19 +1846,36 @@ impl Render for SessionWindow {
                     }),
                 ))
             })
-            .when_some(self.status.clone(), |root, status| {
-                root.child(session::status_banner_with_actions(
-                    &theme,
-                    status,
-                    cx.listener(|this, _, window, cx| {
-                        this.status = None;
-                        this.keep_waiting = false;
-                        this.reconnect(window, cx);
-                        cx.notify();
-                    }),
-                    cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
-                ))
-            })
+            .when_some(
+                self.status
+                    .clone()
+                    .filter(|status| status == crate::direct::DIRECT_LOGIN_ERROR),
+                |root, status| {
+                    root.child(session::fatal_banner(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
+            .when_some(
+                self.status
+                    .clone()
+                    .filter(|status| status != crate::direct::DIRECT_LOGIN_ERROR),
+                |root, status| {
+                    root.child(session::status_banner_with_actions(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| {
+                            this.status = None;
+                            this.keep_waiting = false;
+                            this.reconnect(window, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
             .when_some(
                 self.startup_stalled.filter(|_| self.status.is_none()),
                 |root, after_waiting| {

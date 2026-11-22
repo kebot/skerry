@@ -37,7 +37,10 @@ pub(crate) fn read_config(path: &Path) -> io::Result<Option<DocumentMut>> {
 /// the result only when `edit` reports a change, keeping every other setting and comment.
 /// The folder is private to the user (0700) and the file is replaced atomically by a
 /// temporary file created 0600 before any secret bytes are written.
-pub(crate) fn edit_config(path: &Path, edit: impl FnOnce(&mut DocumentMut) -> bool) -> io::Result<()> {
+pub(crate) fn edit_config(
+    path: &Path,
+    edit: impl FnOnce(&mut DocumentMut) -> bool,
+) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
     let mut document = read_config(path)?.unwrap_or_default();
@@ -117,10 +120,16 @@ mod tests {
         let path = config_file_in(home.path());
         edit_config(&path, |_| false).unwrap();
         assert!(!path.exists());
-        edit_config(&path, |doc| set_start_with_in(doc, Some(StartWith::Selkies))).unwrap();
+        edit_config(&path, |doc| {
+            set_start_with_in(doc, Some(StartWith::Selkies))
+        })
+        .unwrap();
         assert_eq!(start_with(&path).unwrap(), Some(StartWith::Selkies));
         let before = std::fs::read_to_string(&path).unwrap();
-        edit_config(&path, |doc| set_start_with_in(doc, Some(StartWith::Selkies))).unwrap();
+        edit_config(&path, |doc| {
+            set_start_with_in(doc, Some(StartWith::Selkies))
+        })
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         edit_config(&path, |doc| set_start_with_in(doc, None)).unwrap();
         assert_eq!(start_with(&path).unwrap(), None);

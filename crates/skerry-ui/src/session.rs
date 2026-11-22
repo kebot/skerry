@@ -64,6 +64,45 @@ pub fn status_banner_with_actions(
         )
 }
 
+/// A stream that can't come back by reconnecting (a direct Selkies server refused the
+/// login, `ARCH-036`): danger tone, and Disconnect only.
+pub fn fatal_banner(
+    theme: &Theme,
+    status: impl Into<String>,
+    on_disconnect: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    div()
+        .id("session-fatal-banner")
+        .absolute()
+        .bottom_3()
+        .left_3()
+        .right_3()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.danger.opacity(0.4))
+        .bg(theme.popover)
+        .text_color(theme.foreground)
+        .occlude()
+        .h_flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.danger)
+                .child(gpui_kit::component::IconName::CircleX),
+        )
+        .child(div().flex_1().min_w_0().child(status.into()))
+        .child(
+            Button::new("session-banner-disconnect")
+                .outline()
+                .small()
+                .label("Disconnect")
+                .on_click(on_disconnect),
+        )
+}
+
 /// What a print notice's or a Printing card row's button asks (`ARCH-033`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrintJobAction {

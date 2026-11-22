@@ -23,7 +23,10 @@ fn parses_a_plain_https_address_and_adds_the_trailing_slash() {
     let parsed = address("https://desktop.example.com");
     assert_eq!(parsed.base.as_str(), "https://desktop.example.com/");
     assert_eq!(parsed.token, None);
-    assert_eq!(address("https://desktop.example.com:8443/").base.port(), Some(8443));
+    assert_eq!(
+        address("https://desktop.example.com:8443/").base.port(),
+        Some(8443)
+    );
 }
 
 #[test]
@@ -59,7 +62,9 @@ fn takes_the_token_from_the_query_and_strips_it() {
 #[test]
 fn percent_decodes_a_fragment_token() {
     assert_eq!(
-        address("https://h.example/#token=a%2Fb%3D").token.as_deref(),
+        address("https://h.example/#token=a%2Fb%3D")
+            .token
+            .as_deref(),
         Some("a/b=")
     );
 }
@@ -142,7 +147,10 @@ fn recognises_a_sealskin_key_pasted_as_an_address() {
         parse_address("ssk_id_secret@seal.example"),
         Err(AddressError::LooksLikeKey)
     );
-    assert_eq!(parse_address("ftp://h.example/"), Err(AddressError::Invalid));
+    assert_eq!(
+        parse_address("ftp://h.example/"),
+        Err(AddressError::Invalid)
+    );
     assert_eq!(parse_address("  "), Err(AddressError::Empty));
 }
 
@@ -156,7 +164,10 @@ fn header(map: &HeaderMap, name: &str) -> Option<String> {
 fn basic_login_rides_authorization_on_http_and_websocket() {
     let auth = SelkiesAuth::new("ubuntu", "mypasswd", None);
     let expected = "Basic dWJ1bnR1Om15cGFzc3dk";
-    assert_eq!(header(&auth.http_headers(), "authorization").as_deref(), Some(expected));
+    assert_eq!(
+        header(&auth.http_headers(), "authorization").as_deref(),
+        Some(expected)
+    );
     let ws = auth.websocket_headers();
     assert_eq!(header(&ws, "authorization").as_deref(), Some(expected));
     assert!(ws.get("sec-websocket-protocol").is_none());
@@ -185,7 +196,10 @@ fn basic_and_token_together_put_the_token_in_the_selkies_token_cookie() {
     let authorization = header(&http, "authorization").unwrap();
     assert!(authorization.starts_with("Basic "));
     assert!(!authorization.contains("Bearer"));
-    assert_eq!(header(&http, "cookie").as_deref(), Some("selkies_token=a%20b"));
+    assert_eq!(
+        header(&http, "cookie").as_deref(),
+        Some("selkies_token=a%20b")
+    );
     let ws = auth.websocket_headers();
     assert!(header(&ws, "authorization").unwrap().starts_with("Basic "));
     assert!(header(&ws, "sec-websocket-protocol")
@@ -196,7 +210,11 @@ fn basic_and_token_together_put_the_token_in_the_selkies_token_cookie() {
 #[test]
 fn credential_headers_are_marked_sensitive() {
     let auth = SelkiesAuth::new("ubuntu", "pw", Some("tok".into()));
-    for map in [auth.http_headers(), auth.websocket_headers(), auth.token_headers()] {
+    for map in [
+        auth.http_headers(),
+        auth.websocket_headers(),
+        auth.token_headers(),
+    ] {
         for (name, value) in &map {
             assert!(value.is_sensitive(), "{name}");
         }
@@ -313,7 +331,8 @@ async fn serve<R: Into<Vec<u8>>>(
 
 const STATUS_WS: &str = r#"{"current_mode":"websockets","available_modes":["websockets","webrtc"],"enable_dual_mode":true,"ui_layout":"x"}"#;
 const SESSIONS: &str = r#"{"sessions":[{"id":"a1","transport":"websockets","role":"controller","slot":null,"display":"primary","connected_at":1700000000.5,"rtt_ms":3}]}"#;
-const BASIC_CHALLENGE: &str = "www-authenticate: Basic realm=\"Selkies Restricted\", charset=\"UTF-8\"\r\n";
+const BASIC_CHALLENGE: &str =
+    "www-authenticate: Basic realm=\"Selkies Restricted\", charset=\"UTF-8\"\r\n";
 const BEARER_CHALLENGE: &str = "www-authenticate: Bearer realm=\"Selkies Restricted\"\r\n";
 
 fn target(head: &str) -> &str {
@@ -331,7 +350,8 @@ fn authorization(head: &str) -> Option<String> {
 fn cookie(head: &str) -> Option<String> {
     head.lines().find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("cookie").then(|| value.trim().to_string())
+        name.eq_ignore_ascii_case("cookie")
+            .then(|| value.trim().to_string())
     })
 }
 
@@ -340,7 +360,11 @@ fn legacy_basic(head: &str) -> String {
     match target(head) {
         "/api/status" => reply("200 OK", "", STATUS_WS),
         _ => match authorization(head).as_deref() {
-            None => reply("401 Unauthorized", BASIC_CHALLENGE, "Authorization Required"),
+            None => reply(
+                "401 Unauthorized",
+                BASIC_CHALLENGE,
+                "Authorization Required",
+            ),
             Some("Basic dWJ1bnR1Om15cGFzc3dk") => match target(head) {
                 "/api/sessions" => reply("200 OK", "", SESSIONS),
                 _ => reply("405 Method Not Allowed", "", ""),
@@ -371,7 +395,11 @@ fn secure_with_basic(head: &str) -> String {
         Some(a) if a.starts_with("Basic ") => {
             reply("401 Unauthorized", BASIC_CHALLENGE, "Invalid Credentials")
         }
-        _ => reply("401 Unauthorized", BASIC_CHALLENGE, "Authorization Required"),
+        _ => reply(
+            "401 Unauthorized",
+            BASIC_CHALLENGE,
+            "Authorization Required",
+        ),
     }
 }
 
@@ -380,9 +408,7 @@ fn secure_tokens_only(head: &str) -> String {
     match target(head) {
         "/api/status" => reply("200 OK", "", STATUS_WS),
         "/api/tokens" => reply("401 Unauthorized", BEARER_CHALLENGE, "Unauthorized"),
-        _ if authorization(head).as_deref() == Some("Bearer good") => {
-            reply("200 OK", "", SESSIONS)
-        }
+        _ if authorization(head).as_deref() == Some("Bearer good") => reply("200 OK", "", SESSIONS),
         _ => reply("401 Unauthorized", BEARER_CHALLENGE, "Unauthorized"),
     }
 }
@@ -411,7 +437,9 @@ async fn gate_sends_status_without_credentials() {
     let heads = heads.lock().unwrap();
     let status = heads.iter().find(|h| target(h) == "/api/status").unwrap();
     assert!(authorization(status).is_none());
-    assert!(heads.iter().all(|h| !h.to_lowercase().contains("\norigin:")));
+    assert!(heads
+        .iter()
+        .all(|h| !h.to_lowercase().contains("\norigin:")));
 }
 
 #[tokio::test]
@@ -505,9 +533,11 @@ async fn gate_reports_needs_token_and_bad_token_on_bearer_challenges() {
         gate(&at(&base, SelkiesAuth::new("", "", Some("bad".into())))).await,
         Err(GateError::BadToken)
     );
-    assert!(gate(&at(&base, SelkiesAuth::new("", "", Some("good".into()))))
-        .await
-        .is_ok());
+    assert!(
+        gate(&at(&base, SelkiesAuth::new("", "", Some("good".into()))))
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
@@ -532,9 +562,12 @@ async fn gate_reports_bad_token_even_when_basic_is_accepted() {
     );
     // The token was checked alone, with Bearer and no Basic.
     let heads = heads.lock().unwrap();
-    assert!(heads
-        .iter()
-        .any(|h| target(h) == "/api/sessions" && authorization(h).as_deref() == Some("Bearer bad")));
+    assert!(
+        heads
+            .iter()
+            .any(|h| target(h) == "/api/sessions"
+                && authorization(h).as_deref() == Some("Bearer bad"))
+    );
     drop(heads);
     assert!(gate(&at(
         &base,
@@ -579,9 +612,11 @@ async fn a_proxy_login_on_api_status_is_retried_with_the_login() {
         Some(_) => legacy_basic(head),
     })
     .await;
-    assert!(gate(&at(&base, SelkiesAuth::new("ubuntu", "mypasswd", None)))
-        .await
-        .is_ok());
+    assert!(
+        gate(&at(&base, SelkiesAuth::new("ubuntu", "mypasswd", None)))
+            .await
+            .is_ok()
+    );
     assert!(heads.lock().unwrap().len() >= 3);
 }
 
@@ -597,7 +632,10 @@ async fn a_refused_connection_is_a_network_error_that_keeps_the_library() {
         GateError::NotSelkies,
         GateError::BadLogin,
         GateError::WebRtc { dual_mode: false },
-        GateError::PinMismatch { new: [0; 32], old: [1; 32] },
+        GateError::PinMismatch {
+            new: [0; 32],
+            old: [1; 32],
+        },
     ] {
         assert!(!refusal.keeps_library(), "{refusal:?}");
     }
@@ -607,10 +645,8 @@ async fn a_refused_connection_is_a_network_error_that_keeps_the_library() {
 async fn an_untrusted_certificate_is_reported_with_its_fingerprint() {
     use crate::tls::test_server;
     let leaf = test_server::self_signed(&["localhost"]);
-    let address = test_server::serve(vec![leaf.der.clone()], &leaf.key, |head| {
-        legacy_basic(head)
-    })
-    .await;
+    let address =
+        test_server::serve(vec![leaf.der.clone()], &leaf.key, |head| legacy_basic(head)).await;
     let base = Url::parse(&format!("https://localhost:{}/", address.port())).unwrap();
     let unpinned = at(&base, SelkiesAuth::new("ubuntu", "mypasswd", None));
     let expected = crate::tls::fingerprint(&leaf.der);
@@ -640,7 +676,12 @@ async fn screenshot_rejects_non_png_and_oversize_bodies() {
             png.as_slice(),
         ]
         .concat(),
-        _ => reply("401 Unauthorized", BASIC_CHALLENGE, "Authorization Required").into_bytes(),
+        _ => reply(
+            "401 Unauthorized",
+            BASIC_CHALLENGE,
+            "Authorization Required",
+        )
+        .into_bytes(),
     })
     .await;
     let login = SelkiesAuth::new("ubuntu", "mypasswd", None);
@@ -685,7 +726,10 @@ fn saved_server_round_trips_through_a_private_config_toml() {
     let (_home, path) = config_path();
     assert!(saved_servers_at(&path).unwrap().is_empty());
     save_server_at(&path, &saved("https://h.example/"), true).unwrap();
-    assert_eq!(saved_servers_at(&path).unwrap(), vec![saved("https://h.example/")]);
+    assert_eq!(
+        saved_servers_at(&path).unwrap(),
+        vec![saved("https://h.example/")]
+    );
     let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&path), 0o600);
     assert_eq!(mode(path.parent().unwrap()), 0o700);
@@ -755,10 +799,17 @@ fn remember_off_on_an_existing_entry_removes_its_password_and_token() {
     let (_home, path) = config_path();
     save_server_at(&path, &saved("https://h.example/"), true).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, text.replace("[[selkies]]\n", "[[selkies]]\nnote = \"mine\"\n")).unwrap();
+    std::fs::write(
+        &path,
+        text.replace("[[selkies]]\n", "[[selkies]]\nnote = \"mine\"\n"),
+    )
+    .unwrap();
     save_server_at(&path, &saved("https://h.example/"), false).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
-    assert!(!text.contains("password") && !text.contains("token ="), "{text}");
+    assert!(
+        !text.contains("password") && !text.contains("token ="),
+        "{text}"
+    );
     assert!(text.contains("note = \"mine\""), "{text}");
 }
 
@@ -778,9 +829,15 @@ fn forgetting_a_server_removes_only_that_entry() {
 fn start_with_follows_the_last_successful_connect() {
     let (_home, path) = config_path();
     save_server_at(&path, &saved("https://a.example/"), true).unwrap();
-    assert_eq!(config_store::start_with(&path).unwrap(), Some(StartWith::Selkies));
+    assert_eq!(
+        config_store::start_with(&path).unwrap(),
+        Some(StartWith::Selkies)
+    );
     crate::sealskin::save_key_at(&path, "ssk_id_secret@seal.example").unwrap();
-    assert_eq!(config_store::start_with(&path).unwrap(), Some(StartWith::SealSkin));
+    assert_eq!(
+        config_store::start_with(&path).unwrap(),
+        Some(StartWith::SealSkin)
+    );
     save_server_at(&path, &saved("https://a.example/"), true).unwrap();
     clear_start_with_at(&path).unwrap();
     assert_eq!(config_store::start_with(&path).unwrap(), None);
@@ -794,9 +851,16 @@ fn a_malformed_selkies_table_is_reported_not_overwritten() {
     std::fs::write(&path, "selkies = \"oops\"\n").unwrap();
     assert!(saved_servers_at(&path).is_err());
     assert!(save_server_at(&path, &saved("https://h.example/"), true).is_err());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "selkies = \"oops\"\n");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "selkies = \"oops\"\n"
+    );
     // An entry without a url is skipped, not an error.
-    std::fs::write(&path, "[[selkies]]\nusername = \"x\"\n[[selkies]]\nurl = \"https://h.example/\"\n").unwrap();
+    std::fs::write(
+        &path,
+        "[[selkies]]\nusername = \"x\"\n[[selkies]]\nurl = \"https://h.example/\"\n",
+    )
+    .unwrap();
     assert_eq!(saved_servers_at(&path).unwrap().len(), 1);
 }
 
@@ -842,11 +906,19 @@ fn startup_with_start_with_selkies_beats_a_config_key_but_not_an_env_key() {
         Startup::SealSkin
     );
     assert_eq!(
-        startup_choice(Some(KeySource::ConfigFile), false, Some(StartWith::SealSkin), true),
+        startup_choice(
+            Some(KeySource::ConfigFile),
+            false,
+            Some(StartWith::SealSkin),
+            true
+        ),
         Startup::SealSkin
     );
     assert_eq!(startup_choice(None, false, s, false), Startup::Nothing);
-    assert_eq!(startup_choice(None, true, None, false), Startup::SelkiesEnvironment);
+    assert_eq!(
+        startup_choice(None, true, None, false),
+        Startup::SelkiesEnvironment
+    );
     assert_eq!(
         startup_choice(Some(KeySource::ConfigFile), true, None, false),
         Startup::SelkiesEnvironment
@@ -857,7 +929,12 @@ fn startup_with_start_with_selkies_beats_a_config_key_but_not_an_env_key() {
 fn startup_prefers_the_sealskin_environment_key_over_saved_selkies() {
     use crate::sealskin::KeySource;
     assert_eq!(
-        startup_choice(Some(KeySource::Environment), false, Some(StartWith::Selkies), true),
+        startup_choice(
+            Some(KeySource::Environment),
+            false,
+            Some(StartWith::Selkies),
+            true
+        ),
         Startup::SealSkin
     );
 }

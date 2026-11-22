@@ -710,11 +710,41 @@ async fn unless_cancelled<T>(
     }
 }
 
+/// Where a stream connects: a SealSkin session URL (cookie exchange first), or a direct
+/// Selkies server with its own login and TLS (`ARCH-036`).
+#[derive(Clone, Debug)]
+pub enum SessionTarget {
+    SealSkin(Url),
+    Selkies(crate::direct::SelkiesServer),
+}
+
+/// A direct server's upgrade refused: 401/400 are its login (fatal, never retried), 409 is
+/// WebSockets mode switched off after the gate.
+fn direct_upgrade_error(error: &tokio_tungstenite::tungstenite::Error) -> Option<&'static str> {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) => match response.status().as_u16() {
+            400 | 401 => Some(crate::direct::DIRECT_LOGIN_ERROR),
+            409 => Some(crate::direct::DIRECT_WEBRTC_ERROR),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Selkies closes a direct stream with 4001 when the session token is unknown: it upgraded
+/// first (secure mode checks the token after the 101), so this is the login refusal.
+fn direct_close_error(
+    frame: Option<&tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+) -> Option<&'static str> {
+    (u16::from(frame?.code) == 4001).then_some(crate::direct::DIRECT_LOGIN_ERROR)
+}
+
 /// Runs one Selkies stream. `cancel` turns true when the session drops this stream: until
 /// the main loop reads `Input::Close`, the transport checks it so a stream dropped while
 /// still connecting never opens its socket or sends SETTINGS (`ARCH-GAP-DC-09`).
 pub async fn run(
-    url: Url,
+    target: SessionTarget,
     frames: watch::Sender<Frame>,
     mut input: mpsc::UnboundedReceiver<Input>,
     pointer: watch::Receiver<Option<Pointer>>,
@@ -722,10 +752,11 @@ pub async fn run(
     events: &mpsc::UnboundedSender<SessionEvent>,
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(), RunError> {
-    let Some(requested) = unless_cancelled(&mut cancel, socket_request(url)).await else {
+    let direct = matches!(target, SessionTarget::Selkies(_));
+    let Some(requested) = unless_cancelled(&mut cancel, socket_request(target)).await else {
         return Ok(());
     };
-    let (template, access) = requested?;
+    let (template, access, connector) = requested?;
     if let Some(access) = access {
         let _ = events.send(SessionEvent::Files(access));
     }
@@ -742,13 +773,23 @@ pub async fn run(
         request.headers_mut().extend(template.headers().clone());
         let attempt = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio_tungstenite::connect_async_with_config(request, Some(config), false),
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                Some(config),
+                false,
+                connector.clone(),
+            ),
         );
         let Some(attempt) = unless_cancelled(&mut cancel, attempt).await else {
             return Ok(());
         };
         let transient = match attempt {
             Ok(Ok((socket, _))) => break socket,
+            Ok(Err(error)) if direct && direct_upgrade_error(&error).is_some() => {
+                return Err(RunError::Other(
+                    direct_upgrade_error(&error).unwrap_or_default(),
+                ));
+            }
             Ok(Err(error)) => attempt_transient(Err(Some(&error))),
             Err(_) => attempt_transient(Err(None)),
         };
@@ -1050,6 +1091,9 @@ pub async fn run(
                     }
                 }
                 Some(Ok(Message::Ping(_))) => { socket.flush().await.map_err(|_| disconnected)?; }
+                Some(Ok(Message::Close(frame))) if direct && direct_close_error(frame.as_ref()).is_some() => {
+                    return Err(RunError::Other(direct_close_error(frame.as_ref()).unwrap_or_default()));
+                }
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(disconnected.into()),
                 _ => {}
             },
@@ -1435,17 +1479,24 @@ pub async fn selkies_for_session(url: Url) -> Result<selkies::SelkiesClient, &'s
     selkies::SelkiesClient::new(access.base, access.cookie).map_err(|_| ADDRESS_ERROR)
 }
 
-/// The WebSocket handshake for the session, and the session's file routes under the same
-/// cookie (`ARCH-023`), or `None` when they cannot be built.
-async fn socket_request(
-    url: Url,
-) -> Result<
-    (
-        tokio_tungstenite::tungstenite::handshake::client::Request,
-        Option<selkies::SelkiesClient>,
-    ),
-    &'static str,
-> {
+type SocketRequest = (
+    tokio_tungstenite::tungstenite::handshake::client::Request,
+    Option<selkies::SelkiesClient>,
+    Option<tokio_tungstenite::Connector>,
+);
+
+/// The WebSocket handshake for the session, the session's file routes under the same
+/// credentials (`ARCH-023`; `None` when they cannot be built), and the TLS connector: the
+/// default roots for SealSkin, the server's pinned config for a direct server.
+async fn socket_request(target: SessionTarget) -> Result<SocketRequest, &'static str> {
+    let url = match target {
+        SessionTarget::SealSkin(url) => url,
+        SessionTarget::Selkies(server) => {
+            let request = server.websocket_request()?;
+            let connector = tokio_tungstenite::Connector::Rustls(server.tls_config());
+            return Ok((request, Some(server.selkies_client()), Some(connector)));
+        }
+    };
     let SessionAccess {
         redirect,
         base,
@@ -1466,7 +1517,7 @@ async fn socket_request(
             .parse()
             .map_err(|_| ADDRESS_ERROR)?,
     );
-    Ok((request, access))
+    Ok((request, access, None))
 }
 
 #[cfg(test)]
@@ -1625,11 +1676,185 @@ mod tests {
         let (events, _events_rx) = mpsc::unbounded_channel();
         let ended = tokio::time::timeout(
             wait,
-            run(url, frames, input, pointer, test_options(), &events, cancel),
+            run(
+                SessionTarget::SealSkin(url),
+                frames,
+                input,
+                pointer,
+                test_options(),
+                &events,
+                cancel,
+            ),
         )
         .await
         .expect("a cancelled stream ends at once");
         (ended, seen.await.unwrap())
+    }
+
+    /// A direct stream against a fake Selkies that answers each upgrade with `answer`.
+    async fn run_direct(
+        answer: impl Fn() -> Vec<u8> + Send + Sync + 'static,
+        wait: Duration,
+    ) -> (Result<(), RunError>, usize) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(&answer()).await;
+                held.push(stream);
+            }
+        });
+        let server = crate::direct::SelkiesServer::new(
+            Url::parse(&format!("http://localhost:{}/", address.port())).unwrap(),
+            crate::direct::SelkiesAuth::new("ubuntu", "pw", None),
+            None,
+            crate::direct::ServerSource::Typed,
+            false,
+        )
+        .unwrap();
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let ended = tokio::time::timeout(
+            wait,
+            run(
+                SessionTarget::Selkies(server),
+                frames,
+                input,
+                pointer,
+                test_options(),
+                &events,
+                cancel,
+            ),
+        )
+        .await
+        .unwrap_or(Err(RunError::Other("still running")));
+        (ended, attempts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn status_reply(status: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").into_bytes()
+    }
+
+    /// A 101 as Selkies sends it (any key works: tungstenite checks the accept hash, so
+    /// the fake computes it from the request in `upgrade_then`).
+    async fn upgrade_then(after: Vec<u8>, wait: Duration) -> (Result<(), RunError>, usize) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..read]).to_string();
+                let key = head
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("sec-websocket-key")
+                            .then(|| value.trim().to_string())
+                    })
+                    .unwrap_or_default();
+                let accept =
+                    tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+                let reply = format!("HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\nsec-websocket-protocol: selkies\r\n\r\n");
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.write_all(&after).await;
+                held.push(stream);
+            }
+        });
+        let server = crate::direct::SelkiesServer::new(
+            Url::parse(&format!("http://localhost:{}/", address.port())).unwrap(),
+            crate::direct::SelkiesAuth::new("", "", Some("bad".into())),
+            None,
+            crate::direct::ServerSource::Typed,
+            false,
+        )
+        .unwrap();
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let ended = tokio::time::timeout(
+            wait,
+            run(
+                SessionTarget::Selkies(server),
+                frames,
+                input,
+                pointer,
+                test_options(),
+                &events,
+                cancel,
+            ),
+        )
+        .await
+        .unwrap_or(Err(RunError::Other("still running")));
+        (ended, attempts.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_401_on_a_direct_upgrade_is_fatal_not_retried() {
+        let (ended, attempts) =
+            run_direct(|| status_reply("401 Unauthorized"), Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_LOGIN_ERROR))
+        );
+        assert_eq!(attempts, 1);
+        let (ended, _) =
+            run_direct(|| status_reply("400 Bad Request"), Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_LOGIN_ERROR))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_409_upgrade_says_webrtc() {
+        let (ended, attempts) =
+            run_direct(|| status_reply("409 Conflict"), Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_WEBRTC_ERROR))
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_4001_close_on_a_direct_stream_is_fatal_login_not_reconnect() {
+        // A server close frame: FIN + opcode 8, length 2 + reason, code 4001 (0x0FA1).
+        let reason = b"Invalid authentication token";
+        let mut close = vec![0x88, (2 + reason.len()) as u8, 0x0F, 0xA1];
+        close.extend_from_slice(reason);
+        let (ended, attempts) = upgrade_then(close, Duration::from_secs(5)).await;
+        assert_eq!(
+            ended,
+            Err(RunError::Other(crate::direct::DIRECT_LOGIN_ERROR))
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn a_held_direct_handshake_keeps_connecting_without_counting_a_failure() {
+        // Secure mode holds the stream after the 101 until its token table arrives: the
+        // upgrade succeeded, so nothing is retried and the stream just waits.
+        let (ended, attempts) = upgrade_then(Vec::new(), Duration::from_millis(1500)).await;
+        assert_eq!(ended, Err(RunError::Other("still running")));
+        assert_eq!(attempts, 1);
     }
 
     #[tokio::test]

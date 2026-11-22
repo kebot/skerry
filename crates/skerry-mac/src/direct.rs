@@ -116,7 +116,11 @@ pub fn parse_address(raw: &str) -> Result<SelkiesAddress, AddressError> {
             .find(|(key, _)| key == "token")
             .and_then(|(_, value)| non_empty(value.into_owned()));
     }
-    let username = non_empty(percent_decode_str(url.username()).decode_utf8_lossy().into_owned());
+    let username = non_empty(
+        percent_decode_str(url.username())
+            .decode_utf8_lossy()
+            .into_owned(),
+    );
     let password = url
         .password()
         .map(|p| percent_decode_str(p).decode_utf8_lossy().into_owned())
@@ -592,10 +596,15 @@ pub enum GateError {
     /// The roots refused the leaf and nothing is pinned.
     Untrusted(Pin),
     /// A pin is set and the server presented another leaf.
-    PinMismatch { new: Pin, old: Pin },
+    PinMismatch {
+        new: Pin,
+        old: Pin,
+    },
     NotSelkies,
     SealSkinAddress,
-    WebRtc { dual_mode: bool },
+    WebRtc {
+        dual_mode: bool,
+    },
     /// `current_mode` is null: Selkies is still starting.
     Starting,
     NeedsLogin,
@@ -609,7 +618,8 @@ impl GateError {
     /// Refresh keeps the Library on these (ARCH-009's rule): nothing says the server
     /// changed, only that it didn't answer.
     pub fn keeps_library(&self) -> bool {
-        matches!(self, Self::Network(_) | Self::Starting) || matches!(self, Self::Server(code) if *code >= 500)
+        matches!(self, Self::Network(_) | Self::Starting)
+            || matches!(self, Self::Server(code) if *code >= 500)
     }
 
     pub fn message(&self, host: &str) -> String {
@@ -811,7 +821,9 @@ pub async fn gate(server: &SelkiesServer) -> Result<GateReport, GateError> {
         }
     }
 
-    let sessions = server.get("api/sessions", server.auth.http_headers()).await?;
+    let sessions = server
+        .get("api/sessions", server.auth.http_headers())
+        .await?;
     match sessions.status.as_u16() {
         200 => {}
         401 => return Err(server.refusal(&sessions)),
@@ -1095,14 +1107,18 @@ pub fn forget_server_at(path: &Path, url: &str) -> Result<(), String> {
 
 /// Removes `start_with` (Disconnect: the entry stays in Recent Servers).
 pub fn clear_start_with_at(path: &Path) -> Result<(), String> {
-    config_store::edit_config(path, |document| config_store::set_start_with_in(document, None))
-        .map_err(|_| format!("Couldn’t update {CONFIG_DISPLAY}."))
+    config_store::edit_config(path, |document| {
+        config_store::set_start_with_in(document, None)
+    })
+    .map_err(|_| format!("Couldn’t update {CONFIG_DISPLAY}."))
 }
 
 /// The server in `SKERRY_SELKIES_URL` (+ `_USERNAME`, `_PASSWORD`, `_CERT_SHA256`), never
 /// saved. `None` when the variable isn't set.
 pub fn environment() -> Option<Result<SelkiesServer, String>> {
-    let url = std::env::var(URL_VARIABLE).ok().filter(|url| !url.trim().is_empty())?;
+    let url = std::env::var(URL_VARIABLE)
+        .ok()
+        .filter(|url| !url.trim().is_empty())?;
     let var = |name| std::env::var(name).unwrap_or_default();
     Some(environment_server(
         &url,
@@ -1118,8 +1134,7 @@ fn environment_server(
     password: &str,
     pin: &str,
 ) -> Result<SelkiesServer, String> {
-    let address =
-        parse_address(url).map_err(|error| format!("{URL_VARIABLE}: {error}"))?;
+    let address = parse_address(url).map_err(|error| format!("{URL_VARIABLE}: {error}"))?;
     let pin = match pin.trim() {
         "" => None,
         text => Some(
