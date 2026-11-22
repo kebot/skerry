@@ -32,6 +32,11 @@ opus-decoder = "0.1.1"
 percent-encoding = "2.3"
 raw-window-handle = "0.6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+# Direct Selkies TLS (ARCH-036). ring only: a second provider (aws-lc-rs) would make the
+# default connectors without an explicit provider panic at runtime.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 skerry-ui = { path = "../skerry-ui" }
 serde_json = "1"
@@ -46,3 +51,6 @@ tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Checks `open_target` against SealSkin's own URL pattern.
 regex = "1"
+# A self-signed server for the pinning tests, ring only (ARCH-036).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
