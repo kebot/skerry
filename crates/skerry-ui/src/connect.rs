@@ -10,6 +10,9 @@ use gpui_kit::{div, prelude::*, px, App, ClickEvent, Div, Entity, FontWeight, Wi
 pub struct ConnectProps {
     pub status: Option<String>,
     pub busy: Option<String>,
+    /// Links or files that arrived before a server was connected (`ARCH-028`): "Connect to
+    /// a server to open “report.pdf”."
+    pub pending_open: Option<String>,
 }
 
 /// Creates a masked single-line input configured for SealSkin application keys.
@@ -67,6 +70,20 @@ pub fn render(
                                 .disabled(busy),
                         ),
                 )
+                .when_some(props.pending_open.clone(), |view, pending| {
+                    view.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.secondary)
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(pending),
+                    )
+                })
                 .when_some(props.status.clone(), |view, status| {
                     view.child(div().text_sm().text_color(theme.danger).child(status))
                 })

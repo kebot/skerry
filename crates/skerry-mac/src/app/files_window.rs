@@ -190,7 +190,7 @@ pub(super) struct FilesWindow {
 #[derive(Clone)]
 pub(super) enum FilesOwner {
     Session(AnyWindowHandle, WeakEntity<SessionWindow>),
-    Library { session_id: String },
+    Library,
 }
 
 /// Drops every hold on the Files window, so the window's entity (and with it every transfer,
@@ -275,7 +275,7 @@ impl FilesWindow {
             policy,
             storage,
         } = source;
-        let library_owned = matches!(owner, FilesOwner::Library { .. });
+        let library_owned = matches!(owner, FilesOwner::Library);
         let bounds = window.bounds();
         let window_size = size(px(760.), px(520.));
         let origin = point(bounds.left() + px(40.), bounds.top() + px(60.));

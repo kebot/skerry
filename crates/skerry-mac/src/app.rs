@@ -6,14 +6,16 @@ mod promise;
 mod session_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchMemory, LaunchSelection};
-use crate::launch_progress::{self, Flight, Outcome, RowState};
+use crate::launch_progress::{self, Flight, FlightRoute, Outcome, RowState};
+use crate::open_target::{self, Incoming, OpenTarget, OpeningState, RowRef, Subject, Typed};
 use crate::persist::{self, WriteQueue};
 use crate::sealskin::{
-    Credential, KeySource, LaunchError, LaunchParams, Library, LibraryError, RemoteApp,
-    RemoteSession, SealSkinClient,
+    Credential, KeySource, LaunchError, LaunchParams, LaunchRoute, Library, LibraryError,
+    OpenUrlError, RemoteApp, RemoteSession, SealSkinClient, Uploaded,
 };
 use crate::settings::Preferences;
 use crate::transport::{DisplayRequest, Resolution};
+use files_window::{FilesOwner, FilesSource, FilesWindow};
 use gpui_kit::component::{
     input::{InputEvent, InputState},
     select::SelectEvent,
@@ -21,9 +23,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     actions, div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem,
-    Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage,
-    SharedString, Size, Task, TitlebarOptions, Window, WindowAppearance, WindowBounds,
-    WindowOptions,
+    Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, PathPromptOptions,
+    Pixels, RenderImage, SharedString, Size, Task, TitlebarOptions, Window, WindowAppearance,
+    WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
@@ -32,19 +34,23 @@ use session_window::{OpenSession, OpenWindows, SessionWindow};
 use skerry_ui::{
     components::{self, Toast, ToastKind, TOAST_DURATION, TOAST_EXIT},
     connect::{self, ConnectProps},
+    files::Notice,
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
-        LaunchOptions, LaunchSelect, RunningMatch,
+        LaunchOptions, LaunchSelect, OpeningLabel, RunningMatch,
     },
     library::{
         self, AppItem, Filter, FlightAction, LaunchNotice, LaunchingItem, LibraryHandlers,
-        LibraryProps, SessionItem, StageRow, StageState,
+        LibraryProps, OmnibarIcon, OpenHandlers, OpeningAppRow, OpeningKind, OpeningProps,
+        OpeningSessionRow, SessionItem, StageRow, StageState, UploadProgress,
     },
     session::{self, KeySourceLabel},
 };
 use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
@@ -70,6 +76,13 @@ pub fn run() {
     let application = gpui_kit::application().with_assets(skerry_ui::assets::SkerryAssets);
     // A Dock-icon click brings the Library back (ARCH-022).
     application.on_reopen(move |cx| show_library(&reopen_handle, cx));
+    // Finder Open With, Dock drops and `skerry:` links (`ARCH-028`). AppKit calls this with
+    // no `App`, possibly before `run`'s closure (a cold launch), so it only sends; the
+    // channel holds items until the drain task below reads them.
+    let (open_tx, mut open_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    application.on_open_urls(move |urls| {
+        let _ = open_tx.send(urls);
+    });
     application.run(move |cx: &mut App| {
         gpui_kit::init(cx);
         cx.set_global(OpenWindows::default());
@@ -93,10 +106,31 @@ pub fn run() {
             KeyBinding::new("cmd-shift-f", ToggleFiles, None),
         ]);
         cx.bind_keys(files_window::key_bindings());
+        cx.bind_keys(library_key_bindings());
         // Quitting disconnects every session window; no remote session is stopped.
         cx.on_action(|_: &Quit, cx| cx.quit());
         let library_handle = handle.clone();
         cx.on_action(move |_: &ShowLibrary, cx| show_library(&library_handle, cx));
+        let open_handle = handle.clone();
+        cx.on_action(move |_: &OpenFile, cx| choose_files(&open_handle, cx));
+        let location_handle = handle.clone();
+        cx.on_action(move |_: &OpenLocation, cx| {
+            show_library(&location_handle, cx);
+            with_launcher(cx, |launcher, window, cx| {
+                launcher.focus_omnibar(window, cx)
+            });
+        });
+        let drain_handle = handle.clone();
+        cx.spawn(async move |cx| {
+            while let Some(urls) = open_rx.recv().await {
+                let items = urls
+                    .iter()
+                    .map(|url| open_target::from_open_url(url))
+                    .collect();
+                cx.update(|cx| deliver_opens(items, &drain_handle, cx));
+            }
+        })
+        .detach();
         cx.set_menus(vec![
             Menu {
                 name: APP_NAME.into(),
@@ -108,6 +142,10 @@ pub fn run() {
             Menu {
                 name: "File".into(),
                 items: vec![
+                    // The Library's (`ARCH-028`); ⌘O and ⌘L are bound in its key context only.
+                    MenuItem::action("Open…", OpenFile),
+                    MenuItem::action("Open Location…", OpenLocation),
+                    MenuItem::separator(),
                     MenuItem::action("New Folder", files_window::NewFolder),
                     MenuItem::action("Upload…", files_window::UploadFiles),
                     MenuItem::action("Download", files_window::DownloadSelection),
@@ -214,9 +252,92 @@ actions!(
         ToggleSessionControls,
         CloseSessionControls,
         ToggleFullScreen,
-        ToggleFiles
+        ToggleFiles,
+        OpenFile,
+        OpenLocation
     ]
 );
+
+/// The Library window's key context.
+const LIBRARY_CONTEXT: &str = "Library";
+
+/// ⌘O and ⌘L belong to the Library only: in a session window the remote app gets them
+/// (`ARCH-014`, `ARCH-028`). The menu items still work from anywhere.
+fn library_key_bindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("cmd-o", OpenFile, Some(LIBRARY_CONTEXT)),
+        KeyBinding::new("cmd-l", OpenLocation, Some(LIBRARY_CONTEXT)),
+    ]
+}
+
+/// Runs `f` on the Launcher in its own window, if the Library is open.
+fn with_launcher(
+    cx: &mut App,
+    f: impl FnOnce(&mut Launcher, &mut Window, &mut Context<Launcher>) + 'static,
+) {
+    let Some((window, launcher)) = cx
+        .try_global::<OpenWindows>()
+        .and_then(|windows| windows.library.clone())
+    else {
+        return;
+    };
+    let _ = window.update(cx, |_, window, cx| {
+        let _ = launcher.update(cx, |launcher, cx| f(launcher, window, cx));
+    });
+}
+
+/// Items from Finder, the Dock, or a `skerry:` link: the Library comes forward and takes
+/// them. Nothing opens without a click there (`ARCH-028`).
+fn deliver_opens(items: Vec<Incoming>, rt: &Handle, cx: &mut App) {
+    if items.iter().all(|item| matches!(item, Incoming::Ignored)) {
+        return;
+    }
+    show_library(rt, cx);
+    with_launcher(cx, move |launcher, _, cx| launcher.receive(items, cx));
+}
+
+/// File → Open…: the Library comes forward, then the open panel (files only, several).
+fn choose_files(rt: &Handle, cx: &mut App) {
+    show_library(rt, cx);
+    let chosen = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: true,
+        prompt: Some("Open".into()),
+    });
+    cx.spawn(async move |cx| {
+        if let Ok(Ok(Some(paths))) = chosen.await {
+            let items = paths
+                .into_iter()
+                .map(|path| Incoming::Target(OpenTarget::File(path)))
+                .collect::<Vec<_>>();
+            cx.update(|cx| with_launcher(cx, move |launcher, _, cx| launcher.receive(items, cx)));
+        }
+    })
+    .detach();
+}
+
+/// Aborts a Tokio task when dropped: dropping a `JoinHandle` doesn't stop the work.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A file launch's upload, before its launch request (`ARCH-028`).
+struct UploadJob {
+    total: u64,
+    sent: Arc<AtomicU64>,
+    _job: AbortOnDrop,
+}
+
+/// The Launch Dialog was opened from the chooser: what it launches with. `None`: the plain
+/// dialog for a file too large for `/launch/file`.
+struct DialogOpening {
+    target: Option<OpenTarget>,
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum DisplayMode {
@@ -303,6 +424,25 @@ struct Launcher {
     clear_key_input: bool,
     busy: Option<String>,
     status: Option<String>,
+    /// The open chooser's context and queue (`ARCH-028`).
+    opening: OpeningState,
+    opening_apps_expanded: bool,
+    /// The chooser's note, for the generation it was set in.
+    opening_note: Option<(u64, Notice)>,
+    /// The running row whose `open_url` is pending.
+    open_pending: Option<String>,
+    /// Set by the Launch Dialog when it was opened from the chooser.
+    dialog_opening: Option<DialogOpening>,
+    /// File launches still uploading, by launch id. Dropping one aborts its upload.
+    uploads: HashMap<String, UploadJob>,
+    /// Finished uploads waiting for (or used by) their launch request, by launch id.
+    uploaded: HashMap<String, Uploaded>,
+    /// Sessions whose Files button is waiting for the cookie exchange.
+    files_pending: HashSet<String>,
+    /// Items that arrived before a server was connected.
+    pending_opens: Vec<Incoming>,
+    /// Set after a typed link was acted on; the next render clears the omnibar.
+    clear_search_input: bool,
 }
 
 impl Launcher {
@@ -319,11 +459,19 @@ impl Launcher {
         )
         .detach();
         let search_input = library::new_search_input(window, cx);
-        cx.subscribe_in(&search_input, window, |_, _, event: &InputEvent, _, cx| {
-            if matches!(event, InputEvent::Change) {
-                cx.notify();
-            }
-        })
+        cx.subscribe_in(
+            &search_input,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => {
+                    let text = input.read(cx).value().to_string();
+                    this.typed_changed(&text);
+                    cx.notify();
+                }
+                InputEvent::PressEnter { .. } => this.press_enter(window, cx),
+                _ => {}
+            },
+        )
         .detach();
         let mut launcher = Self {
             window: Window::window_handle(window),
@@ -357,6 +505,16 @@ impl Launcher {
             clear_key_input: false,
             busy: None,
             status: None,
+            opening: OpeningState::default(),
+            opening_apps_expanded: false,
+            opening_note: None,
+            open_pending: None,
+            dialog_opening: None,
+            uploads: HashMap::new(),
+            uploaded: HashMap::new(),
+            files_pending: HashSet::new(),
+            pending_opens: Vec::new(),
+            clear_search_input: false,
         };
         // Closing the Library leaves session windows streaming; Window → Library or the
         // Dock icon opens it again (ARCH-022).
@@ -518,12 +676,15 @@ impl Launcher {
                             this.save_key(&credential, cx);
                         }
                         this.fetch_library_media(api, apps, sessions, cx);
+                        let pending = std::mem::take(&mut this.pending_opens);
+                        this.receive(pending, cx);
                     }
                     Err(LibraryError::Refused(error)) => {
                         // ARCH-009: a server that fails the version gate is never used, even
                         // on Refresh, so drop back to Connect. Connect (empty field) retries.
                         this.retry_api = Some(api.clone());
                         this.leave_server();
+                        close_library_files(cx, |_| true);
                         this.status = Some(error);
                     }
                     Err(LibraryError::Failed(error)) if saved_startup_key && this.api.is_none() => {
@@ -657,6 +818,8 @@ impl Launcher {
         self.startup_credential = None;
         self.retry_api = None;
         self.leave_server();
+        // Files windows the Library opened go too; session windows keep streaming.
+        close_library_files(cx, |_| true);
         cx.notify();
     }
 
@@ -842,6 +1005,14 @@ impl Launcher {
         self.launch_dialog = None;
         self.pending_stop = None;
         drop_flights(&mut self.flights, &mut self.launched_at);
+        // Aborts every upload still running.
+        self.uploads.clear();
+        self.uploaded.clear();
+        self.opening.cancel_all();
+        self.opening_note = None;
+        self.open_pending = None;
+        self.dialog_opening = None;
+        self.files_pending.clear();
     }
 
     fn find_app(&self, app_id: &str) -> Option<RemoteApp> {
@@ -908,6 +1079,7 @@ impl Launcher {
             show_organize: true,
             link_copied: false,
             running_match: None,
+            opening: None,
         };
         let selects = LaunchDialogSelects::from_props(&props, window, cx);
         let fields = [
@@ -1010,9 +1182,7 @@ impl Launcher {
         cx: &mut Context<Self>,
     ) {
         match action {
-            LaunchDialogAction::Close => {
-                self.launch_dialog = None;
-            }
+            LaunchDialogAction::Close => self.close_launch_dialog(),
             // Saved at once; the dialog stays open so the change can be undone there.
             LaunchDialogAction::ToggleFavorite => {
                 if let Some((app, dialog, _)) = self.launch_dialog.as_ref() {
@@ -1070,7 +1240,20 @@ impl Launcher {
                         &selection,
                         launch_options::mac_timezone(),
                     );
-                    self.start_launch(app, params, Some(selection), cx);
+                    // The target captured when the dialog opened, never the chooser's
+                    // current context, which may have changed since (`ARCH-028`).
+                    let route = match self.dialog_opening.take() {
+                        Some(opening) => {
+                            self.opening_acted();
+                            match opening.target {
+                                Some(OpenTarget::Url(url)) => FlightRoute::Url(url),
+                                Some(OpenTarget::File(path)) => FlightRoute::File(path),
+                                None => FlightRoute::Simple,
+                            }
+                        }
+                        None => FlightRoute::Simple,
+                    };
+                    self.start_launch(app, params, Some(selection), route, cx);
                 }
             }
         }
@@ -1093,7 +1276,7 @@ impl Launcher {
                     launch_options::default_language(&launch_options::mac_locale());
                 let selection = context.selection(&app, &memory, &default_language);
                 let params = context.params(&app, &selection, launch_options::mac_timezone());
-                self.start_launch(app, params, Some(selection), cx);
+                self.start_launch(app, params, Some(selection), FlightRoute::Simple, cx);
             }
         }
     }
@@ -1124,13 +1307,22 @@ impl Launcher {
         app: RemoteApp,
         params: LaunchParams,
         remember: Option<LaunchSelection>,
+        route: FlightRoute,
         cx: &mut Context<Self>,
     ) {
         if self.api.is_none() || !can_start(&self.flights, &app.id) {
             return;
         }
         // A failed card for this app gives way to the new launch.
-        self.flights.retain(|flight| flight.app.id != app.id);
+        let gone: Vec<String> = self
+            .flights
+            .iter()
+            .filter(|flight| flight.app.id == app.id)
+            .map(|flight| flight.launch_id.clone())
+            .collect();
+        for id in gone {
+            self.forget_flight(&id);
+        }
         let flight = Flight::new(
             app,
             params,
@@ -1138,13 +1330,115 @@ impl Launcher {
             self.session_ids(),
             Instant::now(),
             unix_now_f64(),
-        );
+        )
+        .with_route(route);
         let launch_id = flight.launch_id.clone();
         self.flights.insert(0, flight);
         self.status = None;
-        self.post_flight(&launch_id, cx);
-        self.poll_flight(launch_id, cx);
+        self.begin_flight(launch_id, cx);
         cx.notify();
+    }
+
+    /// Sends a flight's launch request and follows it; a file launch uploads first.
+    fn begin_flight(&mut self, launch_id: String, cx: &mut Context<Self>) {
+        let file = self
+            .flight_mut(&launch_id)
+            .and_then(|flight| match &flight.route {
+                FlightRoute::File(path) => Some(path.clone()),
+                _ => None,
+            });
+        match file {
+            Some(path) => self.upload_flight(launch_id, path, cx),
+            None => {
+                self.post_flight(&launch_id, cx);
+                self.poll_flight(launch_id, cx);
+            }
+        }
+    }
+
+    /// Uploads a file launch's file, then sends its request (`ARCH-028`). Cancel, Dismiss,
+    /// sign-out and closing the Library drop the job, which aborts the Tokio task.
+    fn upload_flight(&mut self, launch_id: String, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else {
+            return;
+        };
+        let total = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+        let sent = Arc::new(AtomicU64::new(0));
+        let job_sent = Arc::clone(&sent);
+        let pending = self
+            .rt
+            .spawn(async move { api.upload_for_launch(&path, &job_sent).await });
+        self.uploaded.remove(&launch_id);
+        self.uploads.insert(
+            launch_id.clone(),
+            UploadJob {
+                total,
+                sent,
+                _job: AbortOnDrop(pending.abort_handle()),
+            },
+        );
+        self.tick_uploads(cx);
+        let window = self.window;
+        let gate = LoadGate(self.server_generation);
+        cx.spawn(async move |this, cx| {
+            // Aborted (Cancel, Dismiss, sign-out): nothing more to do.
+            let Ok(result) = pending.await else {
+                return;
+            };
+            let _ = window.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    if !gate.admits(this.server_generation)
+                        || this.uploads.remove(&launch_id).is_none()
+                    {
+                        return;
+                    }
+                    let Some(flight) = this.flight_mut(&launch_id) else {
+                        return;
+                    };
+                    match result {
+                        Ok(uploaded) => {
+                            // The stall timer starts with the request, not the upload.
+                            flight.keep_waiting(Instant::now());
+                            this.uploaded.insert(launch_id.clone(), uploaded);
+                            this.post_flight(&launch_id, cx);
+                            this.poll_flight(launch_id.clone(), cx);
+                        }
+                        Err(message) => flight.fail_before_request(message),
+                    }
+                    this.flight_changed(&launch_id, window, cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Redraws every 250 ms while a file uploads, so its bar moves.
+    fn tick_uploads(&mut self, cx: &mut Context<Self>) {
+        let window = self.window;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let more = window
+                .update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        cx.notify();
+                        !this.uploads.is_empty()
+                    })
+                })
+                .is_ok_and(|more| more.unwrap_or(false));
+            if !more {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// Drops a flight with its upload (aborted) and its finished upload.
+    fn forget_flight(&mut self, launch_id: &str) {
+        self.flights.retain(|flight| flight.launch_id != launch_id);
+        self.uploads.remove(launch_id);
+        self.uploaded.remove(launch_id);
     }
 
     /// Sends (or resends, under the same id) the flight's launch request.
@@ -1157,12 +1451,27 @@ impl Launcher {
         };
         flight.begin_attempt();
         let (app, params) = (flight.app.clone(), flight.params.clone());
+        let route = flight.route.clone();
+        let uploaded = self.uploaded.get(launch_id).cloned();
         let (sent, on_sent) = tokio::sync::oneshot::channel();
         let pending = self.rt.spawn(async move {
-            api.launch_with_options(app, params, move || {
+            let on_send = move || {
                 let _ = sent.send(());
-            })
-            .await
+            };
+            match (&route, &uploaded) {
+                (FlightRoute::Simple, _) => api.launch_with_options(app, params, on_send).await,
+                (FlightRoute::Url(url), _) => {
+                    api.launch(app, params, LaunchRoute::Url(url), on_send)
+                        .await
+                }
+                (FlightRoute::File(_), Some(uploaded)) => {
+                    api.launch(app, params, LaunchRoute::File(uploaded), on_send)
+                        .await
+                }
+                (FlightRoute::File(_), None) => Err(LaunchError::Server(
+                    "The file wasn’t uploaded. Try again.".into(),
+                )),
+            }
         });
         // Applied through the Library window's handle: gpui-pre's `update_in` uses the
         // entity's *current* window, which is Session Controls whenever that panel last
@@ -1288,6 +1597,7 @@ impl Launcher {
         });
         if let Some(index) = ready {
             let flight = self.flights.remove(index);
+            self.uploaded.remove(&flight.launch_id);
             if let Outcome::Ready(session) = flight.outcome {
                 self.finish_launch(
                     &flight.app.id,
@@ -1355,17 +1665,19 @@ impl Launcher {
         };
         match action {
             FlightAction::KeepWaiting => flight.keep_waiting(now),
-            FlightAction::Dismiss => self.flights.retain(|f| f.launch_id != launch_id),
+            // Cancel stops an upload at once; no notice, the user asked for it.
+            FlightAction::Dismiss | FlightAction::Cancel => self.forget_flight(launch_id),
             FlightAction::Retry if flight.can_retry_same() => {
                 // The same id: the server joins the launch if it still runs.
                 flight.retry_same(now);
                 self.post_flight(launch_id, cx);
             }
             FlightAction::Retry if !flight.in_flight() => {
+                // A file launch uploads again: the server deleted the first upload.
                 flight.retry_fresh(known, now, unix_now_f64());
                 let fresh = flight.launch_id.clone();
-                self.post_flight(&fresh, cx);
-                self.poll_flight(fresh, cx);
+                self.uploaded.remove(launch_id);
+                self.begin_flight(fresh, cx);
             }
             FlightAction::Retry => {}
         }
@@ -1469,6 +1781,8 @@ impl Launcher {
                         if let Some(image) = this.session_thumbnails.remove(&session.session_id) {
                             this.retire(image);
                         }
+                        let stopped = session.session_id.clone();
+                        close_library_files(cx, move |id| id == stopped);
                     }
                     Err(error) => this.status = Some(error),
                 }
@@ -1477,6 +1791,610 @@ impl Launcher {
         })
         .detach();
         cx.notify();
+    }
+
+    // ---- Open links and files (`ARCH-028`) -------------------------------------------------
+
+    /// Items from Finder, the Dock, ⌘O, a drop or a `skerry:` link. Held until a server is
+    /// connected; then each joins the chooser (shown, or queued behind what shows).
+    fn receive(&mut self, items: Vec<Incoming>, cx: &mut Context<Self>) {
+        if items.is_empty() {
+            return;
+        }
+        if self.library.is_none() {
+            self.pending_opens.extend(
+                items
+                    .into_iter()
+                    .filter(|item| matches!(item, Incoming::Target(_))),
+            );
+            self.pending_opens.truncate(open_target::QUEUE_CAP + 1);
+            cx.notify();
+            return;
+        }
+        let mut dropped = 0;
+        let mut folders = 0;
+        for item in items {
+            match item {
+                Incoming::Target(target) => dropped += self.opening.push_external(target.into()),
+                Incoming::Rejected { label, reason } => {
+                    dropped += self
+                        .opening
+                        .push_external(Subject::Rejected { label, reason })
+                }
+                Incoming::Folder(_) => folders += 1,
+                Incoming::NoAddress => {
+                    self.status = Some("That skerry: link has no address to open.".into())
+                }
+                Incoming::Ignored => {}
+            }
+        }
+        if folders > 0 {
+            self.status = Some(folder_notice(folders, true));
+        }
+        if dropped > 0 {
+            self.status = Some(format!("Skipped {dropped} items; open fewer at once."));
+        }
+        cx.notify();
+    }
+
+    /// The omnibar's text changed: a typed link shows the chooser, other text searches.
+    fn typed_changed(&mut self, text: &str) {
+        match open_target::classify_typed(text) {
+            Typed::Link(url) => self.opening.set_typed(Some(Subject::Link(url))),
+            Typed::Rejected { label, reason } => self
+                .opening
+                .set_typed(Some(Subject::Rejected { label, reason })),
+            Typed::Search => self.opening.clear_typed(),
+        }
+    }
+
+    /// Return in the omnibar: the chooser's first row, only for a link typed there.
+    fn press_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (sessions, apps) = self.opening_rows();
+        let generation = self.opening.generation();
+        match self.opening.enter_action(
+            sessions.first().map(|row| row.id.as_str()),
+            apps.iter()
+                .find(|row| !row.launching)
+                .map(|row| row.id.as_str()),
+        ) {
+            Some(RowRef::Session(id)) => self.open_in_session(&id, generation, window, cx),
+            Some(RowRef::App(id)) => self.open_with_app(&id, generation, window, cx),
+            None => {}
+        }
+    }
+
+    /// Open Location… (⌘L): the omnibar, its text selected.
+    fn focus_omnibar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.library.is_none() {
+            return;
+        }
+        let focus = gpui_kit::Focusable::focus_handle(self.search_input.read(cx), cx);
+        window.focus(&focus, cx);
+        window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
+    }
+
+    /// A row's action was done: the next queued item shows; a typed link's text goes.
+    fn opening_acted(&mut self) {
+        if self.opening.current().is_some_and(|current| current.typed) {
+            self.clear_search_input = true;
+        }
+        self.opening.advance_after_action();
+        self.opening_apps_expanded = false;
+    }
+
+    fn set_opening_note(&mut self, text: String, error: bool) {
+        self.opening_note = Some((self.opening.generation(), Notice { text, error }));
+    }
+
+    /// The running sessions and apps the current context can go to.
+    fn opening_rows(&self) -> (Vec<OpeningSessionRow>, Vec<OpeningAppRow>) {
+        let (Some(library), Some(current)) = (&self.library, self.opening.current()) else {
+            return (Vec::new(), Vec::new());
+        };
+        let apps = ordered_apps(&library.apps, &self.preferences);
+        let (sessions, apps): (Vec<&RemoteSession>, Vec<&RemoteApp>) = match &current.subject {
+            Subject::Link(_) => {
+                let (sessions, matching) =
+                    open_target::url_targets(&library.apps, &library.sessions);
+                (
+                    sessions,
+                    apps.into_iter()
+                        .filter(|app| matching.iter().any(|m| m.id == app.id))
+                        .collect(),
+                )
+            }
+            Subject::File(path) => {
+                let ext = open_target::extension_of(path);
+                let (sessions, matching, _) =
+                    open_target::file_targets(&library.apps, &library.sessions, ext.as_deref());
+                (
+                    sessions,
+                    apps.into_iter()
+                        .filter(|app| matching.iter().any(|m| m.id == app.id))
+                        .collect(),
+                )
+            }
+            Subject::Rejected { .. } => (Vec::new(), Vec::new()),
+        };
+        let pending_stop = self.pending_stop.as_ref().map(|s| s.session_id.as_str());
+        let now = unix_now();
+        let sessions = sessions
+            .into_iter()
+            .filter(|session| Some(session.session_id.as_str()) != pending_stop)
+            .map(|session| {
+                let mut detail = format_started_ago_at(session.created_at, now).unwrap_or_default();
+                if !session.home.is_empty() {
+                    if !detail.is_empty() {
+                        detail.push_str(" · ");
+                    }
+                    detail.push_str(&session.home);
+                }
+                OpeningSessionRow {
+                    id: session.session_id.clone(),
+                    app_name: session.app_name.clone(),
+                    detail,
+                    icon: self.app_icons.get(&session.app_id).cloned(),
+                }
+            })
+            .collect();
+        let apps = apps
+            .into_iter()
+            .map(|app| OpeningAppRow {
+                id: app.id.clone(),
+                name: app.name.clone(),
+                icon: self.app_icons.get(&app.id).cloned(),
+                launching: !can_start(&self.flights, &app.id),
+            })
+            .collect();
+        (sessions, apps)
+    }
+
+    /// The chooser as the Library draws it.
+    fn opening_props(&self) -> Option<OpeningProps> {
+        let current = self.opening.current()?;
+        let (sessions, apps) = self.opening_rows();
+        let generation = self.opening.generation();
+        let mut note = self
+            .opening_note
+            .as_ref()
+            .filter(|(at, _)| *at == generation)
+            .map(|(_, note)| note.clone());
+        let info = |text: String| Some(Notice { text, error: false });
+        let (kind, label, tooltip, detail, rejected) = match &current.subject {
+            Subject::Link(url) => {
+                let (label, tooltip) = open_target::display_link(url);
+                if note.is_none() && sessions.is_empty() && apps.is_empty() {
+                    note = info("No app on this server opens links.".into());
+                }
+                (OpeningKind::Link, label, Some(tooltip), None, false)
+            }
+            Subject::File(path) => {
+                let name = file_name(path);
+                let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+                let ext = open_target::extension_of(path);
+                let (position, total) = self.opening.position();
+                let mut parts = Vec::new();
+                if let Some(ext) = &ext {
+                    parts.push(ext.to_uppercase());
+                }
+                parts.push(files_model::size_label(size));
+                if total > 1 {
+                    parts.push(format!("{position} of {total}"));
+                }
+                if note.is_none() {
+                    let fallback = self.library.as_ref().is_some_and(|library| {
+                        open_target::file_targets(&library.apps, &[], ext.as_deref()).2
+                    });
+                    note = if size > open_target::MAX_OPEN_FILE_BYTES {
+                        Some(Notice {
+                            text: format!("“{name}” is too large to open this way (over 4 GB). Copy it to a running session, or launch the app and copy it with Files."),
+                            error: true,
+                        })
+                    } else if fallback && !apps.is_empty() {
+                        match &ext {
+                            Some(ext) => {
+                                info(format!("No app lists .{ext} files, so all apps are shown."))
+                            }
+                            None => {
+                                info("This file has no extension, so all apps are shown.".into())
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                }
+                (
+                    OpeningKind::File,
+                    name,
+                    Some(path.display().to_string()),
+                    Some(parts.join(" · ")),
+                    false,
+                )
+            }
+            Subject::Rejected { label, reason } => {
+                if note.is_none() {
+                    note = info(reason.note().into());
+                }
+                (OpeningKind::Link, label.clone(), None, None, true)
+            }
+        };
+        let enter_hint = self
+            .opening
+            .enter_action(Some("row"), Some("app"))
+            .is_some();
+        Some(OpeningProps {
+            kind,
+            label,
+            tooltip,
+            detail,
+            rejected,
+            sessions,
+            apps,
+            apps_expanded: self.opening_apps_expanded,
+            queue_more: self.opening.queued() > 0,
+            pending_session: self.open_pending.clone(),
+            note,
+            enter_hint,
+            generation,
+        })
+    }
+
+    /// A running row: the link opens in that session, or the file is copied to its Desktop.
+    /// A click drawn for an older context, or while another open is pending, does nothing.
+    fn open_in_session(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.opening.generation() || self.opening.locked() {
+            return;
+        }
+        let (Some(api), Some(session), Some(current)) = (
+            self.api.clone(),
+            self.find_session(session_id),
+            self.opening.current().cloned(),
+        ) else {
+            return;
+        };
+        match current.subject {
+            Subject::Link(url) => {
+                self.opening.set_locked(true);
+                self.open_pending = Some(session.session_id.clone());
+                let id = session.session_id.clone();
+                let pending = self
+                    .rt
+                    .spawn(async move { api.open_url_in_session(&id, &url).await });
+                let launcher_window = self.window;
+                let gate = LoadGate(self.server_generation);
+                cx.spawn(async move |this, cx| {
+                    let result = pending
+                        .await
+                        .unwrap_or_else(|_| Err(OpenUrlError::Failed("interrupted".into())));
+                    let _ = launcher_window.update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            // Cancelled meanwhile (✕, Escape, sign-out): the answer is ignored.
+                            if !gate.admits(this.server_generation)
+                                || this.open_pending.as_deref() != Some(&session.session_id)
+                            {
+                                return;
+                            }
+                            this.open_pending = None;
+                            let app = session.app_name.clone();
+                            match result {
+                                Ok(()) => {
+                                    this.opening_acted();
+                                    this.show_toast(format!("Opened in {app}"), cx);
+                                    this.open_session(session, window, cx);
+                                }
+                                Err(error) => {
+                                    this.opening.set_locked(false);
+                                    let text = match error {
+                                        OpenUrlError::NotTaken => format!("{app} couldn’t take the link. Choose another session or launch a new one."),
+                                        OpenUrlError::Refused => "The server refused this link.".into(),
+                                        OpenUrlError::Failed(reason) => format!("Couldn’t reach {app}: {reason}"),
+                                    };
+                                    this.set_opening_note(text, true);
+                                }
+                            }
+                            cx.notify();
+                        })
+                    });
+                })
+                .detach();
+            }
+            Subject::File(path) => {
+                let name = file_name(&path);
+                self.opening_acted();
+                self.show_toast(format!("Copying “{name}” to {}", session.app_name), cx);
+                self.open_library_files(&session.session_id, vec![path], window, cx);
+            }
+            Subject::Rejected { .. } => {}
+        }
+        cx.notify();
+    }
+
+    /// An app chip: the Launch & Open dialog, holding its own copy of the target. A file
+    /// over 4 GB gets the plain dialog (`/launch/simple`).
+    fn open_with_app(
+        &mut self,
+        app_id: &str,
+        generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if generation != self.opening.generation()
+            || self.opening.locked()
+            || !can_start(&self.flights, app_id)
+        {
+            return;
+        }
+        let (Some(app), Some(current)) = (self.find_app(app_id), self.opening.current().cloned())
+        else {
+            return;
+        };
+        let (target, label) = match current.subject {
+            Subject::Link(url) => {
+                let (label, tooltip) = open_target::display_link(&url);
+                (
+                    Some(OpenTarget::Url(url)),
+                    Some(OpeningLabel {
+                        kind: OpeningKind::Link,
+                        label,
+                        detail: None,
+                        tooltip: Some(tooltip),
+                    }),
+                )
+            }
+            Subject::File(path) => {
+                let size = std::fs::metadata(&path).map_or(0, |meta| meta.len());
+                if size > open_target::MAX_OPEN_FILE_BYTES {
+                    (None, None)
+                } else {
+                    let detail = match open_target::extension_of(&path) {
+                        Some(ext) => {
+                            format!("{} · {}", ext.to_uppercase(), files_model::size_label(size))
+                        }
+                        None => files_model::size_label(size),
+                    };
+                    let label = OpeningLabel {
+                        kind: OpeningKind::File,
+                        label: file_name(&path),
+                        detail: Some(detail),
+                        tooltip: Some(path.display().to_string()),
+                    };
+                    (Some(OpenTarget::File(path)), Some(label))
+                }
+            }
+            Subject::Rejected { .. } => return,
+        };
+        self.open_launch_dialog(app, window, cx);
+        if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+            dialog.opening = label;
+        }
+        self.dialog_opening = Some(DialogOpening { target });
+        // While the dialog is up, nothing from outside replaces the context.
+        self.opening.set_locked(true);
+        cx.notify();
+    }
+
+    /// Closes the Launch Dialog; one opened from the chooser gives the context back.
+    fn close_launch_dialog(&mut self) {
+        self.launch_dialog = None;
+        if self.dialog_opening.take().is_some() {
+            self.opening.set_locked(false);
+        }
+    }
+
+    /// Finder items dropped on the Library: files join the chooser, folders are refused.
+    fn drop_on_library(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let (files, folders) = split_drop(paths);
+        let mut items: Vec<Incoming> = files
+            .into_iter()
+            .map(|path| Incoming::Target(OpenTarget::File(path)))
+            .collect();
+        if folders > 0 {
+            self.status = Some(folder_notice(folders, !items.is_empty()));
+            if items.is_empty() {
+                cx.notify();
+                return;
+            }
+        } else {
+            self.status = None;
+        }
+        let status = self.status.take();
+        self.receive(std::mem::take(&mut items), cx);
+        if self.status.is_none() {
+            self.status = status;
+        }
+    }
+
+    /// Finder items dropped on a session card: every file is copied to its Desktop.
+    fn drop_on_session(
+        &mut self,
+        session_id: &str,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (files, folders) = split_drop(paths);
+        self.status = match (files.is_empty(), folders) {
+            (_, 0) => None,
+            (true, _) => Some("To copy a folder, open Files and drop it there.".into()),
+            (false, n) => Some(folder_notice(n, false)),
+        };
+        if !files.is_empty() {
+            self.open_library_files(session_id, files, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// The session's Files window with no stream (`ARCH-028`): brought forward if open
+    /// (whoever opened it), else opened after the cookie exchange. `uploads` go to its
+    /// Desktop once it exists.
+    fn open_library_files(
+        &mut self,
+        session_id: &str,
+        uploads: Vec<PathBuf>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if raise_files(session_id, uploads.clone(), cx) {
+            return;
+        }
+        if self.files_pending.contains(session_id) {
+            return;
+        }
+        let (Some(api), Some(session)) = (self.api.clone(), self.find_session(session_id)) else {
+            return;
+        };
+        let failed = format!(
+            "Couldn’t reach {}’s files. Refresh and try again.",
+            session.app_name
+        );
+        let url = match api.session_url(&session.session_url) {
+            Ok(url) => url,
+            Err(_) => {
+                self.status = Some(failed);
+                cx.notify();
+                return;
+            }
+        };
+        self.files_pending.insert(session.session_id.clone());
+        let pending = self
+            .rt
+            .spawn(async move { crate::transport::selkies_for_session(url).await });
+        let library = self.window;
+        let gate = LoadGate(self.server_generation);
+        let rt = self.rt.clone();
+        cx.spawn(async move |this, cx| {
+            let result = pending.await.unwrap_or(Err("interrupted"));
+            let _ = library.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    if !gate.admits(this.server_generation) {
+                        return;
+                    }
+                    this.files_pending.remove(&session.session_id);
+                    let Ok(selkies) = result else {
+                        this.status = Some(failed);
+                        cx.notify();
+                        return;
+                    };
+                    let source = FilesSource {
+                        title: session.app_name.clone(),
+                        selkies,
+                        // No stream, no `server_settings`: both directions until a 403.
+                        policy: crate::selkies::Policy::default(),
+                        storage: crate::sealskin::has_storage(&session.home).then(|| {
+                            files_window::Storage {
+                                client: api.clone(),
+                                home: session.home.clone(),
+                            }
+                        }),
+                    };
+                    let session_id = session.session_id.clone();
+                    // Opened outside this update (ARCH-006); checked again there, since a
+                    // session window may have opened Files meanwhile.
+                    cx.defer(move |cx| {
+                        if raise_files(&session_id, uploads.clone(), cx) {
+                            return;
+                        }
+                        let opened = library.update(cx, |_, window, cx| {
+                            FilesWindow::open(
+                                source,
+                                rt,
+                                window,
+                                FilesOwner::Library,
+                                session_id.clone(),
+                                cx,
+                            )
+                        });
+                        if let Ok(Ok((_, files))) = opened {
+                            if !uploads.is_empty() {
+                                files.update(cx, |files, cx| files.enqueue_upload(uploads, cx));
+                            }
+                        }
+                    });
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The chooser's, drops' and Files button's handlers: each captures only the entity and
+    /// looks rows up by id (`ARCH-026`).
+    fn open_handlers(&self, cx: &mut Context<Self>) -> OpenHandlers {
+        let entity = cx.entity();
+        let e = entity.clone();
+        let on_open_in_session: library::OpeningHandler =
+            Rc::new(move |id, generation, window, cx| {
+                e.update(cx, |this, cx| {
+                    this.open_in_session(&id, generation, window, cx)
+                });
+            });
+        let e = entity.clone();
+        let on_open_with_app: library::OpeningHandler =
+            Rc::new(move |id, generation, window, cx| {
+                e.update(cx, |this, cx| {
+                    this.open_with_app(&id, generation, window, cx)
+                });
+            });
+        let e = entity.clone();
+        let on_clear_opening: library::ActionHandler = Rc::new(move |_, cx| {
+            e.update(cx, |this, cx| {
+                if this.opening.current().is_some_and(|current| current.typed) {
+                    this.clear_search_input = true;
+                }
+                this.opening.cancel_all();
+                this.open_pending = None;
+                cx.notify();
+            });
+        });
+        let e = entity.clone();
+        let on_skip_opening: library::ActionHandler = Rc::new(move |_, cx| {
+            e.update(cx, |this, cx| {
+                if !this.opening.locked() {
+                    this.opening.skip();
+                }
+                cx.notify();
+            });
+        });
+        let e = entity.clone();
+        let on_toggle_opening_apps: library::ActionHandler = Rc::new(move |_, cx| {
+            e.update(cx, |this, cx| {
+                this.opening_apps_expanded = !this.opening_apps_expanded;
+                cx.notify();
+            });
+        });
+        let e = entity.clone();
+        let on_files: library::ItemHandler = Rc::new(move |id, window, cx| {
+            e.update(cx, |this, cx| {
+                this.open_library_files(&id, Vec::new(), window, cx)
+            });
+        });
+        let e = entity.clone();
+        let on_drop: library::DropHandler = Rc::new(move |paths, _, cx| {
+            e.update(cx, |this, cx| this.drop_on_library(paths, cx));
+        });
+        let e = entity;
+        let on_drop_to_session: library::SessionDropHandler =
+            Rc::new(move |id, paths, window, cx| {
+                e.update(cx, |this, cx| this.drop_on_session(&id, paths, window, cx));
+            });
+        OpenHandlers {
+            on_open_in_session: Some(on_open_in_session),
+            on_open_with_app: Some(on_open_with_app),
+            on_clear_opening: Some(on_clear_opening),
+            on_skip_opening: Some(on_skip_opening),
+            on_toggle_opening_apps: Some(on_toggle_opening_apps),
+            on_files: Some(on_files),
+            on_drop: Some(on_drop),
+            on_drop_to_session: Some(on_drop_to_session),
+        }
     }
 
     /// Opens `session` in a window of its own, or brings forward the window already showing
@@ -1601,12 +2519,17 @@ impl Render for Launcher {
             self.key_input
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
+        if std::mem::take(&mut self.clear_search_input) {
+            self.search_input
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
         let theme = cx.theme().clone();
         self.ensure_age_tick(window.is_visible(), cx);
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
             let props = ConnectProps {
                 status: self.status.clone(),
                 busy: self.busy.clone(),
+                pending_open: pending_open_banner(&self.pending_opens),
             };
             return connect::render(
                 &theme,
@@ -1640,7 +2563,13 @@ impl Render for Launcher {
             launching: self
                 .flights
                 .iter()
-                .map(|flight| launching_item(flight, self.app_icons.get(&flight.app.id), now))
+                .map(|flight| {
+                    let upload = self
+                        .uploads
+                        .get(&flight.launch_id)
+                        .map(|job| (job.sent.load(Ordering::Relaxed), job.total));
+                    launching_item(flight, self.app_icons.get(&flight.app.id), upload, now)
+                })
                 .collect(),
             launching_apps: self
                 .flights
@@ -1657,6 +2586,19 @@ impl Render for Launcher {
             selected_filter: self.selected_filter.clone(),
             status: self.status.clone(),
             busy: self.busy.clone(),
+            opening: self.opening_props(),
+            omnibar: match self.opening.current() {
+                Some(current) if current.typed => match current.subject {
+                    Subject::Rejected { .. } => OmnibarIcon::Rejected,
+                    _ => OmnibarIcon::Link,
+                },
+                _ => OmnibarIcon::Search,
+            },
+            files_pending: self.files_pending.clone(),
+            accepts_drops: self.launch_dialog.is_none()
+                && self.pending_stop.is_none()
+                && self.pending_sign_out.is_none(),
+            drop_preview: None,
         };
 
         // Handlers capture only the entity and look the app or flight up by id (ARCH-026).
@@ -1669,20 +2611,29 @@ impl Render for Launcher {
         let launcher_for_stop = cx.entity().clone();
         let launcher_for_filter = cx.entity().clone();
         let launcher_for_dialog = cx.entity().clone();
+        let open = self.open_handlers(cx);
 
         div()
             .size_full()
             .relative()
+            .key_context(LIBRARY_CONTEXT)
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape"
-                    && (this.launch_dialog.is_some()
-                        || this.pending_stop.is_some()
-                        || this.pending_sign_out.is_some())
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                if this.launch_dialog.is_some()
+                    || this.pending_stop.is_some()
+                    || this.pending_sign_out.is_some()
                 {
-                    this.launch_dialog = None;
+                    this.close_launch_dialog();
                     this.pending_stop = None;
                     this.pending_sign_out = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if this.opening.current().is_some_and(|current| !current.typed) {
+                    // A context from outside: Escape cancels it, as ✕ does.
+                    this.opening.cancel_all();
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1748,6 +2699,7 @@ impl Render for Launcher {
                             cx.notify();
                         });
                     }),
+                    open,
                 },
             ))
             .when_some(self.launch_dialog.as_ref(), |view, (_, dialog, selects)| {
@@ -1969,6 +2921,9 @@ fn build_items(
             }),
             thumbnail: thumbnails.get(&session.session_id).cloned(),
             app_icon: icons.get(&session.app_id).cloned(),
+            // A collaboration room's Files go through its owner (`ARCH-028`).
+            files: !session.is_collaboration,
+            accepts_drop: !session.is_collaboration,
         })
         .collect();
     (apps, sessions)
@@ -2057,7 +3012,12 @@ fn quick_launch_plan(memory: Option<&LaunchMemory>) -> QuickLaunch {
 }
 
 /// A flight as its card in Running sessions shows it.
-fn launching_item(flight: &Flight, icon: Option<&Arc<RenderImage>>, now: Instant) -> LaunchingItem {
+fn launching_item(
+    flight: &Flight,
+    icon: Option<&Arc<RenderImage>>,
+    upload: Option<(u64, u64)>,
+    now: Instant,
+) -> LaunchingItem {
     let stages = flight
         .checklist(now)
         .into_iter()
@@ -2099,15 +3059,128 @@ fn launching_item(flight: &Flight, icon: Option<&Arc<RenderImage>>, now: Instant
             launch_progress::clock(flight.elapsed(now).as_secs())
         )
     };
+    let subject = match &flight.route {
+        FlightRoute::Simple => None,
+        FlightRoute::Url(url) => Some((OpeningKind::Link, open_target::display_link(url).0)),
+        FlightRoute::File(path) => Some((OpeningKind::File, file_name(path))),
+    };
+    let uploading = upload.is_some() && flight.in_flight();
     LaunchingItem {
         launch_id: flight.launch_id.clone(),
         app_name: flight.app.name.clone(),
         app_icon: icon.cloned(),
         stages,
-        detail: Some(flight.detail_line()),
+        detail: (!uploading).then(|| flight.detail_line()),
         status,
         notice,
+        upload: upload
+            .filter(|_| uploading)
+            .map(|(sent, total)| UploadProgress {
+                fraction: if total == 0 {
+                    0.
+                } else {
+                    (sent as f64 / total as f64).min(1.) as f32
+                },
+                label: format!(
+                    "Uploading {} of {}",
+                    files_model::size_label(sent),
+                    files_model::size_label(total)
+                ),
+            }),
+        subject,
+        cancellable: uploading,
     }
+}
+
+/// A path's file name, for display.
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Apps in the chooser's order: recently launched first, then by name.
+fn ordered_apps<'a>(apps: &'a [RemoteApp], preferences: &Preferences) -> Vec<&'a RemoteApp> {
+    let recent = &preferences.library.recent;
+    let mut ordered: Vec<&RemoteApp> = apps.iter().collect();
+    ordered.sort_by_key(|app| {
+        (
+            recent
+                .iter()
+                .position(|id| *id == app.id)
+                .unwrap_or(usize::MAX),
+            app.name.to_lowercase(),
+        )
+    });
+    ordered
+}
+
+/// Files and the number of folders in a Finder drop.
+fn split_drop(paths: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    let (folders, files): (Vec<PathBuf>, Vec<PathBuf>) =
+        paths.into_iter().partition(|path| path.is_dir());
+    (files, folders.len())
+}
+
+/// What a drop with folders says: all folders (`files` false) or some skipped.
+fn folder_notice(folders: usize, some_files: bool) -> String {
+    if !some_files {
+        return "Open one file at a time. To copy a folder, use Files on a running session.".into();
+    }
+    let noun = if folders == 1 { "folder" } else { "folders" };
+    format!("Skipped {folders} {noun}. To copy a folder, use Files on a running session.")
+}
+
+/// The Connect screen's banner for items waiting for a server.
+fn pending_open_banner(pending: &[Incoming]) -> Option<String> {
+    let targets: Vec<&OpenTarget> = pending
+        .iter()
+        .filter_map(|item| match item {
+            Incoming::Target(target) => Some(target),
+            _ => None,
+        })
+        .collect();
+    match targets.as_slice() {
+        [] => None,
+        [OpenTarget::File(path)] => Some(format!(
+            "Connect to a server to open “{}”.",
+            file_name(path)
+        )),
+        [OpenTarget::Url(url)] => Some(format!(
+            "Connect to a server to open {}.",
+            open_target::display_link(url).0
+        )),
+        many => Some(format!("Connect to a server to open {} items.", many.len())),
+    }
+}
+
+/// Brings forward the session's Files window if one is open, copying `uploads` into it.
+fn raise_files(session_id: &str, uploads: Vec<PathBuf>, cx: &mut App) -> bool {
+    let Some((handle, files)) = cx.default_global::<OpenWindows>().files_window(session_id) else {
+        return false;
+    };
+    if handle
+        .update(cx, |_, window, _| window.activate_window())
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(files) = files.upgrade().filter(|_| !uploads.is_empty()) {
+        cx.defer(move |cx| files.update(cx, |files, cx| files.enqueue_upload(uploads, cx)));
+    }
+    true
+}
+
+/// Closes the Library-opened Files windows of the sessions `matches` picks (Stop, Sign Out).
+fn close_library_files(cx: &mut App, matches: impl Fn(&str) -> bool + 'static) {
+    cx.defer(move |cx| {
+        let windows = cx
+            .default_global::<OpenWindows>()
+            .take_library_files(&matches);
+        for window in windows {
+            let _ = window.update(cx, |_, window, _| window.remove_window());
+        }
+    });
 }
 
 #[cfg(test)]
@@ -2358,14 +3431,24 @@ mod tests {
     #[test]
     fn launching_cards_show_stages_and_the_stall_notice() {
         let flight = test_flight("firefox");
-        let item = launching_item(&flight, None, Instant::now() + Duration::from_secs(16));
+        let item = launching_item(
+            &flight,
+            None,
+            None,
+            Instant::now() + Duration::from_secs(16),
+        );
         assert_eq!(item.status, "Launching · 0:16");
         assert_eq!(item.stages[0].state, StageState::Current);
         assert_eq!(item.stages[0].time.as_deref(), Some("16 s"));
         assert_eq!(item.stages.last().unwrap().time, None);
         assert_eq!(item.detail.as_deref(), Some("Sending the launch request"));
         assert!(item.notice.is_none());
-        let stalled = launching_item(&flight, None, Instant::now() + Duration::from_secs(200));
+        let stalled = launching_item(
+            &flight,
+            None,
+            None,
+            Instant::now() + Duration::from_secs(200),
+        );
         assert!(matches!(
             stalled.notice,
             Some(LaunchNotice::Stalled {
@@ -2390,5 +3473,96 @@ mod tests {
         let (_, rebuilt) = cache.get(build);
         assert!(!Rc::ptr_eq(&first, &rebuilt));
         assert_eq!(rebuilt[0].started_label.as_deref(), Some("Just started"));
+    }
+
+    #[test]
+    fn library_only_actions_do_not_resolve_under_the_session_desktop() {
+        use gpui_kit::{KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(library_key_bindings());
+        let resolve = |key: &'static str, contexts: &[&str]| {
+            let stack: Vec<KeyContext> = contexts
+                .iter()
+                .map(|context| KeyContext::parse(context).unwrap())
+                .collect();
+            let (bindings, _) =
+                keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], &stack);
+            bindings
+                .iter()
+                .map(|binding| binding.action().name().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(resolve("cmd-o", &[LIBRARY_CONTEXT]), ["sealskin::OpenFile"]);
+        assert_eq!(
+            resolve("cmd-l", &[LIBRARY_CONTEXT]),
+            ["sealskin::OpenLocation"]
+        );
+        for key in ["cmd-o", "cmd-l"] {
+            assert!(
+                resolve(key, &[crate::view::DESKTOP_CONTEXT]).is_empty(),
+                "{key}"
+            );
+            assert!(resolve(key, &["FilesWindow"]).is_empty(), "{key}");
+            assert!(resolve(key, &[]).is_empty(), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_file_launch_card_shows_its_upload_and_cancel() {
+        let flight = test_flight("office").with_route(FlightRoute::File("/tmp/q.xlsx".into()));
+        let item = launching_item(
+            &flight,
+            None,
+            Some((12_000_000, 40_000_000)),
+            Instant::now(),
+        );
+        let upload = item.upload.unwrap();
+        assert_eq!(upload.label, "Uploading 12 MB of 40 MB");
+        assert!((upload.fraction - 0.3).abs() < 1e-6);
+        assert!(item.cancellable);
+        assert_eq!(item.subject, Some((OpeningKind::File, "q.xlsx".into())));
+        // After the upload: no bar, no Cancel (the request can't be taken back).
+        let item = launching_item(&flight, None, None, Instant::now());
+        assert!(item.upload.is_none() && !item.cancellable);
+        let link = test_flight("zen").with_route(FlightRoute::Url("https://wiki.lan/page".into()));
+        let item = launching_item(&link, None, None, Instant::now());
+        assert_eq!(
+            item.subject,
+            Some((OpeningKind::Link, "wiki.lan/page".into()))
+        );
+    }
+
+    #[test]
+    fn drops_with_folders_say_what_was_skipped() {
+        assert_eq!(
+            folder_notice(2, false),
+            "Open one file at a time. To copy a folder, use Files on a running session."
+        );
+        assert_eq!(
+            folder_notice(1, true),
+            "Skipped 1 folder. To copy a folder, use Files on a running session."
+        );
+        assert_eq!(
+            folder_notice(3, true),
+            "Skipped 3 folders. To copy a folder, use Files on a running session."
+        );
+    }
+
+    #[test]
+    fn the_connect_banner_names_what_waits() {
+        assert_eq!(pending_open_banner(&[]), None);
+        let file = Incoming::Target(OpenTarget::File("/x/report.pdf".into()));
+        let link = Incoming::Target(OpenTarget::Url("https://wiki.lan/page".into()));
+        assert_eq!(
+            pending_open_banner(std::slice::from_ref(&file)).as_deref(),
+            Some("Connect to a server to open “report.pdf”.")
+        );
+        assert_eq!(
+            pending_open_banner(std::slice::from_ref(&link)).as_deref(),
+            Some("Connect to a server to open wiki.lan/page.")
+        );
+        assert_eq!(
+            pending_open_banner(&[file, link]).as_deref(),
+            Some("Connect to a server to open 2 items.")
+        );
     }
 }

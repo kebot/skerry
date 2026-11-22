@@ -15,7 +15,20 @@ use crate::sealskin::{
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
+
+/// Which launch route a flight takes (`ARCH-028`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FlightRoute {
+    #[default]
+    Simple,
+    /// `/launch/url` with this address.
+    Url(String),
+    /// `/launch/file`: this file is uploaded first, again on a fresh retry (the server
+    /// deletes an upload once a launch reassembles it).
+    File(PathBuf),
+}
 
 /// No change of stage for this long shows the stall prompt.
 pub const STALL: Duration = Duration::from_secs(180);
@@ -196,6 +209,7 @@ pub struct Flight {
     /// outstanding; the Library then reports the refused key as a Refresh would.
     pub signed_out: bool,
     pub outcome: Outcome,
+    pub route: FlightRoute,
 }
 
 impl Flight {
@@ -227,6 +241,7 @@ impl Flight {
             poll_errors: 0,
             signed_out: false,
             outcome: Outcome::Running,
+            route: FlightRoute::Simple,
         };
         flight.reset(now, now_unix);
         flight
@@ -249,6 +264,18 @@ impl Flight {
         self.poll_errors = 0;
         self.signed_out = false;
         self.outcome = Outcome::Running;
+    }
+
+    pub fn with_route(mut self, route: FlightRoute) -> Self {
+        self.route = route;
+        self
+    }
+
+    /// The work before the launch request (a file upload) failed: no request was sent.
+    pub fn fail_before_request(&mut self, message: String) {
+        if self.in_flight() && !self.posting {
+            self.outcome = Outcome::Failed(Some(message));
+        }
     }
 
     pub fn is_running(&self) -> bool {

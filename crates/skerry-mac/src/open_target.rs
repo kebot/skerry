@@ -386,7 +386,7 @@ pub fn app_opens_extension(declared: &[String], ext: &str) -> bool {
         .any(|declared| normalize_extension(declared) == ext)
 }
 
-fn newest_first<'a>(mut sessions: Vec<&'a RemoteSession>) -> Vec<&'a RemoteSession> {
+fn newest_first(mut sessions: Vec<&RemoteSession>) -> Vec<&RemoteSession> {
     sessions.sort_by(|a, b| b.created_at.total_cmp(&a.created_at));
     sessions
 }
