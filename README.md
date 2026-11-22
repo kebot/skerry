@@ -1,99 +1,160 @@
 # Skerry
 
-Skerry is a native Mac client for [SealSkin](https://docs.sealskin.app/latest/) and [Selkies](https://github.com/selkies-project/selkies). It lists the applications and running sessions on a SealSkin server, launches or resumes one, and streams it into a Mac window over the Selkies WebSocket transport. It is written in Rust with [GPUI](https://gpui.rs/).
+Skerry is a native macOS app for [SealSkin](https://docs.sealskin.app/latest/) and [Selkies](https://github.com/selkies-project/selkies). Connect to your SealSkin server—or directly to a Selkies stream—to launch, resume, and use remote desktop apps in native Mac windows without a browser.
 
-- **Video:** H.264, H.265 (HEVC) and AV1 decoded in hardware with VideoToolbox, or JPEG decoded in Rust.
-- **Audio:** stereo Opus played through Core Audio.
-- **Input:** keyboard, mouse, smooth trackpad scrolling, pinch to zoom, and optional Mac input method composition.
-- **Screen:** the remote desktop follows the window size, Retina scaling and the Mac display's UI scale.
-- **Session Controls:** a separate panel (⌘⇧M) for playback, screen, video codec and quality settings, and stream diagnostics.
+## Features
 
-Disconnecting returns to the launcher and leaves the remote session running.
+- **Hardware-accelerated video:** H.264, H.265 (HEVC), and AV1 decoded natively with Apple VideoToolbox, plus JPEG fallback.
+- **Native Mac feel:** Retina/HiDPI scaling, smooth trackpad scrolling, pinch-to-zoom, Mac input method (IME) support, and Command-to-Control mapping.
+- **Audio, mic, and camera:** Stereo Opus audio with selectable output devices, plus optional microphone and webcam forwarding.
+- **Files & clipboard:** Two-way clipboard sync and a built-in **Files** window with upload, download, Quick Look, and drag-and-drop.
+- **Multi-window & second display:** Run multiple remote sessions side by side, or extend a session onto a second display.
+- **Gamepads, pointer capture, and printing:** Controller support, pointer lock (`⌃⌥⇧Z`) for 3D apps and games, and remote printing.
 
-## Install (macOS Apple Silicon, macOS 13+)
+## Requirements
 
-Prebuilt releases are **ad-hoc signed** (not notarized with a paid Apple Developer account), so macOS Gatekeeper will quarantine downloads unless bypassed as shown below.
+- **Mac:** Apple Silicon (M1 or newer) running **macOS 13 Ventura** or later.
+- **Server:** SealSkin **0.5.0+** (over trusted HTTPS with the **Other** client type enabled), or a direct Selkies server.
 
-### Option 1: Homebrew Cask
+---
 
-Install from the cask definition with `--no-quarantine`:
+## Install
 
+> **Note on Gatekeeper:** Skerry releases are ad-hoc signed rather than notarized with a paid Apple Developer account. macOS will block the first launch unless you clear the quarantine attribute as shown below.
+
+### Option 1: Download the DMG (recommended)
+
+1. Download `Skerry-<version>-arm64.dmg` from the [Releases](https://github.com/kebot/skerry/releases) page.
+2. Open the `.dmg` and drag **Skerry.app** into your **Applications** folder.
+3. Open **Terminal** and run this command once before launching Skerry:
+   ```sh
+   xattr -cr /Applications/Skerry.app
+   ```
+4. Launch **Skerry** from Applications or Spotlight.
+
+*(Optional)* To verify the download before installing, download `SHA256SUMS` into the same folder and run:
+```sh
+shasum -a 256 -c SHA256SUMS --ignore-missing
+```
+
+### Option 2: Install with Homebrew
+
+If you have the repository cloned locally:
 ```sh
 brew install --cask --no-quarantine ./packaging/homebrew/Casks/skerry.rb
 ```
 
-Or, if you have configured a Homebrew tap pointing at this repository's `packaging/homebrew` directory:
+---
 
+## Getting Started
+
+When you open Skerry, choose either **SealSkin** or **Selkies** at the top of the Connect screen.
+
+### Connect to a SealSkin server
+
+1. Sign in to your SealSkin web dashboard.
+2. Go to **Settings → Application Keys** and create a new key.
+3. Copy the entire key (including `@your-server-address`).
+4. Paste it into the **SealSkin** tab in Skerry and click **Connect**.
+
+Skerry saves your key locally in `~/.config/skerry/config.toml` (readable only by your user) so you stay signed in next time.
+
+### Connect directly to a Selkies server
+
+1. Switch to the **Selkies** tab.
+2. Enter your Selkies server URL (and credentials/token if your server requires them) and click **Connect**.
+
+---
+
+## Using Skerry
+
+### Library & Sessions
+
+- **Launch or resume:** Click an app in the Library to start a new session, or click a running session to reconnect to it. You can open multiple sessions in separate windows at the same time.
+- **Launch options:** Configure per-app options such as named home storage, GPU, VPN, language, timezone, or collaborative mode before launching.
+- **Open local files or links:** From the Library, use **File → Open… (`⌘O`)** or **File → Open Location… (`⌘L`)** to open a file or URL in a remote app.
+- **Manage home storage:** Use **Window → Storage (`⌘⇧I`)** to view and manage your SealSkin home directories and shared files.
+- **Disconnecting vs. Stopping:** Closing a session window (or choosing **Window → Disconnect Session**) disconnects your Mac while leaving the remote session running so you can resume later. To shut a session down completely, stop it from the Library.
+
+### Session Controls (`⌘⇧M`)
+
+Press `⌘⇧M` (or choose **View → Session Controls**) while in a session to open the floating controls panel. From there you can adjust:
+
+- **Input:** Toggle Command-as-Control, remote cursor, smooth trackpad scrolling, Mac input method (IME), or send remote chords like `Alt+Tab` and `Ctrl+Alt+Delete`.
+- **Shortcuts:** Switch between keeping Mac shortcuts active locally or passing them through to the remote session.
+- **Gamepads:** View and manage connected controllers.
+- **Clipboard:** Control clipboard sync between your Mac and the remote desktop.
+- **Printing:** Configure remote printing when enabled by the server.
+- **Screen:** Adjust scaling/HiDPI mode or open a **Second Display** window.
+- **Video:** Switch codec (H.264, H.265, AV1, JPEG), quality, and framerate.
+- **Audio:** Pick your Mac audio output device and control volume/mute.
+- **Microphone & Camera:** Toggle microphone and webcam forwarding (macOS will ask for permission the first time you enable them).
+- **Stats:** View live codec, framerate, bitrate, and latency stats, or toggle the overlay strip over the stream.
+
+### Files (`⌘⇧F`)
+
+Press `⌘⇧F` (or choose **View → Files**) in a session to open the session's **Files** window:
+
+- Browse folders, create new folders (`⌘⇧N`), upload files (`⌘⇧U`), or download selected files.
+- Preview remote files with **Quick Look** (`Space`), copy/paste (`⌘C` / `⌘V`), or drag files directly between Finder and the Files window.
+
+---
+
+## Keyboard Shortcuts
+
+### In a Session Window
+
+| Shortcut | Action |
+|---|---|
+| `⌘⇧M` | Open / close Session Controls |
+| `⌃⌘F` | Toggle Full Screen |
+| `⌘⇧F` | Open / close session Files window |
+| `⌘0` | Show Library window |
+| `⌃⌥⇧Z` | Toggle Capture Pointer (always stays local so you can always exit pointer lock) |
+| `⌘Q` | Quit Skerry (always stays local) |
+
+### In the Library Window
+
+| Shortcut | Action |
+|---|---|
+| `⌘O` | Open a local file in a remote app |
+| `⌘L` | Open a URL in a remote app |
+| `⌘⇧I` | Open Storage |
+
+---
+
+## Troubleshooting
+
+**"Skerry.app is damaged and can't be opened" or Gatekeeper blocks launch**
+Because releases are ad-hoc signed, macOS quarantines downloaded apps. Run:
 ```sh
-brew install --cask --no-quarantine skerry
+xattr -cr /Applications/Skerry.app
 ```
 
-### Option 2: Direct DMG download
+**Can't connect to SealSkin**
+Make sure your server is running SealSkin **0.5.0 or newer**, uses a trusted HTTPS certificate, and has the **Other** client type enabled.
 
-1. Download `Skerry-<version>-arm64.dmg` (and optionally `SHA256SUMS`) from the [Releases](https://github.com/kebot/skerry/releases) page.
-2. (Optional) Verify the checksum:
-   ```sh
-   shasum -a 256 -c SHA256SUMS --ignore-missing
-   ```
-3. Open the `.dmg` and drag **Skerry.app** into `/Applications`.
-4. Remove the macOS Gatekeeper quarantine attribute before first launch:
-   ```sh
-   xattr -cr /Applications/Skerry.app
-   ```
+**Where does Skerry store my data?**
+- Application keys and direct Selkies connections: `~/.config/skerry/config.toml`
+- Per-server preferences: `~/Library/Application Support/Skerry/`
 
-## Quick start
+---
 
-1. Sign in to your SealSkin server's web app, open **Settings → Application Keys**, and create a key. Copy the whole value, including the server address after `@`.
-2. Open **Skerry** and enter your application key. Skerry saves the key in `~/.config/skerry/config.toml` (`0600`) after it connects.
+## Building from Source & Packaging
 
-The server must run SealSkin **0.5.0** or newer, use a trusted HTTPS certificate, and allow the **Other** client type.
-
-For development, Skerry also reads `SEALSKIN_APPLICATION_KEY` from the environment or from `.env` in the working directory. A key supplied this way is used for that run only and is not saved to `~/.config/skerry/config.toml`.
+For development, Skerry also reads `SEALSKIN_APPLICATION_KEY` from the environment or a `.env` file in the working directory (used for that run only and not saved to `~/.config/skerry/config.toml`). GPUI is built with `runtime_shaders`, so the Xcode Metal toolchain is not required.
 
 ```sh
+# Run locally
 cargo run -p skerry-mac
-scripts/bundle.sh   # produces dist/Skerry.app, .dmg, .zip, and SHA256SUMS (ad-hoc signed)
-```
 
-GPUI is built with the `runtime_shaders` feature, so you don't need the Xcode Metal toolchain.
-
-## Release & packaging
-
-`scripts/bundle.sh` builds a release binary and produces:
-
-- `dist/Skerry.app` — macOS application bundle (`dev.kebot.skerry`, wired with `assets/icons/Skerry.icns`)
-- `dist/Skerry-<version>-<arch>.dmg` — compressed UDZO disk image with an `/Applications` drop link
-- `dist/Skerry-<version>-<arch>.zip` — `ditto` archive used by the Homebrew Cask
-- `dist/SHA256SUMS` — SHA-256 checksums for the `.dmg` and `.zip`
-
-Pass `--app-only` to build only `dist/Skerry.app`, or `--target <triple>` to target a specific Rust triple.
-
-### Optional Developer ID signing & notarization
-
-By default, `scripts/bundle.sh` performs free ad-hoc signing (`codesign --force --deep --sign -`). If you later obtain an Apple Developer ID certificate, set these environment variables (locally or as CI secrets) to sign and notarize automatically:
-
-- `CODESIGN_IDENTITY` — e.g. `Developer ID Application: Your Name (TEAMID)`
-- `NOTARYTOOL_PROFILE` — keychain profile created with `xcrun notarytool store-credentials` (or set `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_PASSWORD`)
-
-Pushing a `v*` tag (matching `Cargo.toml`'s version) triggers `.github/workflows/release-macos.yml` (compatible with both GitHub Actions and Forgejo Actions) to verify the workspace, package the macOS `arm64` artifacts, and publish the release.
-
-## Layout
-
-| Path | Contents |
-|------|----------|
-| `crates/skerry-mac` | The Mac app: SealSkin API client, Selkies transport, video decoding, GPUI views, Core Audio playback |
-| `crates/skerry-ui` | Pure `gpui-kit` UI library and standalone interactive preview workbench |
-| `assets/icons/` | Vector app icon source (`Skerry.svg`) and compiled macOS icon (`Skerry.icns`) |
-| `packaging/homebrew/` | Homebrew Cask definition (`Casks/skerry.rb`) |
-| `.github/workflows/` | Tag-triggered macOS release workflow (`release-macos.yml`, GitHub/Forgejo Actions compatible) |
-| `scripts/bundle.sh` | Builds `Skerry.app`, `.dmg`, `.zip`, and `SHA256SUMS` in `dist/` |
-| `scripts/build-icon.sh` | Regenerates `assets/icons/Skerry.icns` from `assets/icons/Skerry.svg` |
-| `.agents/prose/` | OpenProse responsibility contracts (`src/skerry/`) and architecture decision lattice (`architecture/`) |
-
-## Develop
-
-```sh
+# Run tests, lint, and format checks
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
+
+# Build ad-hoc signed dist/Skerry.app, .dmg, .zip, and SHA256SUMS
+scripts/bundle.sh
 ```
+
+`scripts/bundle.sh` supports `--app-only` and `--target <triple>`, as well as optional signing/notarization environment variables (`CODESIGN_IDENTITY`, plus `NOTARYTOOL_PROFILE` or `APPLE_ID`/`APPLE_TEAM_ID`/`APPLE_APP_PASSWORD`). Pushing a `v*` tag matching `Cargo.toml` triggers `.github/workflows/release-macos.yml` to verify, package, and publish the macOS `arm64` release.
