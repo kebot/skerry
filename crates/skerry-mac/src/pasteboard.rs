@@ -162,7 +162,7 @@ fn markup_has_text(html: &str) -> bool {
 const FILE_URL: &str = "public.file-url";
 
 /// The Finder files on the pasteboard (`public.file-url` items), for ⌘V into the Files window
-/// (`ARCH-018`).
+/// (`ARCH-023`).
 pub fn file_paths() -> Vec<std::path::PathBuf> {
     file_paths_from(&general())
 }
@@ -187,7 +187,7 @@ fn file_path(url: &NSString) -> Option<std::path::PathBuf> {
     (!path.is_empty()).then(|| std::path::PathBuf::from(path))
 }
 
-/// Puts `paths` on the pasteboard as files, so ⌘V in Finder copies them (`ARCH-018`).
+/// Puts `paths` on the pasteboard as files, so ⌘V in Finder copies them (`ARCH-023`).
 pub fn write_file_paths(paths: &[std::path::PathBuf]) -> isize {
     write_file_paths_to(&general(), paths)
 }

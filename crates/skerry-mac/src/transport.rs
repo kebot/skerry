@@ -12,7 +12,10 @@ use serde_json::{json, Value};
 use smallvec::smallvec;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{collections::BTreeSet, io::Cursor};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Cursor,
+};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, protocol::WebSocketConfig, Message,
@@ -141,8 +144,74 @@ pub struct StreamSample {
     pub decode_ms: f64,
     pub dropped: u64,
     pub client_codec: Option<Codec>,
-    pub server_encoder: Option<String>,
     pub rtt_ms: Option<f64>,
+    /// The server's `stream_stats` figures, when fresh (`ARCH-019`).
+    pub server: Option<ServerFigures>,
+    /// Stream bytes received since the stats opened.
+    pub received_bytes: u64,
+    /// Key frames requested since the stats opened.
+    pub keyframe_requests: u64,
+}
+
+/// Server figures older than this are left out of a sample (the web's `SERVER_FRESH_MS`).
+const SERVER_FRESH: Duration = Duration::from_secs(3);
+
+/// One `stream_stats` message: its numeric figures by key, and whether the
+/// server is holding frames back.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ServerFigures {
+    pub numbers: BTreeMap<String, f64>,
+    pub throttled: bool,
+}
+
+impl ServerFigures {
+    pub fn parse(stats: &Value) -> Self {
+        let numbers = stats
+            .as_object()
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| Some((key.clone(), value.as_f64()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            numbers,
+            throttled: stats["throttled"].as_bool().unwrap_or(false),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<f64> {
+        self.numbers.get(key).copied()
+    }
+}
+
+/// The server's description of the stream (`stream_info`), as Selkies'
+/// `ScreenCapture::stream_info` sends it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize)]
+#[serde(default)]
+pub struct StreamInfo {
+    pub backend: String,
+    pub capture: String,
+    pub zero_copy: bool,
+    pub zero_copy_available: bool,
+    pub capture_reason: String,
+    pub encoder: String,
+    pub hardware: bool,
+    pub gpu_present: Option<bool>,
+    pub hardware_expected: bool,
+    pub encoder_reason: String,
+    pub codec: String,
+    pub fullcolor: bool,
+    pub bit_depth: Option<u8>,
+    pub striped: bool,
+    pub gpu: String,
+    pub driver: String,
+    pub encode_node: String,
+    pub renderer: String,
+    pub render_node: String,
+    pub render_gpu: String,
+    pub renderer_reason: String,
 }
 
 #[derive(Default)]
@@ -153,11 +222,22 @@ struct Diagnostics {
     codec: Option<Codec>,
     dropped: u64,
     decode: Duration,
-    server_encoder: Option<String>,
     rtt_ms: Option<f64>,
+    stats_on: bool,
+    received_bytes: u64,
+    keyframe_requests: u64,
+    server: Option<(Instant, ServerFigures)>,
 }
 
 impl Diagnostics {
+    /// The stats opened or shut: counts start again from the opening.
+    fn set_stats(&mut self, on: bool) {
+        self.stats_on = on;
+        self.received_bytes = 0;
+        self.keyframe_requests = 0;
+        self.server = None;
+    }
+
     fn sample(&mut self, elapsed: Duration, width: u16, height: u16) -> StreamSample {
         let seconds = elapsed.as_secs_f64();
         StreamSample {
@@ -169,8 +249,14 @@ impl Diagnostics {
                 / std::mem::take(&mut self.packets).max(1) as f64,
             client_codec: self.codec,
             dropped: self.dropped,
-            server_encoder: self.server_encoder.clone(),
             rtt_ms: self.rtt_ms,
+            server: self
+                .server
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() <= SERVER_FRESH)
+                .map(|(_, figures)| figures.clone()),
+            received_bytes: self.received_bytes,
+            keyframe_requests: self.keyframe_requests,
         }
     }
 }
@@ -255,13 +341,14 @@ pub enum SessionEvent {
     Video(bool),
     Settings(Settings),
     Stats(StreamSample),
+    StreamInfo(Box<StreamInfo>),
     ResizeAllowed(bool),
     ScreenPolicy(ScreenPolicy),
     Cursor(RemoteCursor),
     FingerScroll(bool),
     ClipboardPolicy(clipboard::Policy),
     Clipboard(clipboard::Incoming),
-    /// The session's file routes, once the session cookie is in hand (`ARCH-018`).
+    /// The session's file routes, once the session cookie is in hand (`ARCH-023`).
     Files(selkies::SelkiesClient),
     FilePolicy(selkies::Policy),
     Error(String),
@@ -317,6 +404,8 @@ pub enum Input {
     Appearance(bool),
     /// Write this into the session's clipboard (`ARCH-017`).
     Clipboard(clipboard::Content),
+    /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
+    Stats(bool),
 }
 
 pub struct SessionOptions {
@@ -325,6 +414,8 @@ pub struct SessionOptions {
     pub muted: bool,
     pub codec: Codec,
     pub display: Option<DisplayRequest>,
+    /// Whether the Stats section is open, so the session subscribes once ready.
+    pub stats: bool,
 }
 
 struct HardwareVideo {
@@ -450,14 +541,18 @@ pub async fn run(
     let mut frame = Canvas::default();
     let mut jpeg_size = Resolution(1280, 720);
     let mut active_size = jpeg_size;
-    let mut decoded = None;
     let mut changed = false;
+    // The JPEG frame id last gathered, and the one last shown, so a frame whose
+    // stripes straddle two flushes is counted once (`ARCH-021`).
+    let mut jpeg_frame = None;
+    let mut shown_jpeg_frame = None;
     let mut last_frame = None;
     let mut seen_video = false;
     let mut unsupported_video = false;
     let mut audio = None;
     let mut ready = false;
     let mut diagnostics = Diagnostics::default();
+    diagnostics.set_stats(options.stats);
     let mut sample_start = Instant::now();
     let mut ping = None;
     let mut sample_tick = tokio::time::interval_at(
@@ -476,6 +571,9 @@ pub async fn run(
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
     present.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // JPEG stripes gather into one canvas, flushed this often while any changed.
+    let mut jpeg_flush = tokio::time::interval(Duration::from_millis(8));
+    jpeg_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
     let mut clipboard_in = clipboard::Receiver::default();
@@ -487,6 +585,7 @@ pub async fn run(
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
+                    diagnostics.received_bytes += data.len() as u64;
                     match data.first().copied() {
                     Some(3) if data.len() > 6 && hardware.as_ref().is_none_or(|video| !video.decoded) => {
                         frame.resize(jpeg_size.0, jpeg_size.1)?;
@@ -494,6 +593,7 @@ pub async fn run(
                         let id = u16::from_be_bytes([data[2], data[3]]);
                         let y = u16::from_be_bytes([data[4], data[5]]);
                         last_frame = Some(id);
+                        jpeg_frame = Some(id);
                         let started = Instant::now();
                         if frame.stripe(y, &data[6..]).is_some() {
                             diagnostics.packets += 1;
@@ -516,7 +616,10 @@ pub async fn run(
                             if let Some(picture) = packet.as_ref().and_then(|packet| video.decode(packet)) {
                                 frame = Canvas::default();
                                 active_size = Resolution(picture.width, picture.height);
-                                decoded = Some(picture);
+                                // A hardware frame is a whole picture: show it now rather
+                                // than on the next tick, which capped video at 30 fps (`ARCH-021`).
+                                diagnostics.frames += 1;
+                                frames.send_replace(picture);
                                 changed = false;
                                 diagnostics.codec = Some(video.codec);
                                 diagnostics.packets += 1;
@@ -525,6 +628,7 @@ pub async fn run(
                             } else {
                                 diagnostics.dropped += 1;
                                 if video.recover(Instant::now()) {
+                                    diagnostics.keyframe_requests += 1;
                                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                                 }
                             }
@@ -565,7 +669,12 @@ pub async fn run(
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
                         match data["type"].as_str() {
                             Some("stream_info") => {
-                                diagnostics.server_encoder = data["info"]["encoder"].as_str().map(str::to_owned);
+                                if let Ok(info) = serde_json::from_value::<StreamInfo>(data["info"].clone()) {
+                                    let _ = events.send(SessionEvent::StreamInfo(Box::new(info)));
+                                }
+                            }
+                            Some("stream_stats") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
+                                diagnostics.server = Some((Instant::now(), ServerFigures::parse(&data["stats"])));
                             }
                             Some("stream_resolution") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
                                 let width = dimension(&data["width"])?;
@@ -595,7 +704,6 @@ pub async fn run(
                                     if !capabilities.codecs.contains(&codec) {
                                         codec = capabilities.codecs.first().copied().ok_or("This server offers no video codec this Mac can play.")?;
                                         hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
-                                        decoded = None;
                                         seen_video = false;
                                         let command = codec_command(codec);
                                         socket.send(command.into()).await.map_err(|_| disconnected)?;
@@ -612,6 +720,9 @@ pub async fn run(
                                 }
                                 if data["type"] == "server_settings" && !ready {
                                     ready = true;
+                                    if diagnostics.stats_on {
+                                        socket.send("_stats,1".into()).await.map_err(|_| disconnected)?;
+                                    }
                                     if let Some(legacy) = legacy_settings(&capabilities) {
                                         socket.send(legacy.into()).await.map_err(|_| disconnected)?;
                                     }
@@ -717,6 +828,12 @@ pub async fn run(
                         }
                         continue;
                     }
+                    Some(Input::Stats(on)) => {
+                        if on == diagnostics.stats_on { continue; }
+                        diagnostics.set_stats(on);
+                        if !ready { continue; }
+                        format!("_stats,{}", u8::from(on))
+                    }
                     None => { let _ = socket.close(None).await; return Ok(()); }
                 };
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
@@ -740,6 +857,15 @@ pub async fn run(
                     ping = Some(now);
                 }
             }
+            _ = jpeg_flush.tick(), if changed => {
+                let picture = frame.snapshot();
+                if picture.picture.is_some() && jpeg_frame != shown_jpeg_frame {
+                    diagnostics.frames += 1;
+                    shown_jpeg_frame = jpeg_frame;
+                }
+                frames.send_replace(picture);
+                changed = false;
+            }
             _ = present.tick() => {
                 if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
                     if !capabilities.codecs.contains(&Codec::Jpeg) {
@@ -747,17 +873,11 @@ pub async fn run(
                     }
                     codec = Codec::Jpeg;
                     hardware = None;
-                    decoded = None;
                     seen_video = false;
                     unsupported_video = false;
                     video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
                     socket.send(codec_command(codec).into()).await.map_err(|_| disconnected)?;
                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
-                }
-                if let Some(picture) = decoded.take().or_else(|| changed.then(|| frame.snapshot())) {
-                    if picture.picture.is_some() { diagnostics.frames += 1; }
-                    frames.send_replace(picture);
-                    changed = false;
                 }
                 if let Some(id) = last_frame.take() {
                     socket.send(format!("CLIENT_FRAME_ACK {id} 0").into()).await.map_err(|_| disconnected)?;
@@ -890,7 +1010,7 @@ fn transient_status(status: u16) -> bool {
 }
 
 /// The WebSocket handshake for the session, and the session's file routes under the same
-/// cookie (`ARCH-018`), or `None` when they cannot be built.
+/// cookie (`ARCH-023`), or `None` when they cannot be built.
 async fn socket_request(
     url: Url,
 ) -> Result<

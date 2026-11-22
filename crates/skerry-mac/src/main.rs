@@ -16,6 +16,7 @@ mod sealskin;
 mod selkies;
 #[cfg(target_os = "macos")]
 mod settings;
+mod stats;
 #[cfg(target_os = "macos")]
 mod transport;
 #[cfg(target_os = "macos")]

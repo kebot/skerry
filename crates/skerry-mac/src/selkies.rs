@@ -1,4 +1,4 @@
-//! The session's files over Selkies' HTTP file routes (`ARCH-018`), as the web client uses them
+//! The session's files over Selkies' HTTP file routes (`ARCH-023`), as the web client uses them
 //! (Selkies `715df7c` `web/selkies-web-core/lib/file-upload.ts`, `crates/selkies/src/files/`).
 //!
 //! Every route lives on the session origin beside `api/websockets` and is authorized by the

@@ -3,33 +3,28 @@ mod display;
 mod files_model;
 mod files_window;
 mod promise;
+mod session_window;
 
-use crate::input::InputFeature;
 use crate::launch_options::{self, LaunchContext, LaunchSelection};
 use crate::sealskin::{
     Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession, SealSkinClient,
 };
-use crate::settings::{
-    self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
-};
-use crate::transport::{DisplayRequest, Resolution, SessionEvent, SessionOptions, StreamSample};
-use crate::video::Codec;
-use crate::view::NativeSession;
-use controls::ControlPanel;
-use files_window::FilesWindow;
+use crate::settings::{self, Preferences};
+use crate::transport::{DisplayRequest, Resolution};
 use gpui_kit::component::{
     input::{InputEvent, InputState},
     select::SelectEvent,
     ActiveTheme as _, Theme,
 };
 use gpui_kit::{
-    actions, div, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context,
-    Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage, Size, Task,
+    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
+    FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage, Size,
     TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use session_window::{OpenSession, OpenWindows, SessionWindow};
 use skerry_ui::{
     connect::{self, ConnectProps},
     launch_dialog::{
@@ -43,7 +38,7 @@ use smallvec::smallvec;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
@@ -63,102 +58,141 @@ pub fn run() {
         .build()
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
-    gpui_kit::application()
-        .with_assets(skerry_ui::assets::SkerryAssets)
-        .run(move |cx: &mut App| {
-            gpui_kit::init(cx);
-            cx.bind_keys([
-                KeyBinding::new("cmd-q", Quit, None),
-                KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
-                KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
-                KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
-                KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
-                KeyBinding::new("cmd-shift-f", ToggleFiles, None),
-            ]);
-            cx.bind_keys(files_window::key_bindings());
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.set_menus(vec![
-                Menu {
-                    name: APP_NAME.into(),
-                    items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
-                    disabled: false,
-                },
-                // The Files window's commands (`ARCH-018`); AppKit disables them wherever no
-                // Files window has focus.
-                Menu {
-                    name: "File".into(),
-                    items: vec![
-                        MenuItem::action("New Folder", files_window::NewFolder),
-                        MenuItem::action("Upload…", files_window::UploadFiles),
-                        MenuItem::action("Download", files_window::DownloadSelection),
-                        MenuItem::action("Download To…", files_window::DownloadSelectionTo),
-                        MenuItem::separator(),
-                        MenuItem::action("Open", files_window::OpenSelection),
-                        MenuItem::action("Quick Look", files_window::QuickLook),
-                        MenuItem::separator(),
-                        MenuItem::action("Delete…", files_window::DeleteSelection),
-                        MenuItem::separator(),
-                        MenuItem::action("Close Window", files_window::CloseFiles),
-                    ],
-                    disabled: false,
-                },
-                Menu {
-                    name: "Edit".into(),
-                    items: vec![
-                        MenuItem::action("Copy", files_window::CopyToMac),
-                        MenuItem::action("Paste", files_window::PasteFromMac),
-                        MenuItem::action("Select All", files_window::SelectAll),
-                    ],
-                    disabled: false,
-                },
-                Menu {
-                    name: "Go".into(),
-                    items: vec![
-                        MenuItem::action("Back", files_window::GoBack),
-                        MenuItem::action("Forward", files_window::GoForward),
-                        MenuItem::action("Enclosing Folder", files_window::OpenParent),
-                    ],
-                    disabled: false,
-                },
-                Menu {
-                    name: "View".into(),
-                    items: vec![
-                        MenuItem::action("Session Controls", ToggleSessionControls),
-                        MenuItem::action("Files", ToggleFiles),
-                        MenuItem::action("Toggle Full Screen", ToggleFullScreen),
-                    ],
-                    disabled: false,
-                },
-            ]);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-            let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(640.), px(420.))),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(APP_NAME.into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                cx,
-                move |window, cx| cx.new(|cx| Launcher::new(handle.clone(), window, cx)),
-            )
-            .expect("open SealSkin window");
+    let reopen_handle = handle.clone();
+    let application = gpui_kit::application().with_assets(skerry_ui::assets::SkerryAssets);
+    // A Dock-icon click brings the Library back (ARCH-022).
+    application.on_reopen(move |cx| show_library(&reopen_handle, cx));
+    application.run(move |cx: &mut App| {
+        gpui_kit::init(cx);
+        cx.set_global(OpenWindows::default());
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-0", ShowLibrary, None),
+            KeyBinding::new("cmd-shift-m", ToggleSessionControls, None),
+            KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
+            KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
+            KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+            KeyBinding::new("cmd-shift-f", ToggleFiles, None),
+        ]);
+        cx.bind_keys(files_window::key_bindings());
+        // Quitting disconnects every session window; no remote session is stopped.
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        let library_handle = handle.clone();
+        cx.on_action(move |_: &ShowLibrary, cx| show_library(&library_handle, cx));
+        cx.set_menus(vec![
+            Menu {
+                name: APP_NAME.into(),
+                items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
+                disabled: false,
+            },
+            // The Files window's commands (`ARCH-023`); AppKit disables them wherever no
+            // Files window has focus.
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Folder", files_window::NewFolder),
+                    MenuItem::action("Upload…", files_window::UploadFiles),
+                    MenuItem::action("Download", files_window::DownloadSelection),
+                    MenuItem::action("Download To…", files_window::DownloadSelectionTo),
+                    MenuItem::separator(),
+                    MenuItem::action("Open", files_window::OpenSelection),
+                    MenuItem::action("Quick Look", files_window::QuickLook),
+                    MenuItem::separator(),
+                    MenuItem::action("Delete…", files_window::DeleteSelection),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Window", files_window::CloseFiles),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Copy", files_window::CopyToMac),
+                    MenuItem::action("Paste", files_window::PasteFromMac),
+                    MenuItem::action("Select All", files_window::SelectAll),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Go".into(),
+                items: vec![
+                    MenuItem::action("Back", files_window::GoBack),
+                    MenuItem::action("Forward", files_window::GoForward),
+                    MenuItem::action("Enclosing Folder", files_window::OpenParent),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Session Controls", ToggleSessionControls),
+                    MenuItem::action("Files", ToggleFiles),
+                    MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Window".into(),
+                items: vec![
+                    MenuItem::action("Library", ShowLibrary),
+                    MenuItem::action("Disconnect Session", DisconnectSession),
+                ],
+                disabled: false,
+            },
+        ]);
+        cx.on_window_closed(|cx, _| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        show_library(&handle, cx);
+        cx.activate(true);
+    });
+}
+
+/// Brings the Library window forward, or opens a new one if it was closed (`ARCH-022`).
+fn show_library(rt: &Handle, cx: &mut App) {
+    let open = cx
+        .try_global::<OpenWindows>()
+        .and_then(|windows| windows.library.clone())
+        .filter(|(_, launcher)| launcher.upgrade().is_some());
+    if let Some((window, _)) = open {
+        if window
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+        {
             cx.activate(true);
-        });
+            return;
+        }
+    }
+    let rt = rt.clone();
+    let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
+    let opened = gpui_kit::open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(640.), px(420.))),
+            titlebar: Some(TitlebarOptions {
+                title: Some(APP_NAME.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+        move |window, cx| cx.new(|cx| Launcher::new(rt, window, cx)),
+    );
+    if let Ok((window, launcher)) = opened {
+        cx.default_global::<OpenWindows>().library = Some((window, launcher.downgrade()));
+        cx.activate(true);
+    }
 }
 
 actions!(
     sealskin,
     [
         Quit,
+        ShowLibrary,
+        DisconnectSession,
         ToggleSessionControls,
         CloseSessionControls,
         ToggleFullScreen,
@@ -202,34 +236,7 @@ struct Launcher {
     rt: Handle,
     api: Option<SealSkinClient>,
     library: Option<Library>,
-    current: Option<(RemoteSession, NativeSession)>,
-    stream_events: Option<Task<()>>,
-    audio: Option<bool>,
-    audio_unavailable: Option<&'static str>,
-    muted: bool,
-    video: Option<bool>,
-    settings: Option<Settings>,
-    controls: Option<AnyWindowHandle>,
-    /// The session's Files window (`ARCH-018`).
-    files_window: Option<(AnyWindowHandle, Entity<FilesWindow>)>,
-    stats: Option<StreamSample>,
-    display_mode: DisplayMode,
-    retina: bool,
-    scale_locally: bool,
-    screen_policy: ScreenPolicy,
-    clipboard_policy: Option<crate::clipboard::Policy>,
-    /// The session's file routes and what the server allows (`ARCH-018`).
-    pub(crate) file_access: Option<crate::selkies::SelkiesClient>,
-    pub(crate) file_policy: Option<crate::selkies::Policy>,
-    dpi_override: Option<u16>,
-    ui_scale: display::UiScale,
-    applied_resolution: Option<DisplayRequest>,
-    applied_dpi: Option<u16>,
-    resize_allowed: bool,
-    resize_task: Option<Task<()>>,
     preferences: Preferences,
-    pending_settings: VideoSettings,
-    settings_task: Option<Task<()>>,
     key_input: Entity<InputState>,
     search_input: Entity<InputState>,
     selected_filter: String,
@@ -280,32 +287,7 @@ impl Launcher {
             rt,
             api: None,
             library: None,
-            current: None,
-            stream_events: None,
-            audio: None,
-            audio_unavailable: None,
-            muted: false,
-            video: None,
-            settings: None,
-            controls: None,
-            files_window: None,
-            stats: None,
-            display_mode: DisplayMode::default(),
-            retina: true,
-            scale_locally: true,
-            screen_policy: ScreenPolicy::default(),
-            clipboard_policy: None,
-            file_access: None,
-            file_policy: None,
-            dpi_override: None,
-            ui_scale: display::UiScale::default(),
-            applied_resolution: None,
-            applied_dpi: None,
-            resize_allowed: false,
-            resize_task: None,
             preferences: Preferences::default(),
-            pending_settings: VideoSettings::new(),
-            settings_task: None,
             key_input,
             search_input,
             selected_filter: "All".into(),
@@ -323,26 +305,23 @@ impl Launcher {
             busy: None,
             status: None,
         };
-        let owner = cx.weak_entity();
-        window.on_window_should_close(cx, move |_, cx| {
-            let _ = owner.update(cx, |launcher, cx| launcher.remove_controls(cx));
+        // Closing the Library leaves session windows streaming; Window → Library or the
+        // Dock icon opens it again (ARCH-022).
+        window.on_window_should_close(cx, |window, cx| {
+            let closing = Window::window_handle(window);
+            let windows = cx.default_global::<OpenWindows>();
+            if windows
+                .library
+                .as_ref()
+                .is_some_and(|(open, _)| *open == closing)
+            {
+                windows.library = None;
+            }
             true
         });
-        cx.observe_window_bounds(window, |this, window, cx| {
-            // Leaving full screen restores the standard title bar; hide it again so it doesn't
-            // cover the top of the remote picture.
-            if this.current.is_some() {
-                session_chrome(window, false);
-            }
-            this.resize_display(window, cx)
-        })
-        .detach();
         Theme::sync_system_appearance(Some(window), cx);
-        cx.observe_window_appearance(window, |this, window, cx| {
+        cx.observe_window_appearance(window, |_, window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
-            if let Some((_, stream)) = &this.current {
-                stream.set_appearance(dark_appearance(window));
-            }
             cx.notify();
         })
         .detach();
@@ -804,10 +783,17 @@ impl Launcher {
         let Some(api) = &self.api else {
             return;
         };
+        let memory = selection.memory();
         self.preferences
             .launch
-            .insert(app_id.to_string(), selection.memory());
-        if settings::save(api.server(), &self.preferences).is_err() {
+            .insert(app_id.to_string(), memory.clone());
+        let app_id = app_id.to_string();
+        // Re-read first so a session window's saved codec or input changes survive (ARCH-022).
+        if settings::update(api.server(), |p| {
+            p.launch.insert(app_id, memory);
+        })
+        .is_err()
+        {
             self.status = Some("Couldn’t save this app’s launch options.".into());
         }
     }
@@ -849,453 +835,59 @@ impl Launcher {
         cx.notify();
     }
 
+    /// Opens `session` in a window of its own, or brings forward the window already showing
+    /// it: Skerry never opens a second connection to a session it shows (`ARCH-022`).
     fn open_session(
         &mut self,
         session: RemoteSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.display_mode = DisplayMode::default();
-        self.retina = true;
-        self.scale_locally = true;
-        self.dpi_override = None;
-        self.open(session, window, cx);
-    }
-
-    fn open(&mut self, session: RemoteSession, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(api) = &self.api else {
+        let Some(api) = self.api.clone() else {
             return;
         };
-        self.preferences = settings::load(api.server());
-        let preferences = self
-            .preferences
-            .video
-            .iter()
-            .map(|(&key, &value)| (key, value))
-            .collect();
-        let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-        let stream = api.session_url(&session.session_url).map(|url| {
-            NativeSession::open(
-                url,
-                window,
-                cx,
-                &self.rt,
-                SessionOptions {
-                    preferences,
-                    dark: dark_appearance(window),
-                    muted: self.muted,
-                    codec: self.preferences.codec,
-                    display: self
-                        .display_mode
-                        .request(window.viewport_size(), window.scale_factor()),
-                },
-                events,
-            )
-        });
-        match stream {
-            Ok(stream) => {
-                self.audio = None;
-                self.status = None;
-                window.set_window_title(&format!("{} — {APP_NAME}", session.app_name));
-                if !self.scale_locally {
-                    stream.scale_locally(false, cx);
-                }
-                stream.set_input_settings(self.preferences.input, window, cx);
-                stream.set_clipboard_settings(self.preferences.clipboard, window, cx);
-                self.current = Some((session, stream));
-                session_chrome(window, false);
-                // Pin session events to this window (ARCH-015); see `launch_with_options`.
-                let session_window = Window::window_handle(window);
-                self.stream_events = Some(cx.spawn(async move |this, cx| {
-                    while let Some(event) = incoming.recv().await {
-                        if session_window
-                            .update(cx, |_, window, cx| {
-                                this.update(cx, |this, cx| {
-                                    match event {
-                                        SessionEvent::Audio(enabled) => this.audio = Some(enabled),
-                                        SessionEvent::AudioUnavailable(reason) => {
-                                            this.audio_unavailable = Some(reason)
-                                        }
-                                        SessionEvent::Video(enabled) => this.video = Some(enabled),
-                                        SessionEvent::Settings(settings) => {
-                                            this.settings = Some(settings)
-                                        }
-                                        SessionEvent::Stats(sample) => this.stats = Some(sample),
-                                        SessionEvent::FingerScroll(enabled) => {
-                                            if let Some((_, stream)) = &this.current {
-                                                stream.allow_finger_scroll(enabled, cx);
-                                            }
-                                        }
-                                        SessionEvent::Cursor(cursor) => {
-                                            if let Some((_, stream)) = &this.current {
-                                                stream.set_cursor(cursor, window, cx);
-                                            }
-                                        }
-                                        SessionEvent::ScreenPolicy(policy) => {
-                                            this.screen_policy = policy;
-                                            this.resize_display(window, cx);
-                                        }
-                                        SessionEvent::ResizeAllowed(allowed) => {
-                                            if this.resize_allowed != allowed {
-                                                this.resize_allowed = allowed;
-                                                this.applied_resolution = None;
-                                                this.resize_display(window, cx);
-                                            }
-                                        }
-                                        SessionEvent::ClipboardPolicy(policy) => {
-                                            this.clipboard_policy = Some(policy);
-                                            if let Some((_, stream)) = &this.current {
-                                                stream.set_clipboard_policy(policy, window, cx);
-                                            }
-                                        }
-                                        SessionEvent::Files(access) => {
-                                            this.file_access = Some(access);
-                                        }
-                                        SessionEvent::FilePolicy(policy) => {
-                                            this.file_policy = Some(policy);
-                                            if let Some((_, files)) = &this.files_window {
-                                                files.update(cx, |files, cx| {
-                                                    files.set_policy(policy, cx)
-                                                });
-                                            }
-                                        }
-                                        SessionEvent::Clipboard(incoming) => {
-                                            if let Some((_, stream)) = &this.current {
-                                                stream.receive_clipboard(incoming, cx);
-                                            }
-                                        }
-                                        SessionEvent::Error(error) => {
-                                            this.resize_allowed = false;
-                                            this.settings = None;
-                                            this.audio = None;
-                                            this.video = None;
-                                            this.status = Some(error);
-                                        }
-                                    }
-                                    cx.notify();
-                                })
-                            })
-                            .map_or(true, |updated| updated.is_err())
-                        {
-                            break;
-                        }
-                    }
-                }));
-            }
-            Err(error) => self.status = Some(error),
-        }
-        cx.notify();
-    }
-
-    fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((session, _)) = &self.current {
-            let session = session.clone();
-            // Keep Session Controls open across codec / HiDPI reconnects; it re-renders from
-            // the new stream's settings once they arrive.
-            self.end_stream(window, cx, false);
-            self.open(session, window, cx);
-        }
-    }
-
-    fn change_codec(&mut self, codec: Codec, window: &mut Window, cx: &mut Context<Self>) {
-        if !self
-            .settings
-            .as_ref()
-            .is_some_and(|settings| settings.codecs.contains(&codec))
-        {
-            return;
-        }
-        let Some(api) = &self.api else { return };
-        let previous = self.preferences.codec;
-        self.preferences.codec = codec;
-        if settings::save(api.server(), &self.preferences).is_err() {
-            self.preferences.codec = previous;
-            self.status = Some("Couldn’t save the codec preference.".into());
-            cx.notify();
-            return;
-        }
-        self.reconnect(window, cx);
-    }
-
-    fn change_input(
-        &mut self,
-        feature: InputFeature,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        feature.set(&mut self.preferences.input, enabled);
-        if let Some((_, stream)) = &self.current {
-            stream.set_input_settings(self.preferences.input, window, cx);
-        }
-        if let Some(api) = &self.api {
-            if settings::save(api.server(), &self.preferences).is_err() {
-                self.status = Some("Couldn’t save input preferences.".into());
-            }
-        }
-        cx.notify();
-    }
-
-    fn change_clipboard(
-        &mut self,
-        action: crate::clipboard::ClipboardAction,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::clipboard::ClipboardAction;
-        let Some((_, stream)) = &self.current else {
-            return;
-        };
-        match action {
-            ClipboardAction::SendNow => stream.send_clipboard(cx),
-            ClipboardAction::CopyNow => stream.copy_session_clipboard(cx),
-            _ => {
-                self.preferences.clipboard.apply(action);
-                stream.set_clipboard_settings(self.preferences.clipboard, window, cx);
-                if let Some(api) = &self.api {
-                    if settings::save(api.server(), &self.preferences).is_err() {
-                        self.status = Some("Couldn’t save clipboard preferences.".into());
-                    }
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    fn change_setting(&mut self, key: Key, value: u32, cx: &mut Context<Self>) {
-        let Some(value) = self
-            .settings
-            .as_ref()
-            .and_then(|settings| settings.request(key, value))
-        else {
-            return;
-        };
-        self.preferences.video.insert(key, value);
-        self.pending_settings.insert(key, value);
-        let timer = cx.background_executor().timer(Duration::from_millis(180));
-        self.settings_task = Some(cx.spawn(async move |this, cx| {
-            timer.await;
-            let _ = this.update(cx, |this, cx| {
-                this.apply_settings();
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
-    fn apply_settings(&mut self) {
-        if let Some((_, stream)) = &self.current {
-            stream.set_settings(
-                std::mem::take(&mut self.pending_settings)
-                    .into_iter()
-                    .collect(),
-            );
-        }
-        if let Some(api) = &self.api {
-            if settings::save(api.server(), &self.preferences).is_err() {
-                self.status = Some("Couldn’t save video preferences.".into());
-            }
-        }
-    }
-
-    fn reset_settings(&mut self, cx: &mut Context<Self>) {
-        let Some(settings) = &self.settings else {
-            return;
-        };
-        self.settings_task = None;
-        self.preferences.video.clear();
-        self.pending_settings = Key::ALL
-            .into_iter()
-            .filter_map(|key| {
-                let control = settings.get(key)?;
-                settings
-                    .request(key, control.initial)
-                    .map(|value| (key, value))
-            })
-            .collect();
-        self.apply_settings();
-        cx.notify();
-    }
-
-    fn resize_display(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.current.is_none() {
-            return;
-        }
-        let scale = window.scale_factor();
-        let resolution = self
-            .resize_allowed
-            .then(|| self.display_mode.request(window.viewport_size(), scale))
-            .flatten();
-        let dpi = match self.dpi_override {
-            Some(dpi) => self.screen_policy.dpi_choices.contains(&dpi).then_some(dpi),
-            None if !self.screen_policy.dpi_choices.is_empty() => self
-                .screen_policy
-                .display_dpi(self.ui_scale.for_window(window, cx)),
-            None => None,
-        };
-        if resolution == self.applied_resolution && dpi == self.applied_dpi {
-            self.resize_task = None;
-            return;
-        }
-        let timer = cx.background_executor().timer(Duration::from_millis(250));
-        self.resize_task = Some(cx.spawn(async move |this, cx| {
-            timer.await;
-            let _ = this.update(cx, |this, _| {
-                if let Some((_, stream)) = &this.current {
-                    if resolution != this.applied_resolution {
-                        if let Some(request) = resolution {
-                            stream.set_resolution(request);
-                        }
-                        this.applied_resolution = resolution;
-                    }
-                    if dpi != this.applied_dpi {
-                        if let Some(value) = dpi {
-                            stream.set_screen(ScreenChange::Dpi(value));
-                        }
-                        this.applied_dpi = dpi;
-                    }
-                }
-            });
-        }));
-    }
-
-    fn toggle_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.controls.is_some() {
-            self.close_controls(window, cx);
-            return;
-        }
-        if self.current.is_some() {
-            let display_mode = self.display_mode;
-            let owner_window = Window::window_handle(window);
-            let launcher = cx.entity();
-            cx.defer(move |cx| {
-                let _ = owner_window.update(cx, |_, window, cx| {
-                    let result = ControlPanel::open(display_mode, window, launcher.clone(), cx);
-                    launcher.update(cx, |launcher, cx| {
-                        match result {
-                            Ok(panel) => launcher.controls = Some(panel),
-                            Err(_) => {
-                                launcher.status = Some("Couldn’t open Session Controls.".into())
-                            }
-                        }
-                        cx.notify();
-                    });
-                });
-            });
-        }
-    }
-
-    /// Opens the session's Files window, or brings it forward (`ARCH-018`).
-    fn toggle_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((handle, _)) = &self.files_window {
-            if handle
-                .update(cx, |_, window, _| window.activate_window())
-                .is_ok()
-            {
+        let rt = self.rt.clone();
+        let library = window.bounds();
+        // Opened outside this update: GPUI must not render a new window while the Launcher
+        // is leased (ARCH-006).
+        cx.defer(move |cx| {
+            let windows = cx.default_global::<OpenWindows>();
+            if let Some(open) = windows.session_window(&session.session_id) {
+                let _ = open.update(cx, |_, window, _| window.activate_window());
                 return;
             }
-            self.files_window = None;
-        }
-        let Some((session, _)) = &self.current else {
-            return;
-        };
-        let (Some(access), Some(policy)) = (self.file_access.clone(), self.file_policy) else {
-            self.status =
-                Some("Session files are available once the session has connected.".into());
-            cx.notify();
-            return;
-        };
-        if !policy.upload && !policy.download {
-            self.status = Some("The server doesn’t allow file transfers in this session.".into());
-            cx.notify();
-            return;
-        }
-        let title = session.app_name.clone();
-        let storage = self
-            .api
-            .clone()
-            .filter(|_| crate::sealskin::has_storage(&session.home))
-            .map(|client| files_window::Storage {
-                client,
-                home: session.home.clone(),
-            });
-        let rt = self.rt.clone();
-        let owner_window = Window::window_handle(window);
-        let launcher = cx.entity();
-        cx.defer(move |cx| {
-            let _ = owner_window.update(cx, |_, window, cx| {
-                let source = files_window::FilesSource {
-                    title,
-                    selkies: access,
-                    policy,
-                    storage,
-                };
-                let result = FilesWindow::open(source, rt, window, launcher.clone(), cx);
-                launcher.update(cx, |launcher, cx| {
-                    match result {
-                        Ok(files) => launcher.files_window = Some(files),
-                        Err(_) => launcher.status = Some("Couldn’t open Session Files.".into()),
-                    }
-                    cx.notify();
-                });
-            });
-        });
-    }
-
-    fn close_files(&mut self, cx: &mut App) {
-        if let Some((handle, _)) = self.files_window.take() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
-        }
-    }
-
-    fn remove_controls(&mut self, cx: &mut App) -> bool {
-        self.controls.take().is_some_and(|panel| {
-            let _ = panel.update(cx, |_, panel, _| panel.remove_window());
-            true
-        })
-    }
-
-    fn close_controls(&mut self, window: &mut Window, cx: &mut App) {
-        if self.remove_controls(cx) {
-            window.activate_window();
-            if let Some((_, stream)) = &self.current {
-                stream.focus(window, cx);
+            let step = px(28.) * (windows.sessions.len() as f32 + 1.);
+            let bounds = Bounds::new(
+                point(library.origin.x + step, library.origin.y + step),
+                size(
+                    library.size.width.max(px(1080.)),
+                    library.size.height.max(px(720.)),
+                ),
+            );
+            let session_id = session.session_id.clone();
+            let opened = gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(640.), px(420.))),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some(format!("{} — {APP_NAME}", session.app_name).into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                cx,
+                move |window, cx| cx.new(|cx| SessionWindow::new(rt, api, session, window, cx)),
+            );
+            if let Ok((window, entity)) = opened {
+                cx.default_global::<OpenWindows>()
+                    .sessions
+                    .push(OpenSession {
+                        window,
+                        session_id,
+                        entity: entity.downgrade(),
+                    });
             }
-        }
-    }
-
-    fn close_stream(&mut self, window: &mut Window, cx: &mut App) {
-        self.end_stream(window, cx, true);
-    }
-
-    fn end_stream(&mut self, window: &mut Window, cx: &mut App, close_controls: bool) {
-        self.settings_task = None;
-        if !self.pending_settings.is_empty() {
-            self.apply_settings();
-        }
-        self.settings = None;
-        self.screen_policy = ScreenPolicy::default();
-        self.clipboard_policy = None;
-        self.file_access = None;
-        self.file_policy = None;
-        self.close_files(cx);
-        self.applied_resolution = None;
-        self.applied_dpi = None;
-        self.stats = None;
-        self.resize_allowed = false;
-        self.resize_task = None;
-        if close_controls {
-            self.close_controls(window, cx);
-        }
-        self.stream_events = None;
-        if let Some((_, stream)) = self.current.take() {
-            stream.release_focus(window, cx);
-        }
-        self.audio = None;
-        self.audio_unavailable = None;
-        self.video = None;
-        window.set_window_title(APP_NAME);
-        session_chrome(window, true);
+        });
     }
 }
 
@@ -1326,6 +918,10 @@ fn session_chrome(window: &Window, visible: bool) {
     } else {
         NSWindowTitleVisibility::Hidden
     });
+    set_window_buttons(&native, visible);
+}
+
+fn set_window_buttons(native: &NSWindow, visible: bool) {
     for button in [
         NSWindowButton::CloseButton,
         NSWindowButton::MiniaturizeButton,
@@ -1334,6 +930,14 @@ fn session_chrome(window: &Window, visible: bool) {
         if let Some(button) = native.standardWindowButton(button) {
             button.setHidden(!visible);
         }
+    }
+}
+
+/// Shows the close / minimize / zoom buttons over a session's picture while the pointer is
+/// in the window's top-left corner, so a session window can always be closed (`ARCH-022`).
+pub(crate) fn reveal_window_buttons(window: &Window, visible: bool) {
+    if let Some(native) = native_window(window) {
+        set_window_buttons(&native, visible);
     }
 }
 
@@ -1354,42 +958,6 @@ impl Render for Launcher {
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
         let theme = cx.theme().clone();
-        if let Some((_, stream)) = &self.current {
-            return div()
-                .size_full()
-                .relative()
-                .bg(rgb(0x000000))
-                .text_color(theme.foreground)
-                .on_action(cx.listener(|this, _: &ToggleSessionControls, window, cx| {
-                    this.toggle_controls(window, cx);
-                }))
-                .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
-                    this.toggle_files(window, cx);
-                }))
-                .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
-                    this.close_controls(window, cx);
-                    window.toggle_fullscreen();
-                }))
-                .child(stream.view())
-                .when_some(self.status.clone(), |root, status| {
-                    root.child(session::status_banner_with_actions(
-                        &theme,
-                        status,
-                        cx.listener(|this, _, window, cx| {
-                            this.status = None;
-                            this.reconnect(window, cx);
-                            cx.notify();
-                        }),
-                        cx.listener(|this, _, window, cx| {
-                            this.status = None;
-                            this.close_stream(window, cx);
-                            this.muted = false;
-                            this.refresh(cx);
-                            cx.notify();
-                        }),
-                    ))
-                });
-        }
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
             let props = ConnectProps {
                 status: self.status.clone(),

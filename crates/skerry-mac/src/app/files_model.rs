@@ -1,4 +1,4 @@
-//! The Files window's browsing state (`ARCH-018`): the folder shown, its sorted entries, the
+//! The Files window's browsing state (`ARCH-023`): the folder shown, its sorted entries, the
 //! selection, and Back/Forward history. No I/O, so it is tested on its own.
 
 use crate::selkies::{self, Entry};

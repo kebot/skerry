@@ -586,7 +586,7 @@ impl SealSkinClient {
     }
 
     /// The names in one folder of a home's persistent storage, every page of it
-    /// (`GET /companion/api/files/list/<home>`, `ARCH-019`).
+    /// (`GET /companion/api/files/list/<home>`, `ARCH-024`).
     pub async fn storage_names(&self, home: &str, path: &str) -> Result<Vec<String>, String> {
         if !valid_path_segment(home) {
             return Err("Invalid home name.".into());
@@ -611,7 +611,7 @@ impl SealSkinClient {
 
     /// Deletes `paths` (home-relative, `/`-rooted) from a home's persistent storage and waits
     /// for SealSkin's background deletion to finish (`POST /companion/api/files/delete/<home>`,
-    /// then `GET …/delete_status/<task>`, `ARCH-019`).
+    /// then `GET …/delete_status/<task>`, `ARCH-024`).
     pub async fn delete_storage(&self, home: &str, paths: &[String]) -> Result<String, String> {
         if !valid_path_segment(home) {
             return Err("Invalid home name.".into());

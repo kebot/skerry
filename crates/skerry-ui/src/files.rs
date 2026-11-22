@@ -1,4 +1,4 @@
-//! The session's Files window (`ARCH-018`): a Finder-style list of the session's file-manager
+//! The session's Files window (`ARCH-023`): a Finder-style list of the session's file-manager
 //! folder with breadcrumbs, Back/Forward, sorting, multi-select, New Folder, Upload, Download,
 //! Delete, and a transfers list. Pure presentation: `skerry-mac` owns the data, the transfers,
 //! and the macOS bridges (drops, pasteboard, file promises, Quick Look).
@@ -98,7 +98,7 @@ pub struct FilesProps {
     pub can_forward: bool,
     pub can_upload: bool,
     pub can_download: bool,
-    /// The session's home can delete what is selected (`ARCH-019`).
+    /// The session's home can delete what is selected (`ARCH-024`).
     pub can_delete: bool,
     pub rows: Rc<Vec<FileRow>>,
     pub sort: SortColumn,

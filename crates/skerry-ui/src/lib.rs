@@ -6,3 +6,4 @@ pub mod files;
 pub mod launch_dialog;
 pub mod library;
 pub mod session;
+pub mod stats;

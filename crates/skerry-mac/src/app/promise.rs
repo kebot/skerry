@@ -1,4 +1,4 @@
-//! Dragging session files out to Finder as file promises (`ARCH-018`).
+//! Dragging session files out to Finder as file promises (`ARCH-023`).
 //!
 //! GPUI's own external drag carries only files that already exist on the Mac, so the Files
 //! window starts an AppKit dragging session itself: one `NSFilePromiseProvider` per selected

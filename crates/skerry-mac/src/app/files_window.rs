@@ -1,4 +1,4 @@
-//! The session's Files window (`ARCH-018`): the Selkies file-manager folder as a Finder-style
+//! The session's Files window (`ARCH-023`): the Selkies file-manager folder as a Finder-style
 //! list, with uploads from Finder drops, ⌘V, and Upload…, and downloads to `~/Downloads`, a
 //! chosen folder, the Mac clipboard (⌘C), Open, Quick Look, and drags to Finder.
 //!
@@ -6,7 +6,8 @@
 //! window redraws from, and are cancelled when the window closes or the session ends.
 
 use super::files_model::{size_label, Browser};
-use super::{promise, Launcher};
+use super::promise;
+use super::session_window::SessionWindow;
 use crate::pasteboard;
 use crate::selkies::{self, Entry, Policy, Progress, SelkiesClient};
 use gpui_kit::component::{
@@ -145,7 +146,7 @@ pub(super) struct FilesWindow {
     access: SelkiesClient,
     policy: Policy,
     rt: Handle,
-    /// The session's home in SealSkin's persistent storage, which can delete (`ARCH-019`).
+    /// The session's home in SealSkin's persistent storage, which can delete (`ARCH-024`).
     storage: Option<Storage>,
     /// The home's `Desktop` was seen to be the folder Selkies serves, so deleting there is safe.
     storage_matches: bool,
@@ -175,18 +176,21 @@ pub(super) struct FilesWindow {
     dragging: bool,
     /// The list scrolls to the selection after a keyboard move only, not on every redraw.
     reveal_selection: bool,
-    /// The session window and its Launcher, told when this window closes.
-    owner: (AnyWindowHandle, gpui_kit::WeakEntity<Launcher>),
+    /// The session window, told when this window closes.
+    owner: (AnyWindowHandle, gpui_kit::WeakEntity<SessionWindow>),
 }
 
-/// Drops the Launcher's hold on the Files window, so the window's entity (and with it every
+/// Drops the session window's hold on the Files window, so the window's entity (and with it every
 /// transfer, `Drop`) goes once the window does. Needed for every way the window closes:
 /// `remove_window` (⌘W, session end) does not run `on_window_should_close`.
-fn release_from_launcher(owner: &(AnyWindowHandle, gpui_kit::WeakEntity<Launcher>), cx: &mut App) {
-    let (launcher_window, launcher) = owner.clone();
+fn release_from_session(
+    owner: &(AnyWindowHandle, gpui_kit::WeakEntity<SessionWindow>),
+    cx: &mut App,
+) {
+    let (session_window, session) = owner.clone();
     cx.defer(move |cx| {
-        let _ = launcher_window.update(cx, |_, _, cx| {
-            let _ = launcher.update(cx, |launcher, _| launcher.files_window = None);
+        let _ = session_window.update(cx, |_, _, cx| {
+            let _ = session.update(cx, |session, _| session.files_window = None);
         });
     });
 }
@@ -212,7 +216,7 @@ impl FilesWindow {
         source: FilesSource,
         rt: Handle,
         window: &Window,
-        launcher: Entity<Launcher>,
+        session: Entity<SessionWindow>,
         cx: &mut App,
     ) -> gpui_kit::Result<(AnyWindowHandle, Entity<Self>)> {
         let FilesSource {
@@ -221,7 +225,7 @@ impl FilesWindow {
             policy,
             storage,
         } = source;
-        let owner = (window.window_handle(), launcher.downgrade());
+        let owner = (window.window_handle(), session.downgrade());
         let bounds = window.bounds();
         let window_size = size(px(760.), px(520.));
         let origin = point(bounds.left() + px(40.), bounds.top() + px(60.));
@@ -291,7 +295,7 @@ impl FilesWindow {
                     this
                 });
                 window.on_window_should_close(cx, move |_, cx| {
-                    release_from_launcher(&close_owner, cx);
+                    release_from_session(&close_owner, cx);
                     true
                 });
                 let focus = view.read(cx).list_focus.clone();
@@ -691,7 +695,7 @@ impl FilesWindow {
         cx.notify();
     }
 
-    // ---- Delete (SealSkin storage, `ARCH-019`) -------------------------------------------
+    // ---- Delete (SealSkin storage, `ARCH-024`) -------------------------------------------
 
     /// Compares the Selkies root with the home's `Desktop`: Selkies keeps where its folder is
     /// to itself, so Delete is offered only once the two are seen to list the same names.
@@ -1163,7 +1167,7 @@ impl Render for FilesWindow {
                 cx.listener(|this, _: &UploadFiles, window, cx| this.choose_uploads(window, cx)),
             )
             .on_action(cx.listener(|this, _: &CloseFiles, window, cx| {
-                release_from_launcher(&this.owner, cx);
+                release_from_session(&this.owner, cx);
                 window.remove_window();
             }))
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
@@ -1485,7 +1489,7 @@ async fn download_job(
 }
 
 /// Where the Selkies file-manager folder sits in a SealSkin home: `FILE_MANAGER_PATH` defaults
-/// to `~/Desktop`, and SealSkin mounts the home as `~` (`ARCH-019`).
+/// to `~/Desktop`, and SealSkin mounts the home as `~` (`ARCH-024`).
 const STORAGE_ROOT: &str = "/Desktop";
 
 /// A Selkies root-relative path as a home path for SealSkin.
@@ -1506,7 +1510,7 @@ fn same_folder<'a>(
     ours == theirs
 }
 
-/// What a Files window works through (`ARCH-019`): the Selkies session's own file routes, and,
+/// What a Files window works through (`ARCH-024`): the Selkies session's own file routes, and,
 /// for a SealSkin session with a home, that home's storage, which can also delete.
 pub(super) struct FilesSource {
     pub title: String,

@@ -14,10 +14,9 @@ id: 067NC4KG01SKERRY0000000003
 <!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-06 concept="account-and-key-recovery" question="Display signed-in account, effective capabilities, and usage limits; offer browser wake flow for dormant keys and replacement prompt for expired/revoked keys." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-08 concept="multi-window-sessions" question="Keep the Launcher in its own window and open every launched or resumed remote session in its own dedicated gpui-kit macOS window (including multiple concurrent sessions of the same app), with per-session Session Controls and independent teardown." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-09 concept="native-mac-app-presence" question="Give remote applications first-class native macOS app presence (separate Dock icon, Cmd+Tab entry, and optionally Spotlight); decide in a future compose turn between generated .app shims, automatic per-app helper processes, or both, and how relaunch behaves when a session is already running." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-10 concept="launcher-polish" question="Disconnect Server forgets the saved key with no confirmation; at wide windows (~2540 pt) about 75 % of the Library is empty; Refresh and Copy link give little lasting feedback; 'Started … ago' only updates on render. Add a confirm (or rename to Sign Out), a max content width or denser grid, and transient success toasts?" -->
-<!-- compose:unresolved id=ARCH-GAP-LS-12 concept="direct-selkies-sessions" question="Connect to a standalone Selkies server with no SealSkin in front (its own Basic or secure-mode token login), through `SelkiesClient` alone: what the Library shows for it, and how the credential is kept. The Files window already needs only `SelkiesClient` (`ARCH-019`); Delete stays SealSkin-only." -->
+<!-- compose:unresolved id=ARCH-GAP-LS-13 concept="direct-selkies-sessions" question="Connect to a standalone Selkies server with no SealSkin in front (its own Basic or secure-mode token login), through `SelkiesClient` alone: what the Library shows for it, and how the credential is kept. The Files window already needs only `SelkiesClient` (`ARCH-024`); Delete stays SealSkin-only." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-11 concept="control-plane-hardening" question="Icon fetches send the Bearer application key to any same-origin `logo` path, which shares an origin with container-served session paths (matters once per-session origins land, ARCH-GAP-LS-07); preference and key writes fsync on the main thread; Library render clones the app list once and the session list twice per frame. Use an unauthenticated client (or an allow-listed prefix) for logos, move writes to the Tokio runtime, and borrow instead of cloning?" -->
 
 ### Goal
@@ -52,10 +51,15 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - Manage SealSkin homes, shared files, direct remote file opening without re-upload, and public share links (password, expiry, revocation).
 - `cluster-and-session-origins` (unresolved: `ARCH-GAP-LS-07`):
   - Automatic/pool/node placement, storage move evaluation, and validated token handoff to isolated per-session origins without leaking the control-plane application key.
-- `multi-window-sessions` (design settled in `ARCH-010`; implementation unresolved: `ARCH-GAP-LS-08`):
+- `multi-window-sessions` (settled: `ARCH-010`, `ARCH-022`):
+  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it.
+  - The Library window can close while sessions stream. **Window → Library** (`cmd-0`) or a Dock-icon click reopens it. `cmd-q` disconnects every session and stops none.
+  - A session window closes from its own buttons, which appear when the pointer enters the top-left corner, or from **Window → Disconnect Session**. `cmd-w` stays with the remote app.
+  - Codec, input, clipboard, and video changes are saved per server for the next session. Other open windows keep theirs. Display mode, resolution, mute, and pause are per window.
   - Always-separate-windows model: the Launcher stays in its own window while every launched or resumed session opens in its own dedicated native macOS (`gpui-kit` `Root`-wrapped) window, allowing multiple concurrent sessions—including multiple sessions of the same application—side by side.
 - `native-mac-app-presence` (in scope via `ARCH-010`; mechanism & relaunch behavior unresolved: `ARCH-GAP-LS-09`):
   - First-class native macOS app identity per remote application (separate Dock icon, `Cmd+Tab` entry, and optionally Spotlight). Delivery mechanism (generated `.app` shims vs. automatic per-app helper processes vs. both) and relaunch behavior when a session is already running are deferred to a future compose turn.
+  - Prior art (research only, `ARCH-010` note): Pake compiles a Tauri app per site, which is too heavy for Skerry. Its unused prebuilt `runtime-template` points to a stub-`.app`-copy approach.
 
 Facets:
 - `auth-and-account` — config-file credentials (`~/.config/skerry/config.toml`), account limits, dormant/expired recovery, and cluster origin security
@@ -69,7 +73,7 @@ Postconditions:
 - Skerry never loads a library from, launches on, or saves a key for a SealSkin server whose `GET /companion/api/ui/version` is older than `0.5.0` or cannot be read (`ARCH-009`).
 - Application keys never leave the SealSkin control-plane origin and are never sent to untrusted redirects.
 - Disconnecting never stops a remote session; stopping a session requires explicit user confirmation explaining cleanroom data loss.
-- Once `ARCH-GAP-LS-08` is implemented, closing a session window disconnects only that session and never stops the remote container or closes the Launcher or other open session windows.
+- Closing a session window disconnects only that session and never stops the remote container or closes the Launcher or other open session windows.
 
 ### Continuity
 

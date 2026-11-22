@@ -1,9 +1,10 @@
+use super::session_window::SessionWindow;
 use super::{
-    native_window, CloseSessionControls, DisplayMode, Launcher, ToggleFullScreen,
-    ToggleSessionControls,
+    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, ToggleSessionControls,
 };
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
+use crate::stats;
 use crate::video::Codec;
 use crate::{
     settings::{Key, ScreenChange},
@@ -15,20 +16,20 @@ use gpui_kit::component::{
     ActiveTheme as _,
 };
 use gpui_kit::{
-    div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, Context, Entity, FocusHandle,
-    TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
+    div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem, Context, Entity,
+    FocusHandle, Task, TitlebarOptions, Window, WindowBounds, WindowKind, WindowOptions,
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
     self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
-    ScreenProps, Section, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    ScreenProps, Section, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
 
 #[derive(Clone)]
 struct Owner {
     window: AnyWindowHandle,
-    launcher: Entity<Launcher>,
+    session: Entity<SessionWindow>,
 }
 
 pub(super) struct ControlPanel {
@@ -38,6 +39,8 @@ pub(super) struct ControlPanel {
     ui: ControlsUiState,
     width: Entity<InputState>,
     height: Entity<InputState>,
+    /// Shows the Stats copy button's check, and clears it after a moment.
+    copied: Option<Task<()>>,
 }
 
 #[derive(Clone, Copy)]
@@ -61,18 +64,19 @@ enum Command {
     Input(InputFeature, bool),
     Chord(RemoteChord),
     Clipboard(ClipboardAction),
+    Stats(bool),
 }
 
 impl ControlPanel {
     pub(super) fn open(
         display_mode: DisplayMode,
         window: &Window,
-        launcher: Entity<Launcher>,
+        session: Entity<SessionWindow>,
         cx: &mut App,
     ) -> gpui_kit::Result<AnyWindowHandle> {
         let owner = Owner {
             window: window.window_handle(),
-            launcher: launcher.clone(),
+            session: session.clone(),
         };
         let parent = native_window(window);
         let fullscreen = window.is_fullscreen();
@@ -127,7 +131,7 @@ impl ControlPanel {
                 }
                 let panel_owner = owner.clone();
                 let panel = cx.new(|cx: &mut Context<Self>| {
-                    cx.observe(&launcher, |_, _, cx| cx.notify()).detach();
+                    cx.observe(&session, |_, _, cx| cx.notify()).detach();
                     let initial = if let DisplayMode::Fixed(size) = display_mode {
                         Some(size)
                     } else {
@@ -179,6 +183,7 @@ impl ControlPanel {
                         ui: ControlsUiState::default(),
                         width,
                         height,
+                        copied: None,
                     }
                 });
                 window.on_window_should_close(cx, move |_, cx| {
@@ -197,87 +202,84 @@ impl ControlPanel {
     fn send(owner: Owner, command: Command, cx: &mut App) {
         cx.defer(move |cx| {
             let _ = owner.window.update(cx, |_, window, cx| {
-                owner.launcher.update(cx, |launcher, cx| {
+                owner.session.update(cx, |session, cx| {
                     match command {
-                        Command::Close => launcher.close_controls(window, cx),
+                        Command::Close => session.close_controls(window, cx),
                         Command::FullScreen => {
-                            launcher.close_controls(window, cx);
+                            session.close_controls(window, cx);
                             window.toggle_fullscreen();
                         }
-                        Command::Reconnect => launcher.reconnect(window, cx),
-                        Command::Files => launcher.toggle_files(window, cx),
-                        Command::Disconnect => {
-                            launcher.close_stream(window, cx);
-                            launcher.muted = false;
-                            launcher.refresh(cx);
-                        }
+                        Command::Reconnect => session.reconnect(window, cx),
+                        Command::Files => session.toggle_files(window, cx),
+                        Command::Disconnect => session.disconnect(window, cx),
                         Command::Audio(enabled) => {
-                            if let Some((_, stream)) = &launcher.current {
-                                launcher.muted = !enabled;
+                            if let Some(stream) = &session.current {
+                                session.muted = !enabled;
                                 stream.set_audio(enabled);
                             }
                         }
                         Command::Playback(enabled) => {
-                            if let Some((_, stream)) = &launcher.current {
+                            if let Some(stream) = &session.current {
                                 stream.set_video(enabled);
                             }
                         }
                         Command::Display(mode) => {
-                            launcher.resize_task = None;
-                            launcher.display_mode = mode;
-                            launcher.resize_display(window, cx);
+                            session.resize_task = None;
+                            session.display_mode = mode;
+                            session.resize_display(window, cx);
                         }
                         Command::Retina(enabled) => {
-                            launcher.retina = enabled;
-                            launcher.resize_task = None;
-                            launcher.display_mode = if enabled {
+                            session.retina = enabled;
+                            session.resize_task = None;
+                            session.display_mode = if enabled {
                                 DisplayMode::Retina
                             } else {
                                 DisplayMode::MatchWindow
                             };
-                            launcher.resize_display(window, cx);
+                            session.resize_display(window, cx);
                         }
                         Command::ResetToWindow => {
-                            launcher.dpi_override = None;
-                            launcher.display_mode = if launcher.retina {
+                            session.dpi_override = None;
+                            session.display_mode = if session.retina {
                                 DisplayMode::Retina
                             } else {
                                 DisplayMode::MatchWindow
                             };
-                            launcher.resize_display(window, cx);
+                            session.resize_display(window, cx);
                         }
                         Command::UiScaling(dpi) => {
-                            launcher.dpi_override = dpi;
-                            launcher.resize_display(window, cx);
+                            session.dpi_override = dpi;
+                            session.resize_display(window, cx);
                         }
                         Command::ScaleLocally(enabled) => {
-                            launcher.scale_locally = enabled;
-                            if let Some((_, stream)) = &launcher.current {
+                            session.scale_locally = enabled;
+                            if let Some(stream) = &session.current {
                                 stream.scale_locally(enabled, cx);
                             }
                         }
                         Command::Screen(change) => {
-                            if let Some((_, stream)) = &launcher.current {
+                            if let Some(stream) = &session.current {
                                 stream.set_screen(change);
                             }
                             if matches!(change, ScreenChange::Alignment(_)) {
                                 // Selkies aligns whatever size it last stored, which may not be
                                 // the size this window wants; re-request ours so it is aligned
                                 // (or restored exactly when alignment is turned off).
-                                launcher.applied_resolution = None;
-                                launcher.resize_display(window, cx);
+                                session.applied_resolution = None;
+                                session.resize_display(window, cx);
                             }
                         }
-                        Command::Codec(codec) => launcher.change_codec(codec, window, cx),
-                        Command::Setting(key, value) => launcher.change_setting(key, value, cx),
-                        Command::ResetVideo => launcher.reset_settings(cx),
+                        Command::Codec(codec) => session.change_codec(codec, window, cx),
+                        Command::Setting(key, value) => session.change_setting(key, value, cx),
+                        Command::ResetVideo => session.reset_settings(cx),
                         Command::Input(feature, enabled) => {
-                            launcher.change_input(feature, enabled, window, cx)
+                            session.change_input(feature, enabled, window, cx)
                         }
-                        Command::Clipboard(action) => launcher.change_clipboard(action, window, cx),
+                        Command::Clipboard(action) => session.change_clipboard(action, window, cx),
+                        Command::Stats(open) => session.set_stats_open(open),
                         Command::Chord(chord) => {
-                            launcher.close_controls(window, cx);
-                            if let Some((_, stream)) = &launcher.current {
+                            session.close_controls(window, cx);
+                            if let Some(stream) = &session.current {
                                 stream.send_chord(chord, cx);
                             }
                         }
@@ -294,7 +296,6 @@ impl ControlPanel {
         let resolution = Resolution::manual(&width_val, &height_val);
         self.ui.size_error = resolution.is_none();
         if let Some(size) = resolution {
-            self.ui.picker = None;
             self.width
                 .update(cx, |s, cx| s.set_value(size.0.to_string(), window, cx));
             self.height
@@ -321,12 +322,11 @@ impl ControlPanel {
                     Section::Clipboard => self.ui.clipboard_open = !self.ui.clipboard_open,
                     Section::Screen => self.ui.screen_open = !self.ui.screen_open,
                     Section::Video => self.ui.video_open = !self.ui.video_open,
-                    Section::Stats => self.ui.stats_open = !self.ui.stats_open,
+                    Section::Stats => {
+                        self.ui.stats_open = !self.ui.stats_open;
+                        Self::send(self.owner.clone(), Command::Stats(self.ui.stats_open), cx);
+                    }
                 }
-                cx.notify();
-            }
-            ControlsAction::TogglePicker(picker) => {
-                self.ui.picker = (self.ui.picker != Some(picker)).then_some(picker);
                 cx.notify();
             }
             ControlsAction::SetAudio(enabled) => {
@@ -393,18 +393,15 @@ impl ControlPanel {
                 cx,
             ),
             ControlsAction::SetUiScaling(dpi) => {
-                self.ui.picker = None;
                 Self::send(self.owner.clone(), Command::UiScaling(dpi), cx);
                 cx.notify();
             }
             ControlsAction::SetFitMode => {
-                self.ui.picker = None;
                 self.ui.size_error = false;
                 Self::send(self.owner.clone(), Command::Display(DisplayMode::Fit), cx);
                 cx.notify();
             }
             ControlsAction::SelectPreset(w, h) => {
-                self.ui.picker = None;
                 self.width
                     .update(cx, |s, cx| s.set_value(w.to_string(), window, cx));
                 self.height
@@ -413,7 +410,6 @@ impl ControlPanel {
             }
             ControlsAction::ApplyManualSize => self.apply_size(window, cx),
             ControlsAction::ResetToWindow => {
-                self.ui.picker = None;
                 self.width.update(cx, |s, cx| s.set_value("", window, cx));
                 self.height.update(cx, |s, cx| s.set_value("", window, cx));
                 self.ui.size_error = false;
@@ -425,9 +421,9 @@ impl ControlPanel {
             }
             ControlsAction::SelectCodec(wire) => {
                 if let Some(choice) = Codec::ALL.into_iter().find(|c| c.wire() == wire) {
-                    let launcher = self.owner.launcher.read(cx);
-                    let preferred = launcher.preferences.codec;
-                    let current = current_codec(launcher);
+                    let session = self.owner.session.read(cx);
+                    let preferred = session.preferences.codec;
+                    let current = current_codec(session);
                     if choice != current || choice != preferred {
                         Self::send(self.owner.clone(), Command::Codec(choice), cx);
                     }
@@ -439,11 +435,27 @@ impl ControlPanel {
                 }
             }
             ControlsAction::ResetVideo => Self::send(self.owner.clone(), Command::ResetVideo, cx),
+            ControlsAction::CopyStats => {
+                let session = self.owner.session.read(cx);
+                let history: Vec<_> = session.stats_history.iter().cloned().collect();
+                let text = stats::report(session.stream_info.as_ref(), &history);
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.copied = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1500))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.copied = None;
+                        cx.notify();
+                    });
+                }));
+                cx.notify();
+            }
         }
     }
 
-    fn build_props(&self, launcher: &Launcher, app_name: String) -> ControlsProps {
-        let input = launcher.preferences.input;
+    fn build_props(&self, session: &SessionWindow, app_name: String) -> ControlsProps {
+        let input = session.preferences.input;
         let input_switches = InputFeature::ALL
             .into_iter()
             .map(|(feature, label)| SwitchItem {
@@ -464,8 +476,8 @@ impl ControlPanel {
             },
         ];
 
-        let clipboard = launcher.clipboard_policy.map(|policy| {
-            let settings = launcher.preferences.clipboard;
+        let clipboard = session.clipboard_policy.map(|policy| {
+            let settings = session.preferences.clipboard;
             ClipboardProps {
                 send: policy.inbound.then_some(settings.send),
                 receive: policy.outbound.then_some(settings.receive),
@@ -474,86 +486,60 @@ impl ControlPanel {
             }
         });
 
-        let preset_label = match launcher.display_mode {
+        let preset_label = match session.display_mode {
             DisplayMode::Fixed(size) => format!("{} × {}", size.0, size.1),
             DisplayMode::Fit => "Keep Remote Size".into(),
             DisplayMode::MatchWindow | DisplayMode::Retina => "Match Window".into(),
         };
 
         let screen = ScreenProps {
-            resize_allowed: launcher.resize_allowed,
-            matching_retina: launcher.display_mode == DisplayMode::Retina,
-            alignment: launcher.screen_policy.alignment,
-            dpi: launcher.screen_policy.dpi,
-            dpi_choices: launcher.screen_policy.dpi_choices.clone(),
-            dpi_override: launcher.dpi_override,
+            resize_allowed: session.resize_allowed,
+            matching_retina: session.display_mode == DisplayMode::Retina,
+            alignment: session.screen_policy.alignment,
+            dpi: session.screen_policy.dpi,
+            dpi_choices: session.screen_policy.dpi_choices.clone(),
+            dpi_override: session.dpi_override,
             preset_label,
-            scale_locally: launcher.scale_locally,
+            scale_locally: session.scale_locally,
         };
 
-        let video_settings = build_video_props(launcher);
+        let video_settings = build_video_props(session);
 
-        let diagnostics = launcher.stats.as_ref().map(|stats| {
-            vec![
-                (
-                    "Resolution".into(),
-                    format!("{}×{}", stats.width, stats.height),
-                ),
-                ("Client FPS".into(), format!("{:.0}", stats.fps)),
-                (
-                    "Received bitrate".into(),
-                    format!("{:.2} Mb/s", stats.wire_mbps),
-                ),
-                (
-                    "Decode time".into(),
-                    format!("{:.1} ms per packet", stats.decode_ms),
-                ),
-                ("Rejected packets".into(), stats.dropped.to_string()),
-                (
-                    "Round trip".into(),
-                    stats
-                        .rtt_ms
-                        .map_or("Unavailable".into(), |ms| format!("{ms:.0} ms")),
-                ),
-                ("Transport".into(), "WebSocket".into()),
-                (
-                    "Client decoder".into(),
-                    stats
-                        .client_codec
-                        .map_or("Waiting for video", Codec::decoder_label)
-                        .into(),
-                ),
-                (
-                    "Server encoder".into(),
-                    stats.server_encoder.clone().unwrap_or("Unreported".into()),
-                ),
-            ]
+        let stats = (!session.stats_history.is_empty()).then(|| {
+            let history: Vec<_> = session.stats_history.iter().cloned().collect();
+            let framerate = session
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.get(Key::Fps))
+                .map_or(0, |fps| fps.current);
+            stats::props(session.stream_info.as_ref(), &history, framerate)
         });
 
         ControlsProps {
             app_name,
             fullscreen: self.fullscreen,
-            audio: launcher.audio,
-            video: launcher.video,
-            audio_unavailable: launcher.audio_unavailable.map(str::to_string),
+            audio: session.audio,
+            video: session.video,
+            audio_unavailable: session.audio_unavailable.map(str::to_string),
             input_switches,
             chords,
             clipboard,
             screen,
             video_settings,
-            diagnostics,
+            stats,
+            stats_copied: self.copied.is_some(),
         }
     }
 }
 
-fn current_codec(launcher: &Launcher) -> Codec {
-    let preferred = launcher.preferences.codec;
-    launcher
+fn current_codec(session: &SessionWindow) -> Codec {
+    let preferred = session.preferences.codec;
+    session
         .stats
         .as_ref()
         .and_then(|stats| stats.client_codec)
         .unwrap_or_else(|| {
-            launcher
+            session
                 .settings
                 .as_ref()
                 .map(|settings| {
@@ -567,10 +553,10 @@ fn current_codec(launcher: &Launcher) -> Codec {
         })
 }
 
-fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
-    let settings = launcher.settings.as_ref()?;
-    let codec = current_codec(launcher);
-    let rate = launcher
+fn build_video_props(session: &SessionWindow) -> Option<VideoProps> {
+    let settings = session.settings.as_ref()?;
+    let codec = current_codec(session);
+    let rate = session
         .pending_settings
         .get(&Key::RateControl)
         .copied()
@@ -590,17 +576,22 @@ fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
         })
         .collect();
 
-    let preferred_notice = (launcher.preferences.codec != codec)
-        .then(|| format!("Preferred codec · {}", launcher.preferences.codec.label()));
+    let preferred_notice = (session.preferences.codec != codec)
+        .then(|| format!("Preferred codec · {}", session.preferences.codec.label()));
 
     let rows = [
-        (Key::Fps, "Frame rate cap", "fps", 5),
-        (Key::Jpeg, "JPEG quality", "%", 5),
-        (Key::PaintOver, "Improve still areas", "", 1),
-        (Key::PaintQuality, "Still image quality", "%", 5),
-        (Key::RateControl, "Rate control", "", 1),
-        (Key::Bitrate, "Target bitrate", "kbps", 500),
-        (Key::Crf, "Constant quality (CRF)", "", 1),
+        (Key::Fps, "Frames per second", SliderUnit::Fps, 1),
+        (Key::Jpeg, "Base Quality", SliderUnit::Plain, 1),
+        (Key::PaintOver, "Use Paint-Overs", SliderUnit::Plain, 1),
+        (Key::PaintQuality, "Paintover Quality", SliderUnit::Plain, 1),
+        (
+            Key::RateControl,
+            "Encoder Rate Control Mode",
+            SliderUnit::Plain,
+            1,
+        ),
+        (Key::Bitrate, "Video Bitrate", SliderUnit::Kbps, 500),
+        (Key::Crf, "Video CRF", SliderUnit::Plain, 1),
     ]
     .into_iter()
     .filter_map(|(key, label, unit, step)| {
@@ -615,31 +606,36 @@ fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
             return None;
         }
         let control_spec = settings.get(key)?;
-        let value = launcher
+        let value = session
             .pending_settings
             .get(&key)
             .copied()
             .unwrap_or(control_spec.current);
 
         let control = if key == Key::PaintOver {
-            VideoSettingControl::Toggle {
+            VideoSettingControl::Switch {
                 enabled: value != 0,
-                can_toggle: settings.request(key, 1 - value).is_some(),
+                locked: settings.request(key, 1 - value).is_none(),
             }
         } else if key == Key::RateControl {
-            let options = [(0, "CBR"), (1, "CRF")]
+            let options: Vec<_> = [(0, "CBR (Constant Bitrate)"), (1, "CRF (Constant Quality)")]
                 .into_iter()
                 .filter(|&(mode, _)| value == mode || settings.request(key, mode).is_some())
-                .map(|(mode, label)| (mode, label.to_string(), value == mode))
+                .map(|(mode, label)| (mode, label.to_string()))
                 .collect();
-            VideoSettingControl::Segmented { options }
+            VideoSettingControl::Select {
+                value,
+                locked: options.len() <= 1,
+                options,
+            }
         } else {
-            let dec = value.saturating_sub(step).max(control_spec.min);
-            let inc = value.saturating_add(step).min(control_spec.max);
-            VideoSettingControl::Stepper {
-                display: format!("{value} {unit}").trim_end().to_owned(),
-                decrement: (dec != value && settings.request(key, dec).is_some()).then_some(dec),
-                increment: (inc != value && settings.request(key, inc).is_some()).then_some(inc),
+            VideoSettingControl::Slider {
+                value,
+                min: control_spec.min,
+                max: control_spec.max,
+                step,
+                unit,
+                locked: settings.request(key, value).is_none(),
             }
         };
 
@@ -659,7 +655,7 @@ fn build_video_props(launcher: &Launcher) -> Option<VideoProps> {
 }
 
 impl Render for ControlPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let owner = self.owner.clone();
         let close_owner = owner.clone();
@@ -684,11 +680,11 @@ impl Render for ControlPanel {
                 Self::send(fullscreen_owner.clone(), Command::FullScreen, cx)
             });
 
-        let launcher = owner.launcher.read(cx);
-        let Some((session, _)) = &launcher.current else {
+        let session = owner.session.read(cx);
+        if session.current.is_none() {
             return root;
-        };
-        let props = self.build_props(launcher, session.app_name.clone());
+        }
+        let props = self.build_props(session, session.remote.app_name.clone());
         let entity = cx.entity().clone();
         let handler = Rc::new(
             move |action: ControlsAction, window: &mut Window, cx: &mut App| {
@@ -697,12 +693,13 @@ impl Render for ControlPanel {
         );
 
         root.child(controls::render(
-            &theme,
             &props,
             &self.ui,
             &self.width,
             &self.height,
             handler,
+            window,
+            cx,
         ))
     }
 }
