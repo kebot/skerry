@@ -6,6 +6,7 @@ mod files_backend;
 mod files_model;
 mod files_window;
 mod gamepads;
+mod media_capture;
 mod promise;
 mod selkies_home;
 mod session_window;
@@ -114,6 +115,8 @@ pub fn run() {
         // GPUI gives quit futures 200 ms; wait for queued writes (at most 1 s) before
         // returning one.
         cx.on_app_quit(|cx| {
+            // Microphones go off before anything that may hold the quit (`ARCH-038`).
+            quit_capture_stop(cx);
             cx.global::<WriteQueue>()
                 .flush_blocking(Duration::from_secs(1));
             quit_print_cleanup(cx);
@@ -3000,6 +3003,23 @@ impl Launcher {
                     });
             }
         });
+    }
+}
+
+/// Stops every session window's capture devices.
+fn quit_capture_stop(cx: &mut App) {
+    let sessions: Vec<_> = cx
+        .try_global::<OpenWindows>()
+        .map(|windows| {
+            windows
+                .sessions
+                .iter()
+                .map(|open| open.entity.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for session in sessions.iter().filter_map(|session| session.upgrade()) {
+        session.update(cx, |session, _| session.stop_capture());
     }
 }
 

@@ -85,6 +85,18 @@ subject: skerry
   - A pattern bomb sent to the worker is killed within 3.5 s and the next icon still decodes.
   - All 137 fixture icons decode.
   - The GitHub client sends no credentials and refuses http.
+- Task K tests pass (`ARCH-036`):
+  - Link, token and URL parsing: `+` becomes a space, userinfo and port 0 are refused, the loopback rules hold, and the token is dropped on a host change.
+  - The pin covers the leaf only, with trusted roots loaded. A mismatch is fatal on HTTP and on the session socket.
+  - The secure-mode probe, the 401 classification, and Close 4001 being fatal.
+  - The `[[selkies]]` rules: at most 5, `0600`, the pin kept with Remember off.
+  - `cargo tree -i aws-lc-rs` is empty.
+- Task M1 tests pass (`ARCH-038`):
+  - The real AudioToolbox Opus encoder makes 20 ms packets that decode with `opus-decoder`.
+  - Error, StartupTimeout, Reconnect, close, quit, and closing the sink all stop capture.
+  - Late permission answers are ignored, and the start policy runs only once.
+  - Reconnects don't stack threads while permission is undetermined.
+  - The 10 s no-traffic timeout fires.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

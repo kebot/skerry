@@ -5,8 +5,10 @@ use super::{
     ToggleSessionControls, ToggleStatsStrip,
 };
 use crate::audio::{OutputProblem, OutputStatus};
+use crate::capture::{CapturePolicy, DeviceState, Phase, Subject};
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
+use crate::microphone::{MicProblem, MicStatus};
 use crate::persist::WriteQueue;
 use crate::print_jobs::{self, JobState, PrintJobs};
 use crate::settings::{AudioBitrate, ControlsSections};
@@ -29,10 +31,11 @@ use gpui_kit::{
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
-    self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem, ClipboardProps,
-    CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps, PadRow, PadStatus,
-    PrintJobRow, PrintRowKind, PrintingProps, ScreenProps, Section, ShortcutRow, ShortcutsProps,
-    SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureDeviceProps, CaptureProps,
+    CaptureSubject, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps,
+    ControlsUiState, GamepadsProps, MediaCaptureProps, PadRow, PadStatus, PrintJobRow,
+    PrintRowKind, PrintingProps, ScreenProps, Section, ShortcutRow, ShortcutsProps, SliderUnit,
+    SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use skerry_ui::session::PrintJobAction;
 use std::rc::Rc;
@@ -92,6 +95,9 @@ enum Command {
     GamepadRumble(bool),
     AutoPrint(bool),
     PrintJob(u64, PrintJobAction),
+    Microphone(bool),
+    InputDevice(Option<String>),
+    PrivacySettings(Subject),
 }
 
 impl ControlPanel {
@@ -341,6 +347,11 @@ impl ControlPanel {
                         Command::GamepadInput(on) => session.change_gamepad_input(on, cx),
                         Command::GamepadRumble(on) => session.change_gamepad_rumble(on, cx),
                         Command::AutoPrint(on) => session.set_auto_print(on, cx),
+                        Command::Microphone(on) => session.set_microphone(on, cx),
+                        Command::InputDevice(uid) => session.change_input_device(uid, cx),
+                        Command::PrivacySettings(subject) => {
+                            session.open_privacy_settings(subject, cx)
+                        }
                         Command::PrintJob(id, action) => {
                             session.print_action(id, action, window, cx)
                         }
@@ -525,6 +536,17 @@ impl ControlPanel {
             ControlsAction::PrintJob(id, action) => {
                 Self::send(self.owner.clone(), Command::PrintJob(id, action), cx)
             }
+            ControlsAction::SetMicrophone(on) => {
+                Self::send(self.owner.clone(), Command::Microphone(on), cx)
+            }
+            ControlsAction::SelectInputDevice(uid) => {
+                Self::send(self.owner.clone(), Command::InputDevice(uid), cx)
+            }
+            ControlsAction::OpenPrivacySettings(CaptureSubject::Microphone) => Self::send(
+                self.owner.clone(),
+                Command::PrivacySettings(Subject::Microphone),
+                cx,
+            ),
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -638,6 +660,24 @@ impl ControlPanel {
             stats::props(session.stream_info.as_ref(), &history, framerate)
         });
 
+        // The capturing thread's status while it runs; otherwise the card's own device list
+        // (the thread exists only while capturing, `ARCH-038`).
+        let mic_card_status = session.capture.mic_status.clone().or_else(|| {
+            let (devices, default_uid) = session.capture.devices();
+            (session.capture.inputs.is_some() || session.capture.encoder_unavailable).then(|| {
+                MicStatus {
+                    devices,
+                    default_uid,
+                    chosen: session.preferences.audio.input_device.clone(),
+                    problem: session
+                        .capture
+                        .encoder_unavailable
+                        .then_some(MicProblem::EncoderUnavailable),
+                    ..MicStatus::default()
+                }
+            })
+        });
+
         ControlsProps {
             app_name,
             fullscreen: self.fullscreen,
@@ -666,9 +706,139 @@ impl ControlPanel {
                     std::time::Instant::now(),
                 )
             }),
+            media_capture: media_capture_props(&MicInputs {
+                policy: session.capture.state.policy,
+                state: session.capture.state.mic,
+                status: mic_card_status.as_ref(),
+                chosen: session.preferences.audio.input_device.as_deref(),
+                saved_name: session.preferences.audio.input_device_name.as_deref(),
+            }),
             apps_available: session.apps_available(),
         }
     }
+}
+
+/// What the Microphone & Camera card's microphone group is drawn from (`ARCH-038`).
+struct MicInputs<'a> {
+    /// The stream's capture policy; `None` until its first `server_settings`.
+    policy: Option<CapturePolicy>,
+    state: DeviceState,
+    status: Option<&'a MicStatus>,
+    /// The saved choice (its UID); `None` is System Default.
+    chosen: Option<&'a str>,
+    saved_name: Option<&'a str>,
+}
+
+/// The Microphone & Camera card: hidden until the server's settings arrive.
+fn media_capture_props(mic: &MicInputs) -> Option<MediaCaptureProps> {
+    let policy = mic.policy?.mic;
+    let permitted = policy.permitted && !mic.state.server_disabled;
+    let status = mic.status.filter(|_| permitted);
+    let live = status.is_some_and(|status| status.live);
+    let problem = status.and_then(|status| status.problem);
+    let state = mic.state;
+    let detail = if !permitted {
+        Some(if policy.audio_off {
+            "Unavailable while session audio is off"
+        } else {
+            "Turned off by the server"
+        })
+    } else if live {
+        Some("Sending to the session")
+    } else if state.denied {
+        Some("SealSkin Native isn’t allowed to use the microphone.")
+    } else {
+        match state.phase {
+            Phase::Asking => Some("Waiting for permission…"),
+            Phase::On => Some(match problem {
+                Some(MicProblem::NoDevice) => "No microphone found.",
+                Some(MicProblem::Failed) => "The microphone stopped. Trying again…",
+                _ => "Starting…",
+            }),
+            Phase::Off => match problem {
+                Some(MicProblem::EncoderUnavailable) => {
+                    Some("This Mac can’t encode microphone audio.")
+                }
+                _ if !state.touched && policy.on_demand && !state.refused => {
+                    Some("Starts when an app in the session listens")
+                }
+                _ if policy.locked => Some("Set by the server"),
+                _ => None,
+            },
+        }
+    };
+    // The menu, as E's Output Device menu.
+    let default_label = status.and_then(MicStatus::default_device).map_or_else(
+        || "System Default".to_string(),
+        |device| format!("System Default ({})", device.name),
+    );
+    let mut devices = vec![AudioOutputItem {
+        uid: None,
+        label: default_label.clone(),
+        checked: mic.chosen.is_none() || status.is_none(),
+        connected: true,
+    }];
+    let mut device_label = default_label;
+    let mut note = None;
+    if let Some(status) = status {
+        devices.extend(status.devices.iter().map(|device| AudioOutputItem {
+            uid: Some(device.uid.clone()),
+            label: device.name.clone(),
+            checked: mic.chosen == Some(device.uid.as_str()),
+            connected: true,
+        }));
+        let saved = mic.saved_name.unwrap_or("Saved Microphone");
+        match mic.chosen {
+            Some(uid) if status.device(uid).is_none() => {
+                let missing = format!("{saved} (not connected)");
+                devices.push(AudioOutputItem {
+                    uid: Some(uid.to_string()),
+                    label: missing.clone(),
+                    checked: true,
+                    connected: false,
+                });
+                device_label = missing;
+                let subject = mic
+                    .saved_name
+                    .map_or_else(|| "Your saved microphone".to_string(), str::to_string);
+                let using = status
+                    .active
+                    .as_ref()
+                    .or_else(|| status.default_device())
+                    .or_else(|| status.devices.first());
+                note = Some(match using {
+                    Some(device) => format!(
+                        "{subject} isn’t connected. Using {} until it’s back.",
+                        device.name
+                    ),
+                    None => {
+                        format!("{subject} isn’t connected, and no other microphone is available.")
+                    }
+                });
+            }
+            Some(uid) => {
+                if let Some(device) = status.device(uid) {
+                    device_label = device.name.clone();
+                }
+            }
+            None => {}
+        }
+    }
+    Some(MediaCaptureProps {
+        mic: CaptureDeviceProps {
+            on: permitted && (state.wanted || live),
+            locked: !permitted || policy.locked,
+            picker_locked: !permitted,
+            live,
+            detail: detail.map(str::to_string),
+            denied: permitted && state.denied && !live,
+            device_label,
+            devices,
+            note,
+            level: (live || state.phase == Phase::On)
+                .then(|| status.map_or(0, |status| status.level)),
+        },
+    })
 }
 
 /// The Gamepads card (`ARCH-032`): hidden until the server's settings arrive, and when
@@ -1503,5 +1673,188 @@ mod tests {
         let saved = Some(at(-600.));
         // Content can scroll 300 but the person moved to 100.
         assert_eq!(next_scroll(saved, true, at(-100.), px(300.)), (None, None));
+    }
+
+    fn mic_policy(permitted: bool, locked: bool) -> CapturePolicy {
+        CapturePolicy {
+            mic: crate::capture::DevicePolicy {
+                permitted,
+                locked,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn mic_status(live: bool) -> MicStatus {
+        MicStatus {
+            devices: vec![
+                device("BuiltIn", "MacBook Pro Microphone"),
+                device("Shure", "Shure MV7"),
+            ],
+            default_uid: Some("BuiltIn".into()),
+            active: live.then(|| device("BuiltIn", "MacBook Pro Microphone")),
+            live,
+            level: 3,
+            ..MicStatus::default()
+        }
+    }
+
+    fn mic_inputs(policy: Option<CapturePolicy>, status: Option<&MicStatus>) -> MicInputs<'_> {
+        MicInputs {
+            policy,
+            state: DeviceState::default(),
+            status,
+            chosen: None,
+            saved_name: None,
+        }
+    }
+
+    #[test]
+    fn media_capture_props_hidden_until_policy() {
+        let status = mic_status(false);
+        assert!(media_capture_props(&mic_inputs(None, Some(&status))).is_none());
+        let props = media_capture_props(&mic_inputs(Some(mic_policy(true, false)), Some(&status)))
+            .unwrap()
+            .mic;
+        assert!(!props.on && !props.locked && !props.live);
+        assert_eq!(props.detail, None, "plain Off says nothing more");
+        assert_eq!(
+            props.device_label,
+            "System Default (MacBook Pro Microphone)"
+        );
+        assert_eq!(props.devices.len(), 3);
+        assert_eq!(props.level, None);
+    }
+
+    #[test]
+    fn media_capture_props_locked_off_disabled_with_note() {
+        let props = media_capture_props(&mic_inputs(Some(mic_policy(false, true)), None))
+            .unwrap()
+            .mic;
+        assert!(props.locked && props.picker_locked && !props.on);
+        assert_eq!(props.detail.as_deref(), Some("Turned off by the server"));
+        assert_eq!(props.device_label, "System Default");
+        let mut audio_off = mic_policy(false, false);
+        audio_off.mic.audio_off = true;
+        let props = media_capture_props(&mic_inputs(Some(audio_off), None))
+            .unwrap()
+            .mic;
+        assert_eq!(
+            props.detail.as_deref(),
+            Some("Unavailable while session audio is off")
+        );
+        // MICROPHONE_DISABLED reads the same.
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), None);
+        inputs.state.server_disabled = true;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.locked);
+        assert_eq!(props.detail.as_deref(), Some("Turned off by the server"));
+    }
+
+    #[test]
+    fn locked_on_mic_switch_disabled_but_picker_works() {
+        let status = mic_status(false);
+        let props = media_capture_props(&mic_inputs(Some(mic_policy(true, true)), Some(&status)))
+            .unwrap()
+            .mic;
+        assert!(props.locked && !props.picker_locked);
+        // Locked on starts like on_start (M-QA-3): the switch shows on, and disabled.
+        let status = mic_status(true);
+        let mut inputs = mic_inputs(Some(mic_policy(true, true)), Some(&status));
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::On;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.on && props.locked && props.live);
+    }
+
+    #[test]
+    fn media_capture_props_denied_shows_privacy_button() {
+        let status = mic_status(false);
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.state.denied = true;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.denied && !props.on && !props.locked);
+        assert_eq!(
+            props.detail.as_deref(),
+            Some("SealSkin Native isn’t allowed to use the microphone.")
+        );
+        // A refusal of a start the server asked for stays silent.
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.state.refused = true;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(!props.denied && props.detail.is_none());
+    }
+
+    #[test]
+    fn media_capture_props_missing_device_greyed() {
+        let status = MicStatus {
+            chosen: Some("USB".into()),
+            problem: Some(MicProblem::ChosenMissing),
+            ..mic_status(true)
+        };
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.chosen = Some("USB");
+        inputs.saved_name = Some("USB Mic");
+        let props = media_capture_props(&inputs).unwrap().mic;
+        let last = props.devices.last().unwrap();
+        assert_eq!(last.label, "USB Mic (not connected)");
+        assert!(last.checked && !last.connected);
+        assert_eq!(props.device_label, "USB Mic (not connected)");
+        assert_eq!(
+            props.note.as_deref(),
+            Some("USB Mic isn’t connected. Using MacBook Pro Microphone until it’s back.")
+        );
+        // Nothing else to use.
+        let empty = MicStatus {
+            chosen: Some("USB".into()),
+            ..MicStatus::default()
+        };
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&empty));
+        inputs.chosen = Some("USB");
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert_eq!(
+            props.note.as_deref(),
+            Some("Your saved microphone isn’t connected, and no other microphone is available.")
+        );
+    }
+
+    #[test]
+    fn media_capture_props_follow_the_open_device() {
+        // Wanted and opening: the switch is on, the meter shows, no badge dot yet.
+        let status = mic_status(false);
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), Some(&status));
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::On;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.on && !props.live);
+        assert_eq!(props.detail.as_deref(), Some("Starting…"));
+        assert_eq!(props.level, Some(3));
+        // Open: the dot and "Sending to the session", even before packets are delivered.
+        let status = mic_status(true);
+        inputs.status = Some(&status);
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.live);
+        assert_eq!(props.detail.as_deref(), Some("Sending to the session"));
+        assert_eq!(
+            skerry_ui::controls::media_capture_header(&MediaCaptureProps { mic: props }),
+            Some("Microphone on")
+        );
+        // Demand, untouched: says when it starts.
+        let mut demand = mic_policy(true, false);
+        demand.mic.on_demand = true;
+        let props = media_capture_props(&mic_inputs(Some(demand), None))
+            .unwrap()
+            .mic;
+        assert_eq!(
+            props.detail.as_deref(),
+            Some("Starts when an app in the session listens")
+        );
+        // Asking.
+        let mut inputs = mic_inputs(Some(mic_policy(true, false)), None);
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::Asking;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.on);
+        assert_eq!(props.detail.as_deref(), Some("Waiting for permission…"));
     }
 }

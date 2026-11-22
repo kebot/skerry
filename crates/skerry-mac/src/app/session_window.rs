@@ -8,6 +8,7 @@ use super::apps_window::{self, AppsOwner, AppsWindow};
 use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::gamepads::Gamepads;
+use super::media_capture::{self, MediaCapture};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher, ToggleApps,
     ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSessionControls, ToggleStatsStrip,
@@ -261,6 +262,8 @@ pub(super) struct SessionWindow {
     pub(super) print_reveal: u64,
     /// Session Controls opens with Printing expanded.
     pub(super) print_reveal_on_open: bool,
+    /// The microphone uplink (`ARCH-038`): stopped on every stream end.
+    pub(super) capture: MediaCapture,
 }
 
 /// Auto-open skips documents larger than this: PDFKit reads them on the main thread.
@@ -340,6 +343,7 @@ impl SessionWindow {
             print_ticking: false,
             print_reveal: 0,
             print_reveal_on_open: false,
+            capture: MediaCapture::default(),
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -440,6 +444,8 @@ impl SessionWindow {
             .map(|(&key, &value)| (key, value))
             .collect();
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
+        // A fresh frame channel for this stream's microphone (`ARCH-038`).
+        let mic = self.capture.begin_stream(events.clone());
         let stream = self.api.target(&self.remote).map(|url| {
             NativeSession::open(
                 url,
@@ -464,6 +470,7 @@ impl SessionWindow {
                     },
                     audio_output: self.preferences.audio.output_device.clone(),
                     audio_bitrate: self.preferences.audio.bitrate,
+                    mic: Some(mic),
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -505,12 +512,18 @@ impl SessionWindow {
                     }
                 }));
             }
-            Err(error) => self.status = Some(error),
+            Err(error) => {
+                self.capture.stop();
+                self.status = Some(error);
+            }
         }
         cx.notify();
     }
 
     fn handle_event(&mut self, event: SessionEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A server close, a network drop or the start-up timeout ends the stream without
+        // `end_stream`: the microphone stops here (`ARCH-038`).
+        self.capture.on_stream_event(&event);
         match event {
             SessionEvent::Audio(enabled) => self.audio = Some(enabled),
             SessionEvent::AudioUnavailable(reason) => self.audio_unavailable = Some(reason),
@@ -643,6 +656,26 @@ impl SessionWindow {
                 if let Some(hint) = hint {
                     self.show_capture_hint(hint, cx);
                 }
+            }
+            SessionEvent::CapturePolicy(policy) => {
+                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                let effects = self.capture.on_policy(policy, auth);
+                self.apply_capture(effects, cx);
+                self.ensure_input_ticker(cx);
+            }
+            SessionEvent::Capture(reply) => {
+                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                let effects = self.capture.state.on_reply(reply, auth);
+                self.apply_capture(effects, cx);
+            }
+            SessionEvent::MicStatus(id, status) => {
+                let effects = self.capture.on_status(id, status);
+                self.apply_capture(effects, cx);
+                self.remember_input_name(cx);
+            }
+            SessionEvent::MicInputs(id, inputs) => {
+                self.capture.on_inputs(id, inputs);
+                self.remember_input_name(cx);
             }
             SessionEvent::Error(error) => {
                 // The capture ends with the stream; the banner explains, so no hint.
@@ -818,6 +851,118 @@ impl SessionWindow {
             stream.set_audio_bitrate(bps);
         }
         cx.notify();
+    }
+
+    /// Runs capture effects; a permission prompt answers back through this window's handle,
+    /// and an answer that no longer matches its request starts nothing (`ARCH-038`).
+    fn apply_capture(&mut self, effects: Vec<crate::capture::Effect>, cx: &mut Context<Self>) {
+        let chosen = self.preferences.audio.input_device.clone();
+        for ticket in self.capture.apply(effects, chosen) {
+            let answer = crate::permissions::request(ticket.subject);
+            let handle = self.window;
+            cx.spawn(async move |this, cx| {
+                let granted = answer.await.unwrap_or(false);
+                let _ = handle.update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        let effects = this.capture.state.on_auth(ticket, granted);
+                        this.apply_capture(effects, cx);
+                        cx.notify();
+                    })
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Lists inputs for the card once a second while the server allows the microphone, from
+    /// plain CoreAudio properties: never the microphone itself (M-QA-1).
+    fn ensure_input_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.capture.ticker.is_some() || !self.capture.wants_inputs() {
+            return;
+        }
+        let handle = self.window;
+        self.capture.ticker = Some(cx.spawn(async move |this, cx| loop {
+            let keep = handle
+                .update(cx, |_, _, cx| {
+                    this.update(cx, |this, _| {
+                        let wanted = this.capture.wants_inputs();
+                        if wanted {
+                            this.capture.refresh_inputs();
+                        }
+                        wanted
+                    })
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+        }));
+    }
+
+    /// The **Microphone** switch (`ARCH-038`). Never saved: a later launch never opens the
+    /// microphone because of a past choice.
+    pub(super) fn set_microphone(&mut self, on: bool, cx: &mut Context<Self>) {
+        let subject = crate::capture::Subject::Microphone;
+        let auth = crate::permissions::authorization(subject);
+        let effects = self.capture.state.on_toggle(subject, on, auth);
+        self.apply_capture(effects, cx);
+        cx.notify();
+    }
+
+    /// Captures from `uid` (`None` follows the Mac) and saves the choice with its name.
+    pub(super) fn change_input_device(&mut self, uid: Option<String>, cx: &mut Context<Self>) {
+        let name = uid.as_deref().and_then(|uid| {
+            self.capture
+                .devices()
+                .0
+                .into_iter()
+                .find(|device| device.uid == uid)
+                .map(|device| device.name)
+        });
+        let audio = &mut self.preferences.audio;
+        audio.input_device = uid.clone();
+        audio.input_device_name = name.clone();
+        self.save(
+            "the input device",
+            move |p| {
+                p.audio.input_device = uid.clone();
+                p.audio.input_device_name = name.clone();
+            },
+            cx,
+        );
+        self.capture
+            .set_input(self.preferences.audio.input_device.clone());
+        cx.notify();
+    }
+
+    /// **Open Privacy Settings** after macOS refused the device.
+    pub(super) fn open_privacy_settings(&self, subject: crate::capture::Subject, cx: &App) {
+        cx.open_url(crate::permissions::privacy_settings_url(subject));
+    }
+
+    /// Stops this window's capture devices (app quit).
+    pub(super) fn stop_capture(&mut self) {
+        self.capture.stop();
+    }
+
+    fn remember_input_name(&mut self, cx: &mut Context<Self>) {
+        let audio = &self.preferences.audio;
+        let Some(name) = media_capture::input_name_to_save(
+            audio.input_device.as_deref(),
+            audio.input_device_name.as_deref(),
+            &self.capture.devices().0,
+        ) else {
+            return;
+        };
+        self.preferences.audio.input_device_name = Some(name.clone());
+        self.save(
+            "the input device",
+            move |p| p.audio.input_device_name = Some(name.clone()),
+            cx,
+        );
     }
 
     /// Keeps the chosen device's latest name, saving only when it changed so status churn
@@ -1426,6 +1571,8 @@ impl SessionWindow {
 
     /// Ends the stream; the window and Session Controls stay for a reconnect.
     fn end_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The microphone goes off first, before anything else of the stream (`ARCH-038`).
+        self.capture.stop();
         self.settings_task = None;
         if !self.pending_settings.is_empty() {
             self.apply_settings(cx);
@@ -1986,6 +2133,11 @@ impl Render for SessionWindow {
             // desktop and the trigger under it (`ARCH-031`).
             .when_some(strip, |root, strip| {
                 root.child(skerry_ui::stats::strip(&strip, viewport_width))
+            })
+            // Top left below the traffic lights while the microphone is open, no hitbox
+            // (`ARCH-038`).
+            .when_some(self.capture.badge(), |root, mic| {
+                root.child(session::capture_badge(mic, print_top))
             })
             // Bottom-centre with no hitbox, above a bottom banner when one shows (`ARCH-032`).
             .when_some(self.capture_hint, |root, (hint, generation, fading)| {

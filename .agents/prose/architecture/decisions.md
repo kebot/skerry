@@ -674,6 +674,80 @@
   - The live server runs a Selkies older than c72a9ef7, so install, remove and the job console were not verified live, nor anything on screen (screen locked).
 - **Affected Rust:** `apps.rs` (new), `app/apps_window.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `main.rs`, `crates/skerry-ui/src/{apps.rs,controls.rs,assets.rs}`, `examples/preview.rs`, `tests/fixtures/proot-apps-metadata.yml`.
 
+## ARCH-036: Direct Selkies Servers, with No SealSkin in Front (Task K)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-13`. Amends `ARCH-011`: Selkies credentials may be kept in the same `0600` `config.toml`, never the Keychain. Amends `ARCH-009`: Selkies reports no version, so a capability gate replaces the version check.
+- **Process:** plan → design → review (15 required changes) → build (live against a stock Selkies container) → QA (2 medium, against a local container) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-k-selkies`.
+- **Decision:**
+  - **Connect card:**
+    - A **SealSkin | Selkies** segmented switch. The Selkies side takes the browser link (a `#token=` fragment becomes the token, form-decoded), Username and Password, **Remember on this Mac**, and Recent Servers (up to 5).
+    - Pasting a URL into the key field switches tabs.
+    - Prior art: Windows App splits Add Workspace from Add PC, and Finder ⌘K and Screens use an address plus a login.
+  - **Storage:**
+    - Up to 5 `[[selkies]]` entries in `config.toml` (`url`, `username`, `password`, `token`, `certificate_sha256`), newest first, with a warning comment above them. One connection at a time.
+    - The certificate pin is saved even when Remember is off.
+    - `SKERRY_SELKIES_URL` and `SKERRY_SELKIES_CERT_SHA256` are read for QA and never saved.
+  - **Auth:**
+    - Basic is sent on HTTP requests and on the WebSocket upgrade.
+    - A token goes as Bearer on HTTP, and on the WebSocket as the `selkies.token.` subprotocol plus the `selkies_token` cookie.
+    - No Origin header.
+    - Credentials go only to the configured origin, with redirects off.
+    - A token from a pasted link is dropped when the address changes to another host.
+  - **TLS:**
+    - HTTPS only, plus plain HTTP to loopback. Userinfo is refused, and so is port 0.
+    - The stock container makes its own certificate per install, so it is trusted once by the SHA-256 of the leaf certificate. The Mac's trust store and the hostname are checked first, and the pin is tried only when they fail. Signature checks stay with rustls.
+    - A changed certificate is a hard stop, including on the session socket, with no startup retry.
+    - rustls is ring-only (`default-features = false`, `builder_with_provider`). aws-lc-rs would make the SealSkin tungstenite connector panic, and `cargo tree -i aws-lc-rs` is empty.
+  - **Gate (instead of a version):**
+    - The open `GET /api/status` must report WebSockets mode. A WebRTC-mode server is refused with its own message.
+    - A logged-in `GET /api/sessions` must answer 200.
+    - `GET /api/tokens` tells secure mode apart, and a token is checked on its own with Bearer.
+    - 401 bodies tell "needs password", "wrong password" and "needs token" apart.
+    - A bad token shows up as Close 4001 after the upgrade, and is fatal, never retried.
+  - **Library:**
+    - One Desktop card (thumbnail from `api/screenshot`, login, an "n other pages connected" line, Files, and Open).
+    - A server menu replaces the account menu: Address, Login, Security, Mode, Open in Browser (hidden for token-only servers), Disconnect, and Forget This Server… with a confirmation.
+    - There is no catalog, launch, Stop, account, or Delete in Files (`ARCH-024`).
+    - Stream, audio, clipboard, gamepads, printing, Files and Apps all work.
+    - Connecting to Selkies clears SealSkin recovery, pending saves, and queued opens. A Refresh that fails on the network keeps the Library.
+- **QA (live):** run against `selkies/desktop:latest-ubuntu26.04` on a remote host by the builder, and against a local Selkies 2.2.1 by QA. Basic login, Files, first-trust pin, pin mismatch after the container was recreated, wrong password, needs-token, bad token (no loop), WebRTC refused, and the `config.toml` rules all passed. No request reached another origin under redirects. Not verified: anything on screen (screen locked), and plain-HTTP localhost.
+- **Affected Rust:** `tls.rs` (new), `config_store.rs` (moved out of `sealskin.rs`), `direct.rs`, `app/selkies_home.rs`, `selkies.rs`, `transport.rs`, `persist.rs`, `app.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{connect.rs,selkies.rs,library.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
+## ARCH-038: Microphone Uplink (Task M1; camera follows as M2)
+
+- **Status:** microphone settled 2026-11-22. `ARCH-GAP-DC-05` stays open for the camera (M2, being built) until M2 merges. Echo cancellation is deferred, as `ARCH-GAP-DC-16`.
+- **Process:** plan → design → review (which cut echo cancellation and split the camera off) → build → QA (1 high, 1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-m-mic`.
+- **Protocol (Selkies 715df7c):**
+  - Binary `0x02` plus one Opus packet: mono, 24 kHz, 20 ms.
+  - The server sends `MICROPHONE_DISABLED` and `CAPTURE_DEMAND microphone <0|1>`.
+  - Settings: `microphone_enabled` and `microphone_on_start` (true, false, or demand). "Not enabled but not locked" still allows the mic, as in the web client.
+- **Decision:**
+  - **Encoding:** macOS's own AudioToolbox Opus encoder (streaming `AudioConverterFillComplexBuffer` with a private "no data yet" status and per-packet descriptions), 32 kbps. It resamples and downmixes in the same step. No C library is added; the bindings would need cmake.
+  - **Capture thread:** a per-session `skerry-mic` thread, following `ARCH-030`'s model. It exists only from a granted Start to Stop and opens the cpal device by UID.
+  - **Device list:** comes from plain CoreAudio properties (`input_devices.rs`). Nothing touches the microphone or triggers a macOS privacy request before capture is asked for and granted.
+  - **Starting:** on `on_start` true, on `CAPTURE_DEMAND`, or on the person's switch.
+    - PM decision: a mic the server locks on starts like `on_start` (after permission), with the switch shown on and disabled.
+    - The start policy runs only on the first `server_settings`.
+    - Late permission answers are ignored.
+    - PM decision: after a lock or `MICROPHONE_DISABLED`, the person's earlier "on" is not restored (the safe direction).
+  - **Stopping:** one `stop()` runs on every stream end: Error, StartupTimeout, `end_stream` (Reconnect, close, disconnect), teardown, and quit.
+    - The thread also stops itself when its sink closes, or when its frame channel stays full for 2 s.
+    - A blocked thread is detached, never stacked.
+    - A 10 s silence from the server (no message or pong) ends the stream, so a dead network can't keep the mic open.
+  - **UI:**
+    - A **Microphone & Camera** card after Audio, with a switch, a picker, a 5-segment level meter, the locked and denied states, and Open Privacy Settings.
+    - An in-window badge (left 12, top 48/52/88, with no hitbox) shows while the device is open.
+    - `NSMicrophoneUsageDescription` is in the bundle, and `bundle.sh` fails if the key is missing.
+  - **Echo cancellation deferred (`ARCH-GAP-DC-16`):** VoiceProcessingIO would have to take over playback on the `ARCH-030` thread, losing its health checks, device-return swap and default-following, and its spike could pass falsely.
+- **QA (fake-server harness, real AudioToolbox):**
+  - `0x02` frames decode as 24 kHz mono, 480 samples, 53–123 B, and none are sent before ready.
+  - `on_start`, demand, `MICROPHONE_DISABLED`, and locks all behave.
+  - Every stream end closes the stream and ends `skerry-mic`, and 15 cycles leaked no threads.
+  - Connecting causes no microphone privacy request (`preflight=true` only).
+  - Not verified: real capture and the menu-bar indicator (permission was undetermined with the screen locked), the card on screen, a real Selkies with the mic enabled, and macOS 13 (Opus encoder availability). The encoder emits Hybrid TOC `0x68`.
+- **Known:** a Start that lands while the old thread is still exiting stays at "Starting…" with no capture (safe). It is being fixed in M2.
+- **Affected Rust:** `capture.rs`, `microphone.rs`, `permissions.rs`, `input_devices.rs`, `app/media_capture.rs` (all new), `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `crates/skerry-ui/src/{controls.rs,session.rs}`, `scripts/bundle.sh`, `Cargo.toml` (`objc2-av-foundation`).
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -698,14 +772,15 @@
 | `ARCH-GAP-DC-15` | `desktop-and-collaboration` | `remote-rename-move` | blocked (server) | Delete settled via SealSkin storage (`ARCH-024`); no server offers rename or move, and Cleanroom/direct-Selkies sessions cannot delete. |
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
 | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
-| `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
+| `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | microphone settled (`ARCH-038`); camera in progress (M2) | Mic: AudioToolbox Opus `0x02` uplink, TCC-safe listing, stops on every stream end. Camera: VideoToolbox H.264 `0x06` uplink, being built. |
+| `ARCH-GAP-DC-16` | `desktop-and-collaboration` | `mic-echo-cancellation` | deferred (`ARCH-038`) | VoiceProcessingIO would have to own playback, which breaks `ARCH-030`'s output thread guarantees. |
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
 | `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | settled (`ARCH-034`) | Per-stripe RenderImages, NEON decode, present on the bottom stripe or after a 2 ms settle; about 27–30 % fewer cycles. |
 | `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | mostly settled (`ARCH-018`, `ARCH-026`) | Settled: web-sidebar cards, section memory per server, scroll per window, theme-aware dropdown shadow. Open: the web's stream-toggle tile row (`ARCH-020`). |
 | `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | settled (`ARCH-026`) | Sign Out… with confirmation, 1200 pt Library column, success toasts, live "Started … ago". |
-| `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | unresolved (goal) | Connect to a standalone Selkies server with no SealSkin, through `SelkiesClient` alone (`ARCH-024`). |
+| `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | settled (`ARCH-036`) | Connect to a standalone Selkies server: Basic or token login, a pinned self-signed certificate, up to 5 servers in `config.toml`, and a Desktop card. |
 | `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | settled (`ARCH-026`) | Key only on `/companion/api/`, single FIFO write queue off the main thread, cached Library items. |
 | `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | settled client-side (`ARCH-026`) | Key releases are sent before the socket closes; no `kr`; `KeyLedger`. A live input trace is still to be taken. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
