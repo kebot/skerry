@@ -7,7 +7,8 @@ id: 067NC4KG01SKERRY0000000004
 # Desktop Integration and Collaboration Domain
 
 <!-- compose:status=partially-settled provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-DC-02 concept="file-transfers" question="Add in-session Selkies file upload/download with native macOS Open/Save dialogs, progress, cancel, and permission checks alongside a live stream." -->
+<!-- compose:unresolved id=ARCH-GAP-DC-14 concept="session-file-mount" question="Future scope: mount the session's files in Finder through a File Provider extension, a local WebDAV server, or a local NFS server. Not started; revisit after the Files window ships." -->
+<!-- compose:unresolved id=ARCH-GAP-DC-15 concept="remote-rename-move" question="Delete is settled through SealSkin home storage (ARCH-024). Neither Selkies 715df7c nor SealSkin has a rename or move file route, and Cleanroom or direct Selkies sessions have no delete at all; revisit when a server offers them." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-03 concept="audio-devices-and-quality" question="Handle macOS default output device changes, format resampling when 48 kHz f32 is unavailable, sleep/wake recovery, and server-allowed audio bitrate selection." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-04 concept="remote-printing" question="Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference while honoring read-only/disabled print policies." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-05 concept="microphone-and-webcam" question="Negotiate audio/video uplink formats, request macOS capture permissions on demand, show active capture indicators, and stop capture on disconnect." -->
@@ -40,8 +41,13 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
   - **Deliberate** (Seamless off): Session Controls → Clipboard's **Send Mac Clipboard** and **Copy Session Clipboard** (`cr`) move content on demand.
   - Per-server **Send to Session**, **Receive from Session**, and **Seamless** switches (`Preferences.clipboard`) live within `clipboard_in_enabled`, `clipboard_out_enabled`, `enable_binary_clipboard`, and a locked `clipboard_seamless`.
   - Session secrets are written with `org.nspasteboard.ConcealedType` and taken back after 60 s, or once the session's clipboard moves on, while the Mac pasteboard still holds them.
-- `in-session-file-transfers` (unresolved: `ARCH-GAP-DC-02`):
-  - Native macOS Open/Save dialogs with transfer progress, cancellation, and folder/ZIP support over the Selkies session channel.
+- `in-session-file-transfers` (settled 2026-11-22: `ARCH-023`, `ARCH-024`; mount `ARCH-GAP-DC-14` and rename/move `ARCH-GAP-DC-15` open):
+  - `selkies.rs` (`SelkiesClient`) speaks the Selkies HTTP file routes on the session origin with the SealSkin session cookie `transport.rs` already obtains: `GET api/file-manager/browse`, `POST api/file-manager/mkdir`, `GET api/files/<path>` (with `Range` to resume), and `POST api/upload` (plain at or under 64 MiB, otherwise 64 MiB slices with `X-Upload-Id`/`-Offset`/`-Total`/`-Final`, streamed from disk). It sends no `Origin` header.
+  - A **Files** window per session (`skerry-ui` view, `skerry-mac` wiring) shows the file-manager folder as a sortable list with breadcrumbs, Back/Forward, Refresh, New Folder, multi-select, keyboard navigation, Quick Look, Open (download to a cache, then open with the default app), Upload…, Download…, and a transfers list with progress and Cancel.
+  - Into the session: Finder drops onto the window and ⌘V of Finder file copies (`public.file-url` on `NSPasteboard`) upload into the folder shown; folders are walked on the Mac and recreated with `mkdir`.
+  - Out of the session: dragging rows to Finder writes `NSFilePromiseProvider` items, and Skerry downloads each into the folder Finder names; ⌘C downloads the selection to a staging folder first, then puts the real file URLs on the pasteboard. A folder is downloaded file by file into a matching folder, not as the server's zip.
+  - **Delete** (⌘⌫, confirmed in a native alert) goes through `SealSkinClient` to the session's home storage (`/Desktop/<path>`), offered only for a SealSkin session with a home whose `Desktop` lists the same names as the Selkies root (`ARCH-024`).
+  - Upload and download controls follow `server_settings.file_transfers`; the server also refuses view-only credentials (Skerry connects as the primary client, so it does not model a viewer role).
 - `audio-devices-and-media-uplinks` (baseline 48 kHz Opus output settled; device selection & mic/webcam open in `ARCH-GAP-DC-03`, `ARCH-GAP-DC-05`):
   - Unresolved frontier (`ARCH-GAP-DC-03`): output device picker, sample-rate conversion, sleep/wake recovery, and audio bitrate controls.
   - Unresolved frontier (`ARCH-GAP-DC-05`): microphone and webcam capture uplinks with macOS permission prompts and disconnect teardown.

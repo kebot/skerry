@@ -5,12 +5,13 @@
 //! of them through the [`OpenWindows`] global.
 
 use super::controls::ControlPanel;
+use super::files_window::{self, FilesWindow};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
-    ToggleFullScreen, ToggleSessionControls, APP_NAME,
+    ToggleFiles, ToggleFullScreen, ToggleSessionControls, APP_NAME,
 };
-use crate::api::{Api, RemoteSession};
 use crate::input::InputFeature;
+use crate::sealskin::{RemoteSession, SealSkinClient};
 use crate::settings::{
     self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
 };
@@ -20,7 +21,7 @@ use crate::video::Codec;
 use crate::view::NativeSession;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
-    div, prelude::*, rgb, AnyWindowHandle, App, Context, Global, Task, WeakEntity, Window,
+    div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, Task, WeakEntity, Window,
 };
 use skerry_ui::session;
 use std::collections::VecDeque;
@@ -71,7 +72,7 @@ fn refresh_library(cx: &mut App) {
 
 pub(super) struct SessionWindow {
     rt: Handle,
-    api: Api,
+    api: SealSkinClient,
     pub(super) remote: RemoteSession,
     pub(super) current: Option<NativeSession>,
     stream_events: Option<Task<()>>,
@@ -93,6 +94,11 @@ pub(super) struct SessionWindow {
     pub(super) scale_locally: bool,
     pub(super) screen_policy: ScreenPolicy,
     pub(super) clipboard_policy: Option<crate::clipboard::Policy>,
+    /// The session's Files window (`ARCH-023`).
+    pub(super) files_window: Option<(AnyWindowHandle, Entity<FilesWindow>)>,
+    /// The session's file routes and what the server allows (`ARCH-023`).
+    file_access: Option<crate::selkies::SelkiesClient>,
+    file_policy: Option<crate::selkies::Policy>,
     pub(super) dpi_override: Option<u16>,
     ui_scale: display::UiScale,
     pub(super) applied_resolution: Option<DisplayRequest>,
@@ -110,7 +116,7 @@ pub(super) struct SessionWindow {
 impl SessionWindow {
     pub(super) fn new(
         rt: Handle,
-        api: Api,
+        api: SealSkinClient,
         remote: RemoteSession,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -137,6 +143,9 @@ impl SessionWindow {
             scale_locally: true,
             screen_policy: ScreenPolicy::default(),
             clipboard_policy: None,
+            files_window: None,
+            file_access: None,
+            file_policy: None,
             dpi_override: None,
             ui_scale: display::UiScale::default(),
             applied_resolution: None,
@@ -276,6 +285,13 @@ impl SessionWindow {
                 self.clipboard_policy = Some(policy);
                 if let Some(stream) = &self.current {
                     stream.set_clipboard_policy(policy, window, cx);
+                }
+            }
+            SessionEvent::Files(access) => self.file_access = Some(access),
+            SessionEvent::FilePolicy(policy) => {
+                self.file_policy = Some(policy);
+                if let Some((_, files)) = &self.files_window {
+                    files.update(cx, |files, cx| files.set_policy(policy, cx));
                 }
             }
             SessionEvent::Clipboard(incoming) => {
@@ -495,6 +511,66 @@ impl SessionWindow {
         }
     }
 
+    /// Opens the session's Files window, or brings it forward (`ARCH-023`).
+    pub(super) fn toggle_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((handle, _)) = &self.files_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.files_window = None;
+        }
+        if self.current.is_none() {
+            return;
+        }
+        let (Some(access), Some(policy)) = (self.file_access.clone(), self.file_policy) else {
+            self.status =
+                Some("Session files are available once the session has connected.".into());
+            cx.notify();
+            return;
+        };
+        if !policy.upload && !policy.download {
+            self.status = Some("The server doesn’t allow file transfers in this session.".into());
+            cx.notify();
+            return;
+        }
+        let title = self.remote.app_name.clone();
+        let storage =
+            crate::sealskin::has_storage(&self.remote.home).then(|| files_window::Storage {
+                client: self.api.clone(),
+                home: self.remote.home.clone(),
+            });
+        let rt = self.rt.clone();
+        let owner_window = Window::window_handle(window);
+        let session = cx.entity();
+        cx.defer(move |cx| {
+            let _ = owner_window.update(cx, |_, window, cx| {
+                let source = files_window::FilesSource {
+                    title,
+                    selkies: access,
+                    policy,
+                    storage,
+                };
+                let result = FilesWindow::open(source, rt, window, session.clone(), cx);
+                session.update(cx, |session, cx| {
+                    match result {
+                        Ok(files) => session.files_window = Some(files),
+                        Err(_) => session.status = Some("Couldn’t open Files.".into()),
+                    }
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    fn close_files(&mut self, cx: &mut App) {
+        if let Some((handle, _)) = self.files_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
     /// The Stats section opened or shut: a fresh history, and the session
     /// subscribes to the server's figures only while it is open.
     pub(super) fn set_stats_open(&mut self, open: bool) {
@@ -534,6 +610,9 @@ impl SessionWindow {
         self.settings = None;
         self.screen_policy = ScreenPolicy::default();
         self.clipboard_policy = None;
+        self.file_access = None;
+        self.file_policy = None;
+        self.close_files(cx);
         self.applied_resolution = None;
         self.applied_dpi = None;
         self.stats = None;
@@ -579,6 +658,9 @@ impl Render for SessionWindow {
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &ToggleSessionControls, window, cx| {
                 this.toggle_controls(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
+                this.toggle_files(window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &DisconnectSession, window, cx| this.disconnect(window, cx)),

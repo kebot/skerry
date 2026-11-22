@@ -1,5 +1,6 @@
 use crate::audio::Playback;
 use crate::clipboard;
+use crate::selkies;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -347,6 +348,9 @@ pub enum SessionEvent {
     FingerScroll(bool),
     ClipboardPolicy(clipboard::Policy),
     Clipboard(clipboard::Incoming),
+    /// The session's file routes, once the session cookie is in hand (`ARCH-023`).
+    Files(selkies::SelkiesClient),
+    FilePolicy(selkies::Policy),
     Error(String),
 }
 
@@ -479,7 +483,10 @@ pub async fn run(
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
 ) -> Result<(), &'static str> {
-    let template = socket_request(url).await?;
+    let (template, access) = socket_request(url).await?;
+    if let Some(access) = access {
+        let _ = events.send(SessionEvent::Files(access));
+    }
     let config = WebSocketConfig::default().max_message_size(Some(16 * 1024 * 1024));
     // A just-launched session answers 404/5xx or refuses connections until Selkies is up, so
     // keep retrying transient failures for a while instead of failing the first attempt.
@@ -688,6 +695,7 @@ pub async fn run(
                                 } else {
                                     capabilities.announce(&data["settings"]);
                                     let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
+                                    let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -1001,9 +1009,17 @@ fn transient_status(status: u16) -> bool {
     matches!(status, 404 | 502 | 503 | 504)
 }
 
+/// The WebSocket handshake for the session, and the session's file routes under the same
+/// cookie (`ARCH-023`), or `None` when they cannot be built.
 async fn socket_request(
     url: Url,
-) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, &'static str> {
+) -> Result<
+    (
+        tokio_tungstenite::tungstenite::handshake::client::Request,
+        Option<selkies::SelkiesClient>,
+    ),
+    &'static str,
+> {
     let address_error =
         "SealSkin returned an unsupported session address. Open an individual session.";
     let auth_error =
@@ -1049,6 +1065,10 @@ async fn socket_request(
         .parse::<reqwest::header::HeaderValue>()
         .map_err(|_| auth_error)?;
     cookie.set_sensitive(true);
+    let mut base = redirect.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    let access = selkies::SelkiesClient::new(base, cookie.clone()).ok();
     request.headers_mut().insert("cookie", cookie);
     request.headers_mut().insert(
         "origin",
@@ -1057,7 +1077,7 @@ async fn socket_request(
             .parse()
             .map_err(|_| address_error)?,
     );
-    Ok(request)
+    Ok((request, access))
 }
 
 #[cfg(test)]

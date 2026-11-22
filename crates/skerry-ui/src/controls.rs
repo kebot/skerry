@@ -54,6 +54,8 @@ pub enum ControlsAction {
     ToggleFullScreen,
     Reconnect,
     Disconnect,
+    /// Open the session's Files window (`ARCH-023`).
+    OpenFiles,
     SetInput {
         id: String,
         enabled: bool,
@@ -245,6 +247,11 @@ pub fn render(
                 "Full Screen"
             },
             ControlsAction::ToggleFullScreen,
+            &on_action,
+        ))
+        .child(action_button(
+            "Files",
+            ControlsAction::OpenFiles,
             &on_action,
         ))
         .child(action_button(

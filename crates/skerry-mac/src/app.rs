@@ -1,9 +1,14 @@
 mod controls;
 mod display;
+mod files_model;
+mod files_window;
+mod promise;
 mod session_window;
 
-use crate::api::{Api, Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession};
 use crate::launch_options::{self, LaunchContext, LaunchSelection};
+use crate::sealskin::{
+    Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession, SealSkinClient,
+};
 use crate::settings::{self, Preferences};
 use crate::transport::{DisplayRequest, Resolution};
 use gpui_kit::component::{
@@ -54,7 +59,7 @@ pub fn run() {
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
     let reopen_handle = handle.clone();
-    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    let application = gpui_kit::application().with_assets(skerry_ui::assets::SkerryAssets);
     // A Dock-icon click brings the Library back (ARCH-022).
     application.on_reopen(move |cx| show_library(&reopen_handle, cx));
     application.run(move |cx: &mut App| {
@@ -67,7 +72,9 @@ pub fn run() {
             KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
             KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
             KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+            KeyBinding::new("cmd-shift-f", ToggleFiles, None),
         ]);
+        cx.bind_keys(files_window::key_bindings());
         // Quitting disconnects every session window; no remote session is stopped.
         cx.on_action(|_: &Quit, cx| cx.quit());
         let library_handle = handle.clone();
@@ -78,10 +85,48 @@ pub fn run() {
                 items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
                 disabled: false,
             },
+            // The Files window's commands (`ARCH-023`); AppKit disables them wherever no
+            // Files window has focus.
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Folder", files_window::NewFolder),
+                    MenuItem::action("Upload…", files_window::UploadFiles),
+                    MenuItem::action("Download", files_window::DownloadSelection),
+                    MenuItem::action("Download To…", files_window::DownloadSelectionTo),
+                    MenuItem::separator(),
+                    MenuItem::action("Open", files_window::OpenSelection),
+                    MenuItem::action("Quick Look", files_window::QuickLook),
+                    MenuItem::separator(),
+                    MenuItem::action("Delete…", files_window::DeleteSelection),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Window", files_window::CloseFiles),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Copy", files_window::CopyToMac),
+                    MenuItem::action("Paste", files_window::PasteFromMac),
+                    MenuItem::action("Select All", files_window::SelectAll),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Go".into(),
+                items: vec![
+                    MenuItem::action("Back", files_window::GoBack),
+                    MenuItem::action("Forward", files_window::GoForward),
+                    MenuItem::action("Enclosing Folder", files_window::OpenParent),
+                ],
+                disabled: false,
+            },
             Menu {
                 name: "View".into(),
                 items: vec![
                     MenuItem::action("Session Controls", ToggleSessionControls),
+                    MenuItem::action("Files", ToggleFiles),
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
                 ],
                 disabled: false,
@@ -150,7 +195,8 @@ actions!(
         DisconnectSession,
         ToggleSessionControls,
         CloseSessionControls,
-        ToggleFullScreen
+        ToggleFullScreen,
+        ToggleFiles
     ]
 );
 
@@ -188,7 +234,7 @@ impl DisplayMode {
 
 struct Launcher {
     rt: Handle,
-    api: Option<Api>,
+    api: Option<SealSkinClient>,
     library: Option<Library>,
     preferences: Preferences,
     key_input: Entity<InputState>,
@@ -209,7 +255,7 @@ struct Launcher {
     /// The saved key from startup, kept so Connect can retry it after a failed first connect.
     startup_credential: Option<Credential>,
     /// A server refused on Refresh (ARCH-009); Connect with an empty field checks it again.
-    retry_api: Option<Api>,
+    retry_api: Option<SealSkinClient>,
     focus_handle: FocusHandle,
     /// Set after a typed key connects; the next render clears the key field (needs a Window).
     clear_key_input: bool,
@@ -319,7 +365,7 @@ impl Launcher {
     }
 
     fn connect(&mut self, credential: Credential, save: bool, cx: &mut Context<Self>) {
-        match Api::new(&credential) {
+        match SealSkinClient::new(&credential) {
             Ok(api) => self.load(api, save.then_some(credential), true, cx),
             Err(error) => self.status = Some(error),
         }
@@ -333,7 +379,7 @@ impl Launcher {
 
     fn load(
         &mut self,
-        api: Api,
+        api: SealSkinClient,
         save: Option<Credential>,
         connecting: bool,
         cx: &mut Context<Self>,
@@ -400,7 +446,7 @@ impl Launcher {
 
     fn fetch_library_media(
         &mut self,
-        api: Api,
+        api: SealSkinClient,
         apps: Vec<RemoteApp>,
         sessions: Vec<RemoteSession>,
         cx: &mut Context<Self>,

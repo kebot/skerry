@@ -7,6 +7,7 @@ publish.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 base64 = "0.22"
 block2 = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 core-foundation = "0.10"
 cpal = "0.17.3"
 dotenvy = "0.15"
@@ -14,24 +15,26 @@ futures-util = { version = "0.3", features = ["sink"] }
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["NSButton", "NSControl", "NSEvent", "NSGraphics", "NSPasteboard", "NSView", "NSWindow", "block2"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSView", "NSWindow", "NSWorkspace", "block2", "objc2-uniform-type-identifiers"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "objc2", "objc2-io-surface"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSLocale", "NSString", "NSTimeZone", "NSUserDefaults", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSLocale", "NSString", "NSTimeZone", "NSURL", "NSUserDefaults", "NSValue"] }
 # Enable the CF type implementation required by Core Video's IOSurface getter.
+objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["UTType"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation"] }
 objc2-video-toolbox = { version = "0.3.2", default-features = false, features = ["VTDecompressionProperties", "VTDecompressionSession", "VTErrors", "objc2", "objc2-core-media", "objc2-core-video"] }
 opus-decoder = "0.1.1"
+percent-encoding = "2.3"
 raw-window-handle = "0.6"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
 serde = { version = "1", features = ["derive"] }
 skerry-ui = { path = "../skerry-ui" }
 serde_json = "1"
 smallvec = "1"
 tempfile = "3"
 toml_edit = "0.25.20"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 

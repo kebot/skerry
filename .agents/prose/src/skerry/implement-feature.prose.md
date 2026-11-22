@@ -15,7 +15,7 @@ kind: function
 
 ### Invariants
 
-- Never introduce an embedded browser or bypass `api.rs` / `transport.rs` origin and credential checks.
+- Never introduce an embedded browser or bypass `sealskin.rs` / `selkies.rs` / `transport.rs` origin and credential checks.
 - Respect `gpui-kit` `0.10.0` invariants in `index.prose.md` (`Root`-wrapped windows, deferred child-window opening, Tokio runtime lifetime, `window.drop_image` for JPEG, `window.paint_surface` for VideoToolbox surfaces).
 - Every new control must handle server defaults, server-locked values, missing server capabilities, and reconnect persistence.
 
