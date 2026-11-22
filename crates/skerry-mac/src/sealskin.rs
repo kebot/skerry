@@ -1179,7 +1179,7 @@ impl SealSkinClient {
                 )
             })?;
         if !response.status().is_success() {
-            return Err(LibraryError::Refused(unsupported_version(None)));
+            return Err(classify_version_status(response.status()));
         }
         let server: ServerVersion = response
             .json()
@@ -2110,6 +2110,22 @@ fn unsupported_version(found: Option<&str>) -> String {
         None => format!(
             "Skerry requires SealSkin {minimum} or newer. This server is older or isn’t SealSkin."
         ),
+    }
+}
+
+/// Classifies a non-2xx response from `GET /companion/api/ui/version`:
+/// only 404/405 mean the route is absent (older SealSkin or another app); 5xx and other
+/// statuses mean the server or a proxy in front of it is down or errored.
+fn classify_version_status(status: StatusCode) -> LibraryError {
+    match status {
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED => {
+            LibraryError::Refused(unsupported_version(None))
+        }
+        _ if status.is_server_error() => LibraryError::Failed(format!(
+            "The SealSkin server is unavailable (HTTP {}).",
+            status.as_u16()
+        )),
+        _ => LibraryError::Failed(format!("SealSkin returned HTTP {}.", status.as_u16())),
     }
 }
 
@@ -3057,6 +3073,44 @@ mod tests {
                 error.contains("requires SealSkin 0.5.0 or newer"),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn version_check_http_errors_distinguish_server_down_from_old_sealskin() {
+        for status in [StatusCode::NOT_FOUND, StatusCode::METHOD_NOT_ALLOWED] {
+            match classify_version_status(status) {
+                LibraryError::Refused(msg) => {
+                    assert!(msg.contains("requires SealSkin 0.5.0 or newer"), "{msg}");
+                }
+                other => panic!("expected Refused for {status}, got {other:?}"),
+            }
+        }
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            match classify_version_status(status) {
+                LibraryError::Failed(msg) => {
+                    assert!(msg.contains("unavailable"), "{msg}");
+                    assert!(msg.contains(&status.as_u16().to_string()), "{msg}");
+                }
+                other => panic!("expected Failed for {status}, got {other:?}"),
+            }
+        }
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            match classify_version_status(status) {
+                LibraryError::Failed(msg) => {
+                    assert!(msg.contains(&status.as_u16().to_string()), "{msg}");
+                }
+                other => panic!("expected Failed for {status}, got {other:?}"),
+            }
         }
     }
 
