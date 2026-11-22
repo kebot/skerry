@@ -5,11 +5,14 @@
 //! The window owns its transfers: they run on Tokio, report bytes through shared counters the
 //! window redraws from, and are cancelled when the window closes or the session ends.
 
+use super::files_backend::{BackendError, FilesBackend};
 use super::files_model::{size_label, Browser};
 use super::promise;
 use super::session_window::{OpenFiles, OpenWindows, SessionWindow};
+
 use crate::pasteboard;
 use crate::selkies::{self, Entry, Policy, Progress, SelkiesClient};
+use crate::storage::{self, StoragePlace, UploadTarget};
 use gpui_kit::component::{
     input::{InputEvent, InputState},
     menu::ContextMenuExt as _,
@@ -54,7 +57,11 @@ actions!(
         DownloadSelectionTo,
         UploadFiles,
         CloseFiles,
-        Cancel
+        Cancel,
+        /// Open in… on a top-level Shared Files file (`ARCH-037`).
+        OpenIn,
+        /// ⌘F: the Storage window's Filter field.
+        FocusFilter
     ]
 );
 
@@ -92,6 +99,8 @@ pub(super) fn key_bindings() -> Vec<gpui_kit::KeyBinding> {
         KeyBinding::new("cmd-shift-n", NewFolder, window),
         KeyBinding::new("cmd-shift-u", UploadFiles, window),
         KeyBinding::new("cmd-w", CloseFiles, window),
+        KeyBinding::new("alt-cmd-o", OpenIn, window),
+        KeyBinding::new("cmd-f", FocusFilter, window),
     ]
 }
 
@@ -108,9 +117,29 @@ enum After {
     Clipboard,
     /// Tell Finder the promised file is written (`promise.rs`).
     Promise(promise::Completion),
-    /// An upload: refresh the folder if it is still shown.
-    Uploaded(String),
+    /// An upload: refresh the folder if it is still shown, in the same home.
+    Uploaded {
+        home: Option<String>,
+        folder: String,
+    },
 }
+
+/// What the Storage window's pane tells its window (`ARCH-037`).
+#[derive(Clone, Debug)]
+pub(super) enum PaneEvent {
+    /// Open in… on this top-level Shared Files file.
+    OpenIn(Entry),
+    /// The pane reached a home's `Desktop/files`: show Shared Files.
+    GoShared,
+    /// Files bound for a home's `Desktop/files`: upload them to Shared Files instead.
+    UploadToShared(Vec<PathBuf>),
+    /// An upload, folder or delete finished: the quota may have moved.
+    Changed,
+    /// ⌘R or Refresh: measure again too.
+    Refreshed,
+}
+
+impl gpui_kit::EventEmitter<PaneEvent> for FilesWindow {}
 
 enum State {
     Running,
@@ -143,10 +172,18 @@ struct Transfer {
     /// The files a finished download made.
     made: Vec<PathBuf>,
     after: Option<After>,
+    /// The storage home it moves to or from, for Delete Home (`ARCH-037`).
+    home: Option<String>,
 }
 
 pub(super) struct FilesWindow {
-    access: SelkiesClient,
+    backend: FilesBackend,
+    /// The Storage window's Filter field (`ARCH-037`); `None` in a session's window.
+    filter: Option<Entity<InputState>>,
+    /// The next render empties the Filter field (it needs a Window).
+    clear_filter: bool,
+    /// The folder holds more than the listing shows.
+    truncated: bool,
     policy: Policy,
     rt: Handle,
     /// The session's home in SealSkin's persistent storage, which can delete (`ARCH-024`).
@@ -191,6 +228,9 @@ pub(super) struct FilesWindow {
 pub(super) enum FilesOwner {
     Session(AnyWindowHandle, WeakEntity<SessionWindow>),
     Library,
+    /// The Storage window's own pane: never in `OpenWindows.files`, closed with its window
+    /// (`ARCH-037`).
+    Storage,
 }
 
 /// Drops every hold on the Files window, so the window's entity (and with it every transfer,
@@ -297,51 +337,17 @@ impl FilesWindow {
                 let close_owner = owner.clone();
                 let own_handle = window.window_handle();
                 let view = cx.new(|cx: &mut Context<Self>| {
-                    let folder_name =
-                        cx.new(|cx| InputState::new(window, cx).placeholder("untitled folder"));
-                    cx.subscribe_in(
-                        &folder_name,
-                        window,
-                        |this, _, event: &InputEvent, window, cx| {
-                            if matches!(event, InputEvent::PressEnter { .. }) {
-                                this.create_folder(window, cx);
-                            }
-                        },
-                    )
-                    .detach();
-                    // Selection turns grey when the window is not key, as in Finder.
-                    cx.observe_window_activation(window, |_, _, cx| cx.notify())
-                        .detach();
-                    let mut this = Self {
-                        access,
+                    let mut this = Self::build(
+                        FilesBackend::Selkies(access),
                         policy,
-                        rt,
                         storage,
-                        storage_matches: false,
-                        root_label: "Desktop".into(),
-                        list_focus: cx.focus_handle(),
-                        scroll: UniformListScrollHandle::new(),
-                        browser: Browser::default(),
-                        loading: false,
-                        error: None,
-                        notice: None,
-                        notice_generation: 0,
-                        busy: None,
-                        transfers_open: true,
-                        listing: None,
-                        generation: 0,
-                        transfers: Vec::new(),
-                        next_id: 1,
-                        ticker: None,
-                        folder_name,
-                        creating_folder: false,
-                        pressed: None,
-                        press_at: None,
-                        dragging: false,
-                        reveal_selection: false,
+                        "Desktop".into(),
+                        rt,
                         owner,
-                        handle: Some(own_handle),
-                    };
+                        Some(own_handle),
+                        window,
+                        cx,
+                    );
                     this.reload(cx);
                     this.check_storage(cx);
                     this
@@ -369,6 +375,163 @@ impl FilesWindow {
         Ok((handle, view))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        backend: FilesBackend,
+        policy: Policy,
+        storage: Option<Storage>,
+        root_label: String,
+        rt: Handle,
+        owner: FilesOwner,
+        handle: Option<AnyWindowHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let folder_name = cx.new(|cx| InputState::new(window, cx).placeholder("untitled folder"));
+        cx.subscribe_in(
+            &folder_name,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.create_folder(window, cx);
+                }
+            },
+        )
+        .detach();
+        let filter = backend.storage().map(|_| {
+            let filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter"));
+            cx.subscribe_in(&filter, window, |this, input, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let text = input.read(cx).value().to_string();
+                    this.browser.set_filter(&text);
+                    cx.notify();
+                }
+            })
+            .detach();
+            filter
+        });
+        // Selection turns grey when the window is not key, as in Finder.
+        cx.observe_window_activation(window, |_, _, cx| cx.notify())
+            .detach();
+        Self {
+            backend,
+            filter,
+            clear_filter: false,
+            truncated: false,
+            policy,
+            rt,
+            storage,
+            storage_matches: false,
+            root_label,
+            list_focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            browser: Browser::default(),
+            loading: false,
+            error: None,
+            notice: None,
+            notice_generation: 0,
+            busy: None,
+            transfers_open: true,
+            listing: None,
+            generation: 0,
+            transfers: Vec::new(),
+            next_id: 1,
+            ticker: None,
+            folder_name,
+            creating_folder: false,
+            pressed: None,
+            press_at: None,
+            dragging: false,
+            reveal_selection: false,
+            owner,
+            handle,
+        }
+    }
+
+    /// The Storage window's pane (`ARCH-037`): the same list, built inside that window and
+    /// never registered in `OpenWindows.files`, so nothing that looks Files windows up by
+    /// session ever finds it.
+    pub(super) fn pane(
+        backend: FilesBackend,
+        rt: Handle,
+        owner: FilesOwner,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let root_label = backend.place().map(StoragePlace::label).unwrap_or_default();
+        cx.new(|cx| {
+            // Storage has no per-direction policy: the server's sentence answers a refusal.
+            let mut this = Self::build(
+                backend,
+                Policy::default(),
+                None,
+                root_label,
+                rt,
+                owner,
+                None,
+                window,
+                cx,
+            );
+            this.reload(cx);
+            this
+        })
+    }
+
+    /// Shows another home (or Shared Files): back to its root with no history. Running
+    /// transfers keep their own backend and go on.
+    pub(super) fn set_backend(&mut self, backend: FilesBackend, cx: &mut Context<Self>) {
+        self.root_label = backend.place().map(StoragePlace::label).unwrap_or_default();
+        self.backend = backend;
+        self.browser.reset();
+        self.clear_filter = true;
+        self.truncated = false;
+        self.error = None;
+        self.notice = None;
+        self.creating_folder = false;
+        self.reload(cx);
+    }
+
+    /// The storage homes running transfers move to or from (`ARCH-037`).
+    pub(super) fn busy_homes(&self) -> HashSet<String> {
+        self.transfers
+            .iter()
+            .filter(|t| matches!(t.state, State::Running))
+            .filter_map(|t| t.home.clone())
+            .collect()
+    }
+
+    /// The list's focus, for the Storage window to focus at open.
+    pub(super) fn list_focus(&self) -> FocusHandle {
+        self.list_focus.clone()
+    }
+
+    /// Shows a notice in the pane, for the Storage window's own errors and information.
+    pub(super) fn notify(&mut self, text: impl Into<String>, error: bool, cx: &mut Context<Self>) {
+        self.say(text, error, cx);
+    }
+
+    /// Reloads the folder shown (window activation, ⌘R from the sidebar).
+    pub(super) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.reload(cx);
+    }
+
+    /// The selected entry Open in… would take, if exactly one top-level Shared Files file.
+    fn open_in_entry(&self) -> Option<Entry> {
+        let place = self.backend.place()?;
+        match self.browser.selected_entries().as_slice() {
+            [one] if storage::can_open_in(place, self.browser.path(), one.is_dir) => {
+                Some((*one).clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn open_in(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self.open_in_entry() {
+            cx.emit(PaneEvent::OpenIn(entry));
+        }
+    }
+
     /// The session's transfer policy changed while the window is open.
     pub(super) fn set_policy(&mut self, policy: Policy, cx: &mut Context<Self>) {
         if self.policy != policy {
@@ -387,9 +550,10 @@ impl FilesWindow {
         self.upload_into(paths, String::new(), cx);
     }
 
-    /// What a route's error says about the policy (for browse and mkdir: nothing).
-    fn learn_route(&mut self, route: Route, error: &selkies::Error) {
-        if let selkies::Error::Server(status, _) = error {
+    /// What a Selkies route's error says about the policy (for browse and mkdir: nothing).
+    /// Storage errors never change it (`ARCH-037`).
+    fn learn_route(&mut self, route: Route, error: &BackendError) {
+        if let BackendError::Selkies(selkies::Error::Server(status, _)) = error {
             self.policy = policy_after(self.policy, route, *status);
         }
     }
@@ -402,7 +566,7 @@ impl FilesWindow {
         };
         self.learn_route(
             route,
-            &selkies::Error::Server(StatusCode::FORBIDDEN, String::new()),
+            &BackendError::Selkies(selkies::Error::Server(StatusCode::FORBIDDEN, String::new())),
         );
         self.say(text, true, cx);
     }
@@ -419,9 +583,9 @@ impl FilesWindow {
         self.generation += 1;
         let generation = self.generation;
         self.loading = true;
-        let access = self.access.clone();
+        let backend = self.backend.clone();
         let path = self.browser.path().to_owned();
-        let pending = self.rt.spawn(async move { access.browse(&path).await });
+        let pending = self.rt.spawn(async move { backend.browse(&path).await });
         self.listing = Some(cx.spawn(async move |this, cx| {
             let result = pending.await;
             let _ = this.update(cx, |this, cx| {
@@ -432,6 +596,10 @@ impl FilesWindow {
                 match result {
                     Ok(Ok(listing)) => {
                         this.error = None;
+                        if listing.truncated && !this.truncated {
+                            this.say("Showing the first 10,000 items.", false, cx);
+                        }
+                        this.truncated = listing.truncated;
                         this.browser.set_listing(listing.entries);
                     }
                     Ok(Err(error)) => {
@@ -448,6 +616,17 @@ impl FilesWindow {
 
     fn after_move(&mut self, moved: bool, cx: &mut Context<Self>) {
         if moved {
+            // A home's `Desktop/files` is the Shared Files mount point: show Shared Files.
+            if self
+                .backend
+                .place()
+                .is_some_and(|place| storage::opens_shared_files(place, self.browser.path()))
+            {
+                cx.emit(PaneEvent::GoShared);
+                return;
+            }
+            self.clear_filter = self.filter.is_some();
+            self.truncated = false;
             self.error = None;
             self.creating_folder = false;
             if self.notice.as_ref().is_some_and(|notice| !notice.error) {
@@ -497,7 +676,9 @@ impl FilesWindow {
             FilesAction::Refresh => {
                 self.reload(cx);
                 self.check_storage(cx);
+                cx.emit(PaneEvent::Refreshed);
             }
+            FilesAction::OpenIn => self.open_in(cx),
             FilesAction::Sort(column) => self.browser.sort_by(column),
             FilesAction::Select {
                 index,
@@ -618,15 +799,21 @@ impl FilesWindow {
         }
         self.creating_folder = false;
         window.focus(&self.list_focus, cx);
-        let access = self.access.clone();
+        if self.backend.place().is_some_and(|place| {
+            storage::upload_target(place, self.browser.path()) == UploadTarget::SharedRoot
+        }) {
+            self.say(SHARED_MOUNT_NOTICE, false, cx);
+            return;
+        }
+        let backend = self.backend.clone();
         let path = selkies::join(self.browser.path(), &name);
         let folder = self.browser.path().to_owned();
-        let pending = self.rt.spawn(async move { access.mkdir(&path).await });
+        let pending = self.rt.spawn(async move { backend.mkdir(&path).await });
         cx.spawn(async move |this, cx| {
             let result = pending.await;
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => cx.emit(PaneEvent::Changed),
                     Ok(Err(error)) => {
                         this.learn_route(Route::Mkdir, &error);
                         this.say(error.to_string(), true, cx);
@@ -793,7 +980,9 @@ impl FilesWindow {
         let Some(storage) = self.storage.clone() else {
             return;
         };
-        let selkies = self.access.clone();
+        let FilesBackend::Selkies(selkies) = self.backend.clone() else {
+            return;
+        };
         let pending = self.rt.spawn(async move {
             let ours = selkies
                 .browse("")
@@ -827,14 +1016,39 @@ impl FilesWindow {
         .detach();
     }
 
+    /// Where Delete sends what: the session's home `Desktop` once matched (`ARCH-024`), or
+    /// the Storage window's home itself, never its protected folders (`ARCH-037`).
+    fn delete_plan(&self) -> Option<(Storage, String, Vec<Entry>, Vec<String>)> {
+        let entries = self.selected();
+        if let Some(backend) = self.backend.storage() {
+            let place = &backend.place;
+            let entries: Vec<Entry> = entries
+                .into_iter()
+                .filter(|entry| !storage::protected(place, &entry.path))
+                .collect();
+            if entries.is_empty() {
+                return None;
+            }
+            let paths = deletable_paths(place, &entries);
+            let target = Storage {
+                client: backend.client.clone(),
+                home: place.home().to_string(),
+            };
+            return Some((target, place.full_name(), entries, paths));
+        }
+        let storage = self.storage.clone().filter(|_| self.storage_matches)?;
+        if entries.is_empty() {
+            return None;
+        }
+        let paths = entries.iter().map(|e| storage_path(&e.path)).collect();
+        let label = storage.home.clone();
+        Some((storage, label, entries, paths))
+    }
+
     fn confirm_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(storage) = self.storage.clone().filter(|_| self.storage_matches) else {
+        let Some((storage, home_label, entries, paths)) = self.delete_plan() else {
             return;
         };
-        let entries = self.selected();
-        if entries.is_empty() {
-            return;
-        }
         let message = match entries.as_slice() {
             [one] => format!("Delete “{}”?", one.name),
             many => format!("Delete {} items?", many.len()),
@@ -846,7 +1060,7 @@ impl FilesWindow {
             } else {
                 "These items will be"
             },
-            storage.home
+            home_label
         );
         let busy_label = if entries.len() == 1 {
             "Deleting 1 item…".to_owned()
@@ -863,7 +1077,6 @@ impl FilesWindow {
             ],
             cx,
         );
-        let paths: Vec<String> = entries.iter().map(|e| storage_path(&e.path)).collect();
         let folder = self.browser.path().to_owned();
         let rt = self.rt.clone();
         cx.spawn(async move |this, cx| {
@@ -884,6 +1097,7 @@ impl FilesWindow {
                     Ok(Err(error)) => this.say(error, true, cx),
                     Err(_) => this.say("Deleting was interrupted.", true, cx),
                 }
+                cx.emit(PaneEvent::Changed);
                 if this.browser.path() == folder {
                     this.browser.clear_selection();
                     this.reload(cx);
@@ -935,6 +1149,16 @@ impl FilesWindow {
         if sources.is_empty() {
             return;
         }
+        // Into a home's `Desktop/files`, it would be hidden under the Shared Files mount in
+        // every session: it goes to Shared Files instead (`ARCH-037`).
+        if self
+            .backend
+            .place()
+            .is_some_and(|place| storage::upload_target(place, &folder) == UploadTarget::SharedRoot)
+        {
+            cx.emit(PaneEvent::UploadToShared(sources));
+            return;
+        }
         // The job lists the destination again before naming; these are a fallback.
         let taken: HashSet<String> = if folder == self.browser.path() {
             self.browser
@@ -951,12 +1175,13 @@ impl FilesWindow {
                 .filter_map(|p| p.file_name())
                 .map(|n| n.to_string_lossy().into_owned()),
         );
-        let access = self.access.clone();
+        let backend = self.backend.clone();
+        let home = backend.home_key();
         let meter = Meter::default();
         let job_meter = meter.clone();
         let destination = folder.clone();
         let job = self.rt.spawn(async move {
-            upload_job(access, sources, destination, taken, job_meter)
+            upload_job(backend, sources, destination, taken, job_meter)
                 .await
                 .map(|()| Vec::new())
         });
@@ -965,7 +1190,7 @@ impl FilesWindow {
             Direction::Upload,
             meter,
             job,
-            After::Uploaded(folder),
+            After::Uploaded { home, folder },
             cx,
         );
     }
@@ -987,14 +1212,14 @@ impl FilesWindow {
             return;
         }
         let name = batch_name(entries.iter().map(|e| e.name.clone()));
-        let access = self.access.clone();
+        let backend = self.backend.clone();
         let meter = Meter::default();
         let job_meter = meter.clone();
         // A promise names its file itself: Finder already chose the final path.
         let exact = matches!(after, After::Promise(_));
         let job = self
             .rt
-            .spawn(async move { download_job(access, entries, folder, exact, job_meter).await });
+            .spawn(async move { download_job(backend, entries, folder, exact, job_meter).await });
         self.track(name, Direction::Download, meter, job, after, cx);
     }
 
@@ -1019,6 +1244,7 @@ impl FilesWindow {
             job: Some(job.abort_handle()),
             made: Vec::new(),
             after: Some(after),
+            home: self.backend.home_key(),
         });
         cx.spawn(async move |this, cx| {
             let result = job.await;
@@ -1107,10 +1333,11 @@ impl FilesWindow {
         }
         match after {
             Some(After::Promise(completion)) => completion.finish(failure.as_deref()),
-            Some(After::Uploaded(folder)) => {
-                if self.browser.path() == folder {
+            Some(After::Uploaded { home, folder }) => {
+                if uploaded_shows(self.backend.home_key(), self.browser.path(), &home, &folder) {
                     self.reload(cx);
                 }
+                cx.emit(PaneEvent::Changed);
             }
             Some(After::Open) if failure.is_none() => {
                 for path in &made {
@@ -1210,14 +1437,38 @@ impl Render for FilesWindow {
                 self.scroll.scroll_to_item(focused, ScrollStrategy::Nearest);
             }
         }
+        if std::mem::take(&mut self.clear_filter) {
+            if let Some(filter) = &self.filter {
+                filter.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+        }
+        let place = self.backend.place().cloned();
+        let storage_props = place.as_ref().map(|place| ui::StoragePaneProps {
+            open_in: (place.is_shared() && self.browser.path().is_empty())
+                .then(|| self.open_in_entry().is_some()),
+            total: self.browser.total(),
+            filter: self.browser.filter().to_string(),
+            empty_text: if place.is_shared() && self.browser.path().is_empty() {
+                "Shared Files is empty. Drop files here to keep them for every session.".into()
+            } else {
+                "This folder is empty.".into()
+            },
+            narrow: window.bounds().size.width < px(760.),
+            delete_enabled: storage_can_delete(place, &self.browser.selected_entries()),
+        });
+        let can_delete = self.storage.is_some() && self.storage_matches;
         let props = FilesProps {
             crumbs: self.browser.crumbs(&self.root_label),
             can_back: self.browser.can_back(),
             can_forward: self.browser.can_forward(),
             can_upload: self.policy.upload,
             can_download: self.policy.download,
-            can_delete: self.storage.is_some() && self.storage_matches,
-            rows: Rc::new(self.browser.rows()),
+            can_delete: can_delete || place.is_some(),
+            rows: Rc::new(self.browser.rows(|path| {
+                place
+                    .as_ref()
+                    .is_some_and(|place| storage::protected(place, path))
+            })),
             sort: self.browser.sort,
             ascending: self.browser.ascending,
             loading: self.loading,
@@ -1229,6 +1480,7 @@ impl Render for FilesWindow {
             transfers: self.transfer_rows(),
             creating_folder: self.creating_folder,
             selected: self.browser.selected_count(),
+            storage: storage_props,
         };
         let entity = cx.entity();
         let handler: ui::FilesHandler = Rc::new(move |action, window, cx| {
@@ -1243,6 +1495,16 @@ impl Render for FilesWindow {
             upload: self.policy.upload,
             download: self.policy.download,
             delete: props.can_delete,
+            delete_enabled: props
+                .storage
+                .as_ref()
+                .map_or(!selection.is_empty(), |storage| storage.delete_enabled),
+            open_in: match &place {
+                Some(place) if place.is_shared() && selection.iter().all(|e| !e.is_dir) => {
+                    Some(self.open_in_entry().is_some())
+                }
+                _ => None,
+            },
         };
         div()
             .size_full()
@@ -1265,7 +1527,16 @@ impl Render for FilesWindow {
                 let moved = this.browser.forward();
                 this.after_move(moved, cx);
             }))
-            .on_action(cx.listener(|this, _: &Refresh, _, cx| this.reload(cx)))
+            .on_action(cx.listener(|this, _: &Refresh, _, cx| {
+                this.reload(cx);
+                cx.emit(PaneEvent::Refreshed);
+            }))
+            .on_action(cx.listener(|this, _: &OpenIn, _, cx| this.open_in(cx)))
+            .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
+                if let Some(filter) = &this.filter {
+                    filter.update(cx, |state, cx| state.focus(window, cx));
+                }
+            }))
             .on_action(
                 cx.listener(|this, _: &NewFolder, window, cx| this.start_new_folder(window, cx)),
             )
@@ -1355,6 +1626,7 @@ impl Render for FilesWindow {
                         &theme,
                         &props,
                         &self.folder_name,
+                        self.filter.as_ref(),
                         &self.scroll,
                         handler,
                     ))
@@ -1371,6 +1643,9 @@ struct MenuState {
     upload: bool,
     download: bool,
     delete: bool,
+    delete_enabled: bool,
+    /// Open in… shows in Shared Files (`Some`), enabled at its top level only.
+    open_in: Option<bool>,
 }
 
 /// Finder's right-click menu: the selection's commands, then the folder's.
@@ -1385,6 +1660,13 @@ fn context_menu(
         .menu_with_disabled("Open", Box::new(OpenSelection), none)
         .menu_with_disabled("Quick Look", Box::new(QuickLook), !state.files_only)
         .separator();
+    match state.open_in {
+        Some(true) => menu = menu.menu("Open in…", Box::new(OpenIn)),
+        Some(false) if state.files_only => {
+            menu = menu.menu_with_disabled("Open in… (Top level only)", Box::new(OpenIn), true)
+        }
+        _ => {}
+    }
     if state.download {
         menu = menu
             .menu_with_disabled("Download", Box::new(DownloadSelection), none)
@@ -1399,9 +1681,11 @@ fn context_menu(
             .menu("Paste", Box::new(PasteFromMac));
     }
     if state.delete {
-        menu = menu
-            .separator()
-            .menu_with_disabled("Delete…", Box::new(DeleteSelection), none);
+        menu = menu.separator().menu_with_disabled(
+            "Delete…",
+            Box::new(DeleteSelection),
+            !state.delete_enabled,
+        );
     }
     menu
 }
@@ -1411,7 +1695,7 @@ fn context_menu(
 /// Uploads `sources` into the remote `folder`, each top-level item under a name not `taken`
 /// there yet (Finder's "keep both"), folders walked on the Mac and recreated.
 async fn upload_job(
-    access: SelkiesClient,
+    access: FilesBackend,
     sources: Vec<PathBuf>,
     folder: String,
     taken: HashSet<String>,
@@ -1420,7 +1704,7 @@ async fn upload_job(
     // The window's listing may be stale or still loading (it is empty right after moving to
     // another folder), and the server replaces a file of the same name, so check the folder
     // again before choosing names. A server that refuses listings (downloads off) keeps the
-    // window's names.
+    // window's names. Storage never overwrites; its `name-1.ext` covers a race.
     let mut taken = taken;
     if let Ok(listing) = access.browse(&folder).await {
         taken.extend(listing.entries.into_iter().map(|entry| entry.name));
@@ -1515,13 +1799,13 @@ fn walk_local(dir: &Path, remote: &str, plan: &mut UploadPlan) -> std::io::Resul
 /// Downloads `entries` into the Mac `folder`, each under a free name (or, for a file promise,
 /// the name Finder chose), folders walked and recreated; returns what it made.
 async fn download_job(
-    access: SelkiesClient,
+    access: FilesBackend,
     entries: Vec<Entry>,
     folder: PathBuf,
     exact: bool,
     meter: Meter,
 ) -> Result<Vec<PathBuf>, String> {
-    let fail = |error: selkies::Error| error.to_string();
+    let fail = |error: BackendError| error.to_string();
     let mut made = Vec::new();
     let mut files = Vec::new();
     let mut folders = Vec::new();
@@ -1537,7 +1821,7 @@ async fn download_job(
     let mut reserved = HashSet::new();
     for entry in entries {
         let name = selkies::local_name(&entry.name)
-            .ok_or_else(|| fail(selkies::Error::UnsafeName(entry.name.clone())))?;
+            .ok_or_else(|| fail(selkies::Error::UnsafeName(entry.name.clone()).into()))?;
         let top = if exact {
             folder.clone()
         } else {
@@ -1556,12 +1840,12 @@ async fn download_job(
                     folders.push(local);
                 } else {
                     bytes += child.size.unwrap_or(0);
-                    files.push((child.path, local));
+                    files.push((child.path, local, child.size));
                 }
             }
         } else {
             bytes += entry.size.unwrap_or(0);
-            files.push((entry.path, top));
+            files.push((entry.path, top, entry.size));
         }
     }
     meter.total.store(bytes, Ordering::Relaxed);
@@ -1570,7 +1854,7 @@ async fn download_job(
             .await
             .map_err(|e| e.to_string())?;
     }
-    for (remote, local) in files {
+    for (remote, local, expected) in files {
         let partial = selkies::partial_path(&local);
         let _ = tokio::fs::remove_file(&partial).await;
         if let Ok(mut current) = meter.partial.lock() {
@@ -1581,9 +1865,12 @@ async fn download_job(
         loop {
             // A retry resumes the partial file where the last attempt stopped.
             meter.done.store(before, Ordering::Relaxed);
-            match access.download(&remote, &local, &meter.done).await {
+            match access
+                .download(&remote, &local, &meter.done, expected)
+                .await
+            {
                 Ok(()) => break,
-                Err(selkies::Error::Network(_)) if attempt < 2 => {
+                Err(error) if error.is_network() && attempt < 2 => {
                     attempt += 1;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -1600,11 +1887,42 @@ async fn download_job(
     Ok(made)
 }
 
-/// Marks the transfer as refused by its own route.
-fn note_forbidden(meter: &Meter, error: &selkies::Error) {
-    if matches!(error, selkies::Error::Server(StatusCode::FORBIDDEN, _)) {
+/// Marks the transfer as refused by its own Selkies route (never for storage, `ARCH-037`).
+fn note_forbidden(meter: &Meter, error: &BackendError) {
+    if error.forbidden() {
         meter.forbidden.store(true, Ordering::Relaxed);
     }
+}
+
+/// What the Storage window says when something would land in a home's `Desktop/files`.
+const SHARED_MOUNT_NOTICE: &str =
+    "This folder is your Shared Files. Every session with storage sees it here.";
+
+/// The home-rooted paths a storage Delete sends: never a home's `Desktop` or
+/// `Desktop/files` (`ARCH-037`).
+fn deletable_paths(place: &StoragePlace, entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| !storage::protected(place, &entry.path))
+        .map(|entry| storage::home_path(&entry.path))
+        .collect()
+}
+
+/// Delete is enabled in the Storage window for a selection with something it may send.
+fn storage_can_delete(place: &StoragePlace, selection: &[&Entry]) -> bool {
+    selection
+        .iter()
+        .any(|entry| !storage::protected(place, &entry.path))
+}
+
+/// Whether a finished upload's folder is the one shown, in the same home.
+fn uploaded_shows(
+    shown_home: Option<String>,
+    shown_folder: &str,
+    home: &Option<String>,
+    folder: &str,
+) -> bool {
+    shown_home == *home && shown_folder == folder
 }
 
 /// Where the Selkies file-manager folder sits in a SealSkin home: `FILE_MANAGER_PATH` defaults
@@ -1809,6 +2127,92 @@ mod tests {
         assert!(!same_folder(ours.into_iter(), ["Work"].into_iter()));
         assert!(!same_folder(["a"].into_iter(), ["a", "b"].into_iter()));
         assert!(same_folder([].into_iter(), [].into_iter()));
+    }
+
+    fn entry(path: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: path.rsplit('/').next().unwrap().into(),
+            path: path.into(),
+            is_dir,
+            size: None,
+            mtime: String::new(),
+        }
+    }
+
+    #[test]
+    fn storage_delete_needs_no_folder_match_but_skips_protected_rows() {
+        let home = StoragePlace::Home("work".into());
+        let desktop = entry("Desktop", true);
+        let mount = entry("Desktop/files", true);
+        let docs = entry("Documents", true);
+        let note = entry("Desktop/note.txt", false);
+        assert!(!storage_can_delete(&home, &[&desktop]));
+        assert!(!storage_can_delete(&home, &[&desktop, &mount]));
+        assert!(storage_can_delete(&home, &[&desktop, &docs]));
+        assert_eq!(
+            deletable_paths(&home, &[desktop.clone(), docs, mount.clone(), note]),
+            ["/Documents", "/Desktop/note.txt"]
+        );
+        // Shared Files has no mount points: its own Desktop folder may go.
+        assert_eq!(
+            deletable_paths(&StoragePlace::Shared, &[desktop]),
+            ["/Desktop"]
+        );
+    }
+
+    #[test]
+    fn uploaded_refresh_only_for_the_same_home() {
+        let work = Some("work".to_string());
+        assert!(uploaded_shows(work.clone(), "Docs", &work, "Docs"));
+        assert!(!uploaded_shows(Some("other".into()), "Docs", &work, "Docs"));
+        assert!(!uploaded_shows(work.clone(), "", &work, "Docs"));
+        assert!(uploaded_shows(None, "", &None, ""), "a session's window");
+    }
+
+    #[test]
+    fn storage_quota_403_keeps_upload_enabled_and_shows_the_sentence() {
+        let quota = BackendError::Storage(crate::sealskin::StorageError::Invalid(
+            "Storage limit reached: 50 GB.".into(),
+        ));
+        let meter = Meter::default();
+        note_forbidden(&meter, &quota);
+        assert!(!meter.forbidden.load(Ordering::Relaxed));
+        let refused = BackendError::Storage(crate::sealskin::StorageError::Api(
+            crate::sealskin::ApiError::Forbidden(
+                "Persistent storage is disabled for this account.".into(),
+            ),
+        ));
+        note_forbidden(&meter, &refused);
+        assert!(!meter.forbidden.load(Ordering::Relaxed));
+        assert_eq!(
+            refused.to_string(),
+            "Persistent storage is disabled for this account."
+        );
+        let session =
+            BackendError::Selkies(selkies::Error::Server(StatusCode::FORBIDDEN, String::new()));
+        note_forbidden(&meter, &session);
+        assert!(meter.forbidden.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn storage_keys_stay_in_the_files_window() {
+        use gpui_kit::{KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(key_bindings());
+        let stack = |names: &[&str]| -> Vec<KeyContext> {
+            names
+                .iter()
+                .map(|n| KeyContext::parse(n).unwrap())
+                .collect()
+        };
+        for key in ["alt-cmd-o", "cmd-f"] {
+            let keystroke = [Keystroke::parse(key).unwrap()];
+            let (pane, _) =
+                keymap.bindings_for_input(&keystroke, &stack(&["Storage", "FilesWindow"]));
+            assert!(!pane.is_empty(), "{key}");
+            let (desktop, _) =
+                keymap.bindings_for_input(&keystroke, &stack(&[crate::view::DESKTOP_CONTEXT]));
+            assert!(desktop.is_empty(), "{key}");
+        }
     }
 
     #[test]

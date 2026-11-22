@@ -123,11 +123,6 @@ pub fn home_path(pane_path: &str) -> String {
     format!("/{}", pane_path.trim_matches('/'))
 }
 
-/// A home-rooted path as a pane path.
-pub fn pane_path(home_path: &str) -> String {
-    home_path.trim_matches('/').to_string()
-}
-
 /// A home's `Desktop` and its `Desktop/files` (the Shared Files mount point): sessions need
 /// both, so they are never deleted. App homes are homes too; Shared Files has neither.
 pub fn protected(place: &StoragePlace, pane_path: &str) -> bool {
@@ -471,7 +466,6 @@ mod tests {
         assert_eq!(entry.path, "Reports");
         assert_eq!(home_path("Reports/x"), "/Reports/x");
         assert_eq!(home_path(""), "/");
-        assert_eq!(pane_path("/Desktop/x/"), "Desktop/x");
     }
 
     fn session(app_id: &str, app_name: &str, home: &str) -> RemoteSession {

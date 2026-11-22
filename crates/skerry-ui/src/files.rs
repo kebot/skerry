@@ -53,6 +53,9 @@ pub struct FileRow {
     pub modified: String,
     pub size: String,
     pub selected: bool,
+    /// A folder sessions need (a home's `Desktop` and `Desktop/files`): never deleted, shown
+    /// with a lock (`ARCH-037`).
+    pub locked: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +119,25 @@ pub struct FilesProps {
     pub selected: usize,
     /// The window is key: selection shows in the accent colour, otherwise in grey.
     pub focused: bool,
+    /// The Storage window's extras (`ARCH-037`); `None` in a session's Files window.
+    pub storage: Option<StoragePaneProps>,
+}
+
+/// What the Storage window's pane adds to the Files pane.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoragePaneProps {
+    /// Open in… shows (`Some`) at the top of Shared Files, enabled for one selected file.
+    pub open_in: Option<bool>,
+    /// Entries in the folder before the Filter, for "2 of 14 items".
+    pub total: usize,
+    /// The Filter text, for "No items match “x”.".
+    pub filter: String,
+    /// What an empty folder says.
+    pub empty_text: String,
+    /// The window is narrow (under 760 pt): the Filter field shrinks.
+    pub narrow: bool,
+    /// The selection holds something Delete may send (not only protected folders).
+    pub delete_enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +179,8 @@ pub enum FilesAction {
     QuickLook,
     /// Delete the selection, after a confirmation.
     Delete,
+    /// Open the selected Shared Files file in an app on the server (`ARCH-037`).
+    OpenIn,
     CancelTransfer(u64),
     RevealTransfer(u64),
     ClearTransfers,
@@ -168,13 +192,14 @@ pub fn render(
     theme: &Theme,
     props: &FilesProps,
     folder_name: &Entity<InputState>,
+    filter: Option<&Entity<InputState>>,
     scroll: &UniformListScrollHandle,
     on_action: FilesHandler,
 ) -> Div {
     div()
         .v_flex()
         .size_full()
-        .child(toolbar(theme, props, &on_action))
+        .child(toolbar(theme, props, filter, &on_action))
         .when(props.creating_folder, |view| {
             view.child(new_folder_row(theme, folder_name, &on_action))
         })
@@ -189,8 +214,19 @@ pub fn render(
         .child(status_bar(theme, props))
 }
 
-fn toolbar(theme: &Theme, props: &FilesProps, on_action: &FilesHandler) -> Div {
+fn toolbar(
+    theme: &Theme,
+    props: &FilesProps,
+    filter: Option<&Entity<InputState>>,
+    on_action: &FilesHandler,
+) -> Div {
     let selected = props.selected > 0;
+    let open_in = props.storage.as_ref().and_then(|storage| storage.open_in);
+    let filter_width = if props.storage.as_ref().is_some_and(|storage| storage.narrow) {
+        120.
+    } else {
+        160.
+    };
     div()
         .flex_none()
         .h_flex()
@@ -253,16 +289,39 @@ fn toolbar(theme: &Theme, props: &FilesProps, on_action: &FilesHandler) -> Div {
                 on_action,
             ))
         })
+        .when_some(open_in, |bar, enabled| {
+            bar.child(text_button(
+                "files-open-in",
+                "Open in…",
+                "Open in an app on the server (⌥⌘O)",
+                enabled,
+                FilesAction::OpenIn,
+                on_action,
+            ))
+        })
         .when(props.can_delete, |bar| {
             // Kept apart at the end, where a slip of the pointer cannot reach it.
             bar.child(div().w(px(8.))).child(icon_button(
                 "files-delete",
                 gpui_kit::assets::IconName::Trash,
                 "Delete (⌘⌫)",
-                selected,
+                props
+                    .storage
+                    .as_ref()
+                    .map_or(selected, |storage| storage.delete_enabled),
                 FilesAction::Delete,
                 on_action,
             ))
+        })
+        .when_some(filter, |bar, filter| {
+            bar.child(div().w(px(8.))).child(
+                div().w(px(filter_width)).flex_none().child(
+                    Input::new(filter)
+                        .small()
+                        .prefix(Icon::new(IconName::Search).small())
+                        .cleanable(true),
+                ),
+            )
         })
 }
 
@@ -467,12 +526,17 @@ fn body(
             return container
                 .child(placeholder(theme, "Loading…".into()).child(Spinner::new().small()));
         }
-        let message = if props.can_upload {
-            "This folder is empty. Drop files here to upload them."
-        } else {
-            "This folder is empty."
+        let message = match &props.storage {
+            Some(storage) if !storage.filter.trim().is_empty() && storage.total > 0 => {
+                format!("No items match “{}”.", storage.filter.trim())
+            }
+            Some(storage) => storage.empty_text.clone(),
+            None if props.can_upload => {
+                "This folder is empty. Drop files here to upload them.".into()
+            }
+            None => "This folder is empty.".into(),
         };
-        return container.child(placeholder(theme, message.into()));
+        return container.child(placeholder(theme, message));
     }
     let rows = Rc::clone(&props.rows);
     let theme_row = theme.clone();
@@ -587,8 +651,28 @@ fn row(
                 .flex_1()
                 .min_w_0()
                 .h_flex()
+                .items_center()
                 .child(div().min_w_0().truncate().child(stem.to_owned()))
-                .child(div().flex_none().child(extension.to_owned())),
+                .child(div().flex_none().child(extension.to_owned()))
+                .when(file.locked, |name| {
+                    name.child(
+                        div()
+                            .id(("file-row-lock", index))
+                            .flex_none()
+                            .ml_1()
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::Lock)
+                                    .size(px(12.))
+                                    .text_color(secondary),
+                            )
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(
+                                    "Sessions need this folder, so it can’t be deleted.",
+                                )
+                                .build(window, cx)
+                            }),
+                    )
+                }),
         )
         .child(
             div()
@@ -666,10 +750,12 @@ fn placeholder(theme: &Theme, message: String) -> Div {
 
 fn status_bar(theme: &Theme, props: &FilesProps) -> Div {
     let count = props.rows.len();
-    let items = if count == 1 {
-        "1 item".to_owned()
-    } else {
-        format!("{count} items")
+    let items = match &props.storage {
+        Some(storage) if !storage.filter.trim().is_empty() => {
+            format!("{count} of {} items", storage.total)
+        }
+        _ if count == 1 => "1 item".to_owned(),
+        _ => format!("{count} items"),
     };
     let text = if props.error.is_some() || (props.loading && count == 0) {
         String::new()

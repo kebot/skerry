@@ -596,12 +596,6 @@ pub enum StorageError {
     Invalid(String),
 }
 
-impl StorageError {
-    pub fn is_refusal(&self) -> bool {
-        matches!(self, Self::Api(error) if error.is_refusal())
-    }
-}
-
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
