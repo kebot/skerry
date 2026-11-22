@@ -665,6 +665,11 @@ fn uplink_message(ready: bool, frame: Vec<u8>) -> Option<Message> {
     ready.then(|| Message::Binary(frame.into()))
 }
 
+/// A camera frame for the writer's camera slot, only once the session is ready.
+fn camera_uplink(ready: bool, frame: Vec<u8>) -> Option<Vec<u8>> {
+    ready.then_some(frame)
+}
+
 /// The next uplink frame. A closed channel (or none) never yields, and is forgotten.
 async fn uplink(frames: &mut Option<mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
     if let Some(receiver) = frames {
@@ -1394,7 +1399,7 @@ pub async fn run(
             // Camera frames go to the writer's camera slot, behind every queued command and
             // microphone frame; frames before the session is ready are dropped.
             frame = uplink(&mut cam_frames) => {
-                if ready {
+                if let Some(frame) = camera_uplink(ready, frame) {
                     socket.send_camera(frame);
                 }
             }
@@ -2000,6 +2005,45 @@ mod tests {
     #[test]
     fn uplink_dropped_before_ready() {
         assert!(uplink_message(false, capture::mic_frame(&[1])).is_none());
+        assert!(camera_uplink(false, capture::webcam_frame(true, &[1])).is_none());
+    }
+
+    #[tokio::test]
+    async fn uplink_cam_frames_sent_as_binary_after_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut seen = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Binary(data) => seen.push(data.to_vec()),
+                    Message::Text(text) => seen.push(text.as_bytes().to_vec()),
+                    _ => {}
+                }
+            }
+            seen
+        });
+        let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/"))
+            .await
+            .unwrap();
+        let backlog: Box<dyn Backlog> =
+            match socket_fd(socket.get_ref()).and_then(UnsentBacklog::new) {
+                Some(backlog) => Box::new(backlog),
+                None => Box::new(NoBacklog),
+            };
+        let mut socket = SplitSocket::new(socket, Arc::default(), backlog);
+        let key = capture::webcam_frame(true, &[0, 0, 0, 1, 0x65, 9]);
+        assert!(camera_uplink(false, key.clone()).is_none());
+        socket.send_camera(camera_uplink(true, key.clone()).unwrap());
+        // Let the writer take the frame before the close is queued.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        socket.send("kd,65".into()).await.unwrap();
+        socket.close(None).await.unwrap();
+        let seen = server.await.unwrap();
+        assert_eq!(seen, [key, b"kd,65".to_vec()]);
+        assert_eq!(&seen[0][..3], [0x06, 0x01, 0x01]);
     }
 
     #[tokio::test]
@@ -2031,6 +2075,23 @@ mod tests {
             Some(SessionEvent::Capture(capture::Reply::Demand(
                 capture::Subject::Microphone,
                 true
+            )))
+        ));
+        assert!(matches!(
+            capture_event("WEBCAM_DISABLED"),
+            Some(SessionEvent::Capture(capture::Reply::Disabled(
+                capture::Subject::Camera
+            )))
+        ));
+        assert!(matches!(
+            capture_event("WEBCAM_KEYFRAME"),
+            Some(SessionEvent::Capture(capture::Reply::Keyframe))
+        ));
+        assert!(matches!(
+            capture_event("CAPTURE_DEMAND webcam 0"),
+            Some(SessionEvent::Capture(capture::Reply::Demand(
+                capture::Subject::Camera,
+                false
             )))
         ));
         assert!(capture_event("VIDEO_STARTED").is_none());

@@ -2034,4 +2034,129 @@ mod tests {
         assert!(props.on);
         assert_eq!(props.detail.as_deref(), Some("Waiting for permission…"));
     }
+
+    fn cam_status(live: bool) -> CamStatus {
+        CamStatus {
+            devices: vec![
+                device("FaceTime", "FaceTime HD Camera"),
+                device("iPhone", "iPhone Camera"),
+            ],
+            default_uid: Some("FaceTime".into()),
+            active: live.then(|| device("FaceTime", "FaceTime HD Camera")),
+            live,
+            ..CamStatus::default()
+        }
+    }
+
+    fn cam_inputs(status: Option<&CamStatus>) -> CamInputs<'_> {
+        CamInputs {
+            state: DeviceState::default(),
+            status,
+            chosen: None,
+            saved_name: None,
+        }
+    }
+
+    fn both_policy() -> CapturePolicy {
+        let mut policy = mic_policy(true, false);
+        policy.cam.permitted = true;
+        policy
+    }
+
+    #[test]
+    fn media_capture_props_camera_group() {
+        let status = cam_status(true);
+        let mic = mic_inputs(Some(both_policy()), None);
+        let mut cam = cam_inputs(Some(&status));
+        cam.state.wanted = true;
+        cam.state.phase = Phase::On;
+        let props = media_capture_props(&mic, Some(&cam)).unwrap();
+        let camera = props.camera.clone().unwrap();
+        assert!(
+            camera.on && camera.live && camera.level.is_none(),
+            "no meter"
+        );
+        assert_eq!(camera.device_label, "System Default (FaceTime HD Camera)");
+        assert_eq!(camera.detail.as_deref(), Some("Sending to the session"));
+        assert_eq!(
+            skerry_ui::controls::media_capture_header(&props),
+            Some("Camera on")
+        );
+        // Another app holds it.
+        let in_use = CamStatus {
+            problem: Some(CamProblem::InUse),
+            ..cam_status(false)
+        };
+        cam.status = Some(&in_use);
+        let camera = media_capture_props(&mic, Some(&cam))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("The camera is in use by another app or stopped. Trying again…")
+        );
+        // Demand, untouched.
+        let mut demand = both_policy();
+        demand.cam.on_demand = true;
+        let camera = media_capture_props(&mic_inputs(Some(demand), None), Some(&cam_inputs(None)))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("Starts when an app in the session uses the camera")
+        );
+        // Denied: the camera's own words and the privacy button.
+        let mut denied = cam_inputs(None);
+        denied.state.denied = true;
+        let camera = media_capture_props(&mic, Some(&denied))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert!(camera.denied);
+        assert_eq!(
+            camera.detail.as_deref(),
+            Some("SealSkin Native isn’t allowed to use the camera.")
+        );
+        // WEBCAM_DISABLED.
+        let mut disabled = cam_inputs(None);
+        disabled.state.server_disabled = true;
+        let camera = media_capture_props(&mic, Some(&disabled))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert!(camera.locked && camera.picker_locked);
+        assert_eq!(camera.detail.as_deref(), Some("Turned off by the server"));
+    }
+
+    #[test]
+    fn media_capture_props_camera_hidden_by_server() {
+        let mut hidden = both_policy();
+        hidden.cam_shown = false;
+        hidden.cam.permitted = false;
+        let props =
+            media_capture_props(&mic_inputs(Some(hidden), None), Some(&cam_inputs(None))).unwrap();
+        assert!(props.camera.is_none());
+    }
+
+    #[test]
+    fn media_capture_props_missing_camera_greyed() {
+        let status = CamStatus {
+            chosen: Some("Gone".into()),
+            problem: Some(CamProblem::ChosenMissing),
+            ..cam_status(true)
+        };
+        let mut cam = cam_inputs(Some(&status));
+        cam.chosen = Some("Gone");
+        let camera = media_capture_props(&mic_inputs(Some(both_policy()), None), Some(&cam))
+            .unwrap()
+            .camera
+            .unwrap();
+        assert_eq!(camera.device_label, "Saved Camera (not connected)");
+        assert_eq!(
+            camera.note.as_deref(),
+            Some("Your saved camera isn’t connected. Using FaceTime HD Camera until it’s back.")
+        );
+    }
 }
