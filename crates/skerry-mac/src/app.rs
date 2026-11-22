@@ -73,6 +73,19 @@ pub fn run() {
         .build()
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
+    // Print jobs a crash, an orphaned download, or an Opened file left behind (`ARCH-033`).
+    handle.spawn_blocking(|| {
+        if let Some(root) = crate::print_jobs::cache_root() {
+            let swept = crate::print_jobs::sweep(
+                &root,
+                std::time::SystemTime::now(),
+                crate::print_jobs::SWEEP_AGE,
+            );
+            if let Err(error) = swept {
+                eprintln!("Couldn’t sweep the print cache: {error}");
+            }
+        }
+    });
     let reopen_handle = handle.clone();
     let application = gpui_kit::application().with_assets(skerry_ui::assets::SkerryAssets);
     // A Dock-icon click brings the Library back (ARCH-022).
@@ -94,6 +107,7 @@ pub fn run() {
         cx.on_app_quit(|cx| {
             cx.global::<WriteQueue>()
                 .flush_blocking(Duration::from_secs(1));
+            quit_print_cleanup(cx);
             async {}
         })
         .detach();
@@ -2628,6 +2642,36 @@ impl Launcher {
                     });
             }
         });
+    }
+}
+
+/// Quit skips the windows' close handlers (`cx.quit()`), so every session window's print
+/// jobs are cleaned up here, synchronously with `std::fs`: the runtime is going away. Then
+/// the cache is swept, so Opened files don't wait for a launch a day later (`ARCH-033`).
+fn quit_print_cleanup(cx: &mut App) {
+    let sessions: Vec<_> = cx
+        .try_global::<OpenWindows>()
+        .map(|windows| {
+            windows
+                .sessions
+                .iter()
+                .map(|open| open.entity.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut doomed = Vec::new();
+    for session in sessions.iter().filter_map(|session| session.upgrade()) {
+        doomed.extend(session.update(cx, |session, _| {
+            crate::print_jobs::quit_cleanup([&mut session.print_jobs])
+        }));
+    }
+    crate::print_jobs::remove_now(&doomed);
+    if let Some(root) = crate::print_jobs::cache_root() {
+        let _ = crate::print_jobs::sweep(
+            &root,
+            std::time::SystemTime::now(),
+            crate::print_jobs::SWEEP_AGE,
+        );
     }
 }
 

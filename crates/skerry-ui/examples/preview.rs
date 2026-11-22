@@ -18,8 +18,9 @@ use skerry_ui::{
     },
     controls::{
         self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps,
-        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, ShortcutRow,
-        ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, PrintJobRow, PrintRowKind,
+        PrintingProps, ScreenProps, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem,
+        VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -34,7 +35,7 @@ use skerry_ui::{
         LibraryProps, OmnibarIcon, OpenHandlers, OpeningAppRow, OpeningKind, OpeningProps,
         OpeningSessionRow, SessionItem, StageRow, StageState, UploadProgress,
     },
-    session::{self, KeySourceLabel},
+    session::{self, KeySourceLabel, PrintJobAction, PrintNoticeKind, PrintNoticeProps},
     stats,
 };
 use std::collections::{HashMap, HashSet};
@@ -111,6 +112,9 @@ enum Story {
     ControlsShortcutsLocked,
     ControlsStatsStripOn,
     ControlsStatsWaiting,
+    ControlsPrintingEmpty,
+    ControlsPrintingJobs,
+    ControlsPrintingOff,
     AudioDefault,
     AudioChosen,
     AudioMissing,
@@ -131,6 +135,11 @@ enum Story {
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
+    PrintNoticeStates,
+    PrintNoticeLongName,
+    PrintNoticeStack,
+    PrintNoticeWithStrip,
+    PrintNoticeNarrow,
 }
 
 impl Story {
@@ -198,6 +207,9 @@ impl Story {
         Story::ControlsShortcutsLocked,
         Story::ControlsStatsStripOn,
         Story::ControlsStatsWaiting,
+        Story::ControlsPrintingEmpty,
+        Story::ControlsPrintingJobs,
+        Story::ControlsPrintingOff,
         Story::AudioDefault,
         Story::AudioChosen,
         Story::AudioMissing,
@@ -218,6 +230,11 @@ impl Story {
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
+        Story::PrintNoticeStates,
+        Story::PrintNoticeLongName,
+        Story::PrintNoticeStack,
+        Story::PrintNoticeWithStrip,
+        Story::PrintNoticeNarrow,
     ];
 
     fn group(self) -> &'static str {
@@ -284,7 +301,10 @@ impl Story {
             | Story::ControlsShortcutsOff
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
-            | Story::ControlsStatsWaiting => "Session Controls",
+            | Story::ControlsStatsWaiting
+            | Story::ControlsPrintingEmpty
+            | Story::ControlsPrintingJobs
+            | Story::ControlsPrintingOff => "Session Controls",
             Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -303,6 +323,11 @@ impl Story {
             | Story::SessionStatsStripWithBanner
             | Story::SessionStatsStripFullScreen => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
+            Story::PrintNoticeStates
+            | Story::PrintNoticeLongName
+            | Story::PrintNoticeStack
+            | Story::PrintNoticeWithStrip
+            | Story::PrintNoticeNarrow => "Session Printing",
         }
     }
 
@@ -391,6 +416,14 @@ impl Story {
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
+            Story::ControlsPrintingEmpty => "Printing · Empty",
+            Story::ControlsPrintingJobs => "Printing · Jobs, Auto Off",
+            Story::ControlsPrintingOff => "Printing · Off by Server",
+            Story::PrintNoticeStates => "Every Notice State",
+            Story::PrintNoticeLongName => "Long Name",
+            Story::PrintNoticeStack => "Stack + More",
+            Story::PrintNoticeWithStrip => "Below the Stats Strip",
+            Story::PrintNoticeNarrow => "Narrow Window",
         }
     }
 
@@ -479,6 +512,14 @@ impl Story {
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
+            Story::ControlsPrintingEmpty => "story-controls-printing-empty",
+            Story::ControlsPrintingJobs => "story-controls-printing-jobs",
+            Story::ControlsPrintingOff => "story-controls-printing-off",
+            Story::PrintNoticeStates => "story-print-notice-states",
+            Story::PrintNoticeLongName => "story-print-notice-long-name",
+            Story::PrintNoticeStack => "story-print-notice-stack",
+            Story::PrintNoticeWithStrip => "story-print-notice-strip",
+            Story::PrintNoticeNarrow => "story-print-notice-narrow",
         }
     }
 
@@ -543,6 +584,9 @@ impl Story {
                 | Story::ControlsShortcutsLocked
                 | Story::ControlsStatsStripOn
                 | Story::ControlsStatsWaiting
+                | Story::ControlsPrintingEmpty
+                | Story::ControlsPrintingJobs
+                | Story::ControlsPrintingOff
         ) || self.is_audio()
     }
 
@@ -632,17 +676,23 @@ impl Story {
             ..ControlsUiState::default()
         };
         match self {
-            // Input, Shortcuts and Video open, Screen closed: what a server remembered.
+            // Input, Shortcuts, Printing and Video open, Screen closed: what a server remembered.
             Story::ControlsRestoredSections => ControlsUiState::default()
-                .with_sections([true, true, false, false, true, false, false]),
+                .with_sections([true, true, false, true, false, true, false, false]),
+            Story::ControlsPrintingEmpty | Story::ControlsPrintingJobs => {
+                ControlsUiState::default()
+                    .with_sections([false, false, true, true, false, false, false, false])
+            }
+            Story::ControlsPrintingOff => ControlsUiState::default()
+                .with_sections([false, false, true, false, false, false, false, false]),
             _ if self.is_audio() => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, true, false]),
+                .with_sections([false, false, false, false, false, false, true, false]),
             Story::ControlsShortcutsActive
             | Story::ControlsShortcutsOff
             | Story::ControlsShortcutsLocked => ControlsUiState::default()
-                .with_sections([false, true, false, false, false, false, false]),
+                .with_sections([false, true, false, false, false, false, false, false]),
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, true]),
+                .with_sections([false, false, false, false, false, false, false, true]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()
@@ -2003,6 +2053,17 @@ impl PreviewApp {
                     self.controls_props.shortcuts.mac_active = active;
                 }
             }
+            ControlsAction::SetAutoPrint(on) => {
+                if let Some(printing) = self.controls_props.printing.as_mut() {
+                    printing.auto_print = on;
+                }
+            }
+            ControlsAction::PrintJob(id, PrintJobAction::Remove) => {
+                if let Some(printing) = self.controls_props.printing.as_mut() {
+                    printing.jobs.retain(|row| row.id != id);
+                }
+            }
+            ControlsAction::PrintJob(..) => {}
             ControlsAction::Reconnect
             | ControlsAction::OpenFiles
             | ControlsAction::Disconnect
@@ -2142,6 +2203,7 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                printing: Some(Self::fixture_printing(true, false)),
             },
             Story::ControlsServerLocked => ControlsProps {
                 app_name: "Locked Enterprise Desktop".into(),
@@ -2173,6 +2235,7 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                printing: Some(Self::fixture_printing(true, false)),
             },
             _ if story.is_audio() => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
@@ -2196,6 +2259,17 @@ impl PreviewApp {
                     Story::ControlsShortcutsOff => Self::fixture_shortcuts(false, false),
                     Story::ControlsShortcutsLocked => Self::fixture_shortcuts(false, true),
                     _ => Self::fixture_shortcuts(true, false),
+                };
+                props
+            }
+            Story::ControlsPrintingEmpty
+            | Story::ControlsPrintingJobs
+            | Story::ControlsPrintingOff => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.printing = match story {
+                    Story::ControlsPrintingOff => None,
+                    Story::ControlsPrintingJobs => Some(Self::fixture_printing(false, true)),
+                    _ => Some(Self::fixture_printing(true, false)),
                 };
                 props
             }
@@ -2299,6 +2373,7 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                printing: Some(Self::fixture_printing(true, false)),
             },
         }
     }
@@ -2457,6 +2532,199 @@ impl PreviewApp {
 
     /// The strip over the stream: all good, or the warn case (throttled, over target,
     /// nothing sent lately, no decoder yet).
+    /// The Printing card (`ARCH-033`): empty, or a row in every state.
+    fn fixture_printing(auto_print: bool, jobs: bool) -> PrintingProps {
+        let row = |id: u64, name: &str, meta: &str, kind: PrintRowKind| PrintJobRow {
+            id,
+            name: name.into(),
+            meta: meta.into(),
+            kind,
+            saved_to: None,
+            opened: false,
+        };
+        let rows = if jobs {
+            vec![
+                row(
+                    8,
+                    "Invoice 2026-11.pdf",
+                    "1.2 MB of 3.4 MB",
+                    PrintRowKind::Receiving {
+                        fraction: Some(0.35),
+                    },
+                ),
+                row(7, "Report.pdf", "3.4 MB · Just now", PrintRowKind::Ready),
+                PrintJobRow {
+                    saved_to: Some("Saved to Downloads".into()),
+                    ..row(6, "Slides.pdf", "8.1 MB · 2 min ago", PrintRowKind::Ready)
+                },
+                row(
+                    5,
+                    "Protected.pdf",
+                    "640 KB · 5 min ago · Can’t print here",
+                    PrintRowKind::Unreadable,
+                ),
+                row(
+                    4,
+                    "Invoice.pdf",
+                    "3.4 MB · 12 min ago · Couldn’t receive",
+                    PrintRowKind::Failed,
+                ),
+                row(
+                    3,
+                    "Archive scan.pdf",
+                    "1.4 GB · 1 hr ago · Too large to receive",
+                    PrintRowKind::TooLarge,
+                ),
+                PrintJobRow {
+                    opened: true,
+                    ..row(
+                        2,
+                        "Old notes.pdf",
+                        "220 KB · 3 hr ago · No longer on this Mac",
+                        PrintRowKind::Missing,
+                    )
+                },
+                row(
+                    1,
+                    "Quarterly Financial Statement for the Board of Directors – Final (3).pdf",
+                    "2.2 MB · 3 hr ago",
+                    PrintRowKind::Ready,
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        PrintingProps {
+            auto_print,
+            jobs: rows,
+            at_cap: false,
+        }
+    }
+
+    /// A print notice in every state, in the order of the design's table.
+    fn fixture_print_notices() -> Vec<PrintNoticeProps> {
+        let notice = |id: u64, name: &str, kind: PrintNoticeKind| PrintNoticeProps {
+            id,
+            name: name.to_string().into(),
+            kind,
+        };
+        let ready = |detail: &str, saved: bool| PrintNoticeKind::Ready {
+            detail: detail.to_string().into(),
+            saved,
+        };
+        let failed = |detail: &str| PrintNoticeKind::Failed {
+            detail: detail.to_string().into(),
+        };
+        vec![
+            notice(
+                1,
+                "Report.pdf",
+                PrintNoticeKind::Receiving {
+                    received: 1_200_000,
+                    total: 3_400_000,
+                },
+            ),
+            notice(
+                2,
+                "Report.pdf",
+                PrintNoticeKind::Receiving {
+                    received: 1_200_000,
+                    total: 0,
+                },
+            ),
+            notice(3, "Report.pdf", ready("3.4 MB · From Firefox", false)),
+            notice(
+                4,
+                "Report.pdf",
+                ready("3.4 MB · The print dialog opens when you come back", false),
+            ),
+            notice(5, "Report.pdf", ready("Saved to Downloads", true)),
+            notice(
+                6,
+                "Report.pdf",
+                ready("Finish the open print dialog first.", false),
+            ),
+            notice(7, "Report.pdf", PrintNoticeKind::Unreadable),
+            notice(
+                8,
+                "Report.pdf",
+                failed("The connection dropped partway. Print it again from the session."),
+            ),
+            notice(
+                9,
+                "Report.pdf",
+                failed("What arrived wasn’t a PDF. Print it again from the session."),
+            ),
+            notice(
+                10,
+                "Report.pdf",
+                failed("Printing is turned off for this session."),
+            ),
+            notice(
+                11,
+                "Report.pdf",
+                failed("Couldn’t reach the session. Reconnect to receive Report.pdf."),
+            ),
+            notice(
+                12,
+                "Report.pdf",
+                PrintNoticeKind::TooLarge {
+                    detail: "It’s 1.4 GB. Skerry receives print jobs up to 1 GiB.".into(),
+                },
+            ),
+            notice(13, "Report.pdf", PrintNoticeKind::Missing),
+        ]
+    }
+
+    /// The notice stack over a session frame, as `SessionWindow` draws it.
+    fn print_frame(
+        theme: &gpui_kit::component::Theme,
+        width: f32,
+        height: f32,
+        notices: &[PrintNoticeProps],
+        strip: Option<&stats::StripProps>,
+        entity: Entity<Self>,
+    ) -> gpui_kit::Div {
+        let top =
+            session::print_notices_top(strip.map(|strip| stats::strip_bottom(strip, px(width))));
+        let shown = session::print_notices_shown(px(height), top).min(notices.len());
+        let more = notices.len() - shown;
+        let frame = match strip {
+            Some(strip) => Self::session_frame(width, height, strip),
+            None => div()
+                .relative()
+                .flex_none()
+                .w(px(width))
+                .h(px(height))
+                .overflow_hidden()
+                .bg(gpui_kit::linear_gradient(
+                    180.,
+                    gpui_kit::linear_color_stop(rgb(0xe9eef4), 0.),
+                    gpui_kit::linear_color_stop(rgb(0x1b2430), 0.55),
+                )),
+        };
+        let action_entity = entity.clone();
+        frame
+            .child(session::controls_trigger(
+                point(px(width - 40.), px(8.)),
+                px(32.),
+                |_, _, _| {},
+            ))
+            .child(session::print_notices(
+                theme,
+                &notices[..shown],
+                more,
+                px(width),
+                top,
+                Rc::new(move |id, action, _, cx| {
+                    action_entity.update(cx, |this, cx| {
+                        this.record_event(format!("Print: {action:?} #{id}"), cx)
+                    });
+                }),
+                Rc::new(|_, _, _, _| {}),
+            ))
+    }
+
     fn fixture_strip(warn: bool) -> stats::StripProps {
         use stats::{Status, StripFigure, StripProps};
         let figure = |value: &str, caption: &str, warn: bool| StripFigure {
@@ -2870,6 +3138,9 @@ impl PreviewApp {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsPrintingEmpty
+            | Story::ControlsPrintingJobs
+            | Story::ControlsPrintingOff
             | Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -3056,6 +3327,100 @@ impl PreviewApp {
                         ));
                 }
                 Self::strip_stage(frame)
+            }
+            Story::PrintNoticeStates => {
+                // Every state, three frames side by side; each frame shows its notices whole.
+                let all = Self::fixture_print_notices();
+                let frame = |notices: &[PrintNoticeProps], entity: Entity<Self>| {
+                    let stack = session::print_notices(
+                        theme,
+                        notices,
+                        0,
+                        px(380.),
+                        px(48.),
+                        Rc::new(move |id, action, _, cx| {
+                            entity.update(cx, |this, cx| {
+                                this.record_event(format!("Print: {action:?} #{id}"), cx)
+                            });
+                        }),
+                        Rc::new(|_, _, _, _| {}),
+                    );
+                    div()
+                        .relative()
+                        .flex_none()
+                        .w(px(380.))
+                        .h(px(620.))
+                        .rounded_lg()
+                        .bg(rgb(0x1b2430))
+                        .child(stack.left(px(12.)).w_auto())
+                };
+                Self::strip_stage(
+                    div()
+                        .h_flex()
+                        .items_start()
+                        .gap_4()
+                        .child(frame(&all[..5], entity.clone()))
+                        .child(frame(&all[5..9], entity.clone()))
+                        .child(frame(&all[9..], entity)),
+                )
+            }
+            Story::PrintNoticeLongName => {
+                let notices = vec![PrintNoticeProps {
+                    id: 1,
+                    name:
+                        "Quarterly Financial Statement for the Board of Directors – Final (3).pdf"
+                            .into(),
+                    kind: PrintNoticeKind::Ready {
+                        detail: "2.2 MB · From Firefox".into(),
+                        saved: false,
+                    },
+                }];
+                Self::strip_stage(Self::print_frame(
+                    theme, 1280., 800., &notices, None, entity,
+                ))
+            }
+            Story::PrintNoticeStack => {
+                let all = Self::fixture_print_notices();
+                let notices = [
+                    all[2].clone(),
+                    PrintNoticeProps {
+                        id: 20,
+                        name: "Slides.pdf".into(),
+                        ..all[2].clone()
+                    },
+                    all[0].clone(),
+                    all[7].clone(),
+                    all[12].clone(),
+                ];
+                Self::strip_stage(Self::print_frame(
+                    theme, 1280., 800., &notices, None, entity,
+                ))
+            }
+            Story::PrintNoticeWithStrip => {
+                let strip = Self::fixture_strip(false);
+                let all = Self::fixture_print_notices();
+                let notices = [all[2].clone(), all[0].clone()];
+                Self::strip_stage(Self::print_frame(
+                    theme,
+                    1280.,
+                    800.,
+                    &notices,
+                    Some(&strip),
+                    entity,
+                ))
+            }
+            Story::PrintNoticeNarrow => {
+                let strip = Self::fixture_strip(false);
+                let all = Self::fixture_print_notices();
+                let notices = [all[2].clone(), all[0].clone(), all[7].clone()];
+                Self::strip_stage(Self::print_frame(
+                    theme,
+                    400.,
+                    360.,
+                    &notices,
+                    Some(&strip),
+                    entity,
+                ))
             }
             Story::SessionStatsStripNarrow => {
                 let strip = Self::fixture_strip(false);

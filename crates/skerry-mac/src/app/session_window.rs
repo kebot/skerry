@@ -13,6 +13,8 @@ use super::{
 use crate::audio::OutputStatus;
 use crate::input::InputFeature;
 use crate::persist::WriteQueue;
+use crate::print_dialog::{self, PrintOutcome};
+use crate::print_jobs::{self, Announced, JobId, JobState, PrintJobs};
 use crate::sealskin::{RemoteSession, SealSkinClient};
 use crate::settings::{Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings};
 use crate::stats;
@@ -27,9 +29,10 @@ use gpui_kit::{
     div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, ScrollHandle, Task,
     WeakEntity, Window,
 };
-use skerry_ui::session;
+use skerry_ui::session::{self, PrintJobAction, PrintNoticeKind, PrintNoticeProps};
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::runtime::Handle;
 
 /// The Library window and every open session window, kept app-wide so a reopened Library
@@ -177,7 +180,24 @@ pub(super) struct SessionWindow {
     keep_waiting: bool,
     /// Last seen full-screen state; a change releases held keys (`ARCH-GAP-DC-09`).
     fullscreen: bool,
+    /// `server_settings.printing_enabled` of this stream (`ARCH-033`).
+    pub(super) print_policy: Option<bool>,
+    /// When this stream's first `server_settings` arrived: announcements right after it are
+    /// documents that were already waiting.
+    print_settings_at: Option<Instant>,
+    /// This window's print jobs, kept across reconnects (the files are local).
+    pub(super) print_jobs: PrintJobs,
+    /// The 1 s tick for progress, countdowns, and a pending auto-open.
+    print_tick: Option<Task<()>>,
+    print_ticking: bool,
+    /// Bumped by "+N more": an open Session Controls opens its Printing card.
+    pub(super) print_reveal: u64,
+    /// Session Controls opens with Printing expanded.
+    pub(super) print_reveal_on_open: bool,
 }
+
+/// Auto-open skips documents larger than this: PDFKit reads them on the main thread.
+const AUTO_PRINT_MAX_BYTES: u64 = 200_000_000;
 
 impl SessionWindow {
     pub(super) fn new(
@@ -230,11 +250,32 @@ impl SessionWindow {
             startup_stalled: None,
             keep_waiting: false,
             fullscreen: window.is_fullscreen(),
+            print_policy: None,
+            print_settings_at: None,
+            print_jobs: PrintJobs::new(print_jobs::window_root(
+                &print_jobs::cache_root()
+                    .unwrap_or_else(|| std::env::temp_dir().join("SealSkin Native Print")),
+                &uuid::Uuid::new_v4().to_string(),
+            )),
+            print_tick: None,
+            print_ticking: false,
+            print_reveal: 0,
+            print_reveal_on_open: false,
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            let _ = owner.update(cx, |this, cx| this.teardown(window, cx));
-            true
+            let sheet = owner
+                .update(cx, |this, cx| this.teardown(window, cx))
+                .ok()
+                .flatten();
+            match sheet {
+                // A print sheet is up: end it, then close, in that order (`ARCH-033`).
+                Some(native) => {
+                    close_after_sheet(native, Window::window_handle(window), cx);
+                    false
+                }
+                None => true,
+            }
         });
         cx.observe_window_bounds(window, |this, window, cx| {
             // Leaving full screen restores the standard title bar; hide it again so it doesn't
@@ -245,6 +286,14 @@ impl SessionWindow {
                 this.release_keys(cx);
             }
             this.resize_display(window, cx)
+        })
+        .detach();
+        // A print dialog waiting for this window opens once it is active again (`ARCH-033`).
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.print_auto_step(window, cx);
+                this.after_print_change(cx);
+            }
         })
         .detach();
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -415,6 +464,11 @@ impl SessionWindow {
                     stream.receive_clipboard(incoming, cx);
                 }
             }
+            SessionEvent::PrintPolicy(on) => {
+                self.print_policy = Some(on);
+                self.print_settings_at.get_or_insert_with(Instant::now);
+            }
+            SessionEvent::PrintDocument(announcement) => self.receive_print(announcement, cx),
             SessionEvent::StartupTimeout => {
                 self.resize_allowed = false;
                 self.settings = None;
@@ -925,6 +979,9 @@ impl SessionWindow {
         self.clipboard_policy = None;
         self.file_access = None;
         self.file_policy = None;
+        // Print jobs stay: their files are local. The next stream says its own policy.
+        self.print_policy = None;
+        self.print_settings_at = None;
         self.close_files(cx);
         self.applied_resolution = None;
         self.applied_dpi = None;
@@ -948,21 +1005,414 @@ impl SessionWindow {
 
     /// The window is going away: end only this session's stream (never stop the remote
     /// app), close its Session Controls, and let the Library catch up (`ARCH-022`).
-    fn teardown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Returns the native window when a sheet is still up on it: the caller ends the sheet,
+    /// then removes the window (`close_after_sheet`).
+    fn teardown(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
         self.remove_controls(cx);
         self.end_stream(window, cx);
+        let sheet =
+            super::native_window(window).filter(|native| print_dialog::sheet_attached(native));
+        self.print_tick = None;
+        let doomed = self.print_jobs.teardown();
+        self.rt
+            .spawn_blocking(move || print_jobs::remove_now(&doomed));
         let handle = Window::window_handle(window);
         if cx.has_global::<OpenWindows>() {
             cx.global_mut::<OpenWindows>().forget_session(handle);
         }
         cx.defer(refresh_library);
+        sheet
     }
 
     /// Disconnects and closes this window. The remote session keeps running.
     pub(super) fn disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.teardown(window, cx);
-        window.remove_window();
+        match self.teardown(window, cx) {
+            Some(native) => close_after_sheet(native, Window::window_handle(window), cx),
+            None => window.remove_window(),
+        }
     }
+}
+
+/// Remote printing (`ARCH-033`).
+impl SessionWindow {
+    /// An announced document: fetched at once on Tokio, so closing the window or a panel
+    /// can't cut the one-shot fetch.
+    fn receive_print(&mut self, announcement: print_jobs::Announcement, cx: &mut Context<Self>) {
+        if !print_jobs::should_fetch(self.print_policy, self.file_access.is_some()) {
+            return;
+        }
+        let Some(client) = self.file_access.clone() else {
+            return;
+        };
+        let replayed = print_jobs::is_replay(self.print_settings_at.map(|at| at.elapsed()));
+        let name = announcement.name.clone();
+        let announced =
+            self.print_jobs
+                .announce(announcement, replayed, Instant::now(), SystemTime::now());
+        if let Announced::Fetch {
+            id,
+            dir,
+            file_name,
+            progress,
+        } = announced
+        {
+            let closed = self.print_jobs.closed();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            self.rt.spawn(async move {
+                let result = print_jobs::fetch(
+                    &client,
+                    &name,
+                    &dir,
+                    &file_name,
+                    &progress,
+                    &closed,
+                    print_jobs::STALL_TIMEOUT,
+                )
+                .await;
+                print_jobs::deliver(result, sender, &dir);
+            });
+            let handle = self.window;
+            cx.spawn(async move |this, cx| {
+                let Ok(result) = receiver.await else {
+                    return;
+                };
+                let _ = handle.update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| this.finish_print(id, result, window, cx))
+                });
+            })
+            .detach();
+        }
+        self.after_print_change(cx);
+    }
+
+    fn finish_print(
+        &mut self,
+        id: JobId,
+        result: print_jobs::FetchResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = Instant::now();
+        if self.print_jobs.finished(id, result, now) {
+            let small = self
+                .print_jobs
+                .get(id)
+                .is_some_and(|job| job.size <= AUTO_PRINT_MAX_BYTES);
+            if self.preferences.printing.auto_print && small {
+                self.print_jobs.offer_auto(id, now);
+            }
+        }
+        self.print_auto_step(window, cx);
+        self.after_print_change(cx);
+    }
+
+    /// Opens the pending job's print dialog when the rule allows (`print_jobs::auto_print_now`).
+    fn print_auto_step(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let sheet = super::native_window(window)
+            .is_some_and(|native| print_dialog::sheet_attached(&native));
+        if !sheet && self.print_jobs.opening.is_none() {
+            self.print_jobs.sheet_closed(now);
+        }
+        let next = self.print_jobs.auto_step(
+            self.preferences.printing.auto_print,
+            window.is_window_active(),
+            sheet,
+            self.startup_stalled.is_some(),
+            now,
+            SystemTime::now(),
+        );
+        if let Some(id) = next {
+            self.start_print(id, true, window, cx);
+        }
+    }
+
+    /// Folders to delete go to a blocking thread; the tick starts if needed.
+    fn after_print_change(&mut self, cx: &mut Context<Self>) {
+        let doomed = self.print_jobs.take_doomed();
+        if !doomed.is_empty() {
+            self.rt
+                .spawn_blocking(move || print_jobs::remove_now(&doomed));
+        }
+        self.ensure_print_tick(cx);
+        cx.notify();
+    }
+
+    /// One tick a second while anything printing-related is live; it stops by itself.
+    fn ensure_print_tick(&mut self, cx: &mut Context<Self>) {
+        if self.print_ticking || !self.print_jobs.needs_tick() {
+            return;
+        }
+        self.print_ticking = true;
+        let handle = self.window;
+        self.print_tick = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let keep = handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.print_jobs.tick(Instant::now());
+                        this.print_auto_step(window, cx);
+                        let keep = this.print_jobs.needs_tick();
+                        this.print_ticking = keep;
+                        this.after_print_change(cx);
+                        keep
+                    })
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+        }));
+    }
+
+    /// Starts the print sheet for `id`. The AppKit call runs in a spawned task, with no
+    /// `App` borrow held around it (`ARCH-033`).
+    fn start_print(&mut self, id: JobId, auto: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(job) = self.print_jobs.get(id) else {
+            self.print_jobs.sheet_deferred();
+            return;
+        };
+        let (path, title) = (job.path.clone(), job.name.clone());
+        if !path.exists() {
+            self.print_jobs.sheet_deferred();
+            self.print_jobs.set_missing(id);
+            return;
+        }
+        let Some(native) = super::native_window(window) else {
+            self.print_jobs.sheet_deferred();
+            return;
+        };
+        self.print_jobs.opening = Some(id);
+        self.release_keys(cx);
+        if !auto {
+            // From Session Controls: the sheet belongs to the session window.
+            window.activate_window();
+        }
+        let handle = self.window;
+        cx.spawn(async move |this, cx| {
+            let outcome = print_dialog::print_pdf(&native, &path, &title, auto);
+            let _ = handle.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    match outcome {
+                        PrintOutcome::Shown => this.print_jobs.sheet_shown(id),
+                        PrintOutcome::Busy => this.print_jobs.sheet_busy(id, auto),
+                        PrintOutcome::Unreadable => this.print_jobs.set_unreadable(id),
+                        PrintOutcome::NotKey | PrintOutcome::NoWindow => {
+                            this.print_jobs.sheet_deferred()
+                        }
+                    }
+                    if outcome != PrintOutcome::Shown {
+                        this.print_auto_step(window, cx);
+                    }
+                    this.after_print_change(cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// A notice's or a Printing card row's button.
+    pub(super) fn print_action(
+        &mut self,
+        id: JobId,
+        action: PrintJobAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let file = self.print_jobs.get(id).map(|job| job.path.clone());
+        let missing = |file: &Option<PathBuf>| file.as_ref().is_some_and(|path| !path.exists());
+        match action {
+            PrintJobAction::Print | PrintJobAction::Open | PrintJobAction::Save
+                if missing(&file) && self.print_jobs.has_file(id) =>
+            {
+                self.print_jobs.set_missing(id);
+            }
+            // A second click while the first sheet is still starting does nothing.
+            PrintJobAction::Print if self.print_jobs.opening.is_some() => {}
+            PrintJobAction::Print => {
+                if self.print_jobs.get(id).map(|job| &job.state) == Some(&JobState::Ready) {
+                    self.start_print(id, false, window, cx);
+                }
+            }
+            PrintJobAction::Open => {
+                if let Some(path) = file.filter(|_| self.print_jobs.has_file(id)) {
+                    cx.open_with_system(&path);
+                    self.print_jobs.mark_opened(id);
+                }
+            }
+            PrintJobAction::Save => {
+                if let Some(path) = file.filter(|_| self.print_jobs.has_file(id)) {
+                    self.save_print(id, path, cx);
+                }
+            }
+            PrintJobAction::Reveal => {
+                if let Some(saved) = self.print_jobs.get(id).and_then(|job| job.saved_to.clone()) {
+                    cx.reveal_path(&saved);
+                }
+            }
+            PrintJobAction::Dismiss => self.print_jobs.dismiss(id),
+            PrintJobAction::Remove => {
+                self.print_jobs.remove(id);
+            }
+            PrintJobAction::ShowAll => self.show_printing(window, cx),
+        }
+        self.after_print_change(cx);
+    }
+
+    /// Save…: a copy chosen in the save panel, so Print… and Open still work after.
+    fn save_print(&mut self, id: JobId, path: PathBuf, cx: &mut Context<Self>) {
+        self.release_keys(cx);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let downloads = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("Downloads");
+        let chosen = cx.prompt_for_new_path(&downloads, Some(&name));
+        let (rt, handle) = (self.rt.clone(), self.window);
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(target))) = chosen.await else {
+                return;
+            };
+            let copied = rt
+                .spawn(tokio::fs::copy(path, target.clone()))
+                .await
+                .is_ok_and(|copy| copy.is_ok());
+            let _ = handle.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    this.print_jobs
+                        .mark_saved(id, copied.then_some(target), Instant::now());
+                    this.after_print_change(cx);
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// "+N more": Session Controls with its Printing card open.
+    fn show_printing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.controls.is_some() {
+            self.print_reveal += 1;
+        } else {
+            self.print_reveal_on_open = true;
+            self.toggle_controls(window, cx);
+        }
+    }
+
+    /// **Open Print Dialog Automatically**, saved for this server.
+    pub(super) fn set_auto_print(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.preferences.printing.auto_print = on;
+        self.save(
+            "the printing preference",
+            move |p| p.printing.auto_print = on,
+            cx,
+        );
+        if !on {
+            self.print_jobs.pending_auto = None;
+        }
+        cx.notify();
+    }
+
+    /// The shown notices, newest first, their sentences written.
+    fn print_notice_props(&self, window: &Window) -> Vec<PrintNoticeProps> {
+        let from = format!("From {}", self.remote.app_name);
+        let native = super::native_window(window);
+        let sheet_open = self.print_jobs.sheet_job.is_some()
+            || native
+                .as_ref()
+                .is_some_and(|native| print_dialog::sheet_attached(native));
+        let looking = native
+            .as_ref()
+            .is_some_and(|native| print_dialog::window_or_sheet_key(native));
+        self.print_jobs
+            .notices()
+            .into_iter()
+            .map(|job| {
+                let size = session::size_label(job.size);
+                let kind = match &job.state {
+                    JobState::Receiving => PrintNoticeKind::Receiving {
+                        received: job.received.load(std::sync::atomic::Ordering::Relaxed),
+                        total: job.size,
+                    },
+                    JobState::Ready => {
+                        let detail = if job.busy {
+                            "Finish the open print dialog first.".to_string()
+                        } else if self.print_jobs.pending_auto == Some(job.id) {
+                            match print_jobs::pending_wait(sheet_open, looking) {
+                                print_jobs::PendingWait::AfterSheet => {
+                                    format!("{size} · The print dialog opens after the current one")
+                                }
+                                print_jobs::PendingWait::WindowAway => {
+                                    format!("{size} · The print dialog opens when you come back")
+                                }
+                                print_jobs::PendingWait::Other => format!("{size} · {from}"),
+                            }
+                        } else if job.save_failed {
+                            "Couldn’t save a copy.".to_string()
+                        } else if let Some(saved) = &job.saved_to {
+                            saved_label(saved)
+                        } else {
+                            format!("{size} · {from}")
+                        };
+                        PrintNoticeKind::Ready {
+                            detail: detail.into(),
+                            saved: job.saved_to.is_some() && !job.busy,
+                        }
+                    }
+                    JobState::Unreadable => PrintNoticeKind::Unreadable,
+                    JobState::Failed(print_jobs::FetchFailure::TooLarge(bytes)) => {
+                        PrintNoticeKind::TooLarge {
+                            detail: print_jobs::too_large_detail(*bytes).into(),
+                        }
+                    }
+                    JobState::Failed(failure) => PrintNoticeKind::Failed {
+                        detail: failure.detail(&job.name).into(),
+                    },
+                    JobState::TooLarge => PrintNoticeKind::TooLarge {
+                        detail: print_jobs::too_large_detail(job.size).into(),
+                    },
+                    JobState::Missing => PrintNoticeKind::Missing,
+                };
+                PrintNoticeProps {
+                    id: job.id,
+                    name: job.name.clone().into(),
+                    kind,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Ends the print sheet on `native`, then removes the window, in one task outside any
+/// update: AppKit may re-enter the run loop as the sheet ends (`ARCH-033`).
+fn close_after_sheet(
+    native: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    handle: AnyWindowHandle,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        print_dialog::end_sheet(&native);
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    })
+    .detach();
+}
+
+/// "Saved to Downloads": the folder the copy went to.
+pub(super) fn saved_label(saved: &std::path::Path) -> String {
+    let folder = saved
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "a folder".into());
+    format!("Saved to {folder}")
 }
 
 /// The chosen device's name to save: when the status answers that choice, lists the device,
@@ -994,6 +1444,20 @@ impl Render for SessionWindow {
             stats::strip(self.stream_info.as_ref(), &recent)
         });
         let viewport_width = window.viewport_size().width;
+        // Notices sit below the ⋯ trigger, or below the strip when it reaches lower.
+        let print_top = session::print_notices_top(
+            strip
+                .as_ref()
+                .map(|strip| skerry_ui::stats::strip_bottom(strip, viewport_width)),
+        );
+        let mut notices = self.print_notice_props(window);
+        let print_more = notices.len().saturating_sub(session::print_notices_shown(
+            window.viewport_size().height,
+            print_top,
+        ));
+        notices.truncate(notices.len() - print_more);
+        let print_owner = cx.entity().downgrade();
+        let hover_owner = print_owner.clone();
         div()
             .size_full()
             .relative()
@@ -1023,6 +1487,25 @@ impl Render for SessionWindow {
             // desktop and the trigger under it (`ARCH-031`).
             .when_some(strip, |root, strip| {
                 root.child(skerry_ui::stats::strip(&strip, viewport_width))
+            })
+            .when(!notices.is_empty() || print_more > 0, |root| {
+                root.child(session::print_notices(
+                    &theme,
+                    &notices,
+                    print_more,
+                    viewport_width,
+                    print_top,
+                    std::rc::Rc::new(move |id, action, window, cx| {
+                        let _ = print_owner
+                            .update(cx, |this, cx| this.print_action(id, action, window, cx));
+                    }),
+                    std::rc::Rc::new(move |id, over, _, cx| {
+                        let _ = hover_owner.update(cx, |this, cx| {
+                            this.print_jobs.hover(id, over, Instant::now());
+                            this.ensure_print_tick(cx);
+                        });
+                    }),
+                ))
             })
             .when_some(self.status.clone(), |root, status| {
                 root.child(session::status_banner_with_actions(

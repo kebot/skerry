@@ -1,5 +1,6 @@
 use crate::audio::{OutputStatus, Playback};
 use crate::clipboard;
+use crate::print_jobs;
 use crate::selkies;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
@@ -354,6 +355,10 @@ pub enum SessionEvent {
     /// The session's file routes, once the session cookie is in hand (`ARCH-023`).
     Files(selkies::SelkiesClient),
     FilePolicy(selkies::Policy),
+    /// `server_settings.printing_enabled` (`ARCH-033`).
+    PrintPolicy(bool),
+    /// A document the session printed, ready to fetch once (`ARCH-033`).
+    PrintDocument(print_jobs::Announcement),
     Error(String),
     /// The start-up grace ran out with the session still answering like one starting.
     StartupTimeout,
@@ -593,6 +598,12 @@ impl HardwareVideo {
         self.next_keyframe_request = now + Duration::from_secs(1);
         true
     }
+}
+
+/// A `print_document` frame as its event; `None` for any other frame or a name Selkies
+/// itself would refuse.
+fn print_event(data: &Value) -> Option<SessionEvent> {
+    print_jobs::Announcement::parse(data).map(SessionEvent::PrintDocument)
 }
 
 fn finger_scroll_capability(text: &str) -> Option<bool> {
@@ -862,6 +873,7 @@ pub async fn run(
                                     capabilities.announce(&data["settings"]);
                                     let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
                                     let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
+                                    let _ = events.send(SessionEvent::PrintPolicy(print_jobs::enabled(&data["settings"])));
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -915,6 +927,11 @@ pub async fn run(
                                             AudioStart::Unavailable => { let _ = events.send(SessionEvent::AudioUnavailable("Audio couldn’t start on this Mac.")); }
                                         }
                                     }
+                                }
+                            }
+                            Some("print_document") => {
+                                if let Some(event) = print_event(&data) {
+                                    let _ = events.send(event);
                                 }
                             }
                             _ => {}
@@ -1344,6 +1361,20 @@ async fn socket_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_document_frames_become_print_events() {
+        let frame = json!({"type": "print_document", "name": "Report.pdf", "size_bytes": 3400});
+        match print_event(&frame) {
+            Some(SessionEvent::PrintDocument(announcement)) => {
+                assert_eq!(announcement.name, "Report.pdf");
+                assert_eq!(announcement.size, 3400);
+            }
+            _ => panic!("expected a print event"),
+        }
+        assert!(print_event(&json!({"type": "stream_info", "name": "a.pdf"})).is_none());
+        assert!(print_event(&json!({"type": "print_document", "name": "../a.pdf"})).is_none());
+    }
 
     fn test_options() -> SessionOptions {
         SessionOptions {
