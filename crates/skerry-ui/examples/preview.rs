@@ -21,11 +21,11 @@ use skerry_ui::{
         RecoveryKind, RecoveryProps,
     },
     controls::{
-        self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem,
-        ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps,
-        PadRow, PadStatus, PrintJobRow, PrintRowKind, PrintingProps, ScreenProps,
-        SecondScreenProps, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps,
-        VideoSettingControl, VideoSettingRow,
+        self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureDeviceProps, CaptureProps,
+        ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
+        GamepadsProps, MediaCaptureProps, PadRow, PadStatus, PrintJobRow, PrintRowKind,
+        PrintingProps, ScreenProps, SecondScreenProps, ShortcutRow, ShortcutsProps, SliderUnit,
+        SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -138,6 +138,14 @@ enum Story {
     AudioBitrateLocked,
     AudioBitrateHidden,
     AudioOff,
+    CaptureOff,
+    CaptureMicLive,
+    CaptureAsking,
+    CaptureDenied,
+    CaptureServerOff,
+    CaptureMissingDevice,
+    SessionCaptureBadge,
+    SessionCaptureBadgeNarrow,
     SessionOverlays,
     SessionStartupStalled,
     SessionKeepWaiting,
@@ -168,6 +176,16 @@ enum Story {
     PrintNoticeStack,
     PrintNoticeWithStrip,
     PrintNoticeNarrow,
+    ConnectSelkiesRecent,
+    ConnectSelkiesToken,
+    ConnectSelkiesBadLogin,
+    ConnectSelkiesWebRtc,
+    ConnectSelkiesUnreachable,
+    ConnectCertificate,
+    ConnectCertificateChanged,
+    SelkiesHomeOpen,
+    SelkiesHomeMenu,
+    SelkiesHomeForget,
     AppsLoading,
     AppsBrowsing,
     AppsInstalled,
@@ -264,6 +282,14 @@ impl Story {
         Story::AudioBitrateLocked,
         Story::AudioBitrateHidden,
         Story::AudioOff,
+        Story::CaptureOff,
+        Story::CaptureMicLive,
+        Story::CaptureAsking,
+        Story::CaptureDenied,
+        Story::CaptureServerOff,
+        Story::CaptureMissingDevice,
+        Story::SessionCaptureBadge,
+        Story::SessionCaptureBadgeNarrow,
         Story::SessionOverlays,
         Story::SessionStartupStalled,
         Story::SessionKeepWaiting,
@@ -294,6 +320,16 @@ impl Story {
         Story::PrintNoticeStack,
         Story::PrintNoticeWithStrip,
         Story::PrintNoticeNarrow,
+        Story::ConnectSelkiesRecent,
+        Story::ConnectSelkiesToken,
+        Story::ConnectSelkiesBadLogin,
+        Story::ConnectSelkiesWebRtc,
+        Story::ConnectSelkiesUnreachable,
+        Story::ConnectCertificate,
+        Story::ConnectCertificateChanged,
+        Story::SelkiesHomeOpen,
+        Story::SelkiesHomeMenu,
+        Story::SelkiesHomeForget,
         Story::AppsLoading,
         Story::AppsBrowsing,
         Story::AppsInstalled,
@@ -392,6 +428,14 @@ impl Story {
             | Story::AudioBitrateLocked
             | Story::AudioBitrateHidden
             | Story::AudioOff => "Session Audio",
+            Story::CaptureOff
+            | Story::CaptureMicLive
+            | Story::CaptureAsking
+            | Story::CaptureDenied
+            | Story::CaptureServerOff
+            | Story::CaptureMissingDevice
+            | Story::SessionCaptureBadge
+            | Story::SessionCaptureBadgeNarrow => "Session Capture",
             Story::SessionOverlays
             | Story::SessionStartupStalled
             | Story::SessionKeepWaiting
@@ -418,6 +462,16 @@ impl Story {
             | Story::PrintNoticeStack
             | Story::PrintNoticeWithStrip
             | Story::PrintNoticeNarrow => "Session Printing",
+            Story::ConnectSelkiesRecent
+            | Story::ConnectSelkiesToken
+            | Story::ConnectSelkiesBadLogin
+            | Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => "Connect",
+            Story::SelkiesHomeOpen | Story::SelkiesHomeMenu | Story::SelkiesHomeForget => {
+                "Selkies Library"
+            }
             Story::AppsLoading
             | Story::AppsBrowsing
             | Story::AppsInstalled
@@ -511,6 +565,14 @@ impl Story {
             Story::AudioBitrateLocked => "Bitrate Locked",
             Story::AudioBitrateHidden => "Bitrate Hidden + Long Names",
             Story::AudioOff => "Turned Off by Server",
+            Story::CaptureOff => "Microphone Off",
+            Story::CaptureMicLive => "Microphone Sending",
+            Story::CaptureAsking => "Waiting for Permission",
+            Story::CaptureDenied => "Permission Denied",
+            Story::CaptureServerOff => "Turned Off by Server",
+            Story::CaptureMissingDevice => "Saved Microphone Missing",
+            Story::SessionCaptureBadge => "Badge over the Picture",
+            Story::SessionCaptureBadgeNarrow => "Badge · Narrow Window",
             Story::SessionOverlays => "Waiting + IME + Banner",
             Story::SessionStartupStalled => "Still Starting",
             Story::SessionKeepWaiting => "Waiting to Start",
@@ -554,6 +616,16 @@ impl Story {
             Story::PrintNoticeStack => "Stack + More",
             Story::PrintNoticeWithStrip => "Below the Stats Strip",
             Story::PrintNoticeNarrow => "Narrow Window",
+            Story::ConnectSelkiesRecent => "Selkies · Recent Servers",
+            Story::ConnectSelkiesToken => "Selkies · Token Link",
+            Story::ConnectSelkiesBadLogin => "Selkies · Wrong Password",
+            Story::ConnectSelkiesWebRtc => "Selkies · WebRTC Server",
+            Story::ConnectSelkiesUnreachable => "Selkies · Unreachable",
+            Story::ConnectCertificate => "Selkies · Trust Certificate",
+            Story::ConnectCertificateChanged => "Selkies · Certificate Changed",
+            Story::SelkiesHomeOpen => "Open Here",
+            Story::SelkiesHomeMenu => "Server Menu",
+            Story::SelkiesHomeForget => "Forget Server",
         }
     }
 
@@ -639,6 +711,14 @@ impl Story {
             Story::AudioBitrateLocked => "story-audio-bitrate-locked",
             Story::AudioBitrateHidden => "story-audio-bitrate-hidden",
             Story::AudioOff => "story-audio-off",
+            Story::CaptureOff => "story-capture-off",
+            Story::CaptureMicLive => "story-capture-mic-sending",
+            Story::CaptureAsking => "story-capture-asking",
+            Story::CaptureDenied => "story-capture-denied",
+            Story::CaptureServerOff => "story-capture-server-off",
+            Story::CaptureMissingDevice => "story-capture-problems",
+            Story::SessionCaptureBadge => "story-session-capture-badge",
+            Story::SessionCaptureBadgeNarrow => "story-session-capture-badge-narrow",
             Story::SessionOverlays => "story-session-overlays",
             Story::SessionStartupStalled => "story-session-startup-stalled",
             Story::SessionKeepWaiting => "story-session-keep-waiting",
@@ -682,6 +762,16 @@ impl Story {
             Story::PrintNoticeStack => "story-print-notice-stack",
             Story::PrintNoticeWithStrip => "story-print-notice-strip",
             Story::PrintNoticeNarrow => "story-print-notice-narrow",
+            Story::ConnectSelkiesRecent => "story-connect-selkies-recent",
+            Story::ConnectSelkiesToken => "story-connect-selkies-token",
+            Story::ConnectSelkiesBadLogin => "story-connect-selkies-bad-login",
+            Story::ConnectSelkiesWebRtc => "story-connect-selkies-webrtc",
+            Story::ConnectSelkiesUnreachable => "story-connect-selkies-unreachable",
+            Story::ConnectCertificate => "story-connect-certificate",
+            Story::ConnectCertificateChanged => "story-connect-certificate-changed",
+            Story::SelkiesHomeOpen => "story-selkies-home-open",
+            Story::SelkiesHomeMenu => "story-selkies-home-menu",
+            Story::SelkiesHomeForget => "story-selkies-home-forget",
         }
     }
 
@@ -762,6 +852,20 @@ impl Story {
                 | Story::ControlsPrintingOff
                 | Story::ControlsApps
         ) || self.is_audio()
+            || self.is_capture()
+    }
+
+    /// Microphone & Camera stories: Session Controls with only that card open (`ARCH-038`).
+    fn is_capture(self) -> bool {
+        matches!(
+            self,
+            Story::CaptureOff
+                | Story::CaptureMicLive
+                | Story::CaptureAsking
+                | Story::CaptureDenied
+                | Story::CaptureServerOff
+                | Story::CaptureMissingDevice
+        )
     }
 
     /// Session Audio stories: Session Controls with only Audio Settings open.
@@ -851,33 +955,45 @@ impl Story {
         };
         match self {
             // Input, Shortcuts, Printing and Video open, Screen closed: what a server remembered.
-            Story::ControlsRestoredSections => ControlsUiState::default()
-                .with_sections([true, true, true, false, true, false, true, false, false]),
+            Story::ControlsRestoredSections => ControlsUiState::default().with_sections([
+                true, true, true, false, true, false, true, false, true, false,
+            ]),
             Story::ControlsPrintingEmpty | Story::ControlsPrintingJobs => {
-                ControlsUiState::default()
-                    .with_sections([false, false, false, true, true, false, false, false, false])
+                ControlsUiState::default().with_sections([
+                    false, false, false, true, true, false, false, false, false, false,
+                ])
             }
-            Story::ControlsPrintingOff => ControlsUiState::default()
-                .with_sections([false, false, false, true, false, false, false, false, false]),
-            _ if self.is_audio() => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, false, true, false]),
+            Story::ControlsPrintingOff => ControlsUiState::default().with_sections([
+                false, false, false, true, false, false, false, false, false, false,
+            ]),
+            _ if self.is_capture() => ControlsUiState::default().with_sections([
+                false, false, false, false, false, false, false, false, true, false,
+            ]),
+            _ if self.is_audio() => ControlsUiState::default().with_sections([
+                false, false, false, false, false, false, false, true, false, false,
+            ]),
             Story::ControlsShortcutsActive
             | Story::ControlsShortcutsOff
-            | Story::ControlsShortcutsLocked => ControlsUiState::default()
-                .with_sections([false, true, false, false, false, false, false, false, false]),
+            | Story::ControlsShortcutsLocked => ControlsUiState::default().with_sections([
+                false, true, false, false, false, false, false, false, false, false,
+            ]),
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, false, false, true]),
+                .with_sections([
+                    false, false, false, false, false, false, false, false, false, true,
+                ]),
             Story::GamepadsEmpty
             | Story::GamepadsSending
             | Story::GamepadsReady
             | Story::GamepadsFull
             | Story::GamepadsInputOff
-            | Story::GamepadsServerOff => ControlsUiState::default()
-                .with_sections([false, false, true, false, false, false, false, false, false]),
+            | Story::GamepadsServerOff => ControlsUiState::default().with_sections([
+                false, false, true, false, false, false, false, false, false, false,
+            ]),
             Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
-            | Story::ControlsInputCaptureUnavailable => ControlsUiState::default()
-                .with_sections([true, false, false, false, false, false, false, false, false]),
+            | Story::ControlsInputCaptureUnavailable => ControlsUiState::default().with_sections([
+                true, false, false, false, false, false, false, false, false, false,
+            ]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()
@@ -936,6 +1052,7 @@ struct PreviewApp {
     height: Entity<InputState>,
     files_props: FilesProps,
     folder_name: Entity<InputState>,
+    selkies_inputs: skerry_ui::selkies::SelkiesInputs,
     files_scroll: gpui_kit::UniformListScrollHandle,
     apps_props: AppsProps,
     apps_search: Entity<InputState>,
@@ -1059,6 +1176,7 @@ impl PreviewApp {
             height,
             files_props: Self::fixture_files(story),
             folder_name: cx.new(|cx| InputState::new(window, cx).default_value("untitled folder")),
+            selkies_inputs: Self::fixture_selkies_inputs(story, window, cx),
             files_scroll: gpui_kit::UniformListScrollHandle::new(),
             apps_props: Self::fixture_apps(story, &assets),
             apps_search: cx.new(|cx| {
@@ -1364,6 +1482,250 @@ impl PreviewApp {
             focused: true,
             width,
         }
+    }
+
+    fn fixture_selkies_inputs(
+        story: Story,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> skerry_ui::selkies::SelkiesInputs {
+        let inputs = skerry_ui::selkies::new_selkies_inputs(window, cx);
+        let (address, user, password) = match story {
+            Story::ConnectSelkiesToken => ("https://gpu.example.com/kasm/", "", ""),
+            Story::ConnectSelkiesBadLogin => {
+                ("https://desktop.lab:8443/", "ubuntu", "wrong-password")
+            }
+            Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => {
+                ("https://desktop.lab:8443/", "ubuntu", "mypasswd")
+            }
+            _ => ("", "", ""),
+        };
+        for (input, value) in [
+            (&inputs.address, address),
+            (&inputs.username, user),
+            (&inputs.password, password),
+        ] {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        inputs
+    }
+
+    fn selkies_connect_props(story: Story) -> skerry_ui::selkies::SelkiesConnectProps {
+        use skerry_ui::selkies::{
+            AlertTone, CertificateProps, RecentServerRow, SelkiesConnectProps, SelkiesField,
+            SelkiesProblem,
+        };
+        let fingerprint = |seed: u8| {
+            (0..32u8)
+                .map(|i| format!("{:02X}", i.wrapping_mul(37).wrapping_add(seed)))
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        let base = SelkiesConnectProps {
+            remember: true,
+            ..SelkiesConnectProps::default()
+        };
+        match story {
+            Story::ConnectSelkiesRecent => SelkiesConnectProps {
+                recent: vec![
+                    RecentServerRow {
+                        url: "https://desktop.lab:8443/".into(),
+                        label: "desktop.lab:8443".into(),
+                        login: "ubuntu@".into(),
+                        pinned: true,
+                        loopback: false,
+                    },
+                    RecentServerRow {
+                        url: "https://gpu.example.com/kasm/".into(),
+                        label: "gpu.example.com/kasm/".into(),
+                        login: "Session token".into(),
+                        pinned: false,
+                        loopback: false,
+                    },
+                    RecentServerRow {
+                        url: "http://localhost:8080/".into(),
+                        label: "localhost:8080".into(),
+                        login: "No login".into(),
+                        pinned: false,
+                        loopback: true,
+                    },
+                ],
+                ..base
+            },
+            Story::ConnectSelkiesToken => SelkiesConnectProps {
+                token_chip: true,
+                remember: false,
+                ..base
+            },
+            Story::ConnectSelkiesBadLogin => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Field {
+                    field: SelkiesField::Login,
+                    text: "The username or password is incorrect.".into(),
+                }),
+                ..base
+            },
+            Story::ConnectSelkiesWebRtc => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Alert {
+                    tone: AlertTone::Warning,
+                    title: "This server streams over WebRTC".into(),
+                    body: "Skerry needs the WebSockets mode: ask its operator to run Selkies with --mode=websockets. Dual mode is on, but the server is in WebRTC mode right now; Skerry won’t switch it, because that would change the stream for everyone watching.".into(),
+                    server: Some("desktop.lab:8443".into()),
+                    switch_to_sealskin: false,
+                }),
+                ..base
+            },
+            Story::ConnectSelkiesUnreachable => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Alert {
+                    tone: AlertTone::Danger,
+                    title: "Couldn’t reach desktop.lab:8443".into(),
+                    body: "Nothing is listening at that address and port. Check the address, and that the server is running.".into(),
+                    server: Some("desktop.lab:8443".into()),
+                    switch_to_sealskin: false,
+                }),
+                ..base
+            },
+            Story::ConnectCertificate => SelkiesConnectProps {
+                certificate: Some(CertificateProps {
+                    host: "desktop.lab".into(),
+                    host_port: "desktop.lab:8443".into(),
+                    fingerprint: fingerprint(0x3F),
+                    previous: None,
+                }),
+                ..base
+            },
+            Story::ConnectCertificateChanged => SelkiesConnectProps {
+                certificate: Some(CertificateProps {
+                    host: "desktop.lab".into(),
+                    host_port: "desktop.lab:8443".into(),
+                    fingerprint: fingerprint(0x3F),
+                    previous: Some(fingerprint(0x91)),
+                }),
+                ..base
+            },
+            _ => base,
+        }
+    }
+
+    fn render_selkies_connect(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use skerry_ui::selkies::{ConnectTab, SelkiesConnectHandlers};
+        let entity = cx.entity().clone();
+        let click = |label: &'static str| -> skerry_ui::selkies::Click {
+            let entity = entity.clone();
+            Rc::new(move |_, _, cx| entity.update(cx, |this, cx| this.record_event(label, cx)))
+        };
+        let url = |label: &'static str| -> skerry_ui::selkies::UrlHandler {
+            let entity = entity.clone();
+            Rc::new(move |url, _, cx| {
+                entity.update(cx, |this, cx| {
+                    this.record_event(format!("{label} {url}"), cx)
+                })
+            })
+        };
+        let e = entity.clone();
+        let handlers = SelkiesConnectHandlers {
+            on_tab: Rc::new(move |tab, _, cx| {
+                e.update(cx, |this, cx| {
+                    this.record_event(format!("Tab: {tab:?}"), cx)
+                })
+            }),
+            on_connect: click("Selkies: Connect"),
+            on_recent: url("Recent:"),
+            on_recent_remove: url("Remove recent:"),
+            on_remember: {
+                let e = entity.clone();
+                Rc::new(move |on, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.record_event(format!("Remember: {on}"), cx)
+                    })
+                })
+            },
+            on_drop_token: click("Drop token"),
+            on_trust: click("Trust certificate"),
+            on_cert_cancel: click("Cancel certificate"),
+            on_switch_sealskin: click("Switch to SealSkin"),
+        };
+        let selkies = Self::selkies_connect_props(self.story);
+        connect::render_with_tabs(
+            theme,
+            &ConnectProps::default(),
+            &self.key_input,
+            ConnectHandlers::new(|_, _, _| {}),
+            connect::ConnectTabs {
+                tab: ConnectTab::Selkies,
+                selkies: &selkies,
+                inputs: &self.selkies_inputs,
+                handlers,
+            },
+        )
+    }
+
+    fn render_selkies_home(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use skerry_ui::selkies::{SecurityBadge, SelkiesHomeHandlers, SelkiesHomeProps};
+        let entity = cx.entity().clone();
+        let click = |label: &'static str| -> skerry_ui::selkies::Click {
+            let entity = entity.clone();
+            Rc::new(move |_, _, cx| entity.update(cx, |this, cx| this.record_event(label, cx)))
+        };
+        let open = self.story == Story::SelkiesHomeOpen;
+        let props = SelkiesHomeProps {
+            app_name: "SealSkin Native".into(),
+            display_name: "desktop.lab:8443".into(),
+            base_url: "https://desktop.lab:8443/".into(),
+            login_label: "ubuntu@".into(),
+            security: Some(SecurityBadge::Pinned),
+            fingerprint: Some(
+                (0..32u8)
+                    .map(|i| format!("{:02X}", i.wrapping_mul(37)))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+            open_here: open,
+            others: usize::from(open),
+            thumbnail: open.then(|| self.assets.thumb_zen.clone()),
+            accepts_drop: true,
+            can_open_web: true,
+            menu_open: self.story == Story::SelkiesHomeMenu,
+            ..SelkiesHomeProps::default()
+        };
+        let e = entity.clone();
+        let handlers = SelkiesHomeHandlers {
+            on_open: click("Desktop: Open"),
+            on_files: click("Desktop: Files"),
+            on_refresh: click("Refresh"),
+            on_menu_open: Rc::new(move |open, _, cx| {
+                e.update(cx, |this, cx| {
+                    this.record_event(format!("Menu open: {open}"), cx)
+                })
+            }),
+            on_open_web: click("Open in Browser"),
+            on_disconnect: click("Disconnect"),
+            on_forget: click("Forget This Server…"),
+            on_drop: {
+                let e = entity.clone();
+                Rc::new(move |paths, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.record_event(format!("Drop {} items", paths.len()), cx)
+                    })
+                })
+            },
+            on_copy_pending: click("Copy to Desktop"),
+            on_cancel_pending: click("Cancel copy"),
+        };
+        div()
+            .size_full()
+            .relative()
+            .child(skerry_ui::selkies::render_home(theme, &props, handlers))
+            .when(self.story == Story::SelkiesHomeForget, |view| {
+                view.child(session::forget_server_confirm_modal(
+                    theme,
+                    "desktop.lab:8443",
+                    |_, _, _| {},
+                    |_, _, _| {},
+                ))
+            })
     }
 
     fn fixture_files(story: Story) -> FilesProps {
@@ -2582,6 +2944,29 @@ impl PreviewApp {
                 }
             }
             ControlsAction::PrintJob(..) => {}
+            ControlsAction::SetMicrophone(on) => {
+                if let Some(capture) = self.controls_props.media_capture.as_mut() {
+                    if !capture.mic.locked {
+                        capture.mic.on = on;
+                        capture.mic.live = on;
+                        capture.mic.denied = false;
+                        capture.mic.detail = on.then(|| "Sending to the session".into());
+                        capture.mic.level = on.then_some(3);
+                    }
+                }
+            }
+            ControlsAction::SelectInputDevice(uid) => {
+                if let Some(capture) = self.controls_props.media_capture.as_mut() {
+                    for item in &mut capture.mic.devices {
+                        item.checked = item.uid == uid;
+                    }
+                    if let Some(item) = capture.mic.devices.iter().find(|item| item.checked) {
+                        capture.mic.device_label = item.label.clone();
+                    }
+                    capture.mic.note = None;
+                }
+            }
+            ControlsAction::OpenPrivacySettings(_) => {}
             ControlsAction::Reconnect
             | ControlsAction::OpenFiles
             | ControlsAction::OpenApps
@@ -2727,6 +3112,7 @@ impl PreviewApp {
                 capture: Self::fixture_capture(true, false),
                 gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
                 printing: Some(Self::fixture_printing(true, false)),
+                media_capture: Some(Self::fixture_media_capture(Story::CaptureOff)),
             },
             Story::ControlsServerLocked => ControlsProps {
                 apps_available: story == Story::ControlsApps,
@@ -2763,7 +3149,13 @@ impl PreviewApp {
                 capture: Self::fixture_capture(true, false),
                 gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
                 printing: Some(Self::fixture_printing(true, false)),
+                media_capture: Some(Self::fixture_media_capture(Story::CaptureOff)),
             },
+            _ if story.is_capture() => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.media_capture = Some(Self::fixture_media_capture(story));
+                props
+            }
             _ if story.is_audio() => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
                 props.audio_settings = Some(Self::fixture_audio(story));
@@ -2935,8 +3327,99 @@ impl PreviewApp {
                 capture: Self::fixture_capture(true, false),
                 gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
                 printing: Some(Self::fixture_printing(true, false)),
+                media_capture: Some(Self::fixture_media_capture(Story::CaptureOff)),
             },
         }
+    }
+
+    /// The Microphone & Camera card each Session Capture story shows, as `skerry-mac`
+    /// builds it (`ARCH-038`).
+    fn fixture_media_capture(story: Story) -> MediaCaptureProps {
+        let item =
+            |uid: Option<&str>, label: &str, checked: bool, connected: bool| AudioOutputItem {
+                uid: uid.map(str::to_string),
+                label: label.into(),
+                checked,
+                connected,
+            };
+        let devices = |chosen: Option<&str>| {
+            vec![
+                item(
+                    None,
+                    "System Default (MacBook Pro Microphone)",
+                    chosen.is_none(),
+                    true,
+                ),
+                item(
+                    Some("airpods"),
+                    "AirPods Pro",
+                    chosen == Some("airpods"),
+                    true,
+                ),
+                item(
+                    Some("builtin"),
+                    "MacBook Pro Microphone",
+                    chosen == Some("builtin"),
+                    true,
+                ),
+                item(Some("shure"), "Shure MV7", chosen == Some("shure"), true),
+            ]
+        };
+        let off = CaptureDeviceProps {
+            on: false,
+            locked: false,
+            picker_locked: false,
+            live: false,
+            detail: None,
+            denied: false,
+            device_label: "System Default (MacBook Pro Microphone)".into(),
+            devices: devices(None),
+            note: None,
+            level: None,
+        };
+        let mic = match story {
+            Story::CaptureMicLive => CaptureDeviceProps {
+                on: true,
+                live: true,
+                detail: Some("Sending to the session".into()),
+                level: Some(3),
+                ..off
+            },
+            Story::CaptureAsking => CaptureDeviceProps {
+                on: true,
+                detail: Some("Waiting for permission…".into()),
+                ..off
+            },
+            Story::CaptureDenied => CaptureDeviceProps {
+                denied: true,
+                detail: Some("SealSkin Native isn’t allowed to use the microphone.".into()),
+                ..off
+            },
+            Story::CaptureServerOff => CaptureDeviceProps {
+                locked: true,
+                picker_locked: true,
+                detail: Some("Turned off by the server".into()),
+                device_label: "System Default".into(),
+                devices: vec![item(None, "System Default", true, true)],
+                ..off
+            },
+            Story::CaptureMissingDevice => {
+                let mut list = devices(Some("usb"));
+                list.push(item(Some("usb"), "USB Mic (not connected)", true, false));
+                CaptureDeviceProps {
+                    device_label: "USB Mic (not connected)".into(),
+                    devices: list,
+                    note: Some(
+                        "USB Mic isn’t connected. Using MacBook Pro Microphone until it’s back."
+                            .into(),
+                    ),
+                    detail: Some("Starts when an app in the session listens".into()),
+                    ..off
+                }
+            }
+            _ => off,
+        };
+        MediaCaptureProps { mic }
     }
 
     /// The Audio Settings card each Session Audio story shows, as `skerry-mac` builds it.
@@ -3806,7 +4289,13 @@ impl PreviewApp {
             | Story::AudioRetrying
             | Story::AudioBitrateLocked
             | Story::AudioBitrateHidden
-            | Story::AudioOff => {
+            | Story::AudioOff
+            | Story::CaptureOff
+            | Story::CaptureMicLive
+            | Story::CaptureAsking
+            | Story::CaptureDenied
+            | Story::CaptureServerOff
+            | Story::CaptureMissingDevice => {
                 let handler = Rc::new(
                     move |action: ControlsAction, window: &mut Window, cx: &mut App| {
                         entity.update(cx, |this, cx| {
@@ -4156,6 +4645,39 @@ impl PreviewApp {
                         )),
                 )
             }
+            Story::SessionCaptureBadge => {
+                // Microphone badge at the left, the strip on one line (top 52), the ⋯ trigger
+                // and one print notice at the right.
+                let strip = Self::fixture_strip(false);
+                let top = session::print_notices_top(Some(stats::strip_bottom(&strip, px(1280.))));
+                let notices = Self::fixture_print_notices();
+                Self::strip_stage(
+                    Self::session_frame(1280., 800., &strip)
+                        .child(session::controls_trigger(
+                            point(px(1240.), px(8.)),
+                            px(32.),
+                            |_, _, _| {},
+                        ))
+                        .child(session::capture_badge(true, top))
+                        .child(session::print_notices(
+                            theme,
+                            &notices[..1],
+                            0,
+                            px(1280.),
+                            top,
+                            Rc::new(|_, _, _, _| {}),
+                            Rc::new(|_, _, _, _| {}),
+                        )),
+                )
+            }
+            Story::SessionCaptureBadgeNarrow => {
+                let strip = Self::fixture_strip(false);
+                let top = session::print_notices_top(Some(stats::strip_bottom(&strip, px(400.))));
+                Self::strip_stage(
+                    Self::session_frame(400., 600., &strip)
+                        .child(session::capture_badge(true, top)),
+                )
+            }
             Story::SessionCaptureHintNarrow => {
                 let strip = stats::StripProps {
                     marks: Vec::new(),
@@ -4246,6 +4768,16 @@ impl PreviewApp {
                     Some(&strip),
                     entity,
                 ))
+            }
+            Story::ConnectSelkiesRecent
+            | Story::ConnectSelkiesToken
+            | Story::ConnectSelkiesBadLogin
+            | Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => self.render_selkies_connect(theme, cx),
+            Story::SelkiesHomeOpen | Story::SelkiesHomeMenu | Story::SelkiesHomeForget => {
+                self.render_selkies_home(theme, cx)
             }
             Story::PrintNoticeNarrow => {
                 let strip = Self::fixture_strip(false);

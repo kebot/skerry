@@ -31,6 +31,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
+  <!-- Without it, TCC ends the app at its first microphone access (ARCH-038). -->
+  <key>NSMicrophoneUsageDescription</key><string>SealSkin Native sends your microphone to a remote session only while you turn it on or the session asks for it.</string>
   <!-- Finder Open With and Dock drops for any file, never as the default app (ARCH-028). -->
   <key>CFBundleDocumentTypes</key>
   <array>
@@ -56,6 +58,8 @@ PLIST
 
 # Ad-hoc sign so macOS will launch it locally (not notarised).
 plutil -lint "$APP/Contents/Info.plist" >/dev/null || { echo "error: Info.plist is invalid" >&2; exit 1; }
+plutil -extract NSMicrophoneUsageDescription raw "$APP/Contents/Info.plist" >/dev/null \
+  || { echo "error: Info.plist has no microphone usage string" >&2; exit 1; }
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc codesign failed"
 # Register at once so Open With and skerry: links work without a re-login.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister

@@ -367,6 +367,8 @@ pub struct ControlsSections {
     pub screen: bool,
     pub video: bool,
     pub audio: bool,
+    /// Microphone & Camera (`ARCH-038`).
+    pub capture: bool,
     pub stats: bool,
 }
 
@@ -381,6 +383,7 @@ impl Default for ControlsSections {
             screen: true,
             video: false,
             audio: false,
+            capture: false,
             stats: false,
         }
     }
@@ -392,8 +395,8 @@ impl ControlsSections {
     }
 
     /// In Session Controls order: Input, Shortcuts, Gamepads, Clipboard, Printing, Screen,
-    /// Video, Audio, Stats.
-    pub fn to_array(self) -> [bool; 9] {
+    /// Video, Audio, Microphone & Camera, Stats.
+    pub fn to_array(self) -> [bool; 10] {
         [
             self.input,
             self.shortcuts,
@@ -403,12 +406,13 @@ impl ControlsSections {
             self.screen,
             self.video,
             self.audio,
+            self.capture,
             self.stats,
         ]
     }
 
     pub fn from_array(
-        [input, shortcuts, gamepads, clipboard, printing, screen, video, audio, stats]: [bool; 9],
+        [input, shortcuts, gamepads, clipboard, printing, screen, video, audio, capture, stats]: [bool; 10],
     ) -> Self {
         Self {
             input,
@@ -419,6 +423,7 @@ impl ControlsSections {
             screen,
             video,
             audio,
+            capture,
             stats,
         }
     }
@@ -549,6 +554,13 @@ pub struct AudioPreferences {
     /// The audio bitrate (bps) last picked, re-requested when a session starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate: Option<u32>,
+    /// The chosen microphone's raw Core Audio UID; `None` follows the Mac's default input
+    /// (`ARCH-038`). Whether the microphone is on is never saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+    /// The chosen microphone's last-seen name, to label it while it isn't connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device_name: Option<String>,
 }
 
 impl AudioPreferences {
@@ -1006,14 +1018,14 @@ mod tests {
     fn controls_sections_round_trip_beside_video_settings() {
         let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
         prefs.controls = ControlsSections::from_array([
-            true, false, false, false, false, false, true, true, false,
+            true, false, false, false, false, false, true, true, false, false,
         ]);
         let saved = serde_json::to_value(&prefs).unwrap();
         let restored: Preferences = serde_json::from_value(saved).unwrap();
         // `controls` is read as the struct, not swallowed by the flattened video map.
         assert_eq!(
             restored.controls.to_array(),
-            [true, false, false, false, false, false, true, true, false]
+            [true, false, false, false, false, false, true, true, false, false]
         );
         assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
         assert_eq!(restored.video.len(), 1);
@@ -1021,8 +1033,8 @@ mod tests {
 
     #[test]
     fn controls_sections_round_trip_with_shortcuts() {
-        for bits in 0..512u16 {
-            let open: [bool; 9] = std::array::from_fn(|i| bits & (1 << i) != 0);
+        for bits in 0..1024u16 {
+            let open: [bool; 10] = std::array::from_fn(|i| bits & (1 << i) != 0);
             assert_eq!(ControlsSections::from_array(open).to_array(), open);
         }
         let dir = tempfile::tempdir().unwrap();
@@ -1030,6 +1042,66 @@ mod tests {
         std::fs::write(&path, r#"{"controls": {"stats": true}}"#).unwrap();
         let old = load_at(&path).controls;
         assert!(old.stats && !old.shortcuts && old.screen);
+    }
+
+    #[test]
+    fn controls_sections_ten_roundtrip_and_old_nine_file_loads() {
+        let open = ControlsSections {
+            capture: true,
+            ..ControlsSections::default()
+        };
+        // Microphone & Camera sits between Audio and Stats.
+        assert!(open.to_array()[8]);
+        assert_eq!(ControlsSections::from_array(open.to_array()), open);
+        let saved = serde_json::to_value(Preferences {
+            controls: open,
+            ..Preferences::default()
+        })
+        .unwrap();
+        assert_eq!(saved["controls"]["capture"], json!(true));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // A file from a build with nine sections: the new card starts collapsed.
+        std::fs::write(
+            &path,
+            r#"{"controls": {"input": true, "shortcuts": false, "gamepads": false, "clipboard": false, "printing": false, "screen": false, "video": false, "audio": true, "stats": true}}"#,
+        )
+        .unwrap();
+        let loaded = load_at(&path).controls;
+        assert!(!loaded.capture && loaded.audio && loaded.stats && loaded.input);
+    }
+
+    #[test]
+    fn audio_input_device_saved_and_old_file_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"audio": {"output_device": "USB-DAC"}}"#).unwrap();
+        let old = load_at(&path);
+        assert_eq!(old.audio.input_device, None);
+        assert_eq!(old.audio.output_device.as_deref(), Some("USB-DAC"));
+        update_at(&path, |p| {
+            p.audio.input_device = Some("AppleUSBAudioEngine:Shure".into());
+            p.audio.input_device_name = Some("Shure MV7".into());
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(
+            saved.audio.input_device.as_deref(),
+            Some("AppleUSBAudioEngine:Shure")
+        );
+        assert_eq!(saved.audio.input_device_name.as_deref(), Some("Shure MV7"));
+        assert_eq!(saved.audio.output_device.as_deref(), Some("USB-DAC"));
+        // Nothing else about the microphone is written: no on/off state.
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut keys: Vec<_> = written["audio"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["input_device", "input_device_name", "output_device"]);
     }
 
     #[test]
@@ -1469,7 +1541,7 @@ mod tests {
         let saved = load_at(&path);
         assert_eq!(
             saved.controls.to_array(),
-            [true, false, false, false, false, false, true, false, true]
+            [true, false, false, false, false, false, true, false, false, true]
         );
     }
 
@@ -1483,7 +1555,7 @@ mod tests {
         assert!(restored.controls.gamepads);
         assert_eq!(
             restored.controls.to_array(),
-            [false, false, true, false, false, true, false, false, false]
+            [false, false, true, false, false, true, false, false, false, false]
         );
     }
 

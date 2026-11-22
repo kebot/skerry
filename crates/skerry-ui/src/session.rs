@@ -288,6 +288,45 @@ fn placement_card(
         )
 }
 
+/// A stream that can't come back by reconnecting (a direct Selkies server refused the
+/// login, `ARCH-036`): danger tone, and Disconnect only.
+pub fn fatal_banner(
+    theme: &Theme,
+    status: impl Into<String>,
+    on_disconnect: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    div()
+        .id("session-fatal-banner")
+        .absolute()
+        .bottom_3()
+        .left_3()
+        .right_3()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.danger.opacity(0.4))
+        .bg(theme.popover)
+        .text_color(theme.foreground)
+        .occlude()
+        .h_flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.danger)
+                .child(gpui_kit::component::IconName::CircleX),
+        )
+        .child(div().flex_1().min_w_0().child(status.into()))
+        .child(
+            Button::new("session-banner-disconnect")
+                .outline()
+                .small()
+                .label("Disconnect")
+                .on_click(on_disconnect),
+        )
+}
+
 /// What a print notice's or a Printing card row's button asks (`ARCH-033`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrintJobAction {
@@ -340,6 +379,33 @@ pub type PrintHoverHandler = std::rc::Rc<dyn Fn(u64, bool, &mut Window, &mut App
 pub fn print_notices_top(strip_bottom: Option<Pixels>) -> Pixels {
     let strip = strip_bottom.map_or(0., f32::from);
     px(48f32.max((strip / 4.).ceil() * 4.))
+}
+
+/// The capture badge at the top left while the microphone is open (`ARCH-038`): below the
+/// traffic lights at `top` (`print_notices_top`, the same height as the notices on the
+/// right), always dark, and with **no hitbox** (no id, listeners or occlusion), so clicks
+/// reach the remote app's menus under it (`ARCH-031`). The camera's group joins in M2.
+pub fn capture_badge(mic: bool, top: Pixels) -> Div {
+    let group = |color: u32, icon: IconName| {
+        div()
+            .h_flex()
+            .items_center()
+            .gap(px(4.))
+            .child(div().size(px(8.)).rounded_full().bg(rgb(color)))
+            .child(Icon::new(icon).with_size(px(14.)).text_color(rgb(0xffffff)))
+    };
+    div()
+        .absolute()
+        .left(px(12.))
+        .top(top)
+        .h(px(24.))
+        .px(px(8.))
+        .rounded(px(12.))
+        .bg(rgba(0x0000008c))
+        .h_flex()
+        .items_center()
+        .gap(px(8.))
+        .when(mic, |badge| badge.child(group(0xFF9F0A, IconName::Mic)))
 }
 
 /// How many notice cards fit above the hint and banners: 104 pt per card, 112 pt kept at the
@@ -876,6 +942,30 @@ pub fn sign_out_confirm_modal(
             ],
             confirm_label: "Sign Out",
             confirm_icon: Some(gpui_kit::assets::IconName::LogOut.into()),
+        },
+        on_cancel,
+        on_confirm,
+    )
+}
+
+/// Confirmation before forgetting a direct Selkies server (`ARCH-036`).
+pub fn forget_server_confirm_modal(
+    theme: &Theme,
+    display_name: &str,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    confirm_modal(
+        theme,
+        ConfirmCopy {
+            id: "forget-server",
+            title: format!("Forget {display_name}?"),
+            body: vec![
+                "Skerry removes its address, login and trusted certificate from ~/.config/skerry/config.toml.".into(),
+                "Open session windows stay connected.".into(),
+            ],
+            confirm_label: "Forget",
+            confirm_icon: Some(gpui_kit::assets::IconName::Trash.into()),
         },
         on_cancel,
         on_confirm,

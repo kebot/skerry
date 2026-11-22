@@ -31,7 +31,6 @@ use gpui_kit::{
     div, point, prelude::*, px, rgb, size, AnyWindowHandle, App, Bounds, Context, DisplayId,
     FocusHandle, Pixels, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
 };
-use reqwest::Url;
 use skerry_ui::controls::SecondScreenProps;
 use skerry_ui::session;
 use std::time::Duration;
@@ -275,7 +274,7 @@ impl Streams {
 /// What Display 2's stream starts with, read from the session window at that moment (so
 /// a codec change made since is followed).
 pub(super) struct StreamSetup {
-    pub(super) url: Url,
+    pub(super) target: crate::transport::SessionTarget,
     pub(super) rt: Handle,
     pub(super) preferences: Vec<(Key, u32)>,
     pub(super) codec: Codec,
@@ -809,7 +808,7 @@ impl DisplayWindow {
             .request(window.viewport_size(), window.scale_factor());
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
         let stream = NativeSession::open(
-            setup.url,
+            setup.target,
             window,
             cx,
             &setup.rt,
@@ -825,6 +824,8 @@ impl DisplayWindow {
                 audio_output: None,
                 audio_bitrate: None,
                 role: StreamRole::Secondary(self.side),
+                // The microphone is the primary's (`ARCH-038`).
+                mic: None,
             },
             events,
         );

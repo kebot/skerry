@@ -735,9 +735,10 @@ impl Launcher {
             hint: self.key_hint.clone(),
             pending_open: super::pending_open_banner(&self.pending_opens),
         };
+        let on_selkies_tab = self.connect_tab == skerry_ui::selkies::ConnectTab::Selkies;
         let mut handlers =
             ConnectHandlers::new(cx.listener(|this, _, window, cx| this.submit_key(window, cx)));
-        if self.recovery.is_some() {
+        if self.recovery.is_some() && !on_selkies_tab {
             handlers.on_sign_in_web = Some(Rc::new(
                 cx.listener(|this, _, _, cx| this.sign_in_on_web(cx)),
             ));
@@ -751,11 +752,24 @@ impl Launcher {
                 window.focus(&self.focus_handle, cx);
             }
         }
+        let (selkies, selkies_handlers) = self.connect_tabs(cx);
+        let tabs = connect::ConnectTabs {
+            tab: self.connect_tab,
+            selkies: &selkies,
+            inputs: &self.selkies_form.inputs,
+            handlers: selkies_handlers,
+        };
+        let on_selkies = self.connect_tab == skerry_ui::selkies::ConnectTab::Selkies;
         div()
             .size_full()
+            .relative()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key != "enter" || this.busy.is_some() {
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if this.certificate_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if on_selkies || event.keystroke.key != "enter" || this.busy.is_some() {
                     return;
                 }
                 let Some(recovery) = this.recovery.as_ref() else {
@@ -768,7 +782,16 @@ impl Launcher {
                 }
                 cx.stop_propagation();
             }))
-            .child(connect::render(theme, &props, &self.key_input, handlers))
+            .child(connect::render_with_tabs(
+                theme,
+                &props,
+                &self.key_input,
+                handlers,
+                tabs,
+            ))
+            .when_some(self.toast.as_ref(), |view, toast| {
+                view.child(skerry_ui::components::toast_layer(theme, toast))
+            })
     }
 }
 

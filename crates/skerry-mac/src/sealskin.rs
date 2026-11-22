@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::json;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,6 +231,10 @@ impl Credential {
         self
     }
 
+    pub fn source(&self) -> KeySource {
+        self.source
+    }
+
     /// The key as pasted, for the write queue to save.
     pub(crate) fn raw(&self) -> &str {
         &self.raw
@@ -250,7 +254,16 @@ pub enum KeySource {
 /// Saves `raw` as `application_key` in the config file at `path`. Blocking: only `persist`'s
 /// write queue calls it.
 pub(crate) fn save_key_at(path: &Path, raw: &str) -> Result<(), String> {
-    write_saved_key(path, Some(raw)).map_err(|error| {
+    // One write: the key and `start_with`, so startup reconnects to SealSkin (ARCH-036).
+    crate::config_store::edit_config(path, |document| {
+        set_key_in(document, Some(raw));
+        crate::config_store::set_start_with_in(
+            document,
+            Some(crate::config_store::StartWith::SealSkin),
+        );
+        true
+    })
+    .map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 format!(
                     "Connected for this run. The key wasn’t saved because {CONFIG_DISPLAY} isn’t valid TOML. Fix or delete that file, then connect again."
@@ -280,30 +293,12 @@ pub(crate) fn forget_key_at(path: &Path, raw: &str) -> Result<(), String> {
     }
 }
 
-const CONFIG_DISPLAY: &str = "~/.config/skerry/config.toml";
 const CONFIG_KEY: &str = "application_key";
 
-pub(crate) fn config_file() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .ok_or("Skerry can’t find your home folder to keep the application key.")?;
-    Ok(config_file_in(Path::new(&home)))
-}
-
-pub(crate) fn config_file_in(home: &Path) -> PathBuf {
-    home.join(".config/skerry/config.toml")
-}
-
-fn read_config(path: &Path) -> io::Result<Option<toml_edit::DocumentMut>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => text
-            .parse()
-            .map(Some)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
+pub(crate) use crate::config_store::config_file;
+#[cfg(test)]
+pub(crate) use crate::config_store::config_file_in;
+use crate::config_store::{read_config, CONFIG_DISPLAY};
 
 fn read_saved_key(path: &Path) -> Result<Option<String>, String> {
     let document = read_config(path)
@@ -330,41 +325,19 @@ fn read_saved_key(path: &Path) -> Result<Option<String>, String> {
 }
 
 /// Sets (`Some`) or removes (`None`) `application_key`, keeping every other setting and
-/// comment in the file. The folder is private to the user (0700) and the file is replaced
-/// atomically by a temporary file created 0600 before any secret bytes are written.
+/// comment in the file, through the one config writer (`config_store::edit_config`).
 fn write_saved_key(path: &Path, raw: Option<&str>) -> io::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-    let existing = read_config(path)?;
-    if raw.is_none() && existing.is_none() {
-        return Ok(());
-    }
-    let mut document = existing.unwrap_or_default();
+    crate::config_store::edit_config(path, |document| set_key_in(document, raw))
+}
+
+fn set_key_in(document: &mut toml_edit::DocumentMut, raw: Option<&str>) -> bool {
     match raw {
-        Some(raw) => document[CONFIG_KEY] = toml_edit::value(raw.trim()),
-        None => {
-            if document.remove(CONFIG_KEY).is_none() {
-                return Ok(());
-            }
+        Some(raw) => {
+            document[CONFIG_KEY] = toml_edit::value(raw.trim());
+            true
         }
+        None => document.remove(CONFIG_KEY).is_some(),
     }
-    let dir = path
-        .parent()
-        .ok_or_else(|| io::Error::other("no config folder"))?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-    let mut file = tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o600))
-        .tempfile_in(dir)?;
-    file.write_all(document.to_string().as_bytes())?;
-    file.as_file().sync_all()?;
-    file.persist(path)?;
-    // The rename is durable only once the folder is synced.
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]

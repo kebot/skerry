@@ -5,19 +5,31 @@ mod apps;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod capture;
+#[cfg(target_os = "macos")]
 mod clipboard;
+#[cfg(target_os = "macos")]
+mod config_store;
+#[cfg(target_os = "macos")]
+mod direct;
 #[cfg(target_os = "macos")]
 mod gamepad;
 #[cfg(target_os = "macos")]
 mod input;
 #[cfg(target_os = "macos")]
+mod input_devices;
+#[cfg(target_os = "macos")]
 mod launch_options;
 #[cfg(target_os = "macos")]
 mod launch_progress;
 #[cfg(target_os = "macos")]
+mod microphone;
+#[cfg(target_os = "macos")]
 mod open_target;
 #[cfg(target_os = "macos")]
 mod pasteboard;
+#[cfg(target_os = "macos")]
+mod permissions;
 #[cfg(target_os = "macos")]
 mod persist;
 #[cfg(target_os = "macos")]
@@ -33,6 +45,8 @@ mod settings;
 #[cfg(target_os = "macos")]
 mod shortcuts;
 mod stats;
+#[cfg(target_os = "macos")]
+mod tls;
 #[cfg(target_os = "macos")]
 mod transport;
 #[cfg(target_os = "macos")]

@@ -29,12 +29,14 @@ pub enum Section {
     Screen,
     Video,
     Audio,
+    /// Microphone & Camera (`ARCH-038`).
+    Capture,
     Stats,
 }
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Input,
         Self::Shortcuts,
         Self::Gamepads,
@@ -43,6 +45,7 @@ impl Section {
         Self::Screen,
         Self::Video,
         Self::Audio,
+        Self::Capture,
         Self::Stats,
     ];
 }
@@ -57,6 +60,7 @@ pub struct ControlsUiState {
     pub screen_open: bool,
     pub video_open: bool,
     pub audio_open: bool,
+    pub capture_open: bool,
     pub stats_open: bool,
     pub size_error: bool,
     /// Focus returned to once a dropdown menu closes: the panel's, so Escape and cmd-w
@@ -77,6 +81,7 @@ impl Default for ControlsUiState {
             screen_open: true,
             video_open: false,
             audio_open: false,
+            capture_open: false,
             stats_open: false,
             size_error: false,
             return_focus: None,
@@ -96,6 +101,7 @@ impl ControlsUiState {
             Section::Screen => self.screen_open,
             Section::Video => self.video_open,
             Section::Audio => self.audio_open,
+            Section::Capture => self.capture_open,
             Section::Stats => self.stats_open,
         }
     }
@@ -111,6 +117,7 @@ impl ControlsUiState {
             Section::Screen => &mut self.screen_open,
             Section::Video => &mut self.video_open,
             Section::Audio => &mut self.audio_open,
+            Section::Capture => &mut self.capture_open,
             Section::Stats => &mut self.stats_open,
         };
         *open = !*open;
@@ -118,12 +125,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 9] {
+    pub fn sections(&self) -> [bool; 10] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 9]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 10]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -198,6 +205,56 @@ pub enum ControlsAction {
     PrintJob(u64, PrintJobAction),
     /// "Add Screen +" or "Close Screen 2" (`ARCH-039`).
     SecondScreen,
+    /// The **Microphone** switch (`ARCH-038`).
+    SetMicrophone(bool),
+    /// Capture from this input device (its Core Audio UID); `None` follows the Mac.
+    SelectInputDevice(Option<String>),
+    /// **Open Privacy Settings** after macOS refused a device.
+    OpenPrivacySettings(CaptureSubject),
+}
+
+/// A capture device the Microphone & Camera card shows (`ARCH-038`). The camera joins in M2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureSubject {
+    Microphone,
+}
+
+/// One entry of a capture device menu: E's Output Device entry shape.
+pub type CaptureDeviceItem = AudioOutputItem;
+
+/// One device's group in the Microphone & Camera card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureDeviceProps {
+    /// The switch position.
+    pub on: bool,
+    /// The server decides: the switch is disabled.
+    pub locked: bool,
+    /// The server doesn't allow the device, so there is no list: the picker is disabled.
+    pub picker_locked: bool,
+    /// The device is open: a dot before the label, and the header status.
+    pub live: bool,
+    /// The muted line under the label.
+    pub detail: Option<String>,
+    /// macOS refused the device: the detail in the danger colour, and Open Privacy Settings.
+    pub denied: bool,
+    pub device_label: String,
+    /// System Default, the connected devices, then the missing saved device if any.
+    pub devices: Vec<CaptureDeviceItem>,
+    /// Shown under the picker.
+    pub note: Option<String>,
+    /// `Some(0..=5)` shows the level meter.
+    pub level: Option<u8>,
+}
+
+/// The Microphone & Camera card; M1 has the microphone group only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaCaptureProps {
+    pub mic: CaptureDeviceProps,
+}
+
+/// The card header's status: "Microphone on" while the microphone is open.
+pub fn media_capture_header(props: &MediaCaptureProps) -> Option<&'static str> {
+    props.mic.live.then_some("Microphone on")
 }
 
 /// Whether a pad in a slot reaches the session (`ARCH-032`).
@@ -494,6 +551,8 @@ pub struct ControlsProps {
     pub gamepads: Option<GamepadsProps>,
     /// The Printing card (`ARCH-033`); `None` hides it.
     pub printing: Option<PrintingProps>,
+    /// The Microphone & Camera card (`ARCH-038`); `None` (no settings yet) hides it.
+    pub media_capture: Option<MediaCaptureProps>,
     /// The server allows installing apps: the header offers Apps (`ARCH-035`).
     pub apps_available: bool,
 }
@@ -701,6 +760,16 @@ pub fn render(
                     || render_audio(theme, props.audio_settings.as_ref(), &on_action, menus),
                     toggle(Section::Audio),
                 ))
+                .when_some(props.media_capture.as_ref(), |cards, capture| {
+                    cards.child(section_with_status(
+                        theme,
+                        "Microphone & Camera",
+                        state.capture_open,
+                        media_capture_header(capture).map(|text| header_status(theme, text)),
+                        || render_media_capture(theme, capture, &on_action, menus),
+                        toggle(Section::Capture),
+                    ))
+                })
                 .child(section(
                     theme,
                     "Stats",
@@ -1242,6 +1311,209 @@ fn render_audio(
             ))
         },
     )
+}
+
+/// macOS's own microphone indicator colour.
+const MIC_DOT: u32 = 0xFF9F0A;
+
+/// An 8 px dot in `color`.
+fn dot(color: u32) -> Div {
+    div()
+        .flex_none()
+        .size(px(8.))
+        .rounded_full()
+        .bg(gpui_kit::rgb(color))
+}
+
+/// The header's status: the microphone's dot, then the text.
+fn header_status(theme: &Theme, text: &'static str) -> AnyElement {
+    div()
+        .h_flex()
+        .items_center()
+        .gap(px(6.))
+        .child(dot(MIC_DOT))
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::NORMAL)
+                .text_color(theme.muted_foreground)
+                .whitespace_nowrap()
+                .child(text),
+        )
+        .into_any_element()
+}
+
+/// Five 6×10 segments; lit ones in the accent, the top one amber.
+fn level_meter(theme: &Theme, level: u8) -> Div {
+    div().h_flex().gap(px(3.)).children((0..5u8).map(|index| {
+        let segment = div().w(px(6.)).h(px(10.)).rounded(px(2.));
+        if index >= level {
+            segment.bg(theme.muted)
+        } else if index == 4 {
+            segment.bg(gpui_kit::rgb(MIC_DOT))
+        } else {
+            segment.bg(theme.accent)
+        }
+    }))
+}
+
+/// The Microphone & Camera card (`ARCH-038`): the microphone's switch, picker and meter, then
+/// the menu-bar footnote. The camera's group (M2) slots in before the footnote.
+fn render_media_capture(
+    theme: &Theme,
+    capture: &MediaCaptureProps,
+    on_action: &ControlsHandler,
+    menus: &MenuContext,
+) -> Div {
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(capture_device(
+            theme,
+            &capture.mic,
+            CaptureSubject::Microphone,
+            on_action,
+            menus,
+        ))
+        .child(div().h(px(1.)).w_full().bg(theme.border))
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child("macOS also shows its own indicator in the menu bar while the microphone is in use."),
+        )
+}
+
+/// One device's switch row, privacy button, picker, note and meter.
+fn capture_device(
+    theme: &Theme,
+    device: &CaptureDeviceProps,
+    subject: CaptureSubject,
+    on_action: &ControlsHandler,
+    menus: &MenuContext,
+) -> Div {
+    let (label, picker_label, id, toggle): (_, _, _, fn(bool) -> ControlsAction) = match subject {
+        CaptureSubject::Microphone => (
+            "Microphone",
+            "Input Device",
+            "capture-mic-device",
+            ControlsAction::SetMicrophone,
+        ),
+    };
+    let detail_color = if device.denied {
+        theme.danger
+    } else {
+        theme.muted_foreground
+    };
+    let switch_action = toggle(!device.on);
+    let switch_handler = Rc::clone(on_action);
+    let switch = div()
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            div()
+                .min_w_0()
+                .v_flex()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .when(device.live, |row| row.child(dot(MIC_DOT)))
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child(label)),
+                )
+                .when_some(device.detail.clone(), |column, detail| {
+                    column.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(detail_color)
+                            .child(detail),
+                    )
+                }),
+        )
+        .child(
+            Switch::new(SharedString::from(format!("{id}-switch")))
+                .checked(device.on)
+                .disabled(device.locked)
+                .on_click(move |_, window, cx| switch_handler(switch_action.clone(), window, cx)),
+        );
+    let privacy_handler = Rc::clone(on_action);
+    let switch_group =
+        div()
+            .v_flex()
+            .gap(px(FIELD_GAP))
+            .child(switch)
+            .when(device.denied, |group| {
+                group.child(
+                    div().h_flex().child(
+                        Button::new(SharedString::from(format!("{id}-privacy")))
+                            .outline()
+                            .small()
+                            .label("Open Privacy Settings")
+                            .on_click(move |_, window, cx| {
+                                privacy_handler(
+                                    ControlsAction::OpenPrivacySettings(subject),
+                                    window,
+                                    cx,
+                                )
+                            }),
+                    ),
+                )
+            });
+    let (default, devices): (Vec<_>, Vec<_>) =
+        device.devices.iter().partition(|item| item.uid.is_none());
+    let entry = |item: &CaptureDeviceItem| MenuItem::Action {
+        label: item.label.clone(),
+        checked: item.checked,
+        disabled: !item.connected,
+        action: ControlsAction::SelectInputDevice(item.uid.clone()),
+    };
+    let mut items: Vec<MenuItem> = default.into_iter().map(entry).collect();
+    if !devices.is_empty() {
+        items.push(MenuItem::Separator);
+        items.extend(devices.into_iter().map(entry));
+    }
+    let muted = |text: String| {
+        div()
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .child(text)
+    };
+    let picker = div()
+        .v_flex()
+        .gap(px(FIELD_GAP))
+        .child(field(
+            picker_label,
+            menu_select(
+                id,
+                device.device_label.clone(),
+                items,
+                device.picker_locked,
+                on_action,
+                menus,
+            ),
+        ))
+        .when_some(device.note.clone(), |picker, note| {
+            picker.child(muted(note))
+        })
+        .when_some(device.level, |picker, level| {
+            picker.child(
+                div()
+                    .h_flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(muted("Input level".into()))
+                    .child(level_meter(theme, level)),
+            )
+        });
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_group)
+        .child(picker)
 }
 
 /// The Printing card (`ARCH-033`): the auto-open switch, then this window's jobs.
@@ -2046,6 +2318,18 @@ fn section(
     body: impl FnOnce() -> Div,
     toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
+    section_with_status(theme, title, open, None, body, toggle)
+}
+
+/// A card with a status before its chevron, shown open or collapsed.
+fn section_with_status(
+    theme: &Theme,
+    title: &'static str,
+    open: bool,
+    status: Option<AnyElement>,
+    body: impl FnOnce() -> Div,
+    toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> Div {
     // Card metrics follow the web sidebar: 1px border, 12px radius,
     // 11px/14px header padding, 4px/14px/14px content padding.
     div()
@@ -2065,11 +2349,18 @@ fn section(
                 .justify_between()
                 .font_weight(FontWeight::BOLD)
                 .child(title.to_uppercase())
-                .child(div().text_color(theme.muted_foreground).child(if open {
-                    IconName::ChevronUp
-                } else {
-                    IconName::ChevronDown
-                }))
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .children(status)
+                        .child(div().text_color(theme.muted_foreground).child(if open {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })),
+                )
                 .on_click(toggle),
         )
         .child(
@@ -2283,7 +2574,9 @@ mod tests {
     #[test]
     fn sections_round_trip_in_section_order() {
         // Input, Shortcuts, Gamepads, Printing, Video and Audio open, Screen closed.
-        let open = [true, true, true, false, true, false, true, true, false];
+        let open = [
+            true, true, true, false, true, false, true, true, false, false,
+        ];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
         assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
@@ -2292,8 +2585,46 @@ mod tests {
         assert_eq!(Section::ALL[2], Section::Gamepads);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, false, false, false, true, false, false, false]
+            [false, false, false, false, false, true, false, false, false, false]
         );
+    }
+
+    #[test]
+    fn microphone_and_camera_sit_between_audio_and_stats() {
+        let audio = Section::ALL
+            .iter()
+            .position(|s| *s == Section::Audio)
+            .unwrap();
+        assert_eq!(Section::ALL[audio + 1], Section::Capture);
+        assert_eq!(Section::ALL[audio + 2], Section::Stats);
+        let state = ControlsUiState::default().with_sections([
+            false, false, false, false, false, false, false, false, true, false,
+        ]);
+        assert!(state.capture_open && !state.stats_open && !state.audio_open);
+        assert!(
+            !ControlsUiState::default().capture_open,
+            "collapsed by default"
+        );
+    }
+
+    #[test]
+    fn media_capture_header_line() {
+        let device = CaptureDeviceProps {
+            on: false,
+            locked: false,
+            picker_locked: false,
+            live: false,
+            detail: None,
+            denied: false,
+            device_label: "System Default".into(),
+            devices: Vec::new(),
+            note: None,
+            level: None,
+        };
+        let mut props = MediaCaptureProps { mic: device };
+        assert_eq!(media_capture_header(&props), None);
+        props.mic.live = true;
+        assert_eq!(media_capture_header(&props), Some("Microphone on"));
     }
 
     #[test]
@@ -2312,8 +2643,9 @@ mod tests {
         let clipboard = Section::ALL.iter().position(|s| *s == Section::Clipboard);
         let printing = Section::ALL.iter().position(|s| *s == Section::Printing);
         assert_eq!(printing, clipboard.map(|index| index + 1));
-        let state = ControlsUiState::default()
-            .with_sections([false, false, false, false, true, false, false, false, false]);
+        let state = ControlsUiState::default().with_sections([
+            false, false, false, false, true, false, false, false, false, false,
+        ]);
         assert!(state.printing_open && !state.screen_open);
     }
 }

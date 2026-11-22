@@ -8,6 +8,7 @@ use super::apps_window::{self, AppsOwner, AppsWindow};
 use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::gamepads::Gamepads;
+use super::media_capture::{self, MediaCapture};
 use super::second_display::{KeySync, SecondHost, StreamSetup, KEY_HANDOFF};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher, ToggleApps,
@@ -125,11 +126,55 @@ fn refresh_library(cx: &mut App) {
     }
 }
 
+/// The server a session window streams from (`ARCH-024`, `ARCH-036`).
+#[derive(Clone)]
+pub(super) enum SessionServer {
+    SealSkin(SealSkinClient),
+    Selkies(crate::direct::SelkiesServer),
+}
+
+impl SessionServer {
+    /// The preferences file's name.
+    pub(super) fn server_key(&self) -> String {
+        match self {
+            Self::SealSkin(api) => api.server().to_string(),
+            Self::Selkies(server) => server.prefs_key(),
+        }
+    }
+
+    pub(super) fn target(
+        &self,
+        remote: &RemoteSession,
+    ) -> Result<crate::transport::SessionTarget, String> {
+        match self {
+            Self::SealSkin(api) => api
+                .session_url(&remote.session_url)
+                .map(crate::transport::SessionTarget::SealSkin),
+            Self::Selkies(server) => Ok(crate::transport::SessionTarget::Selkies(server.clone())),
+        }
+    }
+
+    /// SealSkin's storage routes for Delete; a direct server has none.
+    pub(super) fn storage(&self, remote: &RemoteSession) -> Option<files_window::Storage> {
+        match self {
+            Self::SealSkin(api) => {
+                crate::sealskin::has_storage(&remote.home).then(|| files_window::Storage {
+                    client: api.clone(),
+                    home: remote.home.clone(),
+                })
+            }
+            Self::Selkies(_) => None,
+        }
+    }
+}
+
 pub(super) struct SessionWindow {
     /// This session's own window, for async updates (`ARCH-015`).
     window: AnyWindowHandle,
     rt: Handle,
-    api: SealSkinClient,
+    api: SessionServer,
+    /// `api.server_key()`, the preferences file's name.
+    server_key: String,
     pub(super) remote: RemoteSession,
     pub(super) current: Option<NativeSession>,
     stream_events: Option<Task<()>>,
@@ -222,6 +267,8 @@ pub(super) struct SessionWindow {
     pub(super) second: SecondHost,
     /// A resign waiting out the hand-off to Display 2 before pads rest.
     key_handoff: Option<Task<()>>,
+    /// The microphone uplink (`ARCH-038`): stopped on every stream end.
+    pub(super) capture: MediaCapture,
 }
 
 /// Auto-open skips documents larger than this: PDFKit reads them on the main thread.
@@ -230,17 +277,19 @@ const AUTO_PRINT_MAX_BYTES: u64 = 200_000_000;
 impl SessionWindow {
     pub(super) fn new(
         rt: Handle,
-        api: SealSkinClient,
+        api: SessionServer,
         remote: RemoteSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let server_key = api.server_key();
         // The queue's copy includes changes another window queued that aren't on disk yet.
-        let preferences = cx.global::<WriteQueue>().read(api.server());
+        let preferences = cx.global::<WriteQueue>().read(&server_key);
         let mut this = Self {
             window: Window::window_handle(window),
             rt,
             api,
+            server_key,
             remote,
             current: None,
             stream_events: None,
@@ -301,6 +350,7 @@ impl SessionWindow {
             print_reveal_on_open: false,
             second: SecondHost::default(),
             key_handoff: None,
+            capture: MediaCapture::default(),
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -411,7 +461,9 @@ impl SessionWindow {
             .map(|(&key, &value)| (key, value))
             .collect();
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
-        let stream = self.api.session_url(&self.remote.session_url).map(|url| {
+        // A fresh frame channel for this stream's microphone (`ARCH-038`).
+        let mic = self.capture.begin_stream(events.clone());
+        let stream = self.api.target(&self.remote).map(|url| {
             NativeSession::open(
                 url,
                 window,
@@ -436,6 +488,7 @@ impl SessionWindow {
                     audio_output: self.preferences.audio.output_device.clone(),
                     audio_bitrate: self.preferences.audio.bitrate,
                     role: StreamRole::Primary,
+                    mic: Some(mic),
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -477,12 +530,18 @@ impl SessionWindow {
                     }
                 }));
             }
-            Err(error) => self.status = Some(error),
+            Err(error) => {
+                self.capture.stop();
+                self.status = Some(error);
+            }
         }
         cx.notify();
     }
 
     fn handle_event(&mut self, event: SessionEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // A server close, a network drop or the start-up timeout ends the stream without
+        // `end_stream`: the microphone stops here (`ARCH-038`).
+        self.capture.on_stream_event(&event);
         match event {
             SessionEvent::Audio(enabled) => self.audio = Some(enabled),
             SessionEvent::AudioUnavailable(reason) => self.audio_unavailable = Some(reason),
@@ -632,6 +691,26 @@ impl SessionWindow {
                 self.handle_event(SessionEvent::Error(kill.to_string()), window, cx)
             }
             SessionEvent::DisplayLayout(config) => self.second.set_layout(config),
+            SessionEvent::CapturePolicy(policy) => {
+                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                let effects = self.capture.on_policy(policy, auth);
+                self.apply_capture(effects, cx);
+                self.ensure_input_ticker(cx);
+            }
+            SessionEvent::Capture(reply) => {
+                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                let effects = self.capture.state.on_reply(reply, auth);
+                self.apply_capture(effects, cx);
+            }
+            SessionEvent::MicStatus(id, status) => {
+                let effects = self.capture.on_status(id, status);
+                self.apply_capture(effects, cx);
+                self.remember_input_name(cx);
+            }
+            SessionEvent::MicInputs(id, inputs) => {
+                self.capture.on_inputs(id, inputs);
+                self.remember_input_name(cx);
+            }
             SessionEvent::Error(error) => {
                 // The capture ends with the stream; the banner explains, so no hint.
                 if let Some(stream) = &self.current {
@@ -681,7 +760,7 @@ impl SessionWindow {
     ) {
         let done = cx
             .global::<WriteQueue>()
-            .preferences(self.api.server(), change);
+            .preferences(&self.server_key, change);
         let window = self.window;
         cx.spawn(async move |this, cx| {
             if !matches!(done.await, Ok(Ok(()))) {
@@ -808,6 +887,118 @@ impl SessionWindow {
             stream.set_audio_bitrate(bps);
         }
         cx.notify();
+    }
+
+    /// Runs capture effects; a permission prompt answers back through this window's handle,
+    /// and an answer that no longer matches its request starts nothing (`ARCH-038`).
+    fn apply_capture(&mut self, effects: Vec<crate::capture::Effect>, cx: &mut Context<Self>) {
+        let chosen = self.preferences.audio.input_device.clone();
+        for ticket in self.capture.apply(effects, chosen) {
+            let answer = crate::permissions::request(ticket.subject);
+            let handle = self.window;
+            cx.spawn(async move |this, cx| {
+                let granted = answer.await.unwrap_or(false);
+                let _ = handle.update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        let effects = this.capture.state.on_auth(ticket, granted);
+                        this.apply_capture(effects, cx);
+                        cx.notify();
+                    })
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Lists inputs for the card once a second while the server allows the microphone, from
+    /// plain CoreAudio properties: never the microphone itself (M-QA-1).
+    fn ensure_input_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.capture.ticker.is_some() || !self.capture.wants_inputs() {
+            return;
+        }
+        let handle = self.window;
+        self.capture.ticker = Some(cx.spawn(async move |this, cx| loop {
+            let keep = handle
+                .update(cx, |_, _, cx| {
+                    this.update(cx, |this, _| {
+                        let wanted = this.capture.wants_inputs();
+                        if wanted {
+                            this.capture.refresh_inputs();
+                        }
+                        wanted
+                    })
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+        }));
+    }
+
+    /// The **Microphone** switch (`ARCH-038`). Never saved: a later launch never opens the
+    /// microphone because of a past choice.
+    pub(super) fn set_microphone(&mut self, on: bool, cx: &mut Context<Self>) {
+        let subject = crate::capture::Subject::Microphone;
+        let auth = crate::permissions::authorization(subject);
+        let effects = self.capture.state.on_toggle(subject, on, auth);
+        self.apply_capture(effects, cx);
+        cx.notify();
+    }
+
+    /// Captures from `uid` (`None` follows the Mac) and saves the choice with its name.
+    pub(super) fn change_input_device(&mut self, uid: Option<String>, cx: &mut Context<Self>) {
+        let name = uid.as_deref().and_then(|uid| {
+            self.capture
+                .devices()
+                .0
+                .into_iter()
+                .find(|device| device.uid == uid)
+                .map(|device| device.name)
+        });
+        let audio = &mut self.preferences.audio;
+        audio.input_device = uid.clone();
+        audio.input_device_name = name.clone();
+        self.save(
+            "the input device",
+            move |p| {
+                p.audio.input_device = uid.clone();
+                p.audio.input_device_name = name.clone();
+            },
+            cx,
+        );
+        self.capture
+            .set_input(self.preferences.audio.input_device.clone());
+        cx.notify();
+    }
+
+    /// **Open Privacy Settings** after macOS refused the device.
+    pub(super) fn open_privacy_settings(&self, subject: crate::capture::Subject, cx: &App) {
+        cx.open_url(crate::permissions::privacy_settings_url(subject));
+    }
+
+    /// Stops this window's capture devices (app quit).
+    pub(super) fn stop_capture(&mut self) {
+        self.capture.stop();
+    }
+
+    fn remember_input_name(&mut self, cx: &mut Context<Self>) {
+        let audio = &self.preferences.audio;
+        let Some(name) = media_capture::input_name_to_save(
+            audio.input_device.as_deref(),
+            audio.input_device_name.as_deref(),
+            &self.capture.devices().0,
+        ) else {
+            return;
+        };
+        self.preferences.audio.input_device_name = Some(name.clone());
+        self.save(
+            "the input device",
+            move |p| p.audio.input_device_name = Some(name.clone()),
+            cx,
+        );
     }
 
     /// Keeps the chosen device's latest name, saving only when it changed so status churn
@@ -939,7 +1130,7 @@ impl SessionWindow {
 
     /// The server this session runs on.
     pub(super) fn server(&self) -> &str {
-        self.api.server()
+        &self.server_key
     }
 
     /// Shows `status` in this window's banner.
@@ -1026,9 +1217,10 @@ impl SessionWindow {
 
     /// What Display 2's stream starts with, read now (`ARCH-039`).
     pub(super) fn second_setup(&self) -> Option<StreamSetup> {
-        let url = self.api.session_url(&self.remote.session_url).ok()?;
+        // The same target as the primary: a direct server's pinned TLS and login too.
+        let target = self.api.target(&self.remote).ok()?;
         Some(StreamSetup {
-            url,
+            target,
             rt: self.rt.clone(),
             preferences: self
                 .preferences
@@ -1108,7 +1300,11 @@ impl SessionWindow {
     /// The Selkies session whose slot table this window's pads use: each session has its
     /// own, even on one SealSkin host.
     fn gamepad_session(&self) -> String {
-        format!("{}|{}", self.api.server(), self.remote.session_id)
+        match &self.api {
+            SessionServer::SealSkin(_) => format!("{}|{}", self.server_key, self.remote.session_id),
+            // `selkies|<prefs key>`: one slot table per direct server.
+            SessionServer::Selkies(_) => self.remote.session_id.clone(),
+        }
     }
 
     /// A print sheet is open, opening, or about to open on its own.
@@ -1277,11 +1473,7 @@ impl SessionWindow {
         }
         self.release_keys(cx);
         let title = self.remote.app_name.clone();
-        let storage =
-            crate::sealskin::has_storage(&self.remote.home).then(|| files_window::Storage {
-                client: self.api.clone(),
-                home: self.remote.home.clone(),
-            });
+        let storage = self.api.storage(&self.remote);
         let rt = self.rt.clone();
         let owner_window = Window::window_handle(window);
         let session = cx.entity();
@@ -1393,7 +1585,7 @@ impl SessionWindow {
             title: self.remote.app_name.clone(),
             policy,
             selkies: self.file_access.clone(),
-            server: self.api.server().to_owned(),
+            server: self.server_key.clone(),
             saved_filter: self.preferences.apps_category.clone(),
         };
         let rt = self.rt.clone();
@@ -1522,6 +1714,8 @@ impl SessionWindow {
 
     /// Ends the stream; the window and Session Controls stay for a reconnect.
     fn end_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The microphone goes off first, before anything else of the stream (`ARCH-038`).
+        self.capture.stop();
         self.settings_task = None;
         if !self.pending_settings.is_empty() {
             self.apply_settings(cx);
@@ -2090,6 +2284,11 @@ impl Render for SessionWindow {
             .when_some(strip, |root, strip| {
                 root.child(skerry_ui::stats::strip(&strip, viewport_width))
             })
+            // Top left below the traffic lights while the microphone is open, no hitbox
+            // (`ARCH-038`).
+            .when_some(self.capture.badge(), |root, mic| {
+                root.child(session::capture_badge(mic, print_top))
+            })
             // Bottom-centre with no hitbox, above a bottom banner when one shows (`ARCH-032`).
             .when_some(self.capture_hint, |root, (hint, generation, fading)| {
                 let banner = self.status.is_some() || self.startup_stalled.is_some();
@@ -2124,24 +2323,41 @@ impl Render for SessionWindow {
                     }),
                 ))
             })
-            // The Display 2 pill and side picker (`ARCH-039`).
+            // The Display 2 pill and side picker, under the banners (`ARCH-039`).
             .map(|root| {
                 let banner = self.status.is_some() || self.startup_stalled.is_some();
                 self.second_overlays(root, banner, window, cx)
             })
-            .when_some(self.status.clone(), |root, status| {
-                root.child(session::status_banner_with_actions(
-                    &theme,
-                    status,
-                    cx.listener(|this, _, window, cx| {
-                        this.status = None;
-                        this.keep_waiting = false;
-                        this.reconnect(window, cx);
-                        cx.notify();
-                    }),
-                    cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
-                ))
-            })
+            .when_some(
+                self.status
+                    .clone()
+                    .filter(|status| crate::direct::is_fatal_session_error(status)),
+                |root, status| {
+                    root.child(session::fatal_banner(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
+            .when_some(
+                self.status
+                    .clone()
+                    .filter(|status| !crate::direct::is_fatal_session_error(status)),
+                |root, status| {
+                    root.child(session::status_banner_with_actions(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| {
+                            this.status = None;
+                            this.keep_waiting = false;
+                            this.reconnect(window, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
             .when_some(
                 self.startup_stalled.filter(|_| self.status.is_none()),
                 |root, after_waiting| {
@@ -2167,6 +2383,26 @@ impl Render for SessionWindow {
 mod tests {
     use super::*;
     use crate::audio::OutputDevice;
+
+    #[test]
+    fn a_direct_server_display_two_targets_the_same_selkies() {
+        // `second_setup` takes the primary's target: on a direct server Display 2 connects
+        // with the same pinned TLS and login (`ARCH-036`, `ARCH-039`).
+        let server = crate::direct::SelkiesServer::new(
+            reqwest::Url::parse("https://selkies.example:8443/").unwrap(),
+            crate::direct::SelkiesAuth::new("user", "pass", None),
+            None,
+            crate::direct::ServerSource::Environment,
+            false,
+        )
+        .unwrap();
+        let remote = server.as_session();
+        let target = SessionServer::Selkies(server).target(&remote).unwrap();
+        assert!(matches!(
+            target,
+            crate::transport::SessionTarget::Selkies(_)
+        ));
+    }
 
     #[test]
     fn a_pending_print_sheet_skips_the_pending_capture() {

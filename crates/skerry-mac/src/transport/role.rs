@@ -8,7 +8,7 @@
 //! skips the stamp does not compile.
 
 use super::Resolution;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::SinkExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use tokio::net::TcpStream;
@@ -164,7 +164,6 @@ impl Wire {
 
     /// Sends one binary frame (the microphone's `0x02` packets), on the primary only:
     /// Display 2 carries no audio either way, so a secondary drops it unsent.
-    #[allow(dead_code)]
     pub(super) async fn send_binary(&mut self, data: Vec<u8>) -> Result<(), tungstenite::Error> {
         if !self.role.is_primary() {
             return Ok(());
@@ -176,10 +175,6 @@ impl Wire {
         self.socket.send(Message::Ping(payload.into())).await
     }
 
-    pub(super) async fn next(&mut self) -> Option<Result<Message, tungstenite::Error>> {
-        self.socket.next().await
-    }
-
     pub(super) async fn flush(&mut self) -> Result<(), tungstenite::Error> {
         self.socket.flush().await
     }
@@ -189,6 +184,18 @@ impl Wire {
         frame: Option<tungstenite::protocol::CloseFrame>,
     ) -> Result<(), tungstenite::Error> {
         self.socket.close(frame).await
+    }
+}
+
+/// The socket's incoming messages (for the peer-silence watch, `ARCH-038`).
+impl futures_util::Stream for Wire {
+    type Item = Result<Message, tungstenite::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.get_mut().socket).poll_next(cx)
     }
 }
 

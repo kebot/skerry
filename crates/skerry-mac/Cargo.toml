@@ -17,8 +17,15 @@ gpui-kit = "0.10.0"
 libc = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 objc2 = "0.6"
+# Microphone uplink (`ARCH-038`): the Opus encoder is AudioToolbox's own `AudioConverter`, and
+# the permission prompt is `AVCaptureDevice`'s. The first and third are already locked through cpal.
+objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSView", "NSWindow", "NSWorkspace", "block2", "objc2-uniform-type-identifiers"] }
-objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "CFString", "objc2"] }
+# Input devices from plain properties, so listing never asks TCC (`ARCH-038`).
+objc2-core-audio = { version = "0.3.2", default-features = false, features = ["std", "AudioHardware", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGRemoteOperation", "libc"] }
 objc2-core-haptics = { version = "0.3.2", default-features = false, features = ["std", "block2", "CHHapticEngine", "CHHapticEvent", "CHHapticParameter", "CHHapticPattern", "CHHapticPatternPlayer"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
@@ -36,6 +43,11 @@ raw-window-handle = "0.6"
 # SVG app icons (`ARCH-035`): the copy gpui-pre links; `text` only for the empty font database.
 resvg = { version = "0.46", default-features = false, features = ["text"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "stream"] }
+# Direct Selkies TLS (ARCH-036). ring only: a second provider (aws-lc-rs) would make the
+# default connectors without an explicit provider panic at runtime.
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
 serde = { version = "1", features = ["derive"] }
 skerry-ui = { path = "../skerry-ui" }
 serde_json = "1"
@@ -47,6 +59,7 @@ toml_edit = "0.25.20"
 uuid = { version = "1", default-features = false, features = ["v4"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+url = "2"
 # JPEG stripes decode straight to BGRA (`ARCH-034`); already locked through `image`.
 zune-core = "0.5"
 zune-jpeg = "0.5"
@@ -55,3 +68,6 @@ zune-jpeg = "0.5"
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Checks `open_target` against SealSkin's own URL pattern.
 regex = "1"
+# A self-signed server for the pinning tests, ring only (ARCH-036).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
