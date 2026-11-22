@@ -619,6 +619,81 @@ struct DownloadChunk {
     is_last_chunk: bool,
 }
 
+/// What the listing said about a stored file, which a kept partial must match to resume.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialSource {
+    pub size: u64,
+    /// The server's mtime as the pane shows it.
+    pub mtime: String,
+}
+
+/// The extended attribute naming where a `.skerrydownload` partial came from.
+const PARTIAL_XATTR: &str = "com.skerry.partial";
+
+fn partial_tag(home: &str, path: &str, source: &PartialSource) -> String {
+    format!("{home}\n{path}\n{}\n{}", source.size, source.mtime)
+}
+
+fn xattr_name() -> std::ffi::CString {
+    std::ffi::CString::new(PARTIAL_XATTR).unwrap_or_default()
+}
+
+fn c_path(path: &Path) -> Option<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt as _;
+    std::ffi::CString::new(path.as_os_str().as_bytes()).ok()
+}
+
+fn read_partial_tag(path: &Path) -> Option<String> {
+    let path = c_path(path)?;
+    let name = xattr_name();
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: valid C strings and a buffer of the length passed.
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            0,
+            0,
+        )
+    };
+    if read < 0 {
+        return None;
+    }
+    buffer.truncate(read as usize);
+    String::from_utf8(buffer).ok()
+}
+
+fn write_partial_tag(path: &Path, tag: &str) -> io::Result<()> {
+    let path = c_path(path).ok_or_else(|| io::Error::other("bad path"))?;
+    let name = xattr_name();
+    // SAFETY: valid C strings and a value of the length passed.
+    let done = unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            tag.as_ptr().cast(),
+            tag.len(),
+            0,
+            0,
+        )
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn remove_partial_tag(path: &Path) {
+    if let Some(path) = c_path(path) {
+        let name = xattr_name();
+        // SAFETY: valid C strings.
+        unsafe { libc::removexattr(path.as_ptr(), name.as_ptr(), 0) };
+    }
+}
+
 /// Whether a home name is one Skerry must never delete: Shared Files (every session's
 /// `Desktop/files`) and Cleanroom, in any case (`ARCH-037`).
 pub fn undeletable_home(name: &str) -> bool {
@@ -1764,7 +1839,8 @@ impl SealSkinClient {
     /// `.skerrydownload` partial. A partial left by an earlier attempt is resumed at its
     /// last whole chunk (SealSkin has no `Range`). `expected` is the listing's size: a file
     /// that ends at another size changed while it downloaded and fails. `progress` counts
-    /// bytes written on top of what it held.
+    /// bytes written on top of what it held. (Tests: the listing's mtime reads empty.)
+    #[cfg(test)]
     pub async fn download_storage(
         &self,
         home: &str,
@@ -1773,13 +1849,40 @@ impl SealSkinClient {
         expected: Option<u64>,
         progress: &AtomicU64,
     ) -> Result<(), StorageError> {
-        use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
-        let partial = crate::selkies::partial_path(destination);
-        // The earlier attempt flushed and closed the partial, so its length is settled.
-        let have = tokio::fs::metadata(&partial)
+        let source = expected.map(|size| PartialSource {
+            size,
+            mtime: String::new(),
+        });
+        self.download_storage_from(home, path, destination, source.as_ref(), progress)
             .await
-            .map(|meta| meta.len())
-            .unwrap_or(0);
+    }
+
+    /// [`Self::download_storage`] for the listed `source` (size and server mtime). A kept
+    /// partial is resumed only when its `com.skerry.partial` tag names this home, path,
+    /// size and mtime; any other partial (another home's file of the same name, a same-size
+    /// edit, an untagged file) is discarded and the download starts at 0 (`ARCH-037`).
+    pub async fn download_storage_from(
+        &self,
+        home: &str,
+        path: &str,
+        destination: &Path,
+        source: Option<&PartialSource>,
+        progress: &AtomicU64,
+    ) -> Result<(), StorageError> {
+        use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+        let expected = source.map(|source| source.size);
+        let partial = crate::selkies::partial_path(destination);
+        let tag = source.map(|source| partial_tag(home, path, source));
+        let same_source = tag.is_some() && read_partial_tag(&partial) == tag;
+        // The earlier attempt flushed and closed the partial, so its length is settled.
+        let have = if same_source {
+            tokio::fs::metadata(&partial)
+                .await
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let chunk = STORAGE_CHUNK as u64;
         let start = have / chunk;
         let mut file = tokio::fs::OpenOptions::new()
@@ -1789,6 +1892,10 @@ impl SealSkinClient {
             .open(&partial)
             .await?;
         file.set_len(start * chunk).await?;
+        match &tag {
+            Some(tag) => write_partial_tag(&partial, tag)?,
+            None => remove_partial_tag(&partial),
+        }
         file.seek(std::io::SeekFrom::Start(start * chunk)).await?;
         let base = progress.load(Ordering::Relaxed);
         let mut written = start * chunk;
@@ -1823,6 +1930,8 @@ impl SealSkinClient {
                 "“{name}” changed while downloading; try again."
             )));
         }
+        // The finished file carries no partial tag.
+        remove_partial_tag(&partial);
         tokio::fs::rename(&partial, destination).await?;
         Ok(())
     }
@@ -4037,6 +4146,11 @@ mod tests {
         let mut torn = data[..STORAGE_CHUNK + 1000].to_vec();
         torn[STORAGE_CHUNK + 10] ^= 0xff;
         std::fs::write(&partial, &torn).unwrap();
+        let source = PartialSource {
+            size: 5_000_000,
+            mtime: String::new(),
+        };
+        write_partial_tag(&partial, &partial_tag("work", "/a.bin", &source)).unwrap();
         let indexes = Indexes::default();
         let (base, seen) = serve(chunk_server(data.clone(), Arc::clone(&indexes))).await;
         let progress = AtomicU64::new(0);
@@ -4136,6 +4250,80 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), data);
         assert_eq!(*indexes.lock().unwrap(), [0, 1, 1]);
+    }
+
+    /// A partial of 2 MiB + a bit, tagged as from `home`/`path` at `size`/`mtime`, and a
+    /// download from (`work`, `/a.bin`, 5,000,000 bytes, mtime `T1`): which chunks it asks for.
+    async fn resume_from(tag: Option<(&str, &str, u64, &str)>) -> Vec<u64> {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("a.bin");
+        let data: Vec<u8> = (0..5_000_000u32).map(|n| (n % 233) as u8).collect();
+        let partial = crate::selkies::partial_path(&destination);
+        // A stale partial holding other bytes: resuming it would splice two files.
+        std::fs::write(&partial, vec![0xEEu8; STORAGE_CHUNK + 500]).unwrap();
+        if let Some((home, path, size, mtime)) = tag {
+            let source = PartialSource {
+                size,
+                mtime: mtime.into(),
+            };
+            write_partial_tag(&partial, &partial_tag(home, path, &source)).unwrap();
+        }
+        let indexes = Indexes::default();
+        let (base, _) = serve(chunk_server(data.clone(), Arc::clone(&indexes))).await;
+        let source = PartialSource {
+            size: 5_000_000,
+            mtime: "T1".into(),
+        };
+        test_client(base)
+            .download_storage_from(
+                "work",
+                "/a.bin",
+                &destination,
+                Some(&source),
+                &AtomicU64::new(0),
+            )
+            .await
+            .unwrap();
+        let resumed = indexes.lock().unwrap().clone();
+        if resumed.first() == Some(&0) {
+            assert_eq!(std::fs::read(&destination).unwrap(), data, "started over");
+        }
+        assert_eq!(
+            read_partial_tag(&destination),
+            None,
+            "no tag on the finished file"
+        );
+        resumed
+    }
+
+    #[tokio::test]
+    async fn a_kept_partial_from_the_same_source_resumes() {
+        assert_eq!(
+            resume_from(Some(("work", "/a.bin", 5_000_000, "T1"))).await,
+            [1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_same_size_edit_discards_the_partial() {
+        assert_eq!(
+            resume_from(Some(("work", "/a.bin", 5_000_000, "T0"))).await,
+            [0, 1, 2]
+        );
+        // Untagged (from before tags, or another tool): never trusted.
+        assert_eq!(resume_from(None).await, [0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn the_same_name_in_another_home_discards_the_partial() {
+        assert_eq!(
+            resume_from(Some(("_sealskin_shared_files", "/a.bin", 5_000_000, "T1"))).await,
+            [0, 1, 2]
+        );
+        assert_eq!(
+            resume_from(Some(("work", "/Docs/a.bin", 5_000_000, "T1"))).await,
+            [0, 1, 2]
+        );
     }
 
     #[tokio::test]

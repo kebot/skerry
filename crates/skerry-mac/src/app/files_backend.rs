@@ -174,26 +174,31 @@ impl FilesBackend {
     }
 
     /// Downloads the pane path `remote` to `local` (resuming a partial). `expected` is the
-    /// listing's size, checked by storage downloads.
+    /// listing's size and mtime: a storage download checks the size, and resumes a kept
+    /// partial only from the same home, path, size and mtime.
     pub(super) async fn download(
         &self,
         remote: &str,
         local: &Path,
         progress: &Progress,
-        expected: Option<u64>,
+        expected: Option<(u64, String)>,
     ) -> Result<(), BackendError> {
         match self {
             Self::Selkies(access) => Ok(access.download(remote, local, progress).await?),
-            Self::Storage(storage) => Ok(storage
-                .client
-                .download_storage(
-                    storage.place.home(),
-                    &storage::home_path(remote),
-                    local,
-                    expected,
-                    progress,
-                )
-                .await?),
+            Self::Storage(storage) => {
+                let source =
+                    expected.map(|(size, mtime)| crate::sealskin::PartialSource { size, mtime });
+                Ok(storage
+                    .client
+                    .download_storage_from(
+                        storage.place.home(),
+                        &storage::home_path(remote),
+                        local,
+                        source.as_ref(),
+                        progress,
+                    )
+                    .await?)
+            }
         }
     }
 

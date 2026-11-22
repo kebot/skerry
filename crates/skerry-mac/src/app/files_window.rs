@@ -1843,12 +1843,16 @@ async fn download_job(
                     folders.push(local);
                 } else {
                     bytes += child.size.unwrap_or(0);
-                    files.push((child.path, local, child.size));
+                    files.push((
+                        child.path,
+                        local,
+                        child.size.map(|size| (size, child.mtime)),
+                    ));
                 }
             }
         } else {
             bytes += entry.size.unwrap_or(0);
-            files.push((entry.path, top, entry.size));
+            files.push((entry.path, top, entry.size.map(|size| (size, entry.mtime))));
         }
     }
     meter.total.store(bytes, Ordering::Relaxed);
@@ -1859,7 +1863,7 @@ async fn download_job(
     }
     for (remote, local, expected) in files {
         let partial = selkies::partial_path(&local);
-        if !keeps_partial(&access, expected) {
+        if !keeps_partial(&access, expected.as_ref().map(|(size, _)| *size)) {
             let _ = tokio::fs::remove_file(&partial).await;
         }
         if let Ok(mut current) = meter.partial.lock() {
@@ -1871,7 +1875,7 @@ async fn download_job(
             // A retry resumes the partial file where the last attempt stopped.
             meter.done.store(before, Ordering::Relaxed);
             match access
-                .download(&remote, &local, &meter.done, expected)
+                .download(&remote, &local, &meter.done, expected.clone())
                 .await
             {
                 Ok(()) => break,
