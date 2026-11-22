@@ -1,0 +1,32 @@
+# ARCH-035: Apps Catalog Window; Pelorus Excluded (Task J)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-11`. Closes `ARCH-GAP-DC-13` (Pelorus) as excluded. Amends the index rule that Skerry talks only to SealSkin and Selkies: one keyless catalog fetch from GitHub is allowed.
+- **Process:** plan → design → review (13 required changes) → build → QA (1 high: older Selkies; 1 medium: SVG CPU bombs) → code review (4 rounds; an entity bomb, a marker bomb, an ancestor-class bypass and a `url()` whitespace bypass found and fixed, then a worker process added) by subagents (`ARCH-025`). Branch `task-j-apps`.
+- **Protocol (Selkies 715df7c, c72a9ef7 or newer):**
+  - The client sends `apps,{"op":install|remove|update|launch|list|cancel|clear,...}` on the session WebSocket.
+  - The server replies with the system actions `apps_state` (replaces the state) and `apps_job` (console `append`/`reset`), plus `command_error`.
+  - Gated by `command_enabled`, and hidden by `ui_sidebar_show_apps`.
+  - One shared `system_action` match in the transport routes these and `ARCH-032`'s rumble.
+- **Decision:**
+  - **Window:** one **Apps** window per session, like Files (`ARCH-023`): source list (Installed, All Apps, categories with counts, Activity), a 112×104 icon grid, and a 300 pt detail pane. Installed apps get Open, then Update and Remove…, with a confirm. The pane also has a monospace console with auto-scroll, Copy, and Cancel ("Canceling…", since cancel gets no reply). ⌘⌫ removes.
+  - **Opening:** from a Session Controls header button and View → Apps, with no chord. It stays open across a reconnect, and teardown closes it.
+  - **Support detection:** older Selkies drop the ops silently. Skerry sends `list` once per stream and waits 5 s for `apps_state`. If nothing comes, the button hides, the View item is disabled, and an open window shows "This session's Selkies is too old for the Apps catalog." A late reply re-enables it. There is no old-protocol fallback.
+  - **Catalog:**
+    - From the Selkies web client's GitHub raw URL: a separate HTTP client with no key, cookie or user agent, HTTPS only, at most 3 redirects, size-capped, 5 s timeout. This is the one sanctioned third-party fetch.
+    - Or from the session's local repository (`api/apps/`, with the session cookie), whose generated entries may have no icon, description or category.
+    - YAML is parsed under a budget.
+  - **Icons (untrusted SVG):**
+    - Refused outright: any `<!ENTITY` or internal DTD subset, `<marker>`, CSS escapes and `@import`, and `<use>` or element or depth counts over budget.
+    - Removed rather than refused: filters, so drop shadows are dropped.
+    - Checked: nested mask, clipPath and pattern references are resolved through attributes, `style=` and stylesheet classes on the element and its ancestors. `url()` is read exactly as svgtypes reads it, and anything unreadable counts as a reference.
+    - SVGs up to 1 MiB.
+    - Rasterising runs in a child process (`--skerry-svg-worker`, checked first in `main`). It has RLIMIT_CPU 2 s, a 3 s kill, at most 2 at a time, an empty environment, and only stdin and stdout. Output is size-capped and bounds-checked.
+    - PNG icons are capped at 2048 px and 32 MB.
+    - All 137 real catalog icons decode.
+    - Textures retire through a queue drained in render, with a generation counter (`ARCH-014`).
+- **Pelorus excluded (`DC-13`):** `/pelorus/api/run` is an agent loop of up to 50 steps that clicks, types and can run shell commands, so even a "describe" prompt can change the desktop. The panel is aimed at agents, and it needs a model key that Skerry would have to store. Revisit if VoiceOver-style reading of remote windows becomes a goal.
+- **QA:**
+  - Hostile inputs were refused in 0.03–25 ms.
+  - The GitHub fetch got 161 apps in 218 ms with only `accept` and `host` headers.
+  - The live server runs a Selkies older than c72a9ef7, so install, remove and the job console were not verified live, nor anything on screen (screen locked).
+- **Affected Rust:** `apps.rs` (new), `app/apps_window.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `main.rs`, `crates/skerry-ui/src/{apps.rs,controls.rs,assets.rs}`, `examples/preview.rs`, `tests/fixtures/proot-apps-metadata.yml`.

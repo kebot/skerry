@@ -1,0 +1,29 @@
+# ARCH-029: Account Menu and Key Recovery (Task D)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-06`.
+- **Process:** plan → design → review (10 required changes) → build → QA (2 medium, fixed) → code review (1 high, 1 medium, fixed; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-d-account`.
+- **What SealSkin 0.5.0 gives a key:**
+  - `POST /companion/api/admin/status` (`routers/admin.py:116`) is open to every user. It returns name, admin flag, groups, rights (storage, GPU, VPN), limits (sessions, session length, idle, CPUs, memory, storage), the hours allowance, `held`, and storage used (with `?storage=1`).
+  - Key refusals are `401` with `detail` = `unknown` / `expired` / `dormant` / `disabled` / `client` (`security.py:489-513`).
+  - A key's own expiry, name and last use are not available to the key (`/api/keys` answers web sign-ins only), so they are left out.
+  - Only the built-in `admin` user never goes dormant.
+- **Account menu:**
+  - The Library header's right edge holds an account button (user icon, name, caret). It takes the place of Task A's header Sign Out (macOS convention and SealSkin's own profile card).
+  - Its 300 pt popover shows: name with an Admin tag, server, groups; Storage/GPU/VPN chips; and limit rows in the web profile's order with 4 pt meters (warning at 80 %, danger at 100 %, with a caption). Storage uses binary GB, as `quota.py` does, and is measured only when the menu opens; only a failed measure is retried. The key's source and its sleep time come next.
+  - The footer has **Open SealSkin in Browser** and **Sign Out…** (in red), which closes the popover and then opens Task A's confirmation (`ARCH-026`).
+  - Admins see "Administrators have every capability and no limits." The key id appears only in a tooltip.
+- **Recovery:**
+  - **Dormant:** a panel with **Sign In on the Web** (opens `<origin>/?wake=1`, never with the key in the URL), Try Again, and Use a Different Key. Skerry checks again every 5 s for up to 3 minutes and when the window becomes active. The poll is a GPUI task the Launcher owns, cancelled on every exit; `WakeState` clears its in-flight mark whenever a poll starts or stops.
+  - **Revoked or expired:** back to Connect with a red alert. The field is relabelled "New Application Key", empty and focused. The saved key stays in `config.toml` until a replacement connects. An empty Connect says "Paste a new application key." and sends nothing.
+  - **Disabled, client not allowed, or inactive:** a yellow alert, and an empty field retries the current key. Use a Different Key keeps the current key as the retry target, and a network failure on retry doesn't lose it.
+  - **Held:** read from `held: true` before any text match. It shows a panel with Open SealSkin in Browser and Try Again.
+  - Any unrecognised 403 shows the server's own sentence under "SealSkin refused the request" and allows a retry. Quota or permission 403s show the server's sentence alone.
+  - A key from the environment or `.env` gets a note: a pasted key is saved, but the environment key wins at the next launch.
+  - A pasted key that is refused at first and connects later (wake poll, Try Again, empty Connect) is kept as a pending credential and saved on that success. Environment and `.env` keys are never saved.
+  - Refusals on Refresh, Launch (including home creation and Task B's progress 401) and Stop all reach this flow. Session windows keep streaming; their Files window's Storage pane shows the refusal; a new key reaches a session window only after it is reopened.
+- **Evidence:** SealSkin 0.5.0 `routers/admin.py`, `security.py:489-513`, `api.md:42`, `shell/host.js:253`, `ui/app.js:122-165`. Prior art: gh and Tailscale re-authenticate in the browser and keep the old credential until the new one works.
+- **QA:**
+  - Live and read-only: the real `admin/status` for the admin user gives the expected menu.
+  - A fake HTTPS server with the real binary: every refusal code mapped to the right recovery state with one Library round, `config.toml` stayed byte-identical, and the key went only to the control-plane host.
+  - Not verified: anything on screen (screen locked) and the wake flow in a real browser.
+- **Affected Rust:** `app/account.rs` (new), `crates/skerry-ui/src/account.rs` (new), `sealskin.rs`, `app.rs`, `launch_progress.rs`, `app/files_window.rs`, `crates/skerry-ui/src/{library.rs,connect.rs,assets.rs}`, `examples/preview.rs`.

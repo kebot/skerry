@@ -1,0 +1,35 @@
+# ARCH-026: Launcher Polish, Control-Plane Hardening, Session Controls Memory, and Key Release Before Close (Task A)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-10`, `ARCH-GAP-LS-11`, and `ARCH-GAP-DC-09` (client side). `ARCH-GAP-VS-05` is now settled except the web's stream-toggle tile row (`ARCH-020`).
+- **Process:** plan → design → review (14 required changes) → build → QA (1 major, 5 minor) → code review (2 rounds, MERGE), all done by subagents (`ARCH-025`). Branch `task-a-polish`, merged into `frontier-2026-11-22`.
+- **Launcher (`LS-10`):**
+  - **Sign Out…** replaces **Disconnect Server** and asks for confirmation in a modal built like Stop Session (Cancel, then **Sign Out** in danger).
+    - The wording depends on where the key came from. With `config.toml` it says the saved key is removed. With `SEALSKIN_APPLICATION_KEY` or `.env` it says Skerry doesn't store that key and will use it again next launch.
+    - It says open session windows stay connected (`ARCH-022`).
+    - It removes `application_key` whenever `config.toml` holds the active key, and ignores a Refresh or launch still in flight.
+  - The Library content column is capped at 1200 pt and centred. Tiles and cards keep their sizes.
+  - Toasts are a `skerry-ui` component: bottom centre, 3 s, a new one replaces the old, successes only. They read "Library refreshed" (manual Refresh) and "Link copied".
+  - "Started … ago" updates every 30 s, only while the Library is visible and has sessions.
+- **Hardening (`LS-11`):**
+  - The application key is attached only to requests whose resolved path is under `/companion/api/`. Logos and `/app/<id>/icon.png` go through a second HTTP client that has no key. This is chosen on the resolved path in release builds too, and tested over raw TCP.
+  - Preference and key writes go through one first-in-first-out write queue on Tokio (`persist.rs`). It is the only writer, with an in-memory copy that every reader uses, so reads always see queued writes. On quit it flushes within 1 s (`block_on` in `on_app_quit`).
+  - Preferences load field by field. Unknown top-level keys from newer builds are written back. An unreadable file is copied to `<file>.bak-<timestamp>` before it is overwritten.
+  - Library items are cached as `Rc` slices and rebuilt only when marked dirty. Every image retirement (`ARCH-014`) marks them dirty.
+- **Session Controls (`VS-05`):**
+  - Which sections are open is saved per server. Restoring Stats open subscribes as a click would.
+  - Scroll position is kept per session window across closing the panel and reconnecting; it is not saved to disk.
+  - Preset was already a dropdown (`ARCH-018`), so no picker changed.
+  - Session Controls dropdowns use a `skerry-ui` `menu_dropdown` with a stronger, theme-aware shadow. Light: 0 8 24 at 16 % plus 0 2 6 at 8 %. Dark: 0 12 32 at 60 % plus a 1 px white 12 % ring, with GPUI blur at half the CSS value. Launch Dialog `Select` popups keep gpui-kit's own shadow.
+- **Stray Super key (`DC-09`):**
+  - Root cause in Skerry: `NativeSession::drop` aborted the transport task before the queued key releases were sent, so a key held during a codec switch stayed down on the remote.
+  - Now the transport sends `ku` for every held key, then a WebSocket close frame. A 1 s abort watchdog is the fallback, and a cancel flag stops a stream that is dropped while still connecting from ever sending `SETTINGS`.
+  - **No `kr` is sent anywhere.** Selkies' `reset_keyboard` releases Super/Meta/Control/Escape even when they aren't down, which could itself open a menu.
+  - Key bookkeeping lives in a pure `KeyLedger` (`view/keys.rs`):
+    - Command never maps to Super or Meta.
+    - A keysym that Shift changes while held is released.
+    - Keys are released on blur and before Session Controls, Files, or full screen.
+  - `SKERRY_INPUT_TRACE=1` prints each input message, with printable keys redacted.
+- **Corrections from review:** Selkies `disconnect()`/`connect()` reset only at server start and stop. An aborted socket (1006) leaves keys held until the server's roughly 2 s stale sweep, and a clean close runs `reset_keyboard`. Ctrl+Esc is a likelier trigger than Super.
+- **Not verified live:** the screen was locked during QA, so nothing was checked visually (Light/Dark shots, dropdown shadow, toasts). The Sign Out run and the codec-switch input trace were checked in code and unit tests only. The Library loading, keyless logo fetches (a proxy saw no Authorization), and resilience to a corrupt preferences file were verified live.
+- **Known, not fixed:** quitting still ends streams abruptly (1006), so the server holds keys for its grace period. The in-memory preferences stay ahead of disk after a failed write.
+- **Affected Rust:** `persist.rs` (new), `view/keys.rs` (new), `sealskin.rs`, `settings.rs`, `app.rs`, `view.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{library.rs,controls.rs,components.rs}`, `examples/preview.rs`.

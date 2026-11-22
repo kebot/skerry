@@ -1,0 +1,32 @@
+# ARCH-031: Stats Strip over the Stream and a Shortcuts Card (Task F)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-06` and `ARCH-GAP-DC-12`. Amends `ARCH-019`: Stats history now resets only when a subscription starts.
+- **Process:** plan → design → review (7 required changes) → build → QA (4 trivial) → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-f-overlay-shortcuts`.
+- **Stats strip (`VS-06`):**
+  - A **Show over the stream** switch sits at the top of the Stats card, and View → **Toggle Stats Over Stream** does the same.
+  - The strip copies the Selkies web client's "over the stream" strip:
+    - four status marks (encoder, capture, decoder, connection), then fps, video Mbps against the target (amber above 1.1×), capture-to-sent ms, and RTT
+    - a 55 % black pill centred 8 pt from the top, in every theme
+    - tabular digits and fixed minimum widths so it doesn't jump
+    - it wraps whole figures in narrow windows
+  - It has no hitbox, so clicks pass through, including to the ⋯ button it draws over.
+  - It is saved per server through `persist.rs`.
+  - Only the strip was built. Moonlight, Parsec and Steam all use text overlays, and Selkies draws its gauges only in layouts Skerry doesn't follow.
+  - `_stats,1` is sent while the Stats card is open or the strip is on (`StatsInterest`), and sent again after a reconnect.
+  - `stats::strip_bottom` tells later overlays where to start below the strip.
+- **Shortcuts (`DC-12`):**
+  - A Shortcuts card after Input lists Skerry's own chords from one table (`shortcuts::CHORDS`): ⇧⌘M Session Controls, ⌃⌘F full screen, ⇧⌘F, ⌘0 Library, and ⌘Q "Always on the Mac". The glyphs are macOS menu glyphs in Apple's modifier order.
+  - **Mac shortcuts active** follows the server's `keyboard_shortcuts` until the user changes it, then the saved per-server value. A server lock wins, shows as a disabled switch, and survives reconnects.
+  - When it is off, those chords go to the session with ⌘ sent as Control. The key is sent as a down-up tap while Control stays held, so holding ⌘ never auto-repeats it. There is no escape chord: the View menu, the ⋯ button and ⌘Q always work, as in Jump Desktop and Windows App.
+  - One ordered `app::key_bindings()` puts the global chords first, then Files, then the Library's ⌘O/⌘L (`ARCH-028`), then a `NoAction` suppression layer under the `SessionDesktop` key context last. gpui-pre 0.3.12 lets the last binding win at equal depth.
+  - `passes_to_session` reuses the suppression bindings and always calls `stop_propagation`, so neither the menu nor AppKit's own ⌃⌘F item fires.
+- **Key release (amends `ARCH-026`):**
+  - AppKit sends no key-up while ⌘ is held. When ⌘ lifts, every key the ledger still holds is checked against the real HID key state (`CGEventSourceKeyState`) and released if it's up; keys still physically down stay held.
+- **QA:**
+  - A GPUI test window with the shipped key bindings, plus the real transport against a fake WebSocket server, showed:
+    - chords skip their actions and arrive as Ctrl
+    - ⌘Q stays local, and ⌘O/⌘L still work in the Library
+    - the letter's `ku` comes before Control's
+    - `_stats` ref-counting holds across 41 rapid flips and a reconnect
+  - Not verified (screen locked): the strip's look, clicking through it, full screen, and AppKit's ⌃⌘F item live.
+- **Affected Rust:** `shortcuts.rs` (new), `view/keys.rs`, `view.rs`, `stats.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{stats.rs,controls.rs,session.rs}`, `examples/preview.rs`.

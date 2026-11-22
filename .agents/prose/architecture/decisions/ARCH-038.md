@@ -1,0 +1,57 @@
+# ARCH-038: Microphone and Camera Uplinks (Tasks M1 and M2)
+
+- **Status:** settled 2026-11-22: the microphone (M1) and then the camera (M2). This settles `ARCH-GAP-DC-05`. Echo cancellation is deferred, as `ARCH-GAP-DC-16`.
+- **Process:** plan → design → review (which cut echo cancellation and split the camera off) → build → QA (1 high, 1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-m-mic`.
+- **Protocol (Selkies 715df7c):**
+  - Binary `0x02` plus one Opus packet: mono, 24 kHz, 20 ms.
+  - The server sends `MICROPHONE_DISABLED` and `CAPTURE_DEMAND microphone <0|1>`.
+  - Settings: `microphone_enabled` and `microphone_on_start` (true, false, or demand). "Not enabled but not locked" still allows the mic, as in the web client.
+- **Decision:**
+  - **Encoding:** macOS's own AudioToolbox Opus encoder (streaming `AudioConverterFillComplexBuffer` with a private "no data yet" status and per-packet descriptions), 32 kbps. It resamples and downmixes in the same step. No C library is added; the bindings would need cmake.
+  - **Capture thread:** a per-session `skerry-mic` thread, following `ARCH-030`'s model. It exists only from a granted Start to Stop and opens the cpal device by UID.
+  - **Device list:** comes from plain CoreAudio properties (`input_devices.rs`). Nothing touches the microphone or triggers a macOS privacy request before capture is asked for and granted.
+  - **Starting:** on `on_start` true, on `CAPTURE_DEMAND`, or on the person's switch.
+    - PM decision: a mic the server locks on starts like `on_start` (after permission), with the switch shown on and disabled.
+    - The start policy runs only on the first `server_settings`.
+    - Late permission answers are ignored.
+    - PM decision: after a lock or `MICROPHONE_DISABLED`, the person's earlier "on" is not restored (the safe direction).
+  - **Stopping:** one `stop()` runs on every stream end: Error, StartupTimeout, `end_stream` (Reconnect, close, disconnect), teardown, and quit.
+    - The thread also stops itself when its sink closes, or when its frame channel stays full for 2 s.
+    - A blocked thread is detached, never stacked.
+    - A 10 s silence from the server (no message or pong) ends the stream, so a dead network can't keep the mic open.
+  - **UI:**
+    - A **Microphone & Camera** card after Audio, with a switch, a picker, a 5-segment level meter, the locked and denied states, and Open Privacy Settings.
+    - An in-window badge (left 12, top 48/52/88, with no hitbox) shows while the device is open.
+    - `NSMicrophoneUsageDescription` is in the bundle, and `bundle.sh` fails if the key is missing.
+  - **Echo cancellation deferred (`ARCH-GAP-DC-16`):** VoiceProcessingIO would have to take over playback on the `ARCH-030` thread, losing its health checks, device-return swap and default-following, and its spike could pass falsely.
+- **QA (fake-server harness, real AudioToolbox):**
+  - `0x02` frames decode as 24 kHz mono, 480 samples, 53–123 B, and none are sent before ready.
+  - `on_start`, demand, `MICROPHONE_DISABLED`, and locks all behave.
+  - Every stream end closes the stream and ends `skerry-mic`, and 15 cycles leaked no threads.
+  - Connecting causes no microphone privacy request (`preflight=true` only).
+  - Not verified: real capture and the menu-bar indicator (permission was undetermined with the screen locked), the card on screen, a real Selkies with the mic enabled, and macOS 13 (Opus encoder availability). The encoder emits Hybrid TOC `0x68`.
+- **Camera (M2; branch `task-m-camera`):** QA found 1 medium issue (keyframe size against input latency). Code review took 3 rounds and returned MERGE.
+  - **Protocol:** binary `0x06`, then codec `0x01` (H.264), then a flags byte, then Annex B. The server sends `WEBCAM_KEYFRAME`, `WEBCAM_DISABLED`, and `CAPTURE_DEMAND webcam`. The settings `webcam_enabled` and `webcam_on_start` work like the microphone's.
+  - **Capture:** AVFoundation (`objc2-av-foundation`) feeds NV12 frames zero-copy into a hardware VideoToolbox H.264 encoder (Constrained Baseline) on a per-session `skerry-camera` thread.
+    - The compression session is owned and invalidated on the capture delegate queue.
+    - A keyframe goes out every 4 s, on request, and after drops. Forced keyframes are capped at one per 500 ms, wait while one is unsent, and double their gap on repeats.
+    - Cameras are listed and opened only after authorisation.
+    - The macOS 14 device types (External, Continuity Camera) are looked up at runtime, so the app still launches on macOS 13. `bundle.sh` fails on any `AVCaptureDeviceType` symbol import.
+    - `NSCameraUsageDescription` and `NSCameraUseContinuityCameraDeviceType` are in the bundle.
+  - **Socket writer (`socket_writer.rs`, inside `ARCH-039`'s `Wire`):**
+    - Text commands and mic frames go first. Camera frames go through a slot that waits while the kernel holds unsent bytes.
+    - PM decision: input latency wins over camera quality. A WebSocket message can't be interleaved, so camera frames are kept small.
+    - It starts at 640×480 or smaller and 500 kbps, capped at 1.5 Mbps.
+    - The rate adapts to the measured backlog that hasn't been sent yet (the send buffer beyond min(cwnd, send window), plus srtt above its minimum, from `TCP_CONNECTION_INFO`), so round-trip time isn't read as congestion.
+    - Frames are capped at 1/8 s of the link. An oversized keyframe is dropped, the bitrate halves, and no P frame goes out until the next keyframe.
+    - Bounded queues (10 mic frames, 6 camera frames) keep the 2 s stall stop working.
+    - Mic and camera frames go only on the primary display.
+  - **Also fixed:** a Start that lands while the old thread is still exiting is retried from the 1 s ticker.
+  - **Measured (modelled uplink, 60–120 KB keyframes):**
+    - 1 Mbps: `kd` p95 under 87 ms.
+    - 1 Mbps with 150 ms RTT: p95 56–89 ms beyond the one-way delay.
+    - 3 Mbps: P frames keep flowing.
+    - 10 Mbps with 150 ms RTT: climbs to the 1.5 Mbps cap.
+  - **QA:** a synthetic NV12 source ran through the real encoder and transport. Frames were well formed with an IDR first, and the keyframe-request storm was capped. Every stream end stopped `skerry-camera` within 50 ms, 15 cycles leaked no threads, Display 2 got no `0x06` frames, and connecting with `on_start` false caused no camera privacy request.
+  - **Not verified:** a real camera and the green menu-bar light, a real throttled link, a real Selkies server with the webcam enabled, and macOS 13 launch.
+- **Affected Rust:** `capture.rs`, `microphone.rs`, `permissions.rs`, `input_devices.rs`, `app/media_capture.rs` (all new), `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `crates/skerry-ui/src/{controls.rs,session.rs}`, `scripts/bundle.sh`, `Cargo.toml` (`objc2-av-foundation`).

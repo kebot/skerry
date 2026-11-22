@@ -1,0 +1,22 @@
+# ARCH-034: JPEG Stripes as Their Own Images, Presented per Frame (Task I)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-04`. Amends `ARCH-021`: JPEG frames are now presented on the bottom stripe, or after a 2 ms settle, not flushed every 8 ms. Amends `ARCH-003`: the JPEG path no longer composites into a full canvas.
+- **Process:** plan → (no visible UI, so design N/A) → review (8 required changes) → build → QA (3 medium, 1 low, against targets) → fix round → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-i-jpeg`.
+- **Findings:**
+  - Since `ARCH-021`, the whole 11 MB canvas was cloned every 8 ms, and each flush built a new full-size RenderImage. That meant a new Metal texture and an 11 MB upload, even when one stripe changed.
+  - VideoToolbox JPEG decoding is not hardware on Apple Silicon: it moves the work to VTDecoderXPCService. ImageIO was slower than zune-jpeg.
+  - libjpeg-turbo needs cmake, which isn't available.
+- **Decision:**
+  - Each stripe becomes its own RenderImage. Only changed stripes are uploaded, and the canvas buffer is gone.
+  - Decoding: zune-jpeg decodes to RGB with NEON into a reused scratch buffer, then one NEON pass makes BGRA. It compiles only on aarch64, with a scalar fallback elsewhere. Grayscale stripes are accepted.
+  - Each stripe gets one padding row top and bottom, and every edge is snapped to whole device pixels, so there are no seams at any scale.
+  - Replaced stripes are retired with `window.drop_image` 4 paints later, because GPUI does not wait for the GPU (`metal_renderer.rs`). Every exit (resize, codec switch, fallback, stream end, reconnect) goes through the retirer.
+  - **Presentation:** a frame shows as soon as its bottom stripe arrives, since pixelflux sends stripes top to bottom. Otherwise it shows 2 ms after the last stripe, with the timer armed early to absorb tokio's rounding. The pacer resets on hardware frames, codec switch, and resize.
+  - The transport's biased select runs input, gamepad heartbeat, key heartbeat, socket, then settle, so stripes never starve input.
+  - `SKERRY_PRESENT_TRACE=1` logs each present's reason, delay, frame id, and stripe rows.
+- **Measured** (QA's headless harness: the real transport against a fake server replaying real stripes; release builds; excludes GPUI/Metal, so the removed 11 MB texture upload per flush is extra savings on top):
+  - Motion: instructions −27 %, cycles −27 to −30 %, CPU median about 27 % → 17–29 % (noisy).
+  - Typing: cycles −38 %, and last-stripe-to-present p50 1.6 ms against a 0.7–1.9 ms baseline (target ≤ baseline + 1 ms, met).
+  - Footprint 55 MB → 12–35 MB.
+- **Not verified live** (screen locked): real-app CPU, WindowServer and VTDecoder deltas, GPU memory, visual seams and tearing, and the top-to-bottom stripe order on a live server (use the trace).
+- **Affected Rust:** `transport.rs`, `view.rs`, `view/stripes.rs` (new), `Cargo.toml` (zune-jpeg 0.5).

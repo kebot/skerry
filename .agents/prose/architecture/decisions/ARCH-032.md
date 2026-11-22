@@ -1,0 +1,39 @@
+# ARCH-032: Pointer Capture and Gamepads (Task G)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-06`. Custom chords were dropped, following `ARCH-031`.
+- **Process:** plan → design → review (13 required changes) → build (G1 pointer capture, G2 gamepads) → QA (2 medium, 3 low) → code review (4 rounds; one high found in rounds 2 and 3, fixed) by subagents (`ARCH-025`). Branch `task-g-gaming`, merged after Task H.
+- **Protocol (Selkies 715df7c):**
+  - Relative motion is `m2,<dx>,<dy>,<mask>,<magnitude>,<seq>`, integers only, so Skerry carries fractions forward.
+  - Pointer lock is `p,0|1` plus `SET_NATIVE_CURSOR_RENDERING,0|1`.
+  - Gamepads use `js,c,<idx>,<b64 name>,<axes>,<buttons>`, `js,d`, `js,b`/`js,a`, and a `js,h` heartbeat. Mapping follows the W3C standard layout.
+  - Rumble comes back as the system frame `rumble,<slot>,<strong>,<weak>,<ms>`.
+  - Everything is gated by `gamepad_enabled`, read as `{value, locked}`.
+- **Pointer capture (G1):**
+  - **Capture Pointer** lives in the Input card and in the View menu. ⌃⌥⇧Z (Moonlight's chord) captures and releases. It joins `shortcuts::CHORDS` as always-local, and a held chord toggles only once. VMware's ⌃⌘ clashes with ⌃⌘F, and Parallels' ⌃⌥ is a common Linux chord.
+  - **Capturing:**
+    - An app-wide AppKit monitor (`view/capture.rs`, built like `pinch.rs`) sends raw deltas to the input channel as scaled `m2` with carry.
+    - Skerry sends `p,1`, warps the cursor to the picture centre (primary-display flip), drops the first motion after the warp, dissociates the mouse from the cursor, and hides the cursor.
+  - **Releasing:** on the chord, on blur or deactivation, on child windows (including a print sheet, `ARCH-033`), on full screen, on disconnect, and on drop.
+    - Release shows "Pointer released". Errors release with no hint.
+    - Modifiers are lifted before they are muted.
+    - The transport sends `p,0`, `SET_NATIVE_CURSOR_RENDERING,0`, and `js,d` on close, because the server's cursor setting outlives the connection.
+  - Server pointer-lock requests are not honoured: Selkies sends none.
+  - Hint pill: "Pointer captured · ⌃⌥⇧Z releases it" at the bottom centre for 3 s.
+- **Gamepads (G2):**
+  - Apple's GameController framework (`objc2-game-controller` 0.3.2) and CoreHaptics (`objc2-core-haptics` 0.3.2; `createEngineWithLocality` is called through `msg_send!` because the crate gates it to iOS).
+  - **Slots:** an app-wide table gives each pad the lowest free slot 0–3. Drivers are keyed by session (host + session id), because each Selkies session has its own slot table.
+  - **Sending:** only changes are sent, plus `js,h` every 100 ms from the transport.
+    - Pads send only while the session window is key, as in Moonlight. When the window loses key, its slots return to rest.
+    - A window sends `js,d` only for the slots it drove.
+  - **Rumble:** each message starts a fresh haptics player, capped at 5 s. Engines stop with their players, and a start that races a stop is retried once.
+  - **Gamepads card:** four fixed slot rows, each with a numbered badge (Sending / Ready / Not sent), the name, and "· No rumble" when the pad has none. Battery display was cut.
+  - Skerry drives up to four slots; the web client drives one.
+- **Risks recorded:**
+  - Every `p` change makes the server reconfigure its displays.
+  - If the main thread hangs while the pointer is captured, the cursor stays frozen until ⌥⌘Esc.
+  - In collaboration rooms (master token set), the server drops Skerry's `js,` messages (`ARCH-GAP-DC-07`).
+- **QA:**
+  - The app launched with GameController and CoreHaptics loaded and didn't crash.
+  - A fake-server harness confirmed every message, the 100 ms heartbeat, and rumble reaching the haptics path.
+  - Not verified (screen locked, no controller): capture and warp on screen, `kill -9` while captured, real pads and haptics, and the server's display restart.
+- **Affected Rust:** `view/capture.rs` (new), `gamepad/` (new, `native.rs`), `view.rs`, `view/keys.rs`, `transport.rs`, `settings.rs`, `shortcuts.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{controls.rs,session.rs,assets.rs}`, `Cargo.toml`, `examples/preview.rs`.

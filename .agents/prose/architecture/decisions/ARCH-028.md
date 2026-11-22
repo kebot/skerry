@@ -1,0 +1,39 @@
+# ARCH-028: Open Links and Files in Remote Apps, and Files from the Launcher (Task C)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-03` and `ARCH-GAP-LS-02`. Amends `ARCH-023`: a Files window can now be opened from the Library without a stream.
+- **Process:** plan → design → review (17 required changes) → build → QA (4 minor, 2 trivial) → code review (1 medium; 2 rounds, MERGE), all by subagents (`ARCH-025`). Branch `task-c-open`, rebased over Task D.
+- **Server facts** (sealskin `1ba09a7`):
+  - Apps declare `url_support` and `extensions` (`models.py::Application`).
+  - `POST /companion/api/launch/url` takes the `launch/simple` body plus `url`, checked against `^(?:(?:https?|ftp)://|magnet:\?)[^\s\x00-\x1f\x7f]+$`, at most 8192 characters.
+  - `launch/file` works as `upload/initiate` → `upload/chunk` (base64, at most 8 MiB; Skerry sends 1 MiB) → `launch/file`.
+  - `POST /companion/api/sessions/<id>/open_url` answers 200 `opened`, 409 when nothing took the link, and 404 when the session isn't the caller's.
+  - The session cookie comes from a plain GET that answers 303, and the access token is not used up by it.
+- **Links:**
+  - Text typed or pasted into the Library search becomes a link by the web launcher's rule, plus `ftp` and space-free `magnet`. A bare host gets `https://`, and the scheme is lower-cased.
+  - The chooser above the results offers **Open Here** for compatible running sessions (`open_url`) and **Launch & Open** for apps with `url_support`. If a session refuses, Skerry shows a notice and never launches anything by itself.
+  - The chooser shows the real host and drops userinfo.
+  - Return acts only on text the user typed that has a scheme or one of 32 common TLDs. Links from Finder, `skerry:`, drops or ⌘O always need a click.
+  - ⌘L (Open Location…) works only while the Library is key.
+- **Files:**
+  - Files arrive by ⌘O (Library only), a drop on the Library or on a session card (blue ring and pill), Finder **Open With**, or the Dock icon. The bundle declares `public.data` at Alternate rank, so Skerry is never the default app, plus a `skerry://open?url=` scheme. Skerry doesn't register for http or https.
+  - The chooser filters apps by extension, and shows every app when none matches. A running session gets **Copy to Desktop** (an upload through its Files window).
+  - Uploads open the file once and stream 1 MiB chunks. They stop if the file changes, and Cancel aborts the Tokio task.
+  - Files over 4 GiB and folders are refused, and several files go one at a time.
+  - Errors map from the response status: 403 means storage is full, 413 too large, 429 too many uploads.
+  - Uploads ride Task B's launching card. A long upload never shows the stall notice.
+- **Launch & Open dialog:** it keeps its own copy of the target, so a link that arrives mid-dialog joins the queue instead of replacing it. It shows "Opens “report.pdf” · PDF · 2.4 MB", hides Copy link and B's Open Running Session, and its button reads **Launch & Open**.
+- **Files from the launcher (`LS-02`):**
+  - Each running-session card has an icon-only Files button. It opens that session's Files window with no stream window, using `transport::session_access`, which does the cookie exchange on its own client and never sends the application key.
+  - There is one Files window per session, shared between the Library and the session window. Windows the Library opened close on Stop and on Sign Out.
+  - With no stream, Skerry assumes both directions are allowed and turns one off if the server answers 403.
+  - A session that is still starting reads "The session is still starting. Try again in a moment."
+- **Refusals** from launch/url, launch/file, uploads and `open_url` go through `ARCH-029`'s key classification.
+- **⌘O/⌘L in session windows:** these are bound only in the Library's key context, and the session desktop (the `SessionDesktop` key context) claims them, so a remote app gets them when Command sends Control is on. When it is off, they do nothing, like every other ⌘ key. File → Open… does nothing unless the Library is key.
+- **QA (live):**
+  - launch/url worked. launch/file sent a 2.6 MB file as 3 chunks and it reached the session.
+  - `open_url` refusals mapped as expected (422 → refused, 404/409 → not taken). A successful `open_url` was not shown live: Zen answered 409 on its first-run screen.
+  - `session_access` got the cookie with no WebSocket, and `SelkiesClient` listed and uploaded.
+  - `plutil -lint` passed on the bundle.
+  - Not verified: anything on screen, Finder Open With, Dock drops, and 413/429.
+- **Known:** the TLD list includes `app` and `ai`, so "Zen.app" followed by Return opens `https://zen.app`. A key refusal clears the chooser.
+- **Affected Rust:** `open_target.rs` (new), `sealskin.rs`, `transport.rs`, `selkies.rs`, `launch_progress.rs`, `app.rs`, `app/files_window.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,files.rs,assets.rs}`, `scripts/bundle.sh`, `examples/preview.rs`.
