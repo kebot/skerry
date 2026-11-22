@@ -2669,7 +2669,7 @@ impl PreviewApp {
                 12,
                 "Report.pdf",
                 PrintNoticeKind::TooLarge {
-                    detail: "It’s 1.4 GB. Skerry receives print jobs up to 1 GB.".into(),
+                    detail: "It’s 1.4 GB. Skerry receives print jobs up to 1 GiB.".into(),
                 },
             ),
             notice(13, "Report.pdf", PrintNoticeKind::Missing),

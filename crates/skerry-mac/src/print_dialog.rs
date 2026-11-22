@@ -41,6 +41,15 @@ pub fn sheet_attached(window: &NSWindow) -> bool {
     window.attachedSheet().is_some()
 }
 
+/// Whether the person is looking at this window: it, or the sheet on it, is key. (While a
+/// sheet is up the sheet is key, so GPUI's "active" reads false.)
+pub fn window_or_sheet_key(window: &NSWindow) -> bool {
+    window.isKeyWindow()
+        || window
+            .attachedSheet()
+            .is_some_and(|sheet| sheet.isKeyWindow())
+}
+
 /// Ends whatever sheet is up on `window`, before the window goes away.
 pub fn end_sheet(window: &NSWindow) {
     if let Some(sheet) = window.attachedSheet() {

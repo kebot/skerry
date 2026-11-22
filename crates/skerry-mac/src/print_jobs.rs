@@ -191,12 +191,34 @@ impl FetchFailure {
 /// The Too large notice's second line.
 pub fn too_large_detail(size: u64) -> String {
     if size == 0 {
-        "Skerry receives print jobs up to 1 GB.".into()
+        "Skerry receives print jobs up to 1 GiB.".into()
     } else {
         format!(
-            "It’s {}. Skerry receives print jobs up to 1 GB.",
+            "It’s {}. Skerry receives print jobs up to 1 GiB.",
             skerry_ui::session::size_label(size)
         )
+    }
+}
+
+/// Why a pending auto-open hasn't opened yet, for its notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingWait {
+    /// A print sheet is up: it opens after that one.
+    AfterSheet,
+    /// The session window (with any sheet) isn't key: it opens when the person comes back.
+    WindowAway,
+    /// Held by the connect burst or the start-up banner: no promise in the wording.
+    Other,
+}
+
+/// Which pending wording applies: a sheet first, then a window that isn't key.
+pub fn pending_wait(sheet_open: bool, window_or_sheet_key: bool) -> PendingWait {
+    if sheet_open {
+        PendingWait::AfterSheet
+    } else if !window_or_sheet_key {
+        PendingWait::WindowAway
+    } else {
+        PendingWait::Other
     }
 }
 
@@ -222,6 +244,10 @@ pub async fn fetch(
     closed: &AtomicBool,
     stall: Duration,
 ) -> FetchResult {
+    // A window already gone fetches nothing: the document stays for the next connect.
+    if closed.load(Ordering::SeqCst) {
+        return Err(FetchFailure::Retry("the window closed".into()));
+    }
     let local = |error: io::Error| FetchFailure::Local(error.to_string());
     tokio::fs::create_dir_all(job_dir).await.map_err(local)?;
     let partial = job_dir.join(PARTIAL_NAME);
@@ -232,6 +258,11 @@ pub async fn fetch(
         .open(&partial)
         .await
         .map_err(local)?;
+    if closed.load(Ordering::SeqCst) {
+        drop(file);
+        let _ = tokio::fs::remove_dir_all(job_dir).await;
+        return Err(FetchFailure::Retry("the window closed".into()));
+    }
     let received = client
         .print_document(name, &mut file, progress, stall)
         .await;
@@ -482,6 +513,16 @@ impl PrintJobs {
         if repeat {
             return Announced::Ignored;
         }
+        // A re-announce replaces the earlier failed job of that name, and its notice.
+        let failed: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter(|job| job.name == announcement.name && matches!(job.state, JobState::Failed(_)))
+            .map(|job| job.id)
+            .collect();
+        for id in failed {
+            self.remove(id);
+        }
         let id = self.next;
         self.next += 1;
         let dir = self.root.join(id.to_string());
@@ -531,6 +572,7 @@ impl PrintJobs {
             Ok(fetched) => {
                 job.state = JobState::Ready;
                 job.printed_at = fetched.printed_at;
+                job.size = fetched.bytes;
                 if job.notice != Notice::Hidden {
                     job.notice = Notice::Shown {
                         until: Some(now + READY_NOTICE),
@@ -1103,6 +1145,41 @@ mod tests {
     }
 
     #[test]
+    fn a_reannounce_replaces_its_reconnect_notice() {
+        let mut jobs = jobs();
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let first = fetch_id(jobs.announce(announcement("Report.pdf"), false, now, wall));
+        jobs.finished(first, Err(FetchFailure::Retry("403".into())), now);
+        let other = fetch_id(jobs.announce(announcement("Other.pdf"), false, now, wall));
+        jobs.finished(other, Err(FetchFailure::NotPdf), now);
+        let second = fetch_id(jobs.announce(announcement("Report.pdf"), true, now, wall));
+        assert!(jobs.get(first).is_none());
+        assert_eq!(jobs.take_doomed(), [PathBuf::from("/cache/Print/w1/1")]);
+        let names: Vec<_> = jobs.notices().iter().map(|job| job.id).collect();
+        assert_eq!(names, [second, other]);
+    }
+
+    #[test]
+    fn a_fetched_size_replaces_the_announced_one() {
+        let mut jobs = jobs();
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        let announced = Announcement {
+            size: 0,
+            ..announcement("a.pdf")
+        };
+        let id = fetch_id(jobs.announce(announced, false, now, wall));
+        jobs.finished(
+            id,
+            Ok(Fetched {
+                bytes: 4_200,
+                printed_at: None,
+            }),
+            now,
+        );
+        assert_eq!(jobs.get(id).unwrap().size, 4_200);
+    }
+
+    #[test]
     fn a_gone_document_disappears_quietly() {
         let mut jobs = jobs();
         let (now, wall) = (Instant::now(), SystemTime::now());
@@ -1469,6 +1546,14 @@ mod tests {
         assert!(short.ends_with(".pdf"));
         assert!(long.starts_with(&short[..short.len() - 4]));
         assert_eq!(local_file_name("a.pdf"), "a.pdf");
+    }
+
+    #[test]
+    fn pending_wording_follows_the_sheet_then_the_key_window() {
+        assert_eq!(pending_wait(true, true), PendingWait::AfterSheet);
+        assert_eq!(pending_wait(true, false), PendingWait::AfterSheet);
+        assert_eq!(pending_wait(false, false), PendingWait::WindowAway);
+        assert_eq!(pending_wait(false, true), PendingWait::Other);
     }
 
     #[test]

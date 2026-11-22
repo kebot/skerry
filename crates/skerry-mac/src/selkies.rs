@@ -409,6 +409,12 @@ impl SelkiesClient {
             };
             return Err(match status.as_u16() {
                 404 => FetchFailure::Gone,
+                // SealSkin's forward_auth answers a stale or bad cookie with a JSON 403
+                // (`{"detail": …}`) before Selkies sees the request: the document is still
+                // in the spool. Only Selkies' own plain-text 403s are refusals.
+                403 if sealskin_detail(&body).is_some() => {
+                    retry(sealskin_detail(&body).unwrap_or_default())
+                }
                 403 => FetchFailure::Refused(sentence(&server_message(status, &body))),
                 // A 206 deletes nothing; any other answer (a sign-in redirect, a proxy's
                 // 5xx) never reached the document either.
@@ -567,6 +573,15 @@ async fn checked(response: reqwest::Response) -> Result<reqwest::Response, Error
     Err(Error::Server(status, server_message(status, &body)))
 }
 
+/// SealSkin's own error body, `{"detail": …}` (FastAPI), as opposed to Selkies'.
+fn sealskin_detail(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .get("detail")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 /// What a session's proxy answers while its container is still starting: nginx's HTML 404
 /// or a gateway error, before Selkies serves its routes (`ARCH-028`).
 pub const STILL_STARTING: &str = "The session is still starting. Try again in a moment.";
@@ -585,6 +600,9 @@ fn server_message(status: StatusCode, body: &str) -> String {
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         if let Some(message) = value["message"].as_str() {
             return message.to_owned();
+        }
+        if let Some(detail) = value["detail"].as_str() {
+            return detail.to_owned();
         }
     }
     body.trim().chars().take(160).collect()
@@ -825,6 +843,8 @@ mod tests {
             Huge,
             /// Never answers.
             HoldHeaders,
+            /// SealSkin's forward_auth refusing a stale cookie.
+            Detail403,
             /// Sends the headers and part of the body, then goes quiet.
             StallBody(Vec<u8>),
         }
@@ -1149,7 +1169,7 @@ mod tests {
             if headers.contains_key("range") {
                 return respond(stream, "206 Partial Content", &modified, b"%PDF-").await;
             }
-            let taken = !matches!(reply, PrintReply::Status(..));
+            let taken = !matches!(reply, PrintReply::Status(..) | PrintReply::Detail403);
             if taken {
                 fake.prints.lock().unwrap().remove(name);
             }
@@ -1179,6 +1199,11 @@ mod tests {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
                 PrintReply::HoldHeaders => tokio::time::sleep(Duration::from_secs(5)).await,
+                PrintReply::Detail403 => {
+                    let body = br#"{"detail":"Forbidden: Invalid session or token."}"#;
+                    let json = [("Content-Type", "application/json".to_owned())];
+                    respond(stream, "403 Forbidden", &json, body).await
+                }
                 PrintReply::StallBody(bytes) => {
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
@@ -1486,6 +1511,31 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_sealskin_cookie_refusal_says_reconnect() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            spool(fake, "a.pdf", PrintReply::Detail403);
+            let (result, _local, _) = fetch_print(access, "a.pdf", STALL).await;
+            let Err(failure) = result else {
+                panic!("expected a failure");
+            };
+            assert!(failure.still_on_server(), "{failure:?}");
+            let detail = failure.detail("a.pdf");
+            assert_eq!(
+                detail,
+                "Couldn’t reach the session. Reconnect to receive a.pdf."
+            );
+            assert!(!detail.contains('{'));
+            assert_eq!(
+                server_message(
+                    StatusCode::FORBIDDEN,
+                    r#"{"detail":"Forbidden: Invalid session or token."}"#
+                ),
+                "Forbidden: Invalid session or token."
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_print_that_is_not_a_pdf_is_refused() {
             let server = start().await;
             let (access, fake) = (&server.access, &server.fake);
@@ -1632,8 +1682,13 @@ mod tests {
                 STALL,
             )
             .await;
-            assert!(result.is_err());
+            assert!(
+                matches!(&result, Err(f) if f.still_on_server()),
+                "{result:?}"
+            );
             assert!(!job_dir.exists());
+            assert!(requests(&server.fake, "GET", "/sess-1/api/print/").is_empty());
+            assert!(server.fake.prints.lock().unwrap().contains_key("a.pdf"));
         }
     }
 }

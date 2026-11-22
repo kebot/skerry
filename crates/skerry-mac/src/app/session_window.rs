@@ -264,8 +264,18 @@ impl SessionWindow {
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
-            let _ = owner.update(cx, |this, cx| this.teardown(window, cx));
-            true
+            let sheet = owner
+                .update(cx, |this, cx| this.teardown(window, cx))
+                .ok()
+                .flatten();
+            match sheet {
+                // A print sheet is up: end it, then close, in that order (`ARCH-033`).
+                Some(native) => {
+                    close_after_sheet(native, Window::window_handle(window), cx);
+                    false
+                }
+                None => true,
+            }
         });
         cx.observe_window_bounds(window, |this, window, cx| {
             // Leaving full screen restores the standard title bar; hide it again so it doesn't
@@ -995,16 +1005,17 @@ impl SessionWindow {
 
     /// The window is going away: end only this session's stream (never stop the remote
     /// app), close its Session Controls, and let the Library catch up (`ARCH-022`).
-    fn teardown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Returns the native window when a sheet is still up on it: the caller ends the sheet,
+    /// then removes the window (`close_after_sheet`).
+    fn teardown(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
         self.remove_controls(cx);
         self.end_stream(window, cx);
-        // A sheet still up ends before the window goes, outside this update (`ARCH-033`).
-        if let Some(native) = super::native_window(window) {
-            if print_dialog::sheet_attached(&native) {
-                cx.spawn(async move |_, _| print_dialog::end_sheet(&native))
-                    .detach();
-            }
-        }
+        let sheet =
+            super::native_window(window).filter(|native| print_dialog::sheet_attached(native));
         self.print_tick = None;
         let doomed = self.print_jobs.teardown();
         self.rt
@@ -1014,12 +1025,15 @@ impl SessionWindow {
             cx.global_mut::<OpenWindows>().forget_session(handle);
         }
         cx.defer(refresh_library);
+        sheet
     }
 
     /// Disconnects and closes this window. The remote session keeps running.
     pub(super) fn disconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.teardown(window, cx);
-        window.remove_window();
+        match self.teardown(window, cx) {
+            Some(native) => close_after_sheet(native, Window::window_handle(window), cx),
+            None => window.remove_window(),
+        }
     }
 }
 
@@ -1219,6 +1233,8 @@ impl SessionWindow {
             {
                 self.print_jobs.set_missing(id);
             }
+            // A second click while the first sheet is still starting does nothing.
+            PrintJobAction::Print if self.print_jobs.opening.is_some() => {}
             PrintJobAction::Print => {
                 if self.print_jobs.get(id).map(|job| &job.state) == Some(&JobState::Ready) {
                     self.start_print(id, false, window, cx);
@@ -1308,6 +1324,14 @@ impl SessionWindow {
     /// The shown notices, newest first, their sentences written.
     fn print_notice_props(&self, window: &Window) -> Vec<PrintNoticeProps> {
         let from = format!("From {}", self.remote.app_name);
+        let native = super::native_window(window);
+        let sheet_open = self.print_jobs.sheet_job.is_some()
+            || native
+                .as_ref()
+                .is_some_and(|native| print_dialog::sheet_attached(native));
+        let looking = native
+            .as_ref()
+            .is_some_and(|native| print_dialog::window_or_sheet_key(native));
         self.print_jobs
             .notices()
             .into_iter()
@@ -1322,10 +1346,14 @@ impl SessionWindow {
                         let detail = if job.busy {
                             "Finish the open print dialog first.".to_string()
                         } else if self.print_jobs.pending_auto == Some(job.id) {
-                            if window.is_window_active() {
-                                format!("{size} · The print dialog opens after the current one")
-                            } else {
-                                format!("{size} · The print dialog opens when you come back")
+                            match print_jobs::pending_wait(sheet_open, looking) {
+                                print_jobs::PendingWait::AfterSheet => {
+                                    format!("{size} · The print dialog opens after the current one")
+                                }
+                                print_jobs::PendingWait::WindowAway => {
+                                    format!("{size} · The print dialog opens when you come back")
+                                }
+                                print_jobs::PendingWait::Other => format!("{size} · {from}"),
                             }
                         } else if job.save_failed {
                             "Couldn’t save a copy.".to_string()
@@ -1361,6 +1389,20 @@ impl SessionWindow {
             })
             .collect()
     }
+}
+
+/// Ends the print sheet on `native`, then removes the window, in one task outside any
+/// update: AppKit may re-enter the run loop as the sheet ends (`ARCH-033`).
+fn close_after_sheet(
+    native: objc2::rc::Retained<objc2_app_kit::NSWindow>,
+    handle: AnyWindowHandle,
+    cx: &mut App,
+) {
+    cx.spawn(async move |cx| {
+        print_dialog::end_sheet(&native);
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    })
+    .detach();
 }
 
 /// "Saved to Downloads": the folder the copy went to.
