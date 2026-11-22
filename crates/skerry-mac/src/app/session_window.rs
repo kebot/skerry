@@ -111,6 +111,8 @@ pub(super) struct SessionWindow {
     pub(super) pending_settings: VideoSettings,
     settings_task: Option<Task<()>>,
     status: Option<String>,
+    /// Last seen full-screen state; a change releases held keys (`ARCH-GAP-DC-09`).
+    fullscreen: bool,
 }
 
 impl SessionWindow {
@@ -156,6 +158,7 @@ impl SessionWindow {
             pending_settings: VideoSettings::new(),
             settings_task: None,
             status: None,
+            fullscreen: window.is_fullscreen(),
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -166,6 +169,10 @@ impl SessionWindow {
             // Leaving full screen restores the standard title bar; hide it again so it doesn't
             // cover the top of the remote picture.
             session_chrome(window, false);
+            if this.fullscreen != window.is_fullscreen() {
+                this.fullscreen = window.is_fullscreen();
+                this.release_keys(cx);
+            }
             this.resize_display(window, cx)
         })
         .detach();
@@ -484,12 +491,21 @@ impl SessionWindow {
         }));
     }
 
+    /// Lifts every key the session holds, before something else takes the keyboard.
+    fn release_keys(&self, cx: &mut App) {
+        if let Some(stream) = &self.current {
+            stream.release_keys(cx);
+        }
+    }
+
     fn toggle_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.controls.is_some() {
             self.close_controls(window, cx);
             return;
         }
         if self.current.is_some() {
+            // The panel may open without taking focus while a key is held (cmd-shift-m).
+            self.release_keys(cx);
             let display_mode = self.display_mode;
             let owner_window = Window::window_handle(window);
             let session = cx.entity();
@@ -536,6 +552,7 @@ impl SessionWindow {
             cx.notify();
             return;
         }
+        self.release_keys(cx);
         let title = self.remote.app_name.clone();
         let storage =
             crate::sealskin::has_storage(&self.remote.home).then(|| files_window::Storage {
@@ -621,6 +638,9 @@ impl SessionWindow {
         self.resize_allowed = false;
         self.resize_task = None;
         self.stream_events = None;
+        // `release_focus` queues `ku` for held keys; dropping the stream then queues
+        // `Input::Close` behind them, so they reach the server before the close frame
+        // (`ARCH-GAP-DC-09`).
         if let Some(stream) = self.current.take() {
             stream.release_focus(window, cx);
         }
@@ -667,6 +687,7 @@ impl Render for SessionWindow {
             )
             .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
                 this.close_controls(window, cx);
+                this.release_keys(cx);
                 window.toggle_fullscreen();
             }))
             .when_some(self.current.as_ref(), |root, stream| {

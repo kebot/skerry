@@ -406,6 +406,58 @@ pub enum Input {
     Clipboard(clipboard::Content),
     /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
     Stats(bool),
+    /// End the stream: release every held key, then send a close frame (`ARCH-GAP-DC-09`).
+    Close,
+}
+
+/// What a closing stream sends before its close frame: a `ku` for every key the session
+/// still holds. No `kr`: on a clean close the server already resets the keyboard of the
+/// departing input owner, and every reset injects Super, Meta and Escape releases.
+fn closing_commands(held: &BTreeSet<u32>) -> Vec<String> {
+    held.iter().map(|key| format!("ku,{key}")).collect()
+}
+
+/// Whether `SKERRY_INPUT_TRACE=1` asks for a trace of key traffic on stderr. Read once.
+fn input_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SKERRY_INPUT_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Logs one key command (`kd`, `ku`, `kh`, `kr`) the transport writes, when tracing.
+fn trace_input(text: &str) {
+    if input_trace_enabled() {
+        if let Some(line) = redact_key_command(text) {
+            eprintln!("skerry input: {line}");
+        }
+    }
+}
+
+/// Logs a stream event that matters to key traffic (close frame, watchdog abort).
+pub fn trace_input_event(event: &str) {
+    if input_trace_enabled() {
+        eprintln!("skerry input: {event}");
+    }
+}
+
+/// A key command with every printable keysym hidden, so the trace never records typed
+/// text. Modifiers, function and navigation keys (0xff00 to 0xffff) keep their numbers.
+/// Anything other than `kd`, `ku`, `kh` and `kr` gives `None`.
+fn redact_key_command(text: &str) -> Option<String> {
+    if text == "kr" {
+        return Some(text.into());
+    }
+    let (verb, keys) = text.split_once(',')?;
+    if !matches!(verb, "kd" | "ku" | "kh") {
+        return None;
+    }
+    let keys: Vec<String> = keys
+        .split(',')
+        .map(|key| match key.parse::<u32>() {
+            Ok(keysym) if (0xff00..=0xffff).contains(&keysym) => keysym.to_string(),
+            _ => "<char>".into(),
+        })
+        .collect();
+    Some(format!("{verb},{}", keys.join(",")))
 }
 
 pub struct SessionOptions {
@@ -774,6 +826,7 @@ pub async fn run(
                     Some(Input::Zoom(notches, position)) => {
                         let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
                         for command in zoom_commands(notches, position, active_size, control_held) {
+                            trace_input(&command);
                             socket.send(command.into()).await.map_err(|_| disconnected)?;
                         }
                         continue;
@@ -834,18 +887,31 @@ pub async fn run(
                         if !ready { continue; }
                         format!("_stats,{}", u8::from(on))
                     }
-                    None => { let _ = socket.close(None).await; return Ok(()); }
+                    // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
+                    // an explicit close: release held keys, then close cleanly.
+                    Some(Input::Close) | None => {
+                        for command in closing_commands(&held) {
+                            trace_input(&command);
+                            let _ = socket.send(command.into()).await;
+                        }
+                        trace_input_event("close frame");
+                        let _ = socket.close(None).await;
+                        return Ok(());
+                    }
                 };
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
                     held.insert(key);
                 } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
                     held.remove(&key);
                 }
+                trace_input(&text);
                 socket.send(text.into()).await.map_err(|_| disconnected)?;
             }
             _ = heartbeat.tick(), if !held.is_empty() => {
                 let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-                socket.send(format!("kh,{keys}").into()).await.map_err(|_| disconnected)?;
+                let text = format!("kh,{keys}");
+                trace_input(&text);
+                socket.send(text.into()).await.map_err(|_| disconnected)?;
             }
             _ = sample_tick.tick() => {
                 let now = Instant::now();
@@ -1083,6 +1149,35 @@ async fn socket_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_releases_every_held_key_then_closes() {
+        let held = BTreeSet::from([0x61, 0xffe3]);
+        assert_eq!(closing_commands(&held), ["ku,97", "ku,65507"]);
+    }
+
+    #[test]
+    fn closing_with_nothing_held_sends_nothing() {
+        assert!(closing_commands(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn the_input_trace_hides_typed_characters() {
+        assert_eq!(redact_key_command("kd,97").as_deref(), Some("kd,<char>"));
+        assert_eq!(
+            redact_key_command("ku,16777729").as_deref(),
+            Some("ku,<char>")
+        );
+        assert_eq!(redact_key_command("kd,65507").as_deref(), Some("kd,65507"));
+        assert_eq!(redact_key_command("ku,65307").as_deref(), Some("ku,65307"));
+        assert_eq!(
+            redact_key_command("kh,97,65505,32").as_deref(),
+            Some("kh,<char>,65505,<char>")
+        );
+        assert_eq!(redact_key_command("kr").as_deref(), Some("kr"));
+        assert_eq!(redact_key_command("m2,0,0,1,0"), None);
+        assert_eq!(redact_key_command("SETTINGS,{}"), None);
+    }
 
     #[test]
     fn reads_selkies_prefixed_display_capabilities() {
