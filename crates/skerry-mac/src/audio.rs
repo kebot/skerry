@@ -34,9 +34,9 @@ const TICK: Duration = Duration::from_millis(500);
 /// How often the audio thread lists devices and reads the default.
 const ENUMERATE_EVERY: Duration = Duration::from_secs(1);
 /// No render callback for this long while a stream exists is a stall.
-const STALL: Duration = Duration::from_secs(2);
+pub(crate) const STALL: Duration = Duration::from_secs(2);
 /// At most one rebuild this often, for every cause but a person's pick.
-const REBUILD_LIMIT: Duration = Duration::from_secs(1);
+pub(crate) const REBUILD_LIMIT: Duration = Duration::from_secs(1);
 /// A stream that has called back this long clears its device's strikes.
 const HEALTHY_AFTER: Duration = Duration::from_secs(5);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
@@ -164,7 +164,7 @@ impl Drop for Playback {
 }
 
 /// Appends `pcm`, dropping the oldest samples beyond `limit`.
-fn push_bounded(queue: &mut VecDeque<f32>, pcm: &[f32], limit: usize) {
+pub(crate) fn push_bounded(queue: &mut VecDeque<f32>, pcm: &[f32], limit: usize) {
     let dropped = (queue.len() + pcm.len())
         .saturating_sub(limit)
         .min(queue.len());
@@ -230,7 +230,15 @@ fn stream_channels(device_channels: u16) -> u16 {
 /// Devices as `(uid, name)` labelled for the menus: a blank name reads "Output Device n",
 /// a repeated name gets " (2)", " (3)" (both numbered in UID order), and the list is
 /// sorted by name, then UID.
-fn label_devices(mut raw: Vec<(String, Option<String>)>) -> Vec<OutputDevice> {
+fn label_devices(raw: Vec<(String, Option<String>)>) -> Vec<OutputDevice> {
+    label_devices_as(raw, "Output Device")
+}
+
+/// `label_devices` with blanks named `"{blank} n"` (the microphone's "Microphone 1").
+pub(crate) fn label_devices_as(
+    mut raw: Vec<(String, Option<String>)>,
+    blank_name: &str,
+) -> Vec<OutputDevice> {
     raw.sort_by(|a, b| a.0.cmp(&b.0));
     raw.dedup_by(|a, b| a.0 == b.0);
     let mut blank = 0;
@@ -242,7 +250,7 @@ fn label_devices(mut raw: Vec<(String, Option<String>)>) -> Vec<OutputDevice> {
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| {
                     blank += 1;
-                    format!("Output Device {blank}")
+                    format!("{blank_name} {blank}")
                 });
             (uid, name)
         })
@@ -423,7 +431,7 @@ struct Strikes {
 
 /// The wait before the next try after `count` strikes: none after the first, then 2, 4,
 /// 8 … seconds, at most 30.
-fn backoff(count: u32) -> Duration {
+pub(crate) fn backoff(count: u32) -> Duration {
     if count <= 1 {
         Duration::ZERO
     } else {

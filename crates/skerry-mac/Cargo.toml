@@ -15,6 +15,11 @@ futures-util = { version = "0.3", features = ["sink"] }
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 objc2 = "0.6"
+# Microphone uplink (`ARCH-038`): the Opus encoder is AudioToolbox's own `AudioConverter`, and
+# the permission prompt is `AVCaptureDevice`'s. The first and third are already locked through cpal.
+objc2-audio-toolbox = { version = "0.3.2", default-features = false, features = ["std", "AudioConverter", "objc2-core-audio-types"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+objc2-core-audio-types = { version = "0.3.2", default-features = false, features = ["std", "CoreAudioBaseTypes"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSPrintInfo", "NSPrintOperation", "NSResponder", "NSView", "NSWindow", "NSWorkspace", "block2", "objc2-uniform-type-identifiers"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGRemoteOperation", "libc"] }

@@ -3,6 +3,8 @@ mod app;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod capture;
+#[cfg(target_os = "macos")]
 mod clipboard;
 #[cfg(target_os = "macos")]
 mod gamepad;
@@ -12,6 +14,8 @@ mod input;
 mod launch_options;
 #[cfg(target_os = "macos")]
 mod launch_progress;
+#[cfg(target_os = "macos")]
+mod microphone;
 #[cfg(target_os = "macos")]
 mod open_target;
 #[cfg(target_os = "macos")]
