@@ -2,7 +2,6 @@
 
 Skerry is a native macOS client for [SealSkin](https://docs.sealskin.app/latest/) and [Selkies](https://github.com/selkies-project/selkies). Connect to your SealSkin server—or directly to a Selkies stream—to launch, resume, and use remote desktop apps in dedicated Mac windows without a browser.
 
-![Skerry streaming a remote app in a native macOS window with floating Session Controls](assets/screenshots/session-controls.png)
 
 ## Why Skerry instead of the web client?
 
