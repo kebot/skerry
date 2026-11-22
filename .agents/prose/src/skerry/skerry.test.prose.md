@@ -57,6 +57,10 @@ subject: skerry
   - Error mapping: 403 storage full, 413, 429.
   - ⌘O/⌘L don't resolve under the `SessionDesktop` or `FilesWindow` key contexts.
   - No stall notice shows while uploading.
+- Task F tests pass (`ARCH-031`):
+  - Every chord that acts in a session is listed, forwarding matches suppression, and suppression comes last. All three run against the shipped `key_bindings()`.
+  - A forwarded chord taps its key while Control stays latched, and a letter released under ⌘ is released when ⌘ lifts.
+  - `StatsInterest` subscribes while Stats or the strip wants it.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

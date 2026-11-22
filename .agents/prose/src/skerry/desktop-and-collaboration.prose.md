@@ -15,7 +15,6 @@ id: 067NC4KG01SKERRY0000000004
 <!-- compose:unresolved id=ARCH-GAP-DC-07 concept="session-sharing-and-rooms" question="Support Selkies view-only and player-slot roles and evaluate SealSkin collaboration rooms (room API, token handoff, control transfer)." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-08 concept="multitouch-trackpad" question="Keep raw multitouch contact forwarding deferred until gesture-to-display latency in Chrome matches native macOS pinch/pan and contact release on focus loss is proven." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-11 concept="apps-catalog" question="Bring the web's Apps panel (proot-apps catalog with install/remove/update/launch and job consoles, gated by command_enabled) into Session Controls (ARCH-020)?" -->
-<!-- compose:unresolved id=ARCH-GAP-DC-12 concept="session-shortcuts" question="Add a Shortcuts panel listing Skerry's own chords with a switch that hands them to the remote session instead, as the web's Shortcuts active (ARCH-020)?" -->
 <!-- compose:unresolved id=ARCH-GAP-DC-13 concept="pelorus" question="Should Skerry surface the server's Pelorus text description of the desktop (/pelorus/api), as the web's Pelorus panel does (ARCH-020)?" -->
 
 ### Goal
@@ -57,6 +56,7 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
 - `printing-gaming-and-sharing` (unresolved: `ARCH-GAP-DC-04`, `ARCH-GAP-DC-06`, `ARCH-GAP-DC-07`):
   - Remote PDF print job queue (`ARCH-GAP-DC-04`), relative mouse capture and gamepad slots/rumble (`ARCH-GAP-DC-06`), and view-only / player-slot / SealSkin collaboration rooms (`ARCH-GAP-DC-07`).
 - `web-sidebar-panels` (unresolved: `ARCH-GAP-DC-11`, `ARCH-GAP-DC-12`, `ARCH-GAP-DC-13`): the web sidebar's Apps, Shortcuts, and Pelorus panels; `ARCH-020` maps every web panel to its owner.
+  - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
 
 Facets:
 - `input-and-ime` — keyboard, cursor, trackpad pan/pinch, IME composition, and gaming input

@@ -205,6 +205,8 @@
 
 ## ARCH-019: Stats Section Follows the Selkies Web Sidebar's Stats
 
+- **Amended by `ARCH-031`:** the subscription is held while Stats is open or the stream strip is on, and history resets only when a subscription starts.
+
 - **Status:** settled — design approved in the preview workbench on 2026-11-21; amends the 1-second Stream Diagnostics of `ARCH-003` (`playback-and-diagnostics`)
 - **Finding (2026-11-21):** Selkies' web sidebar Stats (`selkies-dashboard/src/panels/stats.tsx` `StatsSection`, `stats-data.ts`, `selkies-web-core/lib/stream-stats{,-view}.ts`) shows four status rows, three history graphs, figure tiles, and host meters, and copies a plain-text report. Its numbers come from the server only while the stats are on screen: the page sends `_stats,1`, and the server answers once a second with `stream_stats` (`encode_ms`, `encoded_fps`, `pipeline_ms` with `pipeline_min_ms`/`pipeline_max_ms`, `send_ms` with its range, `video_mbps`, `peak_mbps`, `target_mbps` under CBR, `rtt_ms`, `throttled`, and the host's `cpu_percent`, `mem_used`/`mem_total`, `gpu_percent`, `gpu_mem_used`/`gpu_mem_total`). `stream_info` describes the encoder and capture path. Skerry showed nine label/value lines from its own counters and read only `stream_info.encoder`.
 - **Decision:** The Session Controls section is titled **Stats** and draws, in order, what the web sidebar draws for a WebSockets session:
@@ -241,7 +243,7 @@
 | **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
 | **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
-| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` |
+| **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
 | **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
 | Footer | "Cite our paper academically" link | — | Excluded |
 
@@ -505,6 +507,39 @@
 - **Known:** the TLD list includes `app` and `ai`, so "Zen.app" followed by Return opens `https://zen.app`. A key refusal clears the chooser.
 - **Affected Rust:** `open_target.rs` (new), `sealskin.rs`, `transport.rs`, `selkies.rs`, `launch_progress.rs`, `app.rs`, `app/files_window.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,files.rs,assets.rs}`, `scripts/bundle.sh`, `examples/preview.rs`.
 
+## ARCH-031: Stats Strip over the Stream and a Shortcuts Card (Task F)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-06` and `ARCH-GAP-DC-12`. Amends `ARCH-019`: Stats history now resets only when a subscription starts.
+- **Process:** plan → design → review (7 required changes) → build → QA (4 trivial) → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-f-overlay-shortcuts`.
+- **Stats strip (`VS-06`):**
+  - A **Show over the stream** switch sits at the top of the Stats card, and View → **Toggle Stats Over Stream** does the same.
+  - The strip copies the Selkies web client's "over the stream" strip:
+    - four status marks (encoder, capture, decoder, connection), then fps, video Mbps against the target (amber above 1.1×), capture-to-sent ms, and RTT
+    - a 55 % black pill centred 8 pt from the top, in every theme
+    - tabular digits and fixed minimum widths so it doesn't jump
+    - it wraps whole figures in narrow windows
+  - It has no hitbox, so clicks pass through, including to the ⋯ button it draws over.
+  - It is saved per server through `persist.rs`.
+  - Only the strip was built. Moonlight, Parsec and Steam all use text overlays, and Selkies draws its gauges only in layouts Skerry doesn't follow.
+  - `_stats,1` is sent while the Stats card is open or the strip is on (`StatsInterest`), and sent again after a reconnect.
+  - `stats::strip_bottom` tells later overlays where to start below the strip.
+- **Shortcuts (`DC-12`):**
+  - A Shortcuts card after Input lists Skerry's own chords from one table (`shortcuts::CHORDS`): ⇧⌘M Session Controls, ⌃⌘F full screen, ⇧⌘F, ⌘0 Library, and ⌘Q "Always on the Mac". The glyphs are macOS menu glyphs in Apple's modifier order.
+  - **Mac shortcuts active** follows the server's `keyboard_shortcuts` until the user changes it, then the saved per-server value. A server lock wins, shows as a disabled switch, and survives reconnects.
+  - When it is off, those chords go to the session with ⌘ sent as Control. The key is sent as a down-up tap while Control stays held, so holding ⌘ never auto-repeats it. There is no escape chord: the View menu, the ⋯ button and ⌘Q always work, as in Jump Desktop and Windows App.
+  - One ordered `app::key_bindings()` puts the global chords first, then Files, then the Library's ⌘O/⌘L (`ARCH-028`), then a `NoAction` suppression layer under the `SessionDesktop` key context last. gpui-pre 0.3.12 lets the last binding win at equal depth.
+  - `passes_to_session` reuses the suppression bindings and always calls `stop_propagation`, so neither the menu nor AppKit's own ⌃⌘F item fires.
+- **Key release (amends `ARCH-026`):**
+  - AppKit sends no key-up while ⌘ is held. When ⌘ lifts, every key the ledger still holds is checked against the real HID key state (`CGEventSourceKeyState`) and released if it's up; keys still physically down stay held.
+- **QA:**
+  - A GPUI test window with the shipped key bindings, plus the real transport against a fake WebSocket server, showed:
+    - chords skip their actions and arrive as Ctrl
+    - ⌘Q stays local, and ⌘O/⌘L still work in the Library
+    - the letter's `ku` comes before Control's
+    - `_stats` ref-counting holds across 41 rapid flips and a reconnect
+  - Not verified (screen locked): the strip's look, clicking through it, full screen, and AppKit's ⌃⌘F item live.
+- **Affected Rust:** `shortcuts.rs` (new), `view/keys.rs`, `view.rs`, `stats.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{stats.rs,controls.rs,session.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -540,7 +575,7 @@
 | `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | settled (`ARCH-026`) | Key only on `/companion/api/`, single FIFO write queue off the main thread, cached Library items. |
 | `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | settled client-side (`ARCH-026`) | Key releases are sent before the socket closes; no `kr`; `KeyLedger`. A live input trace is still to be taken. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
-| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | unresolved (backlog) | The web's "Show over the stream" strip (status marks, fps, video rate vs target, capture-to-sent, RTT over the picture, no pointer input) and its compact/detailed floating gauges (FPS, Mbps, RTT, CPU, GPU, MEM, VRAM half-circles) (`ARCH-020`). |
+| `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | settled (`ARCH-031`) | The web's over-the-stream strip, with no hitbox and saved per server; the floating gauges were not built. |
 | `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | unresolved (backlog) | The web's Apps panel: proot-apps catalog by category with search, install/remove/update/launch and job consoles, gated by the server's `command_enabled` (`ARCH-020`). |
-| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | unresolved (backlog) | A Shortcuts panel listing Skerry's own chords (`cmd-shift-m`, full screen, and any gaming-mode / pointer-lock chord from `ARCH-GAP-DC-06`) with a switch that hands them to the remote session instead, as the web's "Shortcuts active" (`ARCH-020`). |
+| `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
 | `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | unresolved (backlog) | The web's Pelorus panel: a prompt against the server's `/pelorus/api`, which describes the desktop as text for a caller without vision; evaluate whether Skerry should surface it (`ARCH-020`). |
