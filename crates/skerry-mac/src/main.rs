@@ -1,6 +1,4 @@
 #[cfg(target_os = "macos")]
-mod api;
-#[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
 mod audio;
@@ -12,6 +10,10 @@ mod input;
 mod launch_options;
 #[cfg(target_os = "macos")]
 mod pasteboard;
+#[cfg(target_os = "macos")]
+mod sealskin;
+#[cfg(target_os = "macos")]
+mod selkies;
 #[cfg(target_os = "macos")]
 mod settings;
 #[cfg(target_os = "macos")]

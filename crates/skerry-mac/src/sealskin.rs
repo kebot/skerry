@@ -265,6 +265,38 @@ struct HomeDirectories {
     home_dirs: Vec<String>,
 }
 
+/// Pages of a storage listing to read at most (200 names each).
+const STORAGE_LIST_MAX_PAGES: u32 = 50;
+
+#[derive(Deserialize)]
+struct StorageItem {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct StorageListing {
+    items: Vec<StorageItem>,
+    #[serde(default)]
+    total: u64,
+}
+
+#[derive(Deserialize)]
+struct DeleteTask {
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteStatus {
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Whether a session's home is persistent storage SealSkin can reach (not Cleanroom).
+pub fn has_storage(home: &str) -> bool {
+    !home.is_empty() && home != "cleanroom" && valid_path_segment(home)
+}
+
 #[derive(Clone, Deserialize)]
 pub struct RemoteSession {
     pub session_id: String,
@@ -376,12 +408,12 @@ pub struct Library {
 }
 
 #[derive(Clone)]
-pub struct Api {
+pub struct SealSkinClient {
     client: Client,
     base: Url,
 }
 
-impl Api {
+impl SealSkinClient {
     pub fn new(credential: &Credential) -> Result<Self, String> {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, credential.authorization.clone());
@@ -551,6 +583,65 @@ impl Api {
             "SealSkin returned HTTP {} while stopping the session.",
             response.status().as_u16()
         ))
+    }
+
+    /// The names in one folder of a home's persistent storage, every page of it
+    /// (`GET /companion/api/files/list/<home>`, `ARCH-019`).
+    pub async fn storage_names(&self, home: &str, path: &str) -> Result<Vec<String>, String> {
+        if !valid_path_segment(home) {
+            return Err("Invalid home name.".into());
+        }
+        let route = format!("/companion/api/files/list/{home}");
+        let mut names = Vec::new();
+        for page in 1..=STORAGE_LIST_MAX_PAGES {
+            let listing: StorageListing = send(self.request(Method::GET, &route).query(&[
+                ("path", path),
+                ("page", &page.to_string()),
+                ("per_page", "200"),
+            ]))
+            .await?;
+            let count = listing.items.len();
+            names.extend(listing.items.into_iter().map(|item| item.name));
+            if count == 0 || names.len() as u64 >= listing.total {
+                return Ok(names);
+            }
+        }
+        Err("The folder holds too many items to compare.".into())
+    }
+
+    /// Deletes `paths` (home-relative, `/`-rooted) from a home's persistent storage and waits
+    /// for SealSkin's background deletion to finish (`POST /companion/api/files/delete/<home>`,
+    /// then `GET …/delete_status/<task>`, `ARCH-019`).
+    pub async fn delete_storage(&self, home: &str, paths: &[String]) -> Result<String, String> {
+        if !valid_path_segment(home) {
+            return Err("Invalid home name.".into());
+        }
+        let task: DeleteTask = send(
+            self.request(Method::POST, &format!("/companion/api/files/delete/{home}"))
+                .json(&json!({ "paths": paths })),
+        )
+        .await?;
+        if !valid_path_segment(&task.task_id) {
+            return Err("SealSkin returned an invalid deletion task.".into());
+        }
+        let route = format!("/companion/api/files/delete_status/{}", task.task_id);
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let status: DeleteStatus = send(self.request(Method::GET, &route)).await?;
+            match status.status.as_str() {
+                "completed" => return Ok(status.message.unwrap_or_default()),
+                "error" => {
+                    return Err(status
+                        .message
+                        .unwrap_or_else(|| "SealSkin couldn’t delete the items.".into()))
+                }
+                _ if std::time::Instant::now() > deadline => {
+                    return Err("SealSkin is still deleting; refresh later to see.".into())
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Fetches an application's icon strictly from the SealSkin server's own origin.
@@ -839,7 +930,7 @@ mod tests {
     #[test]
     fn session_urls_stay_within_the_sealskin_origin() {
         let credential = Credential::parse("ssk_id_secret@seal.example:8443").unwrap();
-        let api = Api::new(&credential).unwrap();
+        let api = SealSkinClient::new(&credential).unwrap();
         let session = api.session_url("/session/?access_token=mock").unwrap();
         assert_eq!(
             session.as_str(),
@@ -959,7 +1050,7 @@ mod tests {
     #[test]
     fn deep_link_carries_the_launch_options() {
         let credential = Credential::parse("ssk_id_secret@seal.example").unwrap();
-        let api = Api::new(&credential).unwrap();
+        let api = SealSkinClient::new(&credential).unwrap();
         assert_eq!(
             api.app_deep_link("zen", &[]).as_deref(),
             Some("https://seal.example/app/zen/")

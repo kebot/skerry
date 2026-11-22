@@ -45,6 +45,7 @@ enum Command {
     Close,
     FullScreen,
     Reconnect,
+    Files,
     Disconnect,
     Audio(bool),
     Playback(bool),
@@ -204,6 +205,7 @@ impl ControlPanel {
                             window.toggle_fullscreen();
                         }
                         Command::Reconnect => launcher.reconnect(window, cx),
+                        Command::Files => launcher.toggle_files(window, cx),
                         Command::Disconnect => {
                             launcher.close_stream(window, cx);
                             launcher.muted = false;
@@ -337,6 +339,7 @@ impl ControlPanel {
                 Self::send(self.owner.clone(), Command::FullScreen, cx)
             }
             ControlsAction::Reconnect => Self::send(self.owner.clone(), Command::Reconnect, cx),
+            ControlsAction::OpenFiles => Self::send(self.owner.clone(), Command::Files, cx),
             ControlsAction::Disconnect => Self::send(self.owner.clone(), Command::Disconnect, cx),
             ControlsAction::SetInput { id, enabled } => {
                 if let Some((feature, _)) = InputFeature::ALL

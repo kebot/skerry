@@ -3,7 +3,7 @@
 //! which fields show, what each offers, what is pre-selected, what a launch sends, and what
 //! Copy link writes. Everything here is pure so it can be tested without a server or a window.
 
-use crate::api::{GpuInfo, LaunchParams, RemoteApp, ServerStatus};
+use crate::sealskin::{GpuInfo, LaunchParams, RemoteApp, ServerStatus};
 use serde::{Deserialize, Serialize};
 use skerry_ui::launch_dialog::LaunchOption;
 
@@ -671,7 +671,7 @@ pub fn mac_locale_name(locale: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::{UserSettings, VpnChoice, VpnEndpoint};
+    use crate::sealskin::{UserSettings, VpnChoice, VpnEndpoint};
 
     fn app(name: &str, nvidia: bool, dri3: bool) -> RemoteApp {
         serde_json::from_value(serde_json::json!({

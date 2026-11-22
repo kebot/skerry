@@ -16,6 +16,10 @@ use skerry_ui::{
         ControlsUiState, ScreenProps, Section, SwitchItem, VideoProps, VideoSettingControl,
         VideoSettingRow,
     },
+    files::{
+        self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, SortColumn,
+        TransferRow, TransferStatus,
+    },
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
         LaunchOptions, LaunchSelect,
@@ -45,6 +49,9 @@ enum Story {
     ControlsJpeg,
     ControlsServerLocked,
     SessionOverlays,
+    FilesBrowsing,
+    FilesEmpty,
+    FilesDownloadOnly,
 }
 
 impl Story {
@@ -61,6 +68,9 @@ impl Story {
         Story::ControlsJpeg,
         Story::ControlsServerLocked,
         Story::SessionOverlays,
+        Story::FilesBrowsing,
+        Story::FilesEmpty,
+        Story::FilesDownloadOnly,
     ];
 
     fn group(self) -> &'static str {
@@ -75,6 +85,7 @@ impl Story {
                 "Session Controls"
             }
             Story::SessionOverlays => "Session Overlays",
+            Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
         }
     }
 
@@ -92,6 +103,9 @@ impl Story {
             Story::ControlsJpeg => "JPEG + Paint-Over",
             Story::ControlsServerLocked => "Server Locked",
             Story::SessionOverlays => "Waiting + IME + Banner",
+            Story::FilesBrowsing => "Browsing + Transfers",
+            Story::FilesEmpty => "Empty Folder + New Folder",
+            Story::FilesDownloadOnly => "Download Only + Error",
         }
     }
 
@@ -109,6 +123,9 @@ impl Story {
             Story::ControlsJpeg => "story-controls-jpeg",
             Story::ControlsServerLocked => "story-controls-locked",
             Story::SessionOverlays => "story-session-overlays",
+            Story::FilesBrowsing => "story-files-browsing",
+            Story::FilesEmpty => "story-files-empty",
+            Story::FilesDownloadOnly => "story-files-download-only",
         }
     }
 }
@@ -157,6 +174,9 @@ struct PreviewApp {
     controls_props: ControlsProps,
     width: Entity<InputState>,
     height: Entity<InputState>,
+    files_props: FilesProps,
+    folder_name: Entity<InputState>,
+    files_scroll: gpui_kit::UniformListScrollHandle,
 }
 
 impl PreviewApp {
@@ -267,11 +287,153 @@ impl PreviewApp {
             controls_props: Self::fixture_controls(Story::ControlsHardware),
             width,
             height,
+            files_props: Self::fixture_files(story),
+            folder_name: cx.new(|cx| InputState::new(window, cx).default_value("untitled folder")),
+            files_scroll: gpui_kit::UniformListScrollHandle::new(),
+        }
+    }
+
+    fn fixture_files(story: Story) -> FilesProps {
+        let row = |name: &str, is_dir: bool, modified: &str, size: &str| FileRow {
+            name: name.into(),
+            is_dir,
+            modified: modified.into(),
+            size: size.into(),
+            selected: false,
+        };
+        let mut rows = vec![
+            row("Projects", true, "Yesterday at 18:02", "--"),
+            row("Screenshots", true, "Today at 09:14", "--"),
+            row("budget 2027.xlsx", false, "19 Nov 2026 at 11:40", "48 KB"),
+            row("holiday-photos.zip", false, "2 Nov 2026 at 08:05", "1.2 GB"),
+            row("notes.md", false, "Today at 10:04", "3.1 KB"),
+            row(
+                "A very long file name that keeps going and going until it truncates.pdf",
+                false,
+                "30 Oct 2026 at 16:22",
+                "820 KB",
+            ),
+        ];
+        rows[2].selected = true;
+        rows[4].selected = true;
+        let crumbs = vec![
+            Crumb {
+                label: "Desktop".into(),
+                path: String::new(),
+            },
+            Crumb {
+                label: "Work".into(),
+                path: "Work".into(),
+            },
+        ];
+        match story {
+            Story::FilesEmpty => FilesProps {
+                crumbs,
+                can_back: true,
+                can_forward: false,
+                can_upload: true,
+                can_download: true,
+                can_delete: true,
+                rows: Rc::new(Vec::new()),
+                sort: SortColumn::Name,
+                ascending: true,
+                loading: false,
+                error: None,
+                notice: None,
+                busy: None,
+                transfers_open: true,
+                focused: true,
+                transfers: Vec::new(),
+                creating_folder: true,
+                selected: 0,
+            },
+            Story::FilesDownloadOnly => FilesProps {
+                crumbs,
+                can_back: false,
+                can_forward: true,
+                can_upload: false,
+                can_download: true,
+                can_delete: false,
+                rows: Rc::new(Vec::new()),
+                sort: SortColumn::Modified,
+                ascending: false,
+                loading: false,
+                error: Some("The session refused the request: permission denied.".into()),
+                notice: Some(files_ui::Notice {
+                    text: "The server doesn’t allow uploads.".into(),
+                    error: true,
+                }),
+                busy: None,
+                transfers_open: true,
+                focused: true,
+                transfers: Vec::new(),
+                creating_folder: false,
+                selected: 0,
+            },
+            _ => FilesProps {
+                crumbs,
+                can_back: true,
+                can_forward: false,
+                can_upload: true,
+                can_download: true,
+                can_delete: true,
+                rows: Rc::new(rows),
+                sort: SortColumn::Name,
+                ascending: true,
+                loading: false,
+                error: None,
+                notice: Some(files_ui::Notice {
+                    text: "Copied 2 items. Paste in Finder to save them.".into(),
+                    error: false,
+                }),
+                busy: Some("Deleting 1 item…".into()),
+                transfers_open: true,
+                focused: true,
+                transfers: vec![
+                    TransferRow {
+                        id: 1,
+                        name: "holiday-photos.zip".into(),
+                        direction: Direction::Download,
+                        status: TransferStatus::Running {
+                            fraction: Some(0.42),
+                            detail: "504 MB of 1.2 GB".into(),
+                        },
+                        revealable: false,
+                    },
+                    TransferRow {
+                        id: 2,
+                        name: "3 items".into(),
+                        direction: Direction::Upload,
+                        status: TransferStatus::Running {
+                            fraction: None,
+                            detail: "Preparing…".into(),
+                        },
+                        revealable: false,
+                    },
+                    TransferRow {
+                        id: 3,
+                        name: "notes.md".into(),
+                        direction: Direction::Download,
+                        status: TransferStatus::Done("Uploaded as “notes 2.md”".into()),
+                        revealable: true,
+                    },
+                    TransferRow {
+                        id: 4,
+                        name: "huge.iso".into(),
+                        direction: Direction::Upload,
+                        status: TransferStatus::Failed("Uploads disabled.".into()),
+                        revealable: false,
+                    },
+                ],
+                creating_folder: false,
+                selected: 2,
+            },
         }
     }
 
     fn select_story(&mut self, story: Story, window: &mut Window, cx: &mut Context<Self>) {
         self.story = story;
+        self.files_props = Self::fixture_files(story);
         self.last_event = None;
         if matches!(
             story,
@@ -664,6 +826,7 @@ impl PreviewApp {
                 }
             }
             ControlsAction::Reconnect
+            | ControlsAction::OpenFiles
             | ControlsAction::Disconnect
             | ControlsAction::SendChord(_)
             | ControlsAction::ResetVideo => {}
@@ -1113,6 +1276,67 @@ impl PreviewApp {
                             )),
                     )
             }
+            Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => {
+                let entity = entity.clone();
+                let handler: files_ui::FilesHandler = Rc::new(move |action: FilesAction, _, cx| {
+                    entity.update(cx, |this, cx| {
+                        match &action {
+                            FilesAction::Select { index, .. } => {
+                                let mut rows = (*this.files_props.rows).clone();
+                                for (i, row) in rows.iter_mut().enumerate() {
+                                    row.selected = i == *index;
+                                }
+                                this.files_props.selected = 1;
+                                this.files_props.rows = Rc::new(rows);
+                            }
+                            FilesAction::Sort(column) => {
+                                if this.files_props.sort == *column {
+                                    this.files_props.ascending = !this.files_props.ascending;
+                                } else {
+                                    this.files_props.sort = *column;
+                                }
+                            }
+                            FilesAction::NewFolder => this.files_props.creating_folder = true,
+                            FilesAction::CancelNewFolder | FilesAction::ConfirmNewFolder => {
+                                this.files_props.creating_folder = false
+                            }
+                            FilesAction::DismissNotice => this.files_props.notice = None,
+                            FilesAction::ToggleTransfers => {
+                                this.files_props.transfers_open = !this.files_props.transfers_open
+                            }
+                            FilesAction::ClearTransfers => this
+                                .files_props
+                                .transfers
+                                .retain(|t| matches!(t.status, TransferStatus::Running { .. })),
+                            _ => {}
+                        }
+                        if !matches!(action, FilesAction::DragOut(_) | FilesAction::Press(_)) {
+                            this.record_event(format!("Files: {action:?}"), cx);
+                        }
+                        cx.notify();
+                    });
+                });
+                div().size_full().p_6().child(
+                    div()
+                        .size_full()
+                        .max_w(px(820.))
+                        .max_h(px(560.))
+                        .rounded_xl()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .text_color(theme.foreground)
+                        .text_sm()
+                        .child(files_ui::render(
+                            theme,
+                            &self.files_props,
+                            &self.folder_name,
+                            &self.files_scroll,
+                            handler,
+                        )),
+                )
+            }
             Story::SessionOverlays => {
                 let entity = entity.clone();
                 div()
@@ -1385,7 +1609,7 @@ fn fixture_languages() -> Vec<LaunchOption> {
 
 fn main() {
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(skerry_ui::assets::SkerryAssets)
         .run(|cx: &mut App| {
             gpui_kit::init(cx);
             cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

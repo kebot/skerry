@@ -1,9 +1,14 @@
 mod controls;
 mod display;
+mod files_model;
+mod files_window;
+mod promise;
 
-use crate::api::{Api, Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession};
 use crate::input::InputFeature;
 use crate::launch_options::{self, LaunchContext, LaunchSelection};
+use crate::sealskin::{
+    Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession, SealSkinClient,
+};
 use crate::settings::{
     self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
 };
@@ -11,6 +16,7 @@ use crate::transport::{DisplayRequest, Resolution, SessionEvent, SessionOptions,
 use crate::video::Codec;
 use crate::view::NativeSession;
 use controls::ControlPanel;
+use files_window::FilesWindow;
 use gpui_kit::component::{
     input::{InputEvent, InputState},
     select::SelectEvent,
@@ -58,7 +64,7 @@ pub fn run() {
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(skerry_ui::assets::SkerryAssets)
         .run(move |cx: &mut App| {
             gpui_kit::init(cx);
             cx.bind_keys([
@@ -67,7 +73,9 @@ pub fn run() {
                 KeyBinding::new("escape", CloseSessionControls, Some("SessionControls")),
                 KeyBinding::new("cmd-w", CloseSessionControls, Some("SessionControls")),
                 KeyBinding::new("ctrl-cmd-f", ToggleFullScreen, None),
+                KeyBinding::new("cmd-shift-f", ToggleFiles, None),
             ]);
+            cx.bind_keys(files_window::key_bindings());
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.set_menus(vec![
                 Menu {
@@ -75,10 +83,48 @@ pub fn run() {
                     items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
                     disabled: false,
                 },
+                // The Files window's commands (`ARCH-018`); AppKit disables them wherever no
+                // Files window has focus.
+                Menu {
+                    name: "File".into(),
+                    items: vec![
+                        MenuItem::action("New Folder", files_window::NewFolder),
+                        MenuItem::action("Upload…", files_window::UploadFiles),
+                        MenuItem::action("Download", files_window::DownloadSelection),
+                        MenuItem::action("Download To…", files_window::DownloadSelectionTo),
+                        MenuItem::separator(),
+                        MenuItem::action("Open", files_window::OpenSelection),
+                        MenuItem::action("Quick Look", files_window::QuickLook),
+                        MenuItem::separator(),
+                        MenuItem::action("Delete…", files_window::DeleteSelection),
+                        MenuItem::separator(),
+                        MenuItem::action("Close Window", files_window::CloseFiles),
+                    ],
+                    disabled: false,
+                },
+                Menu {
+                    name: "Edit".into(),
+                    items: vec![
+                        MenuItem::action("Copy", files_window::CopyToMac),
+                        MenuItem::action("Paste", files_window::PasteFromMac),
+                        MenuItem::action("Select All", files_window::SelectAll),
+                    ],
+                    disabled: false,
+                },
+                Menu {
+                    name: "Go".into(),
+                    items: vec![
+                        MenuItem::action("Back", files_window::GoBack),
+                        MenuItem::action("Forward", files_window::GoForward),
+                        MenuItem::action("Enclosing Folder", files_window::OpenParent),
+                    ],
+                    disabled: false,
+                },
                 Menu {
                     name: "View".into(),
                     items: vec![
                         MenuItem::action("Session Controls", ToggleSessionControls),
+                        MenuItem::action("Files", ToggleFiles),
                         MenuItem::action("Toggle Full Screen", ToggleFullScreen),
                     ],
                     disabled: false,
@@ -115,7 +161,8 @@ actions!(
         Quit,
         ToggleSessionControls,
         CloseSessionControls,
-        ToggleFullScreen
+        ToggleFullScreen,
+        ToggleFiles
     ]
 );
 
@@ -153,7 +200,7 @@ impl DisplayMode {
 
 struct Launcher {
     rt: Handle,
-    api: Option<Api>,
+    api: Option<SealSkinClient>,
     library: Option<Library>,
     current: Option<(RemoteSession, NativeSession)>,
     stream_events: Option<Task<()>>,
@@ -163,12 +210,17 @@ struct Launcher {
     video: Option<bool>,
     settings: Option<Settings>,
     controls: Option<AnyWindowHandle>,
+    /// The session's Files window (`ARCH-018`).
+    files_window: Option<(AnyWindowHandle, Entity<FilesWindow>)>,
     stats: Option<StreamSample>,
     display_mode: DisplayMode,
     retina: bool,
     scale_locally: bool,
     screen_policy: ScreenPolicy,
     clipboard_policy: Option<crate::clipboard::Policy>,
+    /// The session's file routes and what the server allows (`ARCH-018`).
+    pub(crate) file_access: Option<crate::selkies::SelkiesClient>,
+    pub(crate) file_policy: Option<crate::selkies::Policy>,
     dpi_override: Option<u16>,
     ui_scale: display::UiScale,
     applied_resolution: Option<DisplayRequest>,
@@ -196,7 +248,7 @@ struct Launcher {
     /// The saved key from startup, kept so Connect can retry it after a failed first connect.
     startup_credential: Option<Credential>,
     /// A server refused on Refresh (ARCH-009); Connect with an empty field checks it again.
-    retry_api: Option<Api>,
+    retry_api: Option<SealSkinClient>,
     focus_handle: FocusHandle,
     /// Set after a typed key connects; the next render clears the key field (needs a Window).
     clear_key_input: bool,
@@ -236,12 +288,15 @@ impl Launcher {
             video: None,
             settings: None,
             controls: None,
+            files_window: None,
             stats: None,
             display_mode: DisplayMode::default(),
             retina: true,
             scale_locally: true,
             screen_policy: ScreenPolicy::default(),
             clipboard_policy: None,
+            file_access: None,
+            file_policy: None,
             dpi_override: None,
             ui_scale: display::UiScale::default(),
             applied_resolution: None,
@@ -331,7 +386,7 @@ impl Launcher {
     }
 
     fn connect(&mut self, credential: Credential, save: bool, cx: &mut Context<Self>) {
-        match Api::new(&credential) {
+        match SealSkinClient::new(&credential) {
             Ok(api) => self.load(api, save.then_some(credential), true, cx),
             Err(error) => self.status = Some(error),
         }
@@ -345,7 +400,7 @@ impl Launcher {
 
     fn load(
         &mut self,
-        api: Api,
+        api: SealSkinClient,
         save: Option<Credential>,
         connecting: bool,
         cx: &mut Context<Self>,
@@ -412,7 +467,7 @@ impl Launcher {
 
     fn fetch_library_media(
         &mut self,
-        api: Api,
+        api: SealSkinClient,
         apps: Vec<RemoteApp>,
         sessions: Vec<RemoteSession>,
         cx: &mut Context<Self>,
@@ -893,6 +948,17 @@ impl Launcher {
                                                 stream.set_clipboard_policy(policy, window, cx);
                                             }
                                         }
+                                        SessionEvent::Files(access) => {
+                                            this.file_access = Some(access);
+                                        }
+                                        SessionEvent::FilePolicy(policy) => {
+                                            this.file_policy = Some(policy);
+                                            if let Some((_, files)) = &this.files_window {
+                                                files.update(cx, |files, cx| {
+                                                    files.set_policy(policy, cx)
+                                                });
+                                            }
+                                        }
                                         SessionEvent::Clipboard(incoming) => {
                                             if let Some((_, stream)) = &this.current {
                                                 stream.receive_clipboard(incoming, cx);
@@ -1119,6 +1185,69 @@ impl Launcher {
         }
     }
 
+    /// Opens the session's Files window, or brings it forward (`ARCH-018`).
+    fn toggle_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((handle, _)) = &self.files_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+            self.files_window = None;
+        }
+        let Some((session, _)) = &self.current else {
+            return;
+        };
+        let (Some(access), Some(policy)) = (self.file_access.clone(), self.file_policy) else {
+            self.status =
+                Some("Session files are available once the session has connected.".into());
+            cx.notify();
+            return;
+        };
+        if !policy.upload && !policy.download {
+            self.status = Some("The server doesn’t allow file transfers in this session.".into());
+            cx.notify();
+            return;
+        }
+        let title = session.app_name.clone();
+        let storage = self
+            .api
+            .clone()
+            .filter(|_| crate::sealskin::has_storage(&session.home))
+            .map(|client| files_window::Storage {
+                client,
+                home: session.home.clone(),
+            });
+        let rt = self.rt.clone();
+        let owner_window = Window::window_handle(window);
+        let launcher = cx.entity();
+        cx.defer(move |cx| {
+            let _ = owner_window.update(cx, |_, window, cx| {
+                let source = files_window::FilesSource {
+                    title,
+                    selkies: access,
+                    policy,
+                    storage,
+                };
+                let result = FilesWindow::open(source, rt, window, launcher.clone(), cx);
+                launcher.update(cx, |launcher, cx| {
+                    match result {
+                        Ok(files) => launcher.files_window = Some(files),
+                        Err(_) => launcher.status = Some("Couldn’t open Session Files.".into()),
+                    }
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    fn close_files(&mut self, cx: &mut App) {
+        if let Some((handle, _)) = self.files_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
     fn remove_controls(&mut self, cx: &mut App) -> bool {
         self.controls.take().is_some_and(|panel| {
             let _ = panel.update(cx, |_, panel, _| panel.remove_window());
@@ -1147,6 +1276,9 @@ impl Launcher {
         self.settings = None;
         self.screen_policy = ScreenPolicy::default();
         self.clipboard_policy = None;
+        self.file_access = None;
+        self.file_policy = None;
+        self.close_files(cx);
         self.applied_resolution = None;
         self.applied_dpi = None;
         self.stats = None;
@@ -1230,6 +1362,9 @@ impl Render for Launcher {
                 .text_color(theme.foreground)
                 .on_action(cx.listener(|this, _: &ToggleSessionControls, window, cx| {
                     this.toggle_controls(window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
+                    this.toggle_files(window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
                     this.close_controls(window, cx);

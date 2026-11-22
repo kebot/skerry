@@ -1,6 +1,8 @@
+pub mod assets;
 pub mod components;
 pub mod connect;
 pub mod controls;
+pub mod files;
 pub mod launch_dialog;
 pub mod library;
 pub mod session;

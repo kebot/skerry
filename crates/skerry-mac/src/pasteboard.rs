@@ -159,9 +159,93 @@ fn markup_has_text(html: &str) -> bool {
         .any(|ch| !ch.is_whitespace())
 }
 
+const FILE_URL: &str = "public.file-url";
+
+/// The Finder files on the pasteboard (`public.file-url` items), for ⌘V into the Files window
+/// (`ARCH-018`).
+pub fn file_paths() -> Vec<std::path::PathBuf> {
+    file_paths_from(&general())
+}
+
+fn file_paths_from(board: &NSPasteboard) -> Vec<std::path::PathBuf> {
+    let kind = NSString::from_str(FILE_URL);
+    let Some(items) = board.pasteboardItems() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| item.stringForType(&kind))
+        .filter_map(|url| file_path(&url))
+        .collect()
+}
+
+/// A `public.file-url` as a path. Finder writes file *reference* URLs
+/// (`file:///.file/id=…`), which only Foundation can turn back into the file's path.
+fn file_path(url: &NSString) -> Option<std::path::PathBuf> {
+    let url = objc2_foundation::NSURL::URLWithString(url)?;
+    let path = url.filePathURL()?.path()?.to_string();
+    (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+}
+
+/// Puts `paths` on the pasteboard as files, so ⌘V in Finder copies them (`ARCH-018`).
+pub fn write_file_paths(paths: &[std::path::PathBuf]) -> isize {
+    write_file_paths_to(&general(), paths)
+}
+
+fn write_file_paths_to(board: &NSPasteboard, paths: &[std::path::PathBuf]) -> isize {
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboardItem, NSPasteboardWriting};
+    let kind = NSString::from_str(FILE_URL);
+    let items: Vec<objc2::rc::Retained<ProtocolObject<dyn NSPasteboardWriting>>> = paths
+        .iter()
+        .filter_map(|path| reqwest::Url::from_file_path(path).ok())
+        .map(|url| {
+            let item = NSPasteboardItem::new();
+            item.setString_forType(&NSString::from_str(url.as_str()), &kind);
+            ProtocolObject::from_retained(item)
+        })
+        .collect();
+    board.clearContents();
+    if !items.is_empty() {
+        board.writeObjects(&objc2_foundation::NSArray::from_retained_slice(&items));
+    }
+    board.changeCount()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_urls_round_trip() {
+        let board = Scratch(NSPasteboard::pasteboardWithUniqueName());
+        let board = &board.0;
+        let paths = vec![
+            std::path::PathBuf::from("/tmp/a b/report é.pdf"),
+            std::path::PathBuf::from("/tmp/folder"),
+        ];
+        write_file_paths_to(board, &paths);
+        assert_eq!(file_paths_from(board), paths);
+        write_to(board, Some(&Content::Text("not files".into())), false);
+        assert!(file_paths_from(board).is_empty());
+
+        // Finder copies files as reference URLs (`file:///.file/id=…`), not paths.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let real = file.path().canonicalize().unwrap();
+        let reference =
+            objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(&real.to_string_lossy()))
+                .fileReferenceURL()
+                .and_then(|url| url.absoluteString())
+                .unwrap();
+        assert!(reference.to_string().starts_with("file:///.file/id="));
+        board.clearContents();
+        let item = objc2_app_kit::NSPasteboardItem::new();
+        item.setString_forType(&reference, &NSString::from_str(FILE_URL));
+        board.writeObjects(&objc2_foundation::NSArray::from_retained_slice(&[
+            objc2::runtime::ProtocolObject::from_retained(item),
+        ]));
+        assert_eq!(file_paths_from(board), vec![real]);
+    }
 
     /// A private pasteboard, so tests never touch the person's clipboard.
     struct Scratch(objc2::rc::Retained<NSPasteboard>);
