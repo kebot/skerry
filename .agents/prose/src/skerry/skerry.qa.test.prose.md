@@ -48,7 +48,8 @@ End-to-end QA of the current feature set (Connect, Library, Launch Dialog, Sessi
 - S3 Switching the codec (JPEG ↔ H.264 ↔ H.265 ↔ AV1, as the server allows) keeps the stream alive. Diagnostics show the active codec, FPS, bitrate, decode time, and RTT, refreshed every second.
 - S4 Display modes (**Match Window**, **Match Retina**, **Scale Locally**, fixed presets) change the remote resolution or scaling as labelled. Resizing the window re-negotiates the resolution when Match Window is on.
 - S5 `ctrl-cmd-f` toggles fullscreen and back without a stuck black frame.
-- S6 Disconnect / close returns to the Library. The remote session keeps running.
+- S6 Each session opens in its own window. Pointing at its top-left corner shows the close button. Closing it, **Window → Disconnect Session**, or **Disconnect** closes only that window. The remote session keeps running, and the Library refreshes.
+- S8 Multi-window (`ARCH-022`): open two sessions, one app launched twice included. Both stream side by side. Controls, codec switch, and resize in one leave the other untouched. **Resume** on an open session brings its window forward. Close the Library: sessions keep streaming, and `cmd-0` or a Dock click brings it back. Copy in window A, focus window B: it pastes once in B and doesn't come back to A.
 - S7 Pause, mute, and Reset Video Settings behave as labelled.
 
 #### B — Clipboard (`ARCH-017`)
