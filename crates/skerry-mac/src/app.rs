@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
-const APP_NAME: &str = "SealSkin Native";
+const APP_NAME: &str = "Skerry";
 
 pub fn run() {
     // GPUI 0.2.2 can reenter its window lock when AppKit restores key-window state.
@@ -161,7 +161,7 @@ pub fn run() {
         cx.set_menus(vec![
             Menu {
                 name: APP_NAME.into(),
-                items: vec![MenuItem::action("Quit SealSkin Native", Quit)],
+                items: vec![MenuItem::action("Quit Skerry", Quit)],
                 disabled: false,
             },
             // The Files window's commands (`ARCH-023`); AppKit disables them wherever no

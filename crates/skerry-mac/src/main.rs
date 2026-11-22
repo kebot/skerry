@@ -71,5 +71,5 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("SealSkin Native requires macOS.");
+    eprintln!("Skerry requires macOS.");
 }

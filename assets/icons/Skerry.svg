@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F2942"/>
+      <stop offset="52%" stop-color="#134E6F"/>
+      <stop offset="100%" stop-color="#0B1F33"/>
+    </linearGradient>
+    <linearGradient id="skyGlow" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.28"/>
+      <stop offset="65%" stop-color="#0EA5E9" stop-opacity="0.06"/>
+      <stop offset="100%" stop-color="#0B1F33" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="rockLight" x1="25%" y1="0%" x2="75%" y2="100%">
+      <stop offset="0%" stop-color="#E2E8F0"/>
+      <stop offset="55%" stop-color="#94A3B8"/>
+      <stop offset="100%" stop-color="#475569"/>
+    </linearGradient>
+    <linearGradient id="rockShadow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#64748B"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="water" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0C4A6E" stop-opacity="0.92"/>
+      <stop offset="100%" stop-color="#082032" stop-opacity="0.98"/>
+    </linearGradient>
+    <linearGradient id="screenGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7DD3FC"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+    <clipPath id="squircle">
+      <rect x="100" y="100" width="824" height="824" rx="185" ry="185"/>
+    </clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+  </defs>
+
+  <!-- Outer macOS icon squircle with soft drop shadow -->
+  <g filter="url(#shadow)">
+    <rect x="100" y="100" width="824" height="824" rx="185" ry="185" fill="url(#bg)"/>
+  </g>
+
+  <g clip-path="url(#squircle)">
+    <!-- Subtle atmospheric sky glow -->
+    <rect x="100" y="100" width="824" height="540" fill="url(#skyGlow)"/>
+
+    <!-- Distant minimal remote-window horizon frame -->
+    <rect x="272" y="218" width="480" height="304" rx="28" fill="#0B192C" fill-opacity="0.52" stroke="#7DD3FC" stroke-opacity="0.38" stroke-width="6"/>
+    <!-- Window traffic-light dots -->
+    <circle cx="316" cy="258" r="10" fill="#38BDF8" fill-opacity="0.75"/>
+    <circle cx="350" cy="258" r="10" fill="#7DD3FC" fill-opacity="0.5"/>
+    <circle cx="384" cy="258" r="10" fill="#BAE6FD" fill-opacity="0.32"/>
+    <!-- Inner subtle viewport glow -->
+    <rect x="298" y="290" width="428" height="206" rx="14" fill="url(#screenGlow)" fill-opacity="0.12"/>
+
+    <!-- Stylized geometric skerry (rocky island) rising from the sea -->
+    <!-- Main left facet (lit) -->
+    <polygon points="214,650 370,418 512,356 496,650" fill="url(#rockLight)"/>
+    <!-- Right facet (shaded) -->
+    <polygon points="512,356 646,456 808,650 496,650" fill="url(#rockShadow)"/>
+    <!-- Secondary front ridge -->
+    <polygon points="348,650 484,486 628,538 712,650" fill="#334155" fill-opacity="0.82"/>
+    <!-- Bright crest highlight -->
+    <polygon points="370,418 512,356 544,442 436,464" fill="#F8FAFC" fill-opacity="0.35"/>
+
+    <!-- Sea surface -->
+    <rect x="100" y="638" width="824" height="286" fill="url(#water)"/>
+
+    <!-- Clean wave lines -->
+    <path d="M 100 644 Q 240 620 380 644 T 660 644 T 924 644" fill="none" stroke="#7DD3FC" stroke-width="10" stroke-linecap="round" stroke-opacity="0.85"/>
+    <path d="M 140 712 Q 280 692 420 712 T 700 712 T 924 712" fill="none" stroke="#38BDF8" stroke-width="8" stroke-linecap="round" stroke-opacity="0.45"/>
+    <path d="M 190 778 Q 330 760 470 778 T 750 778 T 900 778" fill="none" stroke="#38BDF8" stroke-width="6" stroke-linecap="round" stroke-opacity="0.25"/>
+
+    <!-- Subtle inner squircle rim highlight -->
+    <rect x="103" y="103" width="818" height="818" rx="182" ry="182" fill="none" stroke="#FFFFFF" stroke-opacity="0.16" stroke-width="6"/>
+  </g>
+</svg>
