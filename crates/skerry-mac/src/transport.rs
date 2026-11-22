@@ -21,9 +21,10 @@ use tokio_tungstenite::tungstenite::{
 
 mod role;
 
+#[cfg(test)]
+pub use role::LayoutRect;
 use role::Wire;
-#[allow(unused_imports)]
-pub use role::{DisplayConfig, Kill, LayoutRect, Side, StreamRole};
+pub use role::{DisplayConfig, Kill, Side, StreamRole};
 
 const MAX_WIDTH: u16 = 4096;
 const MAX_HEIGHT: u16 = 2160;
@@ -1088,7 +1089,7 @@ async fn stream(
         return Ok(());
     }
     socket
-        .send(format!("SETTINGS,{settings}").into())
+        .send(format!("SETTINGS,{settings}"))
         .await
         .map_err(|_| disconnected)?;
     let mut frame = Canvas::default();
@@ -1158,7 +1159,7 @@ async fn stream(
                         let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
                         for command in zoom_commands(notches, position, active_size, control_held) {
                             trace_input(&command);
-                            socket.send(command.into()).await.map_err(|_| disconnected)?;
+                            socket.send(command).await.map_err(|_| disconnected)?;
                         }
                         continue;
                     }
@@ -1195,7 +1196,7 @@ async fn stream(
                     }
                     Some(Input::AudioBitrate(bps)) => {
                         let Some((command, applied)) = audio_bitrate_command(&capabilities, bps) else { continue; };
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        socket.send(command).await.map_err(|_| disconnected)?;
                         // Selkies may not echo it to the controller that asked.
                         capabilities.live(&applied);
                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
@@ -1203,7 +1204,7 @@ async fn stream(
                     }
                     Some(Input::Settings(changes)) => {
                         let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        socket.send(command).await.map_err(|_| disconnected)?;
                         // Some Selkies versions only echo changes to other controllers.
                         capabilities.live(&applied);
                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
@@ -1211,7 +1212,7 @@ async fn stream(
                     }
                     Some(Input::Screen(change)) => {
                         if let Some(settings) = screen_policy.apply(change) {
-                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
+                            socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
                             let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
                         }
                         continue;
@@ -1229,7 +1230,7 @@ async fn stream(
                     Some(Input::Appearance(next)) => {
                         dark = next;
                         if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
-                            socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
+                            socket.send(color_command(scheme)).await.map_err(|_| disconnected)?;
                             sent_scheme = Some(scheme);
                         }
                         continue;
@@ -1237,7 +1238,7 @@ async fn stream(
                     Some(Input::Clipboard(content)) => {
                         clipboard_transfer += 1;
                         for frame in clipboard::encode(&content, clipboard_transfer) {
-                            socket.send(frame.into()).await.map_err(|_| disconnected)?;
+                            socket.send(frame).await.map_err(|_| disconnected)?;
                         }
                         continue;
                     }
@@ -1258,7 +1259,7 @@ async fn stream(
                     Some(Input::Close) | None => {
                         for command in closing_commands(&held, pointer_lock, &mut pads, socket.role()) {
                             trace_input(&command);
-                            let _ = socket.send(command.into()).await;
+                            let _ = socket.send(command).await;
                         }
                         trace_input_event("close frame");
                         let _ = socket.close(None).await;
@@ -1273,18 +1274,18 @@ async fn stream(
                     held.remove(&key);
                 }
                 trace_input(&text);
-                socket.send(text.into()).await.map_err(|_| disconnected)?;
+                socket.send(text).await.map_err(|_| disconnected)?;
             }
             _ = pad_heartbeat.tick(), if pads.active() && socket.role().is_primary() => {
                 for text in pads.heartbeat() {
-                    socket.send(text.into()).await.map_err(|_| disconnected)?;
+                    socket.send(text).await.map_err(|_| disconnected)?;
                 }
             }
             _ = heartbeat.tick(), if !held.is_empty() => {
                 let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
                 let text = format!("kh,{keys}");
                 trace_input(&text);
-                socket.send(text.into()).await.map_err(|_| disconnected)?;
+                socket.send(text).await.map_err(|_| disconnected)?;
             }
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Binary(data))) => {
@@ -1455,7 +1456,7 @@ async fn stream(
                                         pacer.reset();
                                         seen_video = false;
                                         let command = codec_command(codec);
-                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        socket.send(command).await.map_err(|_| disconnected)?;
                                         socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                                         video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
                                     }
@@ -1463,7 +1464,7 @@ async fn stream(
                                 let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                 if data["type"] == "server_settings" && primary {
                                     if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
-                                        socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
+                                        socket.send(color_command(scheme)).await.map_err(|_| disconnected)?;
                                         sent_scheme = Some(scheme);
                                     }
                                 }
@@ -1476,15 +1477,15 @@ async fn stream(
                                         socket.send("_stats,1".into()).await.map_err(|_| disconnected)?;
                                     }
                                     if let Some(legacy) = legacy_settings(&capabilities).filter(|_| primary) {
-                                        socket.send(legacy.into()).await.map_err(|_| disconnected)?;
+                                        socket.send(legacy).await.map_err(|_| disconnected)?;
                                     }
                                     if let Some((command, applied)) = settings_command(&capabilities, options.preferences.iter().copied()) {
-                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        socket.send(command).await.map_err(|_| disconnected)?;
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
                                     if let Some((command, applied)) = options.audio_bitrate.filter(|_| primary).and_then(|bps| audio_bitrate_command(&capabilities, bps)) {
-                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        socket.send(command).await.map_err(|_| disconnected)?;
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
@@ -1558,16 +1559,16 @@ async fn stream(
                     seen_video = false;
                     unsupported_video = false;
                     video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
-                    socket.send(codec_command(codec).into()).await.map_err(|_| disconnected)?;
+                    socket.send(codec_command(codec)).await.map_err(|_| disconnected)?;
                     socket.send("REQUEST_KEYFRAME".into()).await.map_err(|_| disconnected)?;
                 }
                 if let Some(id) = last_frame.take() {
-                    socket.send(format!("CLIENT_FRAME_ACK {id} 0").into()).await.map_err(|_| disconnected)?;
+                    socket.send(format!("CLIENT_FRAME_ACK {id} 0")).await.map_err(|_| disconnected)?;
                 }
                 if pointer.has_changed().unwrap_or(false) {
                     let position = *pointer.borrow_and_update();
                     if let Some(command) = position.and_then(|p| p.command_for(active_size)) {
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        socket.send(command).await.map_err(|_| disconnected)?;
                     }
                 }
             }
@@ -2168,6 +2169,27 @@ mod tests {
         )
         .await;
         assert!(matches!(played.ended, Err(RunError::Other(_))));
+    }
+
+    #[tokio::test]
+    async fn owner_teardown_releases_display_two_keys_before_close() {
+        // What the owner's teardown does to Display 2: release the held key (the `ku` the
+        // view queues), then drop the stream (`Input::Close`): the release goes first.
+        let played = play(
+            StreamRole::Secondary(Side::Right),
+            Vec::new(),
+            vec![Input::Command("kd,97".into()), Input::Close],
+            None,
+            1000,
+        )
+        .await;
+        assert_eq!(played.ended, Ok(()));
+        let keys: Vec<_> = played
+            .received
+            .iter()
+            .filter(|text| text.starts_with("kd,") || text.starts_with("ku,"))
+            .collect();
+        assert_eq!(keys, ["kd,97", "ku,97"]);
     }
 
     #[test]

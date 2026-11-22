@@ -112,6 +112,8 @@ pub fn placement_key(key: &str, sides: [bool; 4]) -> Option<usize> {
 
 /// A picker callback for one side (its index).
 pub type SideHandler = std::rc::Rc<dyn Fn(usize, &mut Window, &mut App)>;
+/// The side under the pointer, `None` when it leaves.
+pub type HoverHandler = std::rc::Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>;
 
 /// "Where is your second display?" over the session window (`ARCH-039`): a scrim, one
 /// button on each offered edge, and a centre card with the arrangement. A click on the
@@ -121,7 +123,7 @@ pub fn screen_placement(
     sides: [bool; 4],
     hovered: Option<usize>,
     on_pick: SideHandler,
-    on_hover: std::rc::Rc<dyn Fn(Option<usize>, &mut Window, &mut App)>,
+    on_hover: HoverHandler,
     on_dismiss: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui_kit::Stateful<Div> {
     let icons = [

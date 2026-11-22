@@ -8,10 +8,11 @@ use super::apps_window::{self, AppsOwner, AppsWindow};
 use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::gamepads::Gamepads;
+use super::second_display::{KeySync, SecondHost, StreamSetup, KEY_HANDOFF};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher, ToggleApps,
-    ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSessionControls, ToggleStatsStrip,
-    APP_NAME,
+    ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSecondDisplay,
+    ToggleSessionControls, ToggleStatsStrip, APP_NAME,
 };
 use crate::audio::OutputStatus;
 use crate::input::InputFeature;
@@ -217,6 +218,10 @@ pub(super) struct SessionWindow {
     pub(super) print_reveal: u64,
     /// Session Controls opens with Printing expanded.
     pub(super) print_reveal_on_open: bool,
+    /// Display 2, its picker and its pill (`ARCH-039`).
+    pub(super) second: SecondHost,
+    /// A resign waiting out the hand-off to Display 2 before pads rest.
+    key_handoff: Option<Task<()>>,
 }
 
 /// Auto-open skips documents larger than this: PDFKit reads them on the main thread.
@@ -294,6 +299,8 @@ impl SessionWindow {
             print_ticking: false,
             print_reveal: 0,
             print_reveal_on_open: false,
+            second: SecondHost::default(),
+            key_handoff: None,
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -327,6 +334,16 @@ impl SessionWindow {
         cx.observe_window_activation(window, |this, window, cx| {
             let active = window.is_window_active();
             this.window_active = active;
+            // Focus moving to Display 2 must not drop the pads to rest (`ARCH-039`).
+            let sync = this.second.key.set_primary(active, this.second.is_open());
+            if sync == KeySync::AfterHandOff {
+                this.defer_key_sync(cx);
+                if this.pending_capture {
+                    this.pending_capture = false;
+                }
+                cx.notify();
+                return;
+            }
             // Pads follow the key window: the global only records it (this window holds its
             // own lease), this window syncs itself, and the one that lost key is synced
             // after this update (`ARCH-015`).
@@ -476,7 +493,13 @@ impl SessionWindow {
                 self.audio_output = Some(status);
             }
             SessionEvent::AudioOutput(_) => {}
-            SessionEvent::Video(enabled) => self.video = Some(enabled),
+            SessionEvent::Video(enabled) => {
+                self.video = Some(enabled);
+                if enabled {
+                    // Display 2 resumes on the primary's first picture (`ARCH-039`).
+                    self.second_on_picture(cx);
+                }
+            }
             SessionEvent::Settings(settings) => {
                 // The session answered: later reconnects get the normal 45 s grace.
                 self.keep_waiting = false;
@@ -588,7 +611,7 @@ impl SessionWindow {
                 self.startup_stalled = Some(self.keep_waiting);
             }
             SessionEvent::Rumble(rumble) => {
-                if self.window_active && self.gamepad_input() && self.preferences.gamepads.rumble {
+                if self.session_key() && self.gamepad_input() && self.preferences.gamepads.rumble {
                     if let Some(gamepads) = cx.try_global::<Gamepads>() {
                         gamepads.rumble(&rumble);
                     }
@@ -604,7 +627,7 @@ impl SessionWindow {
             SessionEvent::Killed(kill) => {
                 self.handle_event(SessionEvent::Error(kill.to_string()), window, cx)
             }
-            SessionEvent::DisplayLayout(_) => {}
+            SessionEvent::DisplayLayout(config) => self.second.set_layout(config),
             SessionEvent::Error(error) => {
                 // The capture ends with the stream; the banner explains, so no hint.
                 if let Some(stream) = &self.current {
@@ -827,6 +850,10 @@ impl SessionWindow {
         if let Some(stream) = &self.current {
             stream.set_settings(changes.iter().map(|(&key, &value)| (key, value)).collect());
         }
+        self.second.set_settings(
+            changes.iter().map(|(&key, &value)| (key, value)).collect(),
+            cx,
+        );
         let chosen: Vec<(Key, u32)> = changes
             .keys()
             .filter_map(|key| self.preferences.video.get(key).map(|&value| (*key, value)))
@@ -932,6 +959,93 @@ impl SessionWindow {
         self.window_active
     }
 
+    /// Whether the session is key: this window or its Display 2 (`ARCH-039`).
+    pub(super) fn session_key(&self) -> bool {
+        self.window_active || self.second.key.key()
+    }
+
+    /// Display 2 became key or resigned. The gamepads follow the session while either
+    /// window is key; a resign waits out the hand-off.
+    pub(super) fn set_second_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if !self.second.is_open() && active {
+            return;
+        }
+        if self.second.key.set_second(active) == KeySync::AfterHandOff {
+            self.defer_key_sync(cx);
+            return;
+        }
+        self.key_handoff = None;
+        if cx.has_global::<Gamepads>() {
+            let (handle, entity) = (self.window, cx.weak_entity());
+            cx.update_global::<Gamepads, _>(|gamepads, _| {
+                gamepads.set_active(handle, entity, true);
+            });
+        }
+        self.sync_gamepads(cx);
+    }
+
+    /// Syncs the pads after the key hand-off grace, unless the session took key again.
+    fn defer_key_sync(&mut self, cx: &mut Context<Self>) {
+        let timer = cx.background_executor().timer(KEY_HANDOFF);
+        let window = self.window;
+        self.key_handoff = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = window.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    this.key_handoff = None;
+                    if !this.session_key() {
+                        if let Some(gamepads) = cx.try_global::<Gamepads>() {
+                            gamepads.stop_rumble();
+                        }
+                    }
+                    this.sync_gamepads(cx);
+                })
+            });
+        }));
+    }
+
+    /// What Display 2's stream starts with, read now (`ARCH-039`).
+    pub(super) fn second_setup(&self) -> Option<StreamSetup> {
+        let url = self.api.session_url(&self.remote.session_url).ok()?;
+        Some(StreamSetup {
+            url,
+            rt: self.rt.clone(),
+            preferences: self
+                .preferences
+                .video
+                .iter()
+                .map(|(&key, &value)| (key, value))
+                .collect(),
+            codec: self.preferences.codec,
+            input: self.preferences.input,
+            clipboard: self.preferences.clipboard,
+            mac_shortcuts: self.mac_shortcuts(),
+            mode: self.display_mode,
+        })
+    }
+
+    /// Display 2's ⋯ trigger: Session Controls opens here (never closes).
+    pub(super) fn open_controls_from_second(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.controls.is_none() {
+            self.toggle_controls(window, cx);
+        }
+    }
+
+    /// View → Toggle Stats Over Stream, from either window.
+    pub(super) fn toggle_stats_strip(&mut self, cx: &mut Context<Self>) {
+        self.set_stats_strip(!self.preferences.stats_strip, cx);
+    }
+
+    /// The pill takes the capture hint's slot.
+    pub(super) fn clear_capture_hint(&mut self) {
+        self.capture_hint = None;
+        self.hint_task = None;
+    }
+
     /// **Gamepad input**: the saved choice, else the server's `gamepad_on_start`. Off until
     /// the server's settings arrive.
     pub(super) fn gamepad_input(&self) -> bool {
@@ -952,7 +1066,7 @@ impl SessionWindow {
                 .as_ref()
                 .is_some_and(|settings| settings.gamepad.enabled),
             input_on: self.gamepad_input(),
-            key: self.window_active,
+            key: self.session_key(),
         };
         // Slots another window took while this one wasn't key are forgotten, not dropped.
         let yielded = self.yield_gamepad_slots(cx);
@@ -1045,6 +1159,7 @@ impl SessionWindow {
     /// Shows `hint` over the picture, replacing any other. It fades out over its last
     /// 200 ms, then clears, unless a newer hint replaced it.
     fn show_capture_hint(&mut self, hint: CaptureHint, cx: &mut Context<Self>) {
+        self.clear_second_pill();
         self.hint_generation += 1;
         let generation = self.hint_generation;
         self.capture_hint = Some((hint, generation, false));
@@ -1417,6 +1532,8 @@ impl SessionWindow {
         self.capture_hint = None;
         self.hint_task = None;
         self.stream_events = None;
+        // Display 2 waits for the next primary stream (`ARCH-039`).
+        self.second.on_primary_end(cx);
         // Announced pads leave before the key releases and the close frame (`ARCH-032`).
         if self.current.is_some() {
             // Only the slots this window still drives; another window's stay its own.
@@ -1454,6 +1571,8 @@ impl SessionWindow {
         cx: &mut Context<Self>,
     ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
         self.remove_controls(cx);
+        // Display 2 releases its keys and drops its stream before its window goes.
+        self.second.close(cx);
         self.end_stream(window, cx);
         // After `end_stream`'s disconnect, so nothing is sent from a closing window.
         self.close_apps(cx);
@@ -1940,6 +2059,9 @@ impl Render for SessionWindow {
             .on_action(cx.listener(|this, _: &TogglePointerCapture, window, cx| {
                 this.request_capture(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleSecondDisplay, window, cx| {
+                this.toggle_second_display(window, cx);
+            }))
             .when_some(self.current.as_ref(), |root, stream| {
                 root.child(stream.view())
             })
@@ -1981,6 +2103,11 @@ impl Render for SessionWindow {
                         });
                     }),
                 ))
+            })
+            // The Display 2 pill and side picker (`ARCH-039`).
+            .map(|root| {
+                let banner = self.status.is_some() || self.startup_stalled.is_some();
+                self.second_overlays(root, banner, window, cx)
             })
             .when_some(self.status.clone(), |root, status| {
                 root.child(session::status_banner_with_actions(

@@ -6,6 +6,7 @@ mod files_model;
 mod files_window;
 mod gamepads;
 mod promise;
+mod second_display;
 mod session_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchMemory, LaunchSelection};
@@ -201,6 +202,8 @@ pub fn run() {
                     MenuItem::action("Files", ToggleFiles),
                     MenuItem::action("Apps", ToggleApps),
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
+                    // No checkmark: menus are set once (`ARCH-039`).
+                    MenuItem::action("Second Display", ToggleSecondDisplay),
                     // No checkmark: menus are set once, and the strip is per window.
                     MenuItem::action("Toggle Stats Over Stream", ToggleStatsStrip),
                     // No checkmark either; while captured the menu bar is out of reach.
@@ -280,7 +283,9 @@ actions!(
         OpenFile,
         OpenLocation,
         ToggleStatsStrip,
-        TogglePointerCapture
+        TogglePointerCapture,
+        /// Opens Display 2 for the key session, or closes it (`ARCH-039`). No key chord.
+        ToggleSecondDisplay
     ]
 );
 
@@ -2603,7 +2608,9 @@ impl Launcher {
     }
 
     /// Opens `session` in a window of its own, or brings forward the window already showing
-    /// it: Skerry never opens a second connection to a session it shows (`ARCH-022`).
+    /// it: Skerry never opens a second connection to a session it shows (`ARCH-022`), apart
+    /// from the one Display 2 stream the session window itself owns (`ARCH-039` amends
+    /// `ARCH-022`).
     fn open_session(
         &mut self,
         session: RemoteSession,
