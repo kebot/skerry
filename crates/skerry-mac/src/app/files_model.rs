@@ -9,8 +9,12 @@ use std::collections::BTreeSet;
 pub struct Browser {
     /// The folder shown, root-relative.
     path: String,
-    /// The listing in display order.
+    /// The listing in display order, as the filter leaves it.
     entries: Vec<Entry>,
+    /// The whole listing, before the filter.
+    all: Vec<Entry>,
+    /// The Storage window's Filter text (`ARCH-037`); empty shows everything.
+    filter: String,
     /// Indices into `entries`.
     selected: BTreeSet<usize>,
     /// Where Shift-selection extends from.
@@ -26,6 +30,8 @@ impl Default for Browser {
         Browser {
             path: String::new(),
             entries: Vec::new(),
+            all: Vec::new(),
+            filter: String::new(),
             selected: BTreeSet::new(),
             anchor: None,
             back: Vec::new(),
@@ -90,6 +96,8 @@ impl Browser {
 
     fn clear_folder(&mut self) {
         self.entries.clear();
+        self.all.clear();
+        self.filter.clear();
         self.selected.clear();
         self.anchor = None;
     }
@@ -105,9 +113,52 @@ impl Browser {
             .anchor
             .and_then(|index| self.entries.get(index))
             .map(|entry| entry.name.clone());
-        self.entries = entries;
-        self.sort_entries();
+        self.all = entries;
+        self.apply_filter();
         self.reselect(&keep, anchor.as_deref());
+    }
+
+    /// Shows only names containing `filter`, ignoring case; the selection keeps its names.
+    pub fn set_filter(&mut self, filter: &str) {
+        if self.filter == filter {
+            return;
+        }
+        let keep: BTreeSet<String> = self
+            .selected_entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        self.filter = filter.to_owned();
+        self.apply_filter();
+        self.reselect(&keep, None);
+    }
+
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Entries in the folder before the filter.
+    pub fn total(&self) -> usize {
+        self.all.len()
+    }
+
+    fn apply_filter(&mut self) {
+        self.entries = self
+            .all
+            .iter()
+            .filter(|entry| crate::storage::matches_filter(&entry.name, &self.filter))
+            .cloned()
+            .collect();
+        self.sort_entries();
+    }
+
+    /// Back to the root with no history: the Storage window switched homes.
+    pub fn reset(&mut self) {
+        *self = Self {
+            sort: self.sort,
+            ascending: self.ascending,
+            ..Self::default()
+        };
     }
 
     /// Sorts by `column`; the same column again flips the direction.
@@ -226,7 +277,8 @@ impl Browser {
         self.selected.first().copied()
     }
 
-    pub fn rows(&self) -> Vec<FileRow> {
+    /// The rows as drawn; `locked` marks the folders sessions need (`ARCH-037`).
+    pub fn rows(&self, locked: impl Fn(&str) -> bool) -> Vec<FileRow> {
         let today = today();
         self.entries
             .iter()
@@ -237,6 +289,7 @@ impl Browser {
                 modified: date_label(&entry.mtime, today),
                 size: entry.size.map(size_label).unwrap_or_else(|| "--".into()),
                 selected: self.selected.contains(&index),
+                locked: locked(&entry.path),
             })
             .collect()
     }

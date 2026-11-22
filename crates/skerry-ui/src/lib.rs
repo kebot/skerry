@@ -10,3 +10,4 @@ pub mod library;
 pub mod selkies;
 pub mod session;
 pub mod stats;
+pub mod storage;

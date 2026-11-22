@@ -356,6 +356,8 @@ pub struct AccountHandlers {
     pub on_open_web: ActionHandler,
     /// Asks to sign out; the caller shows the confirmation.
     pub on_sign_out: ActionHandler,
+    /// Opens the Storage window (`ARCH-037`); `None` hides Manage Storage….
+    pub on_manage_storage: Option<ActionHandler>,
 }
 
 /// The header's account button and its popover.
@@ -522,6 +524,22 @@ pub fn panel(
                             .map(|(index, row)| limit_row(theme, index, row)),
                     ),
             );
+    }
+    if let Some(on_manage) = handlers.on_manage_storage.clone().filter(|_| available) {
+        let close = handlers.on_open_change.clone();
+        body = body.child(
+            div().child(
+                Button::new("account-manage-storage")
+                    .link()
+                    .xsmall()
+                    .label("Manage Storage…")
+                    // The menu closes first, then the window opens.
+                    .on_click(move |event, window, cx| {
+                        close(false, window, cx);
+                        on_manage(event, window, cx);
+                    }),
+            ),
+        );
     }
     if let Some(source) = props.key_source {
         let key_id = props.key_id.clone();

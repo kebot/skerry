@@ -28,6 +28,9 @@ pub enum FlightRoute {
     /// `/launch/file`: this file is uploaded first, again on a fresh retry (the server
     /// deletes an upload once a launch reassembles it).
     File(PathBuf),
+    /// `/launch/file_path`: a top-level Shared Files file by name; nothing is uploaded, so a
+    /// retry just sends again (`ARCH-037`).
+    Stored(String),
 }
 
 /// No change of stage for this long shows the stall prompt.
