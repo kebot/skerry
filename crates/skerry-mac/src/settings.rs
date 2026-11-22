@@ -279,11 +279,28 @@ pub struct Preferences {
     /// The Launch Dialog options each app last launched with, by app id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub launch: BTreeMap<String, LaunchMemory>,
-    #[serde(flatten)]
+    #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
 
-fn path(server: &str) -> Option<PathBuf> {
+/// Reads the flattened video map, skipping keys this build doesn't know. A file written by a
+/// newer build (another top-level preference) must not fail to load, or the next write would
+/// replace every preference with the defaults.
+fn lenient_video<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<VideoSettings, D::Error> {
+    let raw = BTreeMap::<String, Value>::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let key = serde_json::from_value::<Key>(Value::String(name)).ok()?;
+            Some((key, serde_json::from_value::<u32>(value).ok()?))
+        })
+        .collect())
+}
+
+/// Where `server`'s preferences live. Writes go only through `persist::WriteQueue`.
+pub(crate) fn path(server: &str) -> Option<PathBuf> {
     Some(
         PathBuf::from(std::env::var_os("HOME")?)
             .join("Library/Application Support/SealSkin Native")
@@ -298,13 +315,9 @@ pub fn load(server: &str) -> Preferences {
 }
 
 /// Re-reads the saved preferences, applies `change`, and saves them, so that windows
-/// changing different preferences never overwrite each other's (`ARCH-022`).
-pub fn update(server: &str, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
-    let path = path(server).ok_or_else(|| io::Error::other("Home directory unavailable"))?;
-    update_at(&path, change)
-}
-
-fn update_at(path: &Path, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
+/// changing different preferences never overwrite each other's (`ARCH-022`). Blocking:
+/// only `persist`'s write queue calls it, so writes never race each other.
+pub(crate) fn update_at(path: &Path, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
     let mut preferences = load_from(path);
     change(&mut preferences);
     save_to(path, &preferences)

@@ -39,8 +39,9 @@ pub struct SessionItem {
 pub struct LibraryProps {
     pub app_name: String,
     pub server: String,
-    pub apps: Vec<AppItem>,
-    pub sessions: Vec<SessionItem>,
+    /// Built once per Library change and shared, never rebuilt per frame.
+    pub apps: Rc<[AppItem]>,
+    pub sessions: Rc<[SessionItem]>,
     pub search_query: String,
     pub selected_filter: String,
     pub status: Option<String>,
@@ -84,7 +85,7 @@ pub fn render(
     };
 
     let mut categories = BTreeSet::new();
-    for app in &props.apps {
+    for app in props.apps.iter() {
         for cat in &app.categories {
             if !cat.is_empty() {
                 categories.insert(cat.clone());

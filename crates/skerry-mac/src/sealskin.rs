@@ -26,6 +26,7 @@ pub struct Credential {
     raw: String,
     base: Url,
     authorization: HeaderValue,
+    source: KeySource,
 }
 
 impl Credential {
@@ -65,6 +66,7 @@ impl Credential {
             raw: raw.into(),
             base,
             authorization,
+            source: KeySource::Typed,
         })
     }
 
@@ -72,23 +74,48 @@ impl Credential {
     /// `~/.config/skerry/config.toml`. Skerry never reads or writes the macOS Keychain
     /// (ARCH-011).
     pub fn startup() -> Result<Option<Self>, String> {
+        let from = |raw: &str, source| Self::parse(raw).map(|key| Some(key.from_source(source)));
         if let Ok(value) = std::env::var(KEY_VARIABLE) {
-            return Self::parse(&value).map(Some);
+            return from(&value, KeySource::Environment);
         }
         if let Ok(entries) = dotenvy::from_path_iter(".env") {
             for (name, value) in entries.flatten() {
                 if name == KEY_VARIABLE {
-                    return Self::parse(&value).map(Some);
+                    return from(&value, KeySource::DotEnv);
                 }
             }
         }
-        read_saved_key(&config_file()?)?
-            .map(|raw| Self::parse(&raw))
-            .transpose()
+        match read_saved_key(&config_file()?)? {
+            Some(raw) => from(&raw, KeySource::ConfigFile),
+            None => Ok(None),
+        }
     }
 
-    pub fn save(&self) -> Result<(), String> {
-        write_saved_key(&config_file()?, Some(&self.raw)).map_err(|error| {
+    fn from_source(mut self, source: KeySource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The key as pasted, for the write queue to save.
+    pub(crate) fn raw(&self) -> &str {
+        &self.raw
+    }
+}
+
+/// Where an application key came from, which decides what Sign Out can remove (`ARCH-011`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeySource {
+    Environment,
+    DotEnv,
+    ConfigFile,
+    /// Pasted on the Connect screen.
+    Typed,
+}
+
+/// Saves `raw` as `application_key` in the config file at `path`. Blocking: only `persist`'s
+/// write queue calls it.
+pub(crate) fn save_key_at(path: &Path, raw: &str) -> Result<(), String> {
+    write_saved_key(path, Some(raw)).map_err(|error| {
             if error.kind() == io::ErrorKind::InvalidData {
                 format!(
                     "Connected for this run. The key wasn’t saved because {CONFIG_DISPLAY} isn’t valid TOML. Fix or delete that file, then connect again."
@@ -97,26 +124,26 @@ impl Credential {
                 format!("Connected for this run. Skerry couldn’t save the key to {CONFIG_DISPLAY}.")
             }
         })
-    }
+}
 
-    pub fn forget() -> Result<(), String> {
-        write_saved_key(&config_file()?, None).map_err(|_| {
-            format!("Couldn’t remove the saved application key from {CONFIG_DISPLAY}.")
-        })
-    }
+/// Removes `application_key` from the config file at `path`. Blocking: only `persist`'s
+/// write queue calls it.
+pub(crate) fn forget_key_at(path: &Path) -> Result<(), String> {
+    write_saved_key(path, None)
+        .map_err(|_| format!("Couldn’t remove the saved application key from {CONFIG_DISPLAY}."))
 }
 
 const CONFIG_DISPLAY: &str = "~/.config/skerry/config.toml";
 const CONFIG_KEY: &str = "application_key";
 
-fn config_file() -> Result<PathBuf, String> {
+pub(crate) fn config_file() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or("Skerry can’t find your home folder to keep the application key.")?;
     Ok(config_file_in(Path::new(&home)))
 }
 
-fn config_file_in(home: &Path) -> PathBuf {
+pub(crate) fn config_file_in(home: &Path) -> PathBuf {
     home.join(".config/skerry/config.toml")
 }
 
@@ -407,28 +434,61 @@ pub struct Library {
     pub homes: Vec<String>,
 }
 
+/// The only paths that get the application key.
+const COMPANION_API_PREFIX: &str = "/companion/api/";
+
+/// Whether a request to `path` (already resolved, as `Url::path` gives it) carries the key.
+pub(crate) fn requires_key(path: &str) -> bool {
+    path.starts_with(COMPANION_API_PREFIX)
+}
+
+/// The SealSkin control plane. The key goes only to `/companion/api/`. Everything else
+/// (logos, `/app/<id>/icon.png`, which session containers serve) is fetched without
+/// credentials, through a second client that has no `Authorization` header at all.
 #[derive(Clone)]
 pub struct SealSkinClient {
-    client: Client,
+    authed: Client,
+    public: Client,
     base: Url,
+    key_source: KeySource,
 }
 
 impl SealSkinClient {
     pub fn new(credential: &Credential) -> Result<Self, String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, credential.authorization.clone());
-        headers.insert("x-sealskin-app", HeaderValue::from_static("other"));
-        let client = Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|_| "Couldn’t initialize the secure connection.")?;
+        let build = |key: Option<&HeaderValue>| {
+            let mut headers = HeaderMap::new();
+            if let Some(key) = key {
+                headers.insert(AUTHORIZATION, key.clone());
+            }
+            headers.insert("x-sealskin-app", HeaderValue::from_static("other"));
+            Client::builder()
+                .default_headers(headers)
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .map_err(|_| "Couldn’t initialize the secure connection.".to_string())
+        };
         Ok(Self {
-            client,
+            authed: build(Some(&credential.authorization))?,
+            public: build(None)?,
             base: credential.base.clone(),
+            key_source: credential.source,
         })
+    }
+
+    /// A client for `credential` that talks to `base` (a plain-HTTP test listener).
+    #[cfg(test)]
+    fn with_base(credential: &Credential, base: Url) -> Self {
+        Self {
+            base,
+            ..Self::new(credential).unwrap()
+        }
+    }
+
+    /// Where the key this client uses came from.
+    pub fn key_source(&self) -> KeySource {
+        self.key_source
     }
 
     pub fn server(&self) -> &str {
@@ -454,10 +514,14 @@ impl SealSkinClient {
         Ok(url)
     }
 
+    /// A request to `path` on this server. The check runs on the resolved URL, in release
+    /// builds too: a path outside `/companion/api/` goes out without the key.
     fn request(&self, method: Method, path: &str) -> RequestBuilder {
         let mut url = self.base.clone();
         url.set_path(path);
-        self.client.request(method, url)
+        let keyed = requires_key(url.path());
+        debug_assert!(keyed, "{path} is not a companion API path");
+        if keyed { &self.authed } else { &self.public }.request(method, url)
     }
 
     /// Refuses any SealSkin server whose `GET /companion/api/ui/version` is older than
@@ -713,7 +777,7 @@ impl SealSkinClient {
     }
 
     async fn fetch_bytes(&self, url: Url) -> Option<Vec<u8>> {
-        let response = self.client.get(url).send().await.ok()?;
+        let response = self.public.get(url).send().await.ok()?;
         if !response.status().is_success() {
             return None;
         }
@@ -830,6 +894,89 @@ async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, String>
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    /// Answers `count` HTTP requests with 404 and returns each raw request, lowercased.
+    async fn capture_requests(count: usize) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                seen.push(String::from_utf8_lossy(&request).to_lowercase());
+            }
+            seen
+        });
+        (base, task)
+    }
+
+    fn test_client(base: Url) -> SealSkinClient {
+        let credential = Credential::parse("ssk_id_secret@seal.example").unwrap();
+        SealSkinClient::with_base(&credential, base)
+    }
+
+    #[tokio::test]
+    async fn logo_fetches_never_carry_the_application_key() {
+        let (base, requests) = capture_requests(2).await;
+        let app: RemoteApp = serde_json::from_value(json!({
+            "id": "firefox",
+            "name": "Firefox",
+            "logo": "/api/logos/x.png",
+            "is_meta_app": false,
+        }))
+        .unwrap();
+        assert!(test_client(base).app_icon(&app).await.is_none());
+        let requests = requests.await.unwrap();
+        assert!(requests[0].starts_with("get /api/logos/x.png "));
+        assert!(requests[1].starts_with("get /app/firefox/icon.png "));
+        for request in requests {
+            assert!(!request.contains("authorization:"), "{request}");
+            assert!(!request.contains("ssk_id_secret"), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn companion_requests_carry_the_application_key() {
+        let (base, requests) = capture_requests(1).await;
+        assert!(matches!(
+            test_client(base).check_version().await,
+            Err(LibraryError::Refused(_))
+        ));
+        let request = requests.await.unwrap().remove(0);
+        assert!(request.starts_with("get /companion/api/ui/version "));
+        assert!(
+            request.contains("authorization: bearer ssk_id_secret"),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn only_companion_api_paths_get_the_key() {
+        assert!(requires_key("/companion/api/sessions"));
+        assert!(!requires_key("/api/logos/a.png"));
+        assert!(!requires_key("/app/x/icon.png"));
+        assert!(!requires_key("/companion/apix"));
+        // The check runs on the resolved path, after `..` is folded away.
+        let mut url = Url::parse("https://seal.example/").unwrap();
+        url.set_path("/companion/api/../../app/x/icon.png");
+        assert!(!requires_key(url.path()), "{}", url.path());
+    }
 
     #[test]
     fn saved_key_round_trips_through_a_private_config_toml() {

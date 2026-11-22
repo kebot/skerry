@@ -6,6 +6,7 @@ mod promise;
 mod session_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchSelection};
+use crate::persist::{self, WriteQueue};
 use crate::sealskin::{
     Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession, SealSkinClient,
 };
@@ -17,9 +18,9 @@ use gpui_kit::component::{
     ActiveTheme as _, Theme,
 };
 use gpui_kit::{
-    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
-    FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage, Size,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem,
+    Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage,
+    Size, TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
@@ -38,7 +39,7 @@ use smallvec::smallvec;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
@@ -65,6 +66,16 @@ pub fn run() {
     application.run(move |cx: &mut App| {
         gpui_kit::init(cx);
         cx.set_global(OpenWindows::default());
+        // Every preference and key write goes through this one queue (`persist`).
+        cx.set_global(persist::start(&handle));
+        // GPUI gives quit futures 200 ms; wait for queued writes (at most 1 s) before
+        // returning one.
+        cx.on_app_quit(|cx| {
+            cx.global::<WriteQueue>()
+                .flush_blocking(Duration::from_secs(1));
+            async {}
+        })
+        .detach();
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-0", ShowLibrary, None),
@@ -233,6 +244,8 @@ impl DisplayMode {
 }
 
 struct Launcher {
+    /// The Library window, for async updates (`ARCH-015`).
+    window: AnyWindowHandle,
     rt: Handle,
     api: Option<SealSkinClient>,
     library: Option<Library>,
@@ -247,8 +260,11 @@ struct Launcher {
     language_options: Option<Vec<LaunchOption>>,
     pending_stop: Option<RemoteSession>,
     /// Images replaced or removed since the last render; their GPU textures are freed with
-    /// `window.drop_image` on the next render (GPUI never frees them on drop).
+    /// `window.drop_image` on the next render (GPUI never frees them on drop). Only
+    /// `retire` adds to it, and it also drops `items`, which may still hold the image.
     retired_images: Vec<Arc<RenderImage>>,
+    /// The Library's cards and tiles, built once per change instead of every frame.
+    items: ItemCache,
     /// Bumped on every Library load and on Disconnect Server, so icon/thumbnail downloads
     /// started for an older Library never write into a newer one.
     media_generation: u64,
@@ -284,6 +300,7 @@ impl Launcher {
         })
         .detach();
         let mut launcher = Self {
+            window: Window::window_handle(window),
             rt,
             api: None,
             library: None,
@@ -297,6 +314,7 @@ impl Launcher {
             language_options: None,
             pending_stop: None,
             retired_images: Vec::new(),
+            items: ItemCache::default(),
             media_generation: 0,
             startup_credential: None,
             retry_api: None,
@@ -419,8 +437,10 @@ impl Launcher {
                         // Launch options remembered per app live with the other preferences.
                         this.preferences = settings::load(api.server());
                         this.api = Some(api.clone());
-                        this.library = Some(library);
-                        this.status = save.and_then(|credential| credential.save().err());
+                        this.set_library(Some(library));
+                        if let Some(credential) = save {
+                            this.save_key(&credential, cx);
+                        }
                         this.fetch_library_media(api, apps, sessions, cx);
                     }
                     Err(LibraryError::Refused(error)) => {
@@ -464,7 +484,7 @@ impl Launcher {
             .collect();
         for id in gone {
             if let Some(image) = self.session_thumbnails.remove(&id) {
-                self.retired_images.push(image);
+                self.retire(image);
             }
         }
         let missing_apps: Vec<RemoteApp> = apps
@@ -483,12 +503,13 @@ impl Launcher {
                 if let Ok(Some(image)) = pending.await {
                     let _ = this.update(cx, |this, cx| {
                         if this.media_generation != generation {
-                            this.retired_images.push(image);
+                            this.retire(image);
                             return;
                         }
                         if let Some(old) = this.app_icons.insert(app_id, image) {
-                            this.retired_images.push(old);
+                            this.retire(old);
                         }
+                        this.items.invalidate();
                         cx.notify();
                     });
                 }
@@ -507,13 +528,14 @@ impl Launcher {
                 if let Ok(Some(image)) = pending.await {
                     let _ = this.update(cx, |this, cx| {
                         if this.media_generation != generation {
-                            this.retired_images.push(image);
+                            this.retire(image);
                             return;
                         }
                         if let Some(old) = this.session_thumbnails.insert(session.session_id, image)
                         {
-                            this.retired_images.push(old);
+                            this.retire(old);
                         }
+                        this.items.invalidate();
                         cx.notify();
                     });
                 }
@@ -523,24 +545,96 @@ impl Launcher {
     }
 
     fn forget(&mut self, cx: &mut Context<Self>) {
-        self.status = Credential::forget().err();
+        self.status = None;
+        let done = cx.global::<WriteQueue>().forget_key();
+        self.on_written(done, |this, error| this.status = Some(error), cx);
         self.startup_credential = None;
         self.retry_api = None;
         self.leave_server();
         cx.notify();
     }
 
+    /// Queues `credential` to be saved; a failure shows in the status banner.
+    fn save_key(&mut self, credential: &Credential, cx: &mut Context<Self>) {
+        let done = cx.global::<WriteQueue>().save_key(credential);
+        self.on_written(done, |this, error| this.status = Some(error), cx);
+    }
+
+    /// Runs `failed` with the error once a queued write fails, through the Library window.
+    fn on_written<E: ToString + 'static>(
+        &self,
+        done: tokio::sync::oneshot::Receiver<Result<(), E>>,
+        failed: impl FnOnce(&mut Self, String) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            let error = match done.await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "Skerry couldn’t finish saving its settings.".to_string(),
+            };
+            let _ = window.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    failed(this, error);
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Frees `image`'s texture on the next render. The item cache may hold it, so it is
+    /// dropped in the same update (`ARCH-014`).
+    fn retire(&mut self, image: Arc<RenderImage>) {
+        self.retired_images.push(image);
+        self.items.invalidate();
+    }
+
+    /// Replaces the Library; the cards and tiles rebuild on the next render.
+    fn set_library(&mut self, library: Option<Library>) {
+        self.library = library;
+        self.items.invalidate();
+    }
+
+    /// Changes the loaded Library in place; the cards and tiles rebuild on the next render.
+    fn edit_library(&mut self, edit: impl FnOnce(&mut Library)) {
+        if let Some(library) = &mut self.library {
+            edit(library);
+            self.items.invalidate();
+        }
+    }
+
     /// Returns to the Connect screen, dropping the Library and its textures.
     fn leave_server(&mut self) {
         self.api = None;
-        self.library = None;
+        self.set_library(None);
         self.media_generation += 1;
-        self.retired_images
-            .extend(self.app_icons.drain().map(|(_, image)| image));
-        self.retired_images
-            .extend(self.session_thumbnails.drain().map(|(_, image)| image));
+        let images: Vec<_> = self
+            .app_icons
+            .drain()
+            .chain(self.session_thumbnails.drain())
+            .map(|(_, image)| image)
+            .collect();
+        for image in images {
+            self.retire(image);
+        }
         self.launch_dialog = None;
         self.pending_stop = None;
+    }
+
+    fn find_app(&self, app_id: &str) -> Option<RemoteApp> {
+        let library = self.library.as_ref()?;
+        library.apps.iter().find(|app| app.id == app_id).cloned()
+    }
+
+    fn find_session(&self, session_id: &str) -> Option<RemoteSession> {
+        let library = self.library.as_ref()?;
+        library
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .cloned()
     }
 
     /// What this server lets the user launch with, from the loaded Library.
@@ -755,16 +849,16 @@ impl Launcher {
                     this.busy = None;
                     match result {
                         Ok(session) => {
-                            if let Some(library) = &mut this.library {
+                            this.edit_library(|library| {
                                 library.sessions.insert(0, session.clone());
                                 if session.home.starts_with("auto-")
                                     && !library.homes.contains(&session.home)
                                 {
                                     library.homes.push(session.home.clone());
                                 }
-                            }
+                            });
                             if let Some(selection) = &remember {
-                                this.remember_launch(&app_id, selection);
+                                this.remember_launch(&app_id, selection, cx);
                             }
                             this.open_session(session, window, cx);
                         }
@@ -779,7 +873,12 @@ impl Launcher {
     }
 
     /// Keeps `selection` as the options `app_id` opens with next time (saved per server).
-    fn remember_launch(&mut self, app_id: &str, selection: &LaunchSelection) {
+    fn remember_launch(
+        &mut self,
+        app_id: &str,
+        selection: &LaunchSelection,
+        cx: &mut Context<Self>,
+    ) {
         let Some(api) = &self.api else {
             return;
         };
@@ -788,14 +887,18 @@ impl Launcher {
             .launch
             .insert(app_id.to_string(), memory.clone());
         let app_id = app_id.to_string();
-        // Re-read first so a session window's saved codec or input changes survive (ARCH-022).
-        if settings::update(api.server(), |p| {
-            p.launch.insert(app_id, memory);
-        })
-        .is_err()
-        {
-            self.status = Some("Couldn’t save this app’s launch options.".into());
-        }
+        // The queue re-reads first, so a session window's saved codec or input changes
+        // survive (ARCH-022).
+        let done = cx
+            .global::<WriteQueue>()
+            .preferences(api.server(), move |p| {
+                p.launch.insert(app_id, memory);
+            });
+        self.on_written(
+            done,
+            |this, _| this.status = Some("Couldn’t save this app’s launch options.".into()),
+            cx,
+        );
     }
 
     fn stop_session(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
@@ -817,13 +920,13 @@ impl Launcher {
                 this.busy = None;
                 match result {
                     Ok(()) => {
-                        if let Some(library) = &mut this.library {
+                        this.edit_library(|library| {
                             library
                                 .sessions
                                 .retain(|s| s.session_id != session.session_id);
-                        }
+                        });
                         if let Some(image) = this.session_thumbnails.remove(&session.session_id) {
-                            this.retired_images.push(image);
+                            this.retire(image);
                         }
                     }
                     Err(error) => this.status = Some(error),
@@ -971,52 +1074,27 @@ impl Render for Launcher {
             );
         };
 
+        // Built after the retired textures were dropped above and before any element uses
+        // them, so no cached item hands a freed texture to `img` (`ARCH-014`).
+        let (apps, sessions) = self.items.get(|| {
+            build_items(
+                library,
+                &self.app_icons,
+                &self.session_thumbnails,
+                unix_now(),
+            )
+        });
         let props = LibraryProps {
             app_name: APP_NAME.to_string(),
             server: api.server().to_string(),
-            apps: library
-                .apps
-                .iter()
-                .map(|app| AppItem {
-                    id: app.id.clone(),
-                    name: app.name.clone(),
-                    categories: if app.kind.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![app.kind.clone()]
-                    },
-                    recent: false,
-                    icon: self.app_icons.get(&app.id).cloned(),
-                })
-                .collect(),
-            sessions: library
-                .sessions
-                .iter()
-                .map(|session| SessionItem {
-                    id: session.session_id.clone(),
-                    app_name: session.app_name.clone(),
-                    started_label: format_started_ago(session.created_at),
-                    gpu: session.gpu,
-                    // No home means a cleanroom session; label it so every card shows its
-                    // storage and the cards line up.
-                    storage_label: Some(if session.home.is_empty() {
-                        "Cleanroom".to_string()
-                    } else {
-                        session.home.clone()
-                    }),
-                    thumbnail: self.session_thumbnails.get(&session.session_id).cloned(),
-                    app_icon: self.app_icons.get(&session.app_id).cloned(),
-                })
-                .collect(),
+            apps,
+            sessions,
             search_query: self.search_input.read(cx).value().to_string(),
             selected_filter: self.selected_filter.clone(),
             status: self.status.clone(),
             busy: self.busy.clone(),
         };
 
-        let apps_by_id = library.apps.clone();
-        let sessions_by_id = library.sessions.clone();
-        let sessions_for_stop = library.sessions.clone();
         let launcher_for_launch = cx.entity().clone();
         let launcher_for_resume = cx.entity().clone();
         let launcher_for_stop = cx.entity().clone();
@@ -1045,33 +1123,27 @@ impl Render for Launcher {
                     on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(cx))),
                     on_forget: Box::new(cx.listener(|this, _, _, cx| this.forget(cx))),
                     on_launch: Rc::new(move |app_id, window, cx| {
-                        if let Some(app) = apps_by_id.iter().find(|a| a.id == app_id).cloned() {
-                            launcher_for_launch
-                                .update(cx, |this, cx| this.open_launch_dialog(app, window, cx));
-                        }
+                        launcher_for_launch.update(cx, |this, cx| {
+                            if let Some(app) = this.find_app(&app_id) {
+                                this.open_launch_dialog(app, window, cx);
+                            }
+                        });
                     }),
                     on_resume: Rc::new(move |session_id, window, cx| {
-                        if let Some(session) = sessions_by_id
-                            .iter()
-                            .find(|s| s.session_id == session_id)
-                            .cloned()
-                        {
-                            launcher_for_resume
-                                .update(cx, |this, cx| this.open_session(session, window, cx));
-                        }
+                        launcher_for_resume.update(cx, |this, cx| {
+                            if let Some(session) = this.find_session(&session_id) {
+                                this.open_session(session, window, cx);
+                            }
+                        });
                     }),
                     on_stop: Some(Rc::new(move |session_id, window, cx| {
-                        if let Some(session) = sessions_for_stop
-                            .iter()
-                            .find(|s| s.session_id == session_id)
-                            .cloned()
-                        {
-                            launcher_for_stop.update(cx, |this, cx| {
+                        launcher_for_stop.update(cx, |this, cx| {
+                            if let Some(session) = this.find_session(&session_id) {
                                 this.pending_stop = Some(session);
                                 window.focus(&this.focus_handle, cx);
                                 cx.notify();
-                            });
-                        }
+                            }
+                        });
                     })),
                     on_select_filter: Rc::new(move |filter, _, cx| {
                         launcher_for_filter.update(cx, |this, cx| {
@@ -1162,11 +1234,85 @@ fn decode_image(bytes: &[u8], max_edge: u32) -> Option<Arc<RenderImage>> {
     )])))
 }
 
+/// The Library's cards and tiles, built once and shared until the Library, an icon or a
+/// thumbnail changes (or the age tick asks for fresh "Started … ago" labels).
+#[derive(Default)]
+struct ItemCache {
+    items: Option<(Rc<[AppItem]>, Rc<[SessionItem]>)>,
+}
+
+impl ItemCache {
+    fn invalidate(&mut self) {
+        self.items = None;
+    }
+
+    fn get(
+        &mut self,
+        build: impl FnOnce() -> (Rc<[AppItem]>, Rc<[SessionItem]>),
+    ) -> (Rc<[AppItem]>, Rc<[SessionItem]>) {
+        self.items.get_or_insert_with(build).clone()
+    }
+}
+
+fn build_items(
+    library: &Library,
+    icons: &HashMap<String, Arc<RenderImage>>,
+    thumbnails: &HashMap<String, Arc<RenderImage>>,
+    now: u64,
+) -> (Rc<[AppItem]>, Rc<[SessionItem]>) {
+    let apps = library
+        .apps
+        .iter()
+        .map(|app| AppItem {
+            id: app.id.clone(),
+            name: app.name.clone(),
+            categories: if app.kind.is_empty() {
+                Vec::new()
+            } else {
+                vec![app.kind.clone()]
+            },
+            recent: false,
+            icon: icons.get(&app.id).cloned(),
+        })
+        .collect();
+    let sessions = library
+        .sessions
+        .iter()
+        .map(|session| SessionItem {
+            id: session.session_id.clone(),
+            app_name: session.app_name.clone(),
+            started_label: format_started_ago_at(session.created_at, now),
+            gpu: session.gpu,
+            // No home means a cleanroom session; label it so every card shows its
+            // storage and the cards line up.
+            storage_label: Some(if session.home.is_empty() {
+                "Cleanroom".to_string()
+            } else {
+                session.home.clone()
+            }),
+            thumbnail: thumbnails.get(&session.session_id).cloned(),
+            app_icon: icons.get(&session.app_id).cloned(),
+        })
+        .collect();
+    (apps, sessions)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[cfg(test)]
 fn format_started_ago(created_at: f64) -> Option<String> {
+    format_started_ago_at(created_at, unix_now())
+}
+
+/// "Started … ago" for a session created at `created_at` (Unix seconds), seen at `now`.
+fn format_started_ago_at(created_at: f64, now: u64) -> Option<String> {
     if created_at <= 0.0 {
         return None;
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let elapsed = now.saturating_sub(created_at as u64);
     let label = if elapsed < 60 {
         "Just started".to_string()
@@ -1238,5 +1384,57 @@ mod tests {
             format_started_ago(now - 172_800.0).as_deref(),
             Some("Started 2 days ago")
         );
+    }
+
+    #[test]
+    fn format_started_ago_at_ticks_by_minute() {
+        let created = 1_000_000.0;
+        let at = |elapsed: u64| format_started_ago_at(created, 1_000_000 + elapsed);
+        assert_eq!(at(59).as_deref(), Some("Just started"));
+        assert_eq!(at(60).as_deref(), Some("Started 1m ago"));
+        assert_eq!(at(119).as_deref(), Some("Started 1m ago"));
+        assert_eq!(at(120).as_deref(), Some("Started 2m ago"));
+        assert_eq!(at(3_599).as_deref(), Some("Started 59m ago"));
+        assert_eq!(at(3_600).as_deref(), Some("Started 1h ago"));
+        assert_eq!(at(86_399).as_deref(), Some("Started 23h ago"));
+        assert_eq!(at(86_400).as_deref(), Some("Started 1 day ago"));
+        assert_eq!(at(172_799).as_deref(), Some("Started 1 day ago"));
+        assert_eq!(at(172_800).as_deref(), Some("Started 2 days ago"));
+        // Clock skew: a session "from the future" has just started.
+        assert_eq!(
+            format_started_ago_at(created, 999_000).as_deref(),
+            Some("Just started")
+        );
+    }
+
+    fn library_with_one_session() -> Library {
+        Library {
+            apps: Vec::new(),
+            sessions: vec![serde_json::from_value(serde_json::json!({
+                "session_id": "s1",
+                "app_id": "zen",
+                "app_name": "Zen",
+                "session_url": "/s1/",
+                "created_at": 1_000.0,
+            }))
+            .unwrap()],
+            status: Default::default(),
+            homes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn library_items_rebuild_only_when_dirty() {
+        let library = library_with_one_session();
+        let none = HashMap::new();
+        let mut cache = ItemCache::default();
+        let build = || build_items(&library, &none, &none, 1_000);
+        let (_, first) = cache.get(build);
+        let (_, again) = cache.get(build);
+        assert!(Rc::ptr_eq(&first, &again));
+        cache.invalidate();
+        let (_, rebuilt) = cache.get(build);
+        assert!(!Rc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt[0].started_label.as_deref(), Some("Just started"));
     }
 }

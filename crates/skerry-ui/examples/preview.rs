@@ -1356,7 +1356,8 @@ impl PreviewApp {
                             recent: false,
                             icon: Some(Arc::clone(&self.assets.icon_firefox)),
                         },
-                    ],
+                    ]
+                    .into(),
                     sessions: vec![
                         SessionItem {
                             id: "sess-zen".into(),
@@ -1376,7 +1377,8 @@ impl PreviewApp {
                             thumbnail: Some(Arc::clone(&self.assets.thumb_lightcraft)),
                             app_icon: Some(Arc::clone(&self.assets.icon_lightcraft)),
                         },
-                    ],
+                    ]
+                    .into(),
                     search_query: self.search_input.read(cx).value().to_string(),
                     selected_filter: self.selected_filter.clone(),
                     status: None,
@@ -1409,8 +1411,8 @@ impl PreviewApp {
                 let props = LibraryProps {
                     app_name: "SealSkin Native".into(),
                     server: "sealskin.example.internal".into(),
-                    apps: vec![],
-                    sessions: vec![],
+                    apps: Rc::from([]),
+                    sessions: Rc::from([]),
                     search_query: self.search_input.read(cx).value().to_string(),
                     selected_filter: self.selected_filter.clone(),
                     status: None,
@@ -1428,8 +1430,9 @@ impl PreviewApp {
                         categories: vec!["browser".into()],
                         recent: true,
                         icon: None,
-                    }],
-                    sessions: vec![],
+                    }]
+                    .into(),
+                    sessions: Rc::from([]),
                     search_query: self.search_input.read(cx).value().to_string(),
                     selected_filter: self.selected_filter.clone(),
                     status: Some("Previous launch timed out; retrying connection.".into()),
