@@ -168,6 +168,10 @@ pub(super) struct SessionWindow {
     pub(super) apps_window: Option<(AnyWindowHandle, Entity<AppsWindow>)>,
     /// What this stream's `server_settings` allows Apps; `None` while disconnected.
     pub(super) apps_policy: Option<crate::apps::Policy>,
+    /// Whether this stream's Selkies answers the apps protocol; reset on reconnect.
+    apps_probe: crate::apps::Probe,
+    /// An Apps window open is deferred: a second toggle must not open another.
+    apps_opening: bool,
     pub(super) dpi_override: Option<u16>,
     ui_scale: display::UiScale,
     pub(super) applied_resolution: Option<DisplayRequest>,
@@ -258,6 +262,8 @@ impl SessionWindow {
             file_policy: None,
             apps_window: None,
             apps_policy: None,
+            apps_probe: crate::apps::Probe::default(),
+            apps_opening: false,
             dpi_override: None,
             ui_scale: display::UiScale::default(),
             applied_resolution: None,
@@ -531,11 +537,22 @@ impl SessionWindow {
                 if let Some((_, apps)) = &self.apps_window {
                     apps.update(cx, |apps, cx| apps.set_policy(policy, cx));
                 }
+                if let Some(generation) = self.apps_probe.on_policy(policy, Instant::now()) {
+                    self.probe_apps(generation, cx);
+                }
                 if changed {
                     cx.notify();
                 }
             }
             SessionEvent::Apps(event) => {
+                if !matches!(event, crate::apps::Event::CommandError(_))
+                    && self.apps_probe.on_answer()
+                {
+                    if let Some((_, apps)) = &self.apps_window {
+                        apps.update(cx, |apps, cx| apps.set_too_old(false, cx));
+                    }
+                    cx.notify();
+                }
                 // Ignored while no Apps window is open: opening one lists the whole state.
                 if let Some((_, apps)) = &self.apps_window {
                     apps.update(cx, |apps, cx| apps.receive(event, cx));
@@ -1158,9 +1175,43 @@ impl SessionWindow {
         });
     }
 
+    /// Asks the stream for `list` and waits [`crate::apps::PROBE_TIMEOUT`] for `apps_state`:
+    /// a Selkies older than the apps protocol never answers, and Apps stays hidden for it.
+    fn probe_apps(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if let Some(list) = crate::apps::request(crate::apps::Op::List, None, None) {
+            self.send_apps(list);
+        }
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(crate::apps::PROBE_TIMEOUT)
+                .await;
+            let _ = window.update(cx, |_, _, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    if this.apps_probe.on_timeout(generation, Instant::now()) {
+                        if let Some((_, apps)) = &this.apps_window {
+                            apps.update(cx, |apps, cx| apps.set_too_old(true, cx));
+                        }
+                        cx.notify();
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Apps is offered: the server allows it and answered the support probe.
+    pub(super) fn apps_available(&self) -> bool {
+        self.apps_policy.is_some_and(|policy| policy.allowed) && self.apps_probe.supported()
+    }
+
     /// Opens the session's Apps window, or brings it forward (`ARCH-035`). Only opens; it
     /// doesn't close an open window, as Files.
     pub(super) fn toggle_apps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apps_opening {
+            // A deferred open is on its way: never a second window.
+            return;
+        }
         if let Some((handle, _)) = &self.apps_window {
             if handle
                 .update(cx, |_, window, _| window.activate_window())
@@ -1173,11 +1224,16 @@ impl SessionWindow {
         if self.current.is_none() {
             return;
         }
-        let Some(policy) = self.apps_policy.filter(|policy| policy.allowed) else {
-            self.status = Some(if self.apps_policy.is_none() {
-                "Apps are available once the session has connected.".into()
-            } else {
-                "The server doesn’t allow installing apps in this session.".into()
+        let Some(policy) = self.apps_policy.filter(|_| self.apps_available()) else {
+            self.status = Some(match self.apps_policy {
+                None => "Apps are available once the session has connected.".into(),
+                Some(policy) if !policy.allowed => {
+                    "The server doesn’t allow installing apps in this session.".into()
+                }
+                Some(_) if self.apps_probe.unsupported() => {
+                    "This session’s Selkies is too old for the Apps catalog.".into()
+                }
+                Some(_) => "Checking whether this session supports Apps…".into(),
             });
             cx.notify();
             return;
@@ -1193,14 +1249,16 @@ impl SessionWindow {
         let rt = self.rt.clone();
         let owner_window = Window::window_handle(window);
         let session = cx.entity();
+        self.apps_opening = true;
         cx.defer(move |cx| {
-            let _ = owner_window.update(cx, |_, window, cx| {
+            let opened = owner_window.update(cx, |_, window, cx| {
                 let owner = AppsOwner {
                     window: owner_window,
                     session: session.downgrade(),
                 };
                 let result = AppsWindow::open(source, rt, window, owner, cx);
                 session.update(cx, |session, cx| {
+                    session.apps_opening = false;
                     match result {
                         Ok(apps) => session.apps_window = Some(apps),
                         Err(_) => session.status = Some("Couldn’t open Apps.".into()),
@@ -1208,6 +1266,10 @@ impl SessionWindow {
                     cx.notify();
                 });
             });
+            if opened.is_err() {
+                // The session window went away first.
+                session.update(cx, |session, _| session.apps_opening = false);
+            }
         });
     }
 
@@ -1325,6 +1387,7 @@ impl SessionWindow {
         self.close_files(cx);
         // Apps stays open across a reconnect, waiting (`ARCH-035`); teardown closes it.
         self.apps_policy = None;
+        self.apps_probe.reset();
         if let Some((_, apps)) = &self.apps_window {
             apps.update(cx, |apps, cx| apps.disconnect(cx));
         }
@@ -1839,9 +1902,12 @@ impl Render for SessionWindow {
             .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
                 this.toggle_files(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ToggleApps, window, cx| {
-                this.toggle_apps(window, cx);
-            }))
+            // Only while Apps is offered, so View → Apps is disabled otherwise.
+            .when(self.apps_available(), |root| {
+                root.on_action(cx.listener(|this, _: &ToggleApps, window, cx| {
+                    this.toggle_apps(window, cx);
+                }))
+            })
             .on_action(
                 cx.listener(|this, _: &DisconnectSession, window, cx| this.disconnect(window, cx)),
             )

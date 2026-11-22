@@ -666,7 +666,7 @@ impl ControlPanel {
                     std::time::Instant::now(),
                 )
             }),
-            apps_available: session.apps_policy.is_some_and(|policy| policy.allowed),
+            apps_available: session.apps_available(),
         }
     }
 }

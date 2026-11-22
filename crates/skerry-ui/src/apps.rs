@@ -191,6 +191,8 @@ pub enum CatalogView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Banner {
     Waiting,
+    /// The session's Selkies predates the apps protocol.
+    TooOld,
     CommandsDisabled,
     InstalledUnknown,
 }
@@ -199,6 +201,7 @@ impl Banner {
     pub fn text(self) -> &'static str {
         match self {
             Banner::Waiting => "Waiting for the session…",
+            Banner::TooOld => "This session’s Selkies is too old for the Apps catalog.",
             Banner::CommandsDisabled => {
                 "App installation is unavailable: remote commands are disabled on this server."
             }

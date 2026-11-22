@@ -116,7 +116,8 @@ enum IconState {
 /// Where the catalog and icons come from.
 #[derive(Clone)]
 enum Fetcher {
-    Remote(reqwest::Client),
+    /// `None`: the restricted client couldn't be built, so nothing is fetched.
+    Remote(Option<reqwest::Client>),
     Local(SelkiesClient),
 }
 
@@ -125,8 +126,11 @@ pub(super) struct AppsWindow {
     rt: Handle,
     server: String,
     link: apps::Link,
+    /// The session's Selkies never answered `list` (`apps::Probe`): nothing is sent.
+    too_old: bool,
     selkies: Option<SelkiesClient>,
-    plain: reqwest::Client,
+    /// `None` if it couldn't be built: GitHub is then never asked.
+    plain: Option<reqwest::Client>,
     board: Board,
     /// Bumped by every board change, so the console text is rebuilt only then.
     board_version: u64,
@@ -288,6 +292,7 @@ impl AppsWindow {
                         rt,
                         server: source.server,
                         link: apps::Link::default(),
+                        too_old: false,
                         selkies: source.selkies,
                         plain: apps::plain_client(),
                         board: Board::default(),
@@ -322,8 +327,11 @@ impl AppsWindow {
                         reveal_selection: false,
                     };
                     this.load_catalog(false, cx);
-                    // The stream is up and allows Apps (checked by the session): list now.
+                    // The stream is up, allows Apps, and answers `list` (checked by the
+                    // session): opening lists the whole state. A reconnect's list is the
+                    // session's support probe, whose answer reaches this window.
                     this.set_policy(source.policy, cx);
+                    this.send(Op::List, None, None, cx);
                     this
                 });
                 window.on_window_should_close(cx, move |_, cx| {
@@ -349,9 +357,6 @@ impl AppsWindow {
     /// catalog source reloads the catalog and starts the icons over.
     pub(super) fn set_policy(&mut self, policy: Policy, cx: &mut Context<Self>) {
         let change = self.link.on_policy(policy);
-        if change.list {
-            self.send(Op::List, None, None, cx);
-        }
         if change.source_changed || policy.local_repo != self.catalog_local {
             self.catalog_local = policy.local_repo;
             self.reset_icons();
@@ -365,6 +370,20 @@ impl AppsWindow {
     /// The session's file routes (and so its local catalog) for the current stream.
     pub(super) fn set_access(&mut self, access: Option<SelkiesClient>, cx: &mut Context<Self>) {
         self.selkies = access;
+        if self.selkies.is_some() && self.catalog_local {
+            // Icons that failed for want of the session get another go.
+            let failed: Vec<String> = self
+                .icons
+                .iter()
+                .filter(|(_, state)| matches!(state, IconState::Failed))
+                .map(|(icon, _)| icon.clone())
+                .collect();
+            for icon in failed {
+                self.icons.remove(&icon);
+                self.icon_queue.forget(&icon);
+            }
+            cx.notify();
+        }
         if self.catalog_local && !matches!(self.catalog, CatalogState::Ready(_)) {
             self.load_catalog(false, cx);
         }
@@ -373,6 +392,8 @@ impl AppsWindow {
     /// The stream ended: the window stays, waiting, with nothing pending (`ARCH-035`).
     pub(super) fn disconnect(&mut self, cx: &mut Context<Self>) {
         self.link.on_disconnect();
+        // The next stream probes again.
+        self.too_old = false;
         self.board = Board::default();
         self.board_version += 1;
         self.state_seen = false;
@@ -381,6 +402,18 @@ impl AppsWindow {
         self.last_launch = None;
         self.selkies = None;
         cx.notify();
+    }
+
+    /// The session's support probe settled: the server never answered `list`.
+    pub(super) fn set_too_old(&mut self, too_old: bool, cx: &mut Context<Self>) {
+        if self.too_old != too_old {
+            self.too_old = too_old;
+            cx.notify();
+        }
+    }
+
+    fn can_send(&self) -> bool {
+        self.link.can_send() && !self.too_old
     }
 
     /// An apps event from the stream, already parsed on Tokio.
@@ -416,7 +449,7 @@ impl AppsWindow {
 
     /// Sends one request through the gate; `false` when it didn't go.
     fn send(&mut self, op: Op, app: Option<&str>, id: Option<u64>, cx: &mut Context<Self>) -> bool {
-        if !self.link.can_send() {
+        if !self.can_send() {
             return false;
         }
         let Some(request) = apps::request(op, app, id) else {
@@ -500,7 +533,7 @@ impl AppsWindow {
     }
 
     fn primary(&mut self, app: &str, cx: &mut Context<Self>) {
-        if self.busy(app) || !self.link.can_send() {
+        if self.busy(app) || !self.can_send() {
             return;
         }
         if self.board.is_installed(app) {
@@ -512,7 +545,7 @@ impl AppsWindow {
 
     /// Remove… asks first, in a native warning alert.
     fn confirm_remove(&mut self, app: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy(&app) || !self.link.can_send() || !self.board.is_installed(&app) {
+        if self.busy(&app) || !self.can_send() || !self.board.is_installed(&app) {
             return;
         }
         let name = self.full_name(&app);
@@ -583,6 +616,7 @@ impl AppsWindow {
         let pending = self.rt.spawn(async move {
             let bytes = match fetcher {
                 Fetcher::Remote(client) => {
+                    let client = client.ok_or("no HTTPS client")?;
                     apps::fetch_capped(
                         &client,
                         apps::remote_catalog_url(),
@@ -731,6 +765,10 @@ impl AppsWindow {
             if icon.is_empty() || self.icons.contains_key(&icon) {
                 continue;
             }
+            if self.catalog_local && self.selkies.is_none() {
+                // Asked again once the session's routes are back.
+                continue;
+            }
             if apps::icon_path(&icon).is_none() {
                 self.icons.insert(icon, IconState::Failed);
                 continue;
@@ -761,6 +799,7 @@ impl AppsWindow {
                 };
                 let bytes = match fetcher {
                     Fetcher::Remote(client) => {
+                        let client = client?;
                         let url = apps::remote_icon_url(&path)?;
                         apps::fetch_capped(&client, url, apps::ICON_CAP, apps::ICON_TIMEOUT)
                             .await
@@ -774,6 +813,10 @@ impl AppsWindow {
                 // The permit goes with the decode, so a decode the watchdog gave up on still
                 // holds its slot until it really ends.
                 let permit = decodes.acquire_owned().await.ok()?;
+                // A watchdog may have tripped while this load waited for its slot.
+                if svg && svg_stopped.load(Ordering::Relaxed) {
+                    return None;
+                }
                 let decode = tokio::task::spawn_blocking(move || {
                     let _permit = permit;
                     apps::decode_icon(&bytes, svg)
@@ -928,7 +971,7 @@ impl AppsWindow {
     // ---- Props -----------------------------------------------------------------------
 
     fn props(&mut self, window: &Window) -> AppsProps {
-        let enabled = self.link.can_send();
+        let enabled = self.can_send();
         let width = window.viewport_size().width;
         let (source_width, inspector_width) = ui::pane_widths(width);
         self.columns = ui::columns(width - px(source_width + inspector_width + 2.));
@@ -1030,6 +1073,8 @@ impl AppsWindow {
             .collect();
         let banner = if !self.link.connected() {
             Some(Banner::Waiting)
+        } else if self.too_old {
+            Some(Banner::TooOld)
         } else if !enabled {
             Some(Banner::CommandsDisabled)
         } else if self.state_seen && self.board.installed.is_none() {
