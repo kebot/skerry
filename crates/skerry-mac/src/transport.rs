@@ -5,7 +5,6 @@ use crate::selkies;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
 use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::{SinkExt, StreamExt};
 use gpui_kit::RenderImage;
 use image::{ImageFormat, ImageReader};
 use reqwest::Url;
@@ -19,6 +18,12 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, protocol::WebSocketConfig, Message,
 };
+
+mod role;
+
+use role::Wire;
+#[allow(unused_imports)]
+pub use role::{DisplayConfig, Kill, LayoutRect, Side, StreamRole};
 
 const MAX_WIDTH: u16 = 4096;
 const MAX_HEIGHT: u16 = 2160;
@@ -614,6 +619,10 @@ pub enum SessionEvent {
     Apps(crate::apps::Event),
     /// What `server_settings` allows the Apps window (`ARCH-035`).
     AppsPolicy(crate::apps::Policy),
+    /// The server ended the stream with `KILL <reason>` (`ARCH-039`).
+    Killed(Kill),
+    /// The server's display arrangement, from `DISPLAY_CONFIG_UPDATE` (`ARCH-039`).
+    DisplayLayout(DisplayConfig),
 }
 
 /// The action of a `system,{"action": "<action>"}` frame; `None` for anything else.
@@ -702,6 +711,9 @@ pub enum Input {
     Stats(bool),
     /// Gamepad slots another window drives now: forgotten here, nothing sent (`ARCH-032`).
     ForgetPads(Vec<u8>),
+    /// Display 2 moved to this side (`ARCH-039`): later frames carry it, and the server is
+    /// told now with a `SETTINGS` (and the resize, if any). Ignored by a primary.
+    Position(Side, Option<DisplayRequest>),
     /// End the stream: release every held key, then send a close frame (`ARCH-GAP-DC-09`).
     Close,
 }
@@ -716,10 +728,16 @@ fn closing_commands(
     held: &BTreeSet<u32>,
     pointer: PointerLock,
     pads: &mut crate::gamepad::JsTracker,
+    role: StreamRole,
 ) -> Vec<String> {
-    // Every announced gamepad slot first (`ARCH-032`).
-    let mut commands: Vec<String> = pads.closing();
-    if pointer.locked {
+    // Every announced gamepad slot first (`ARCH-032`). Display 2 never drives pads or the
+    // capture, so it releases only its keys (`ARCH-039`).
+    let mut commands: Vec<String> = if role.is_primary() {
+        pads.closing()
+    } else {
+        Vec::new()
+    };
+    if pointer.locked && role.is_primary() {
         commands.extend(["p,0".into(), "SET_NATIVE_CURSOR_RENDERING,0".into()]);
         if pointer.buttons != 0 {
             commands.push("m2,0,0,0,0".into());
@@ -846,14 +864,18 @@ pub struct SessionOptions {
     pub audio_output: Option<String>,
     /// The saved audio bitrate (bps), requested once ready if the server offers it.
     pub audio_bitrate: Option<u32>,
+    /// The display this stream claims: the session window's, or Display 2 (`ARCH-039`).
+    pub role: StreamRole,
 }
 
 /// Why a stream ended with an error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunError {
     /// The session kept answering like one still starting until the grace ran out: it
     /// may still be booting, so the window offers Retry and Keep Waiting.
     StartupTimeout,
+    /// The server sent `KILL <reason>`: no retry (`ARCH-039`).
+    Killed(Kill),
     Other(&'static str),
 }
 
@@ -861,6 +883,7 @@ impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StartupTimeout => f.write_str("The session hasn’t answered yet."),
+            Self::Killed(kill) => kill.fmt(f),
             Self::Other(message) => f.write_str(message),
         }
     }
@@ -956,15 +979,6 @@ fn print_event(data: &Value) -> Option<SessionEvent> {
     print_jobs::Announcement::parse(data).map(SessionEvent::PrintDocument)
 }
 
-fn finger_scroll_capability(text: &str) -> Option<bool> {
-    let payload = text.strip_prefix("DISPLAY_CONFIG_UPDATE,").unwrap_or(text);
-    let data: Value = serde_json::from_str(payload).ok()?;
-    if data["type"] != "display_config_update" {
-        return None;
-    }
-    Some(data["finger_scroll"].as_bool().unwrap_or(false))
-}
-
 /// Runs `work` unless the stream is cancelled first (`None`). A dropped sender counts as
 /// cancelled: the session that owned it is gone.
 async fn unless_cancelled<T>(
@@ -984,7 +998,7 @@ async fn unless_cancelled<T>(
 pub async fn run(
     url: Url,
     frames: watch::Sender<Frame>,
-    mut input: mpsc::UnboundedReceiver<Input>,
+    input: mpsc::UnboundedReceiver<Input>,
     pointer: watch::Receiver<Option<Pointer>>,
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
@@ -994,14 +1008,14 @@ pub async fn run(
         return Ok(());
     };
     let (template, access) = requested?;
-    if let Some(access) = access {
+    if let Some(access) = access.filter(|_| options.role.is_primary()) {
         let _ = events.send(SessionEvent::Files(access));
     }
     let config = WebSocketConfig::default().max_message_size(Some(16 * 1024 * 1024));
     // A just-launched session answers 404/5xx or refuses connections until Selkies is up, so
     // keep retrying transient failures for a while instead of failing the first attempt.
     let give_up = Instant::now() + options.startup_grace;
-    let mut socket = loop {
+    let socket = loop {
         let mut request = template
             .uri()
             .clone()
@@ -1031,6 +1045,20 @@ pub async fn run(
             Retry::Fail => return Err("Couldn’t connect to the Selkies WebSocket.".into()),
         }
     };
+    let socket = Wire::new(socket, options.role);
+    stream(socket, frames, input, pointer, options, events, cancel).await
+}
+
+/// The stream on an open socket: the claim, then the loop until it ends.
+async fn stream(
+    mut socket: Wire,
+    frames: watch::Sender<Frame>,
+    mut input: mpsc::UnboundedReceiver<Input>,
+    pointer: watch::Receiver<Option<Pointer>>,
+    options: SessionOptions,
+    events: &mpsc::UnboundedSender<SessionEvent>,
+    cancel: watch::Receiver<bool>,
+) -> Result<(), RunError> {
     let mut codec = if options.codec.supported() {
         options.codec
     } else {
@@ -1050,7 +1078,7 @@ pub async fn run(
     settings["encoderFallback"] = json!(true);
     settings["video_10bit"] = json!(false);
     settings["video_fullcolor"] = json!(false);
-    settings["displayId"] = json!("primary");
+    options.role.claim(&mut settings);
     settings["audioRedundancy"] = json!(false);
     let disconnected = "The Selkies stream disconnected. Choose Reconnect to resume.";
     if *cancel.borrow() {
@@ -1119,6 +1147,8 @@ pub async fn run(
             biased;
             command = input.recv() => {
                 let text = match command {
+                    // Gamepads stay on the primary's stream (`ARCH-039`).
+                    Some(Input::Command(text)) if !socket.role().is_primary() && text.starts_with("js,") => continue,
                     Some(Input::Command(text)) => text,
                     Some(Input::Pointer(position)) => {
                         let Some(text) = position.command_for(active_size) else { continue; };
@@ -1138,6 +1168,21 @@ pub async fn run(
                             video.deadline = enabled.then(|| Instant::now() + WAIT_FOR_VIDEO);
                         }
                         if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
+                    }
+                    // Display 2 has no audio, stats, colour scheme or DPI: those stay on the
+                    // primary (`ARCH-039`).
+                    Some(Input::Audio(_) | Input::AudioOutput(_) | Input::AudioBitrate(_) | Input::Stats(_) | Input::Appearance(_) | Input::Screen(ScreenChange::Dpi(_)))
+                        if !socket.role().is_primary() => continue,
+                    Some(Input::Position(side, request)) => {
+                        if socket.role().is_primary() { continue; }
+                        socket.set_side(side);
+                        let settings = request.map_or_else(|| json!({}), DisplayRequest::settings);
+                        socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
+                        if let Some(request) = request {
+                            let command = socket.role().resize_command(request.resolution);
+                            socket.send(command).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
                     }
                     Some(Input::Audio(enabled)) => {
                         if let Some(audio) = &mut audio { audio.clear(); }
@@ -1172,11 +1217,12 @@ pub async fn run(
                         continue;
                     }
                     Some(Input::Resolution(request)) => {
-                        if resize_allowed {
-                            let Resolution(width, height) = request.resolution;
+                        // Display 2 always resizes, as the web's does (`ARCH-039`).
+                        if resize_allowed || !socket.role().is_primary() {
                             let settings = request.settings();
-                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
-                            socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
+                            socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
+                            let command = socket.role().resize_command(request.resolution);
+                            socket.send(command).await.map_err(|_| disconnected)?;
                         }
                         continue;
                     }
@@ -1210,7 +1256,7 @@ pub async fn run(
                     // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
                     // an explicit close: release held keys, then close cleanly.
                     Some(Input::Close) | None => {
-                        for command in closing_commands(&held, pointer_lock, &mut pads) {
+                        for command in closing_commands(&held, pointer_lock, &mut pads, socket.role()) {
                             trace_input(&command);
                             let _ = socket.send(command.into()).await;
                         }
@@ -1229,7 +1275,7 @@ pub async fn run(
                 trace_input(&text);
                 socket.send(text.into()).await.map_err(|_| disconnected)?;
             }
-            _ = pad_heartbeat.tick(), if pads.active() => {
+            _ = pad_heartbeat.tick(), if pads.active() && socket.role().is_primary() => {
                 for text in pads.heartbeat() {
                     socket.send(text.into()).await.map_err(|_| disconnected)?;
                 }
@@ -1316,6 +1362,12 @@ pub async fn run(
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
+                    // Before anything else: the 1008 close right behind it must not read as
+                    // a plain disconnect (`ARCH-039`).
+                    if let Some(kill) = role::kill_reason(&text) {
+                        trace_input_event("killed by the server");
+                        return Err(RunError::Killed(kill));
+                    }
                     if let Some(event) = system_frame(&text) {
                         if let Some(event) = event {
                             if matches!(event, SessionEvent::Rumble(_)) && input_trace_enabled() {
@@ -1334,16 +1386,20 @@ pub async fn run(
                     match clipboard_in.on_text(&text) {
                         clipboard::Frame::NotClipboard => {}
                         clipboard::Frame::Pending => continue,
+                        // Only the primary writes the Mac pasteboard (`ARCH-039`).
                         clipboard::Frame::Payload(payload) => {
-                            let _ = events.send(SessionEvent::Clipboard(payload));
+                            if socket.role().is_primary() {
+                                let _ = events.send(SessionEvent::Clipboard(payload));
+                            }
                             continue;
                         }
                     }
                     if text.starts_with("MODE ") && text != "MODE websockets" {
                         return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.".into());
                     }
-                    if let Some(finger_scroll) = finger_scroll_capability(&text) {
-                        let _ = events.send(SessionEvent::FingerScroll(finger_scroll));
+                    if let Some(config) = role::display_config(&text) {
+                        let _ = events.send(SessionEvent::FingerScroll(config.finger_scroll));
+                        let _ = events.send(SessionEvent::DisplayLayout(config));
                         continue;
                     }
                     if let Ok(data) = serde_json::from_str::<Value>(text.as_str()) {
@@ -1353,10 +1409,10 @@ pub async fn run(
                                     let _ = events.send(SessionEvent::StreamInfo(Box::new(info)));
                                 }
                             }
-                            Some("stream_stats") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
+                            Some("stream_stats") if socket.role().owns(&data, false) => {
                                 diagnostics.server = Some((Instant::now(), ServerFigures::parse(&data["stats"])));
                             }
-                            Some("stream_resolution") if data["displayId"].as_str().unwrap_or("primary") == "primary" => {
+                            Some("stream_resolution") if socket.role().owns(&data, false) => {
                                 let width = dimension(&data["width"])?;
                                 let height = dimension(&data["height"])?;
                                 if !valid_resolution(width, height) {
@@ -1373,15 +1429,21 @@ pub async fn run(
                                     frames.send_replace(frame.snapshot());
                                 }
                             }
-                            Some("server_settings") | Some("display_settings") if primary_display(&data) => {
+                            Some("server_settings") | Some("display_settings") if socket.role().owns(&data, data["type"] == "server_settings") => {
+                                let primary = socket.role().is_primary();
                                 if data["type"] == "display_settings" {
                                     capabilities.live(&data["settings"]);
                                 } else {
+                                    if !primary && data["settings"]["second_screen"]["value"].as_bool() == Some(false) {
+                                        return Err(RunError::Killed(Kill::Refused(role::SECOND_SCREEN_OFF.into())));
+                                    }
                                     capabilities.announce(&data["settings"]);
                                     let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
-                                    let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
-                                    let _ = events.send(SessionEvent::PrintPolicy(print_jobs::enabled(&data["settings"])));
-                                    let _ = events.send(SessionEvent::AppsPolicy(crate::apps::Policy::from_server(&data["settings"])));
+                                    if primary {
+                                        let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
+                                        let _ = events.send(SessionEvent::PrintPolicy(print_jobs::enabled(&data["settings"])));
+                                        let _ = events.send(SessionEvent::AppsPolicy(crate::apps::Policy::from_server(&data["settings"])));
+                                    }
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -1399,7 +1461,7 @@ pub async fn run(
                                     }
                                 }
                                 let _ = events.send(SessionEvent::Settings(capabilities.clone()));
-                                if data["type"] == "server_settings" {
+                                if data["type"] == "server_settings" && primary {
                                     if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
                                         socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
                                         sent_scheme = Some(scheme);
@@ -1407,10 +1469,13 @@ pub async fn run(
                                 }
                                 if data["type"] == "server_settings" && !ready {
                                     ready = true;
-                                    if diagnostics.stats_on {
+                                    // Display 2 sends only its video preferences: stats, the
+                                    // legacy defaults, the audio bitrate and audio are the
+                                    // primary's (`ARCH-039`).
+                                    if diagnostics.stats_on && primary {
                                         socket.send("_stats,1".into()).await.map_err(|_| disconnected)?;
                                     }
-                                    if let Some(legacy) = legacy_settings(&capabilities) {
+                                    if let Some(legacy) = legacy_settings(&capabilities).filter(|_| primary) {
                                         socket.send(legacy.into()).await.map_err(|_| disconnected)?;
                                     }
                                     if let Some((command, applied)) = settings_command(&capabilities, options.preferences.iter().copied()) {
@@ -1418,12 +1483,14 @@ pub async fn run(
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
-                                    if let Some((command, applied)) = options.audio_bitrate.and_then(|bps| audio_bitrate_command(&capabilities, bps)) {
+                                    if let Some((command, applied)) = options.audio_bitrate.filter(|_| primary).and_then(|bps| audio_bitrate_command(&capabilities, bps)) {
                                         socket.send(command.into()).await.map_err(|_| disconnected)?;
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
-                                    if data["settings"]["audio_enabled"]["value"].as_bool() == Some(false) {
+                                    if !primary {
+                                        // Display 2 never plays audio; the server sends it none.
+                                    } else if data["settings"]["audio_enabled"]["value"].as_bool() == Some(false) {
                                         let _ = events.send(SessionEvent::AudioUnavailable("Audio turned off by the server"));
                                     } else {
                                         let statuses = events.clone();
@@ -1438,7 +1505,8 @@ pub async fn run(
                                     }
                                 }
                             }
-                            Some("print_document") => {
+                            // Replayed to every socket on connect; documents are the primary's.
+                            Some("print_document") if socket.role().is_primary() => {
                                 if let Some(event) = print_event(&data) {
                                     let _ = events.send(event);
                                 }
@@ -1470,7 +1538,7 @@ pub async fn run(
                 let _ = events.send(SessionEvent::Stats(sample));
                 sample_start = now;
                 if ping.is_none() {
-                    socket.send(Message::Ping(b"sealskin-rtt".as_slice().into())).await.map_err(|_| disconnected)?;
+                    socket.ping(b"sealskin-rtt").await.map_err(|_| disconnected)?;
                     ping = Some(now);
                 }
             }
@@ -1571,10 +1639,6 @@ fn color_command(scheme: &str) -> String {
 fn allows_resize(settings: &Value) -> bool {
     settings["enable_resize"]["value"].as_bool().unwrap_or(true)
         && settings["manual_resolution"]["locked"].as_bool() != Some(true)
-}
-
-fn primary_display(data: &Value) -> bool {
-    data["displayId"].as_str().unwrap_or("primary") == "primary"
 }
 
 fn legacy_settings(settings: &Settings) -> Option<String> {
@@ -1784,6 +1848,366 @@ mod tests {
             waiting: String::new(),
             audio_output: None,
             audio_bitrate: None,
+            role: StreamRole::Primary,
+        }
+    }
+
+    /// What a fake Selkies saw and the stream raised, for the role tests (`ARCH-039`).
+    struct Played {
+        ended: Result<(), RunError>,
+        /// Every text frame the server received, the handshake first.
+        received: Vec<String>,
+        events: Vec<SessionEvent>,
+    }
+
+    /// The server's on-connect and live messages, as Selkies sends them to any socket.
+    fn selkies_script() -> Vec<String> {
+        vec![
+            json!({"type": "print_document", "name": "Report.pdf", "size_bytes": 3400}).to_string(),
+            json!({"type": "server_settings", "settings": {
+                "framerate": {"value": 30, "min": 15, "max": 60},
+                "audio_bitrate": {"value": "128000", "allowed": ["64000", "128000"]},
+                "color_scheme": {"value": "light", "allowed": ["light", "dark"]},
+                "scaling_dpi": {"value": 96, "allowed": ["96", "192"]},
+                "second_screen": {"value": true},
+                "printing_enabled": {"value": true},
+            }})
+            .to_string(),
+            r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","displays":["primary","display2"],"finger_scroll":false,"layouts":{"primary":{"x":0,"y":0,"w":1920,"h":1080},"display2":{"x":1920,"y":0,"w":1280,"h":720}}}"#.into(),
+            json!({"type": "server_settings", "displayId": "display2", "settings": {
+                "framerate": {"value": 30, "min": 15, "max": 60},
+                "second_screen": {"value": true},
+            }})
+            .to_string(),
+            json!({"type": "stream_resolution", "displayId": "primary", "width": 1920, "height": 1080}).to_string(),
+            json!({"type": "stream_resolution", "displayId": "display2", "width": 1280, "height": 720}).to_string(),
+        ]
+    }
+
+    /// Every `Input` a window can send, in the order the role tests drive them.
+    fn every_input() -> Vec<Input> {
+        vec![
+            Input::Settings(vec![(Key::Fps, 45)]),
+            Input::AudioBitrate(64_000),
+            Input::Screen(ScreenChange::Dpi(192)),
+            Input::Screen(ScreenChange::Alignment(true)),
+            Input::Resolution(DisplayRequest {
+                resolution: Resolution(1280, 720),
+                scale: Some(1.),
+            }),
+            Input::Appearance(true),
+            Input::Stats(true),
+            Input::Audio(true),
+            Input::AudioOutput(None),
+            Input::Clipboard(clipboard::Content::Text("hi".into())),
+            Input::Command("kd,97".into()),
+            Input::Command("js,c,0,Pad,4,16".into()),
+            Input::Zoom(
+                1,
+                Pointer {
+                    display: Resolution(1280, 720),
+                    position: (10, 10),
+                    buttons: 0,
+                },
+            ),
+            Input::Position(Side::Left, None),
+            Input::Settings(vec![(Key::Fps, 50)]),
+        ]
+    }
+
+    /// Runs `role`'s stream against a fake Selkies on plain TCP: the server sends
+    /// `script`, the stream gets `inputs`, then the server sends `last` (a `KILL`, say) and
+    /// closes with `close` (1008 for a refusal), and every text frame it read is returned.
+    async fn play(
+        role: StreamRole,
+        script: Vec<String>,
+        inputs: Vec<Input>,
+        last: Option<&'static str>,
+        close: u16,
+    ) -> Played {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (go_tx, go) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let mut received = Vec::new();
+            // The handshake SETTINGS comes first.
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                received.push(text.to_string());
+            }
+            for message in script {
+                ws.send(Message::text(message)).await.unwrap();
+            }
+            let reader = async {
+                while let Some(Ok(message)) = ws.next().await {
+                    if let Message::Text(text) = message {
+                        received.push(text.to_string());
+                    }
+                }
+            };
+            tokio::select! {
+                _ = reader => return received,
+                _ = go => {}
+            }
+            if let Some(last) = last {
+                let _ = ws.send(Message::text(last)).await;
+            }
+            let _ = ws
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(close),
+                    reason: "".into(),
+                })))
+                .await;
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Text(text) = message {
+                    received.push(text.to_string());
+                }
+            }
+            received
+        });
+        let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (ws, _) = tokio_tungstenite::client_async(
+            format!("ws://{address}/api/websockets"),
+            tokio_tungstenite::MaybeTlsStream::Plain(tcp),
+        )
+        .await
+        .unwrap();
+        let (frames, _frames_rx) = watch::channel(Frame::default());
+        let (input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let options = SessionOptions {
+            muted: false,
+            stats: true,
+            audio_bitrate: Some(64_000),
+            role,
+            ..test_options()
+        };
+        let driver = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for input in inputs {
+                let _ = input_tx.send(input);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let _ = go_tx.send(());
+            std::future::pending::<()>().await;
+        };
+        let ended = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                ended = stream(Wire::new(ws, role), frames, input, pointer, options, &events, cancel) => ended,
+                _ = driver => unreachable!(),
+            }
+        })
+        .await
+        .expect("the stream ends");
+        drop(events);
+        let mut seen = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            seen.push(event);
+        }
+        Played {
+            ended,
+            received: server.await.unwrap(),
+            events: seen,
+        }
+    }
+
+    fn settings_frames(received: &[String]) -> Vec<Value> {
+        received
+            .iter()
+            .filter_map(|text| text.strip_prefix("SETTINGS,"))
+            .map(|json| serde_json::from_str(json).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_secondary_stream_claims_display2_and_ends_on_kill() {
+        let played = play(
+            StreamRole::Secondary(Side::Right),
+            selkies_script(),
+            every_input(),
+            Some("KILL The host compositor has a single output, so a second display has nothing to capture."),
+            1008,
+        )
+        .await;
+        assert_eq!(
+            played.ended,
+            Err(RunError::Killed(Kill::Refused(
+                "The host compositor has a single output, so a second display has nothing to capture.".into()
+            )))
+        );
+        let settings = settings_frames(&played.received);
+        assert!(settings.len() >= 4, "{:?}", played.received);
+        // The handshake claims display2 on the right, with its own size request.
+        assert_eq!(settings[0]["displayId"], "display2");
+        assert_eq!(settings[0]["displayPosition"], "right");
+        let mut moved = false;
+        for frame in &settings {
+            assert_eq!(frame["displayId"], "display2", "{frame}");
+            assert!(frame.get("color_scheme").is_none(), "{frame}");
+            assert!(frame.get("audio_bitrate").is_none(), "{frame}");
+            assert!(frame.get("scaling_dpi").is_none(), "{frame}");
+            moved |= frame["displayPosition"] == "left";
+            if moved {
+                // Every frame after the move carries the new side.
+                assert_eq!(frame["displayPosition"], "left", "{frame}");
+            }
+        }
+        assert!(moved, "{:?}", played.received);
+        // The last settings change, after Position(Left), names the new side.
+        let last = settings.last().unwrap();
+        assert_eq!(last["framerate"], 50);
+        assert_eq!(last["displayPosition"], "left");
+        assert!(!played
+            .received
+            .iter()
+            .any(|text| text.contains("\"primary\"")));
+        for text in &played.received {
+            assert!(
+                !(text == "START_AUDIO"
+                    || text.starts_with("_stats")
+                    || text.starts_with("s,")
+                    || text.starts_with("js,")),
+                "{text}"
+            );
+        }
+        // Display 2 always resizes, naming its display.
+        assert!(played
+            .received
+            .iter()
+            .any(|text| text == "r,1280x720,display2"));
+        // Keys and the clipboard still go over its own socket.
+        assert!(played.received.iter().any(|text| text == "kd,97"));
+        assert!(played.received.iter().any(|text| text.starts_with("cw,")));
+        for event in &played.events {
+            assert!(
+                !matches!(
+                    event,
+                    SessionEvent::PrintDocument(_)
+                        | SessionEvent::PrintPolicy(_)
+                        | SessionEvent::Audio(_)
+                        | SessionEvent::AudioUnavailable(_)
+                        | SessionEvent::AudioOutput(_)
+                        | SessionEvent::Files(_)
+                ),
+                "a secondary raised a primary-only event"
+            );
+        }
+        assert!(played
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::DisplayLayout(config) if config.layouts.contains_key("display2"))));
+    }
+
+    #[tokio::test]
+    async fn a_primary_taken_over_reports_superseded() {
+        let played = play(
+            StreamRole::Primary,
+            selkies_script(),
+            every_input(),
+            Some("KILL a new primary client connected connection killed"),
+            1000,
+        )
+        .await;
+        assert_eq!(played.ended, Err(RunError::Killed(Kill::Superseded)));
+        let settings = settings_frames(&played.received);
+        assert_eq!(settings[0]["displayId"], "primary");
+        // The primary's own frames are as before: no stamp, no position.
+        assert!(settings[1..]
+            .iter()
+            .all(|frame| frame.get("displayId").is_none()));
+        assert!(settings
+            .iter()
+            .all(|frame| frame.get("displayPosition").is_none()));
+        // It still sends what Display 2 skips.
+        assert!(played.received.iter().any(|text| text == "_stats,1"));
+        assert!(played.received.iter().any(|text| text.starts_with("js,")));
+        assert!(settings
+            .iter()
+            .any(|frame| frame.get("audio_bitrate").is_some()));
+        assert!(played
+            .events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::PrintDocument(_))));
+    }
+
+    #[tokio::test]
+    async fn second_screen_off_ends_a_secondary() {
+        let script = vec![json!({"type": "server_settings", "settings": {
+            "second_screen": {"value": false},
+        }})
+        .to_string()];
+        let played = play(
+            StreamRole::Secondary(Side::Right),
+            script,
+            Vec::new(),
+            None,
+            1000,
+        )
+        .await;
+        assert_eq!(
+            played.ended,
+            Err(RunError::Killed(Kill::Refused(
+                role::SECOND_SCREEN_OFF.into()
+            )))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_without_kill_is_still_a_disconnect() {
+        let played = play(
+            StreamRole::Secondary(Side::Up),
+            Vec::new(),
+            Vec::new(),
+            None,
+            1000,
+        )
+        .await;
+        assert!(matches!(played.ended, Err(RunError::Other(_))));
+    }
+
+    #[test]
+    fn secondary_closing_commands_release_keys_only() {
+        let held = BTreeSet::from([0x61]);
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,Pad,4,16");
+        let lock = PointerLock {
+            locked: true,
+            buttons: 1,
+        };
+        assert_eq!(
+            closing_commands(&held, lock, &mut pads, StreamRole::Secondary(Side::Left)),
+            ["ku,97"]
+        );
+    }
+
+    #[test]
+    fn every_settings_frame_on_a_secondary_names_display2() {
+        let role = StreamRole::Secondary(Side::Down);
+        let mut settings = Settings::default();
+        settings.announce(&json!({
+            "framerate": {"value": 30, "min": 15, "max": 60},
+            "audio_bitrate": {"value": "128000", "allowed": ["64000", "128000"]},
+        }));
+        let request = DisplayRequest {
+            resolution: Resolution(800, 600),
+            scale: None,
+        };
+        let frames = [
+            settings_command(&settings, [(Key::Fps, 45)]).unwrap().0,
+            codec_command(Codec::Jpeg),
+            format!("SETTINGS,{}", request.settings()),
+            audio_bitrate_command(&settings, 64_000).unwrap().0,
+        ];
+        for frame in frames {
+            let stamped: Value =
+                serde_json::from_str(role.stamp(frame).strip_prefix("SETTINGS,").unwrap()).unwrap();
+            assert_eq!(stamped["displayId"], "display2");
+            assert_eq!(stamped["displayPosition"], "down");
         }
     }
 
@@ -1954,7 +2378,8 @@ mod tests {
                     locked: true,
                     buttons: 0
                 },
-                &mut Default::default()
+                &mut Default::default(),
+                StreamRole::Primary
             ),
             ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "ku,97"]
         );
@@ -1972,7 +2397,12 @@ mod tests {
     fn closing_releases_every_held_key_then_closes() {
         let held = BTreeSet::from([0x61, 0xffe3]);
         assert_eq!(
-            closing_commands(&held, PointerLock::default(), &mut Default::default()),
+            closing_commands(
+                &held,
+                PointerLock::default(),
+                &mut Default::default(),
+                StreamRole::Primary
+            ),
             ["ku,97", "ku,65507"]
         );
     }
@@ -1982,7 +2412,8 @@ mod tests {
         assert!(closing_commands(
             &BTreeSet::new(),
             PointerLock::default(),
-            &mut Default::default()
+            &mut Default::default(),
+            StreamRole::Primary
         )
         .is_empty());
     }
@@ -2000,13 +2431,24 @@ mod tests {
         lock.observe("m2,0,0,20,1");
         assert_eq!(lock.buttons, 4);
         assert_eq!(
-            closing_commands(&BTreeSet::new(), lock, &mut Default::default()),
+            closing_commands(
+                &BTreeSet::new(),
+                lock,
+                &mut Default::default(),
+                StreamRole::Primary
+            ),
             ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "m2,0,0,0,0"]
         );
         // Released by the view first: nothing more at close.
         lock.observe("m2,0,0,0,0");
         lock.observe("p,0");
-        assert!(closing_commands(&BTreeSet::new(), lock, &mut Default::default()).is_empty());
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            lock,
+            &mut Default::default(),
+            StreamRole::Primary
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2046,10 +2488,21 @@ mod tests {
         pads.observe("js,c,2,UGFk,4,17");
         pads.observe("js,d,0");
         assert_eq!(
-            closing_commands(&BTreeSet::from([0x61]), PointerLock::default(), &mut pads),
+            closing_commands(
+                &BTreeSet::from([0x61]),
+                PointerLock::default(),
+                &mut pads,
+                StreamRole::Primary
+            ),
             ["js,d,2", "ku,97"]
         );
-        assert!(closing_commands(&BTreeSet::new(), PointerLock::default(), &mut pads).is_empty());
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            PointerLock::default(),
+            &mut pads,
+            StreamRole::Primary
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2149,17 +2602,18 @@ mod tests {
 
     #[test]
     fn reads_selkies_prefixed_display_capabilities() {
+        let finger_scroll = |text: &str| role::display_config(text).map(|c| c.finger_scroll);
         assert_eq!(
-            finger_scroll_capability(
+            finger_scroll(
                 r#"DISPLAY_CONFIG_UPDATE,{"type":"display_config_update","finger_scroll":true}"#
             ),
             Some(true)
         );
         assert_eq!(
-            finger_scroll_capability(r#"{"type":"display_config_update"}"#),
+            finger_scroll(r#"{"type":"display_config_update"}"#),
             Some(false)
         );
-        assert_eq!(finger_scroll_capability(r#"{"type":"stream_info"}"#), None);
+        assert_eq!(finger_scroll(r#"{"type":"stream_info"}"#), None);
     }
 
     fn jpeg(color: [u8; 3]) -> Vec<u8> {

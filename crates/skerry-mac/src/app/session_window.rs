@@ -22,8 +22,8 @@ use crate::sealskin::{RemoteSession, SealSkinClient};
 use crate::settings::{Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings};
 use crate::stats;
 use crate::transport::{
-    DisplayRequest, SessionEvent, SessionOptions, StreamInfo, StreamSample, KEEP_WAITING_GRACE,
-    SOCKET_STARTUP_GRACE,
+    DisplayRequest, SessionEvent, SessionOptions, StreamInfo, StreamRole, StreamSample,
+    KEEP_WAITING_GRACE, SOCKET_STARTUP_GRACE,
 };
 use crate::video::Codec;
 use crate::view::{CaptureHint, NativeSession};
@@ -418,6 +418,7 @@ impl SessionWindow {
                     },
                     audio_output: self.preferences.audio.output_device.clone(),
                     audio_bitrate: self.preferences.audio.bitrate,
+                    role: StreamRole::Primary,
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -598,6 +599,12 @@ impl SessionWindow {
                     self.show_capture_hint(hint, cx);
                 }
             }
+            // "This session was opened somewhere else.", or the server's reason: the same
+            // banner as an error, with no retry loop (`ARCH-039`).
+            SessionEvent::Killed(kill) => {
+                self.handle_event(SessionEvent::Error(kill.to_string()), window, cx)
+            }
+            SessionEvent::DisplayLayout(_) => {}
             SessionEvent::Error(error) => {
                 // The capture ends with the stream; the banner explains, so no hint.
                 if let Some(stream) = &self.current {
