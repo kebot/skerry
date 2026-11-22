@@ -630,6 +630,9 @@ fn audio_header_line(audio: &AudioInputs) -> Option<String> {
     let status = audio.status?;
     match audio.problem(status) {
         Some(OutputProblem::Failed) => Some("Audio output stopped".into()),
+        Some(OutputProblem::ChosenFailing) if status.active.is_none() => {
+            Some("Audio output stopped".into())
+        }
         _ if status.devices.is_empty() => Some("No audio output".into()),
         _ => None,
     }
@@ -686,7 +689,9 @@ fn audio_props(audio: &AudioInputs) -> Option<AudioProps> {
         .map_or_else(|| "Your saved output device".to_string(), str::to_string);
     let playing = status.active.as_ref().map(|device| device.name.as_str());
     let note = match (audio.problem(status), playing) {
-        (Some(OutputProblem::Failed), _) => Some("Audio output stopped. Trying again…".into()),
+        (Some(OutputProblem::Failed), _) | (Some(OutputProblem::ChosenFailing), None) => {
+            Some("Audio output stopped. Trying again…".into())
+        }
         _ if missing => Some(match playing {
             Some(active) => {
                 format!("{subject} isn’t connected. Playing through {active} until it’s back.")
@@ -1126,6 +1131,21 @@ mod tests {
         let mut failed = status(None, None);
         failed.problem = Some(OutputProblem::Failed);
         let audio = inputs(Some(&failed), None, None);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("Audio output stopped")
+        );
+        assert_eq!(
+            audio_props(&audio).unwrap().note.as_deref(),
+            Some("Audio output stopped. Trying again…")
+        );
+    }
+
+    #[test]
+    fn a_failing_choice_with_nothing_playing_says_so() {
+        let mut stuck = status(Some("AirPods"), None);
+        stuck.problem = Some(OutputProblem::ChosenFailing);
+        let audio = inputs(Some(&stuck), Some("AirPods"), None);
         assert_eq!(
             audio_header_line(&audio).as_deref(),
             Some("Audio output stopped")

@@ -115,9 +115,8 @@ impl Playback {
         std::thread::Builder::new()
             .name("skerry-audio".into())
             .spawn(move || {
-                let heartbeat = Arc::new(AtomicU64::new(0));
-                let backend = CoreAudio::new(thread_queue, heartbeat.clone());
-                run(Engine::new(backend, heartbeat, chosen), &controls, report);
+                let backend = CoreAudio::new(thread_queue);
+                run(Engine::new(backend, chosen), &controls, report);
             })
             .ok()?;
         Some(Self {
@@ -173,9 +172,26 @@ fn push_bounded(queue: &mut VecDeque<f32>, pcm: &[f32], limit: usize) {
     queue.extend(pcm);
 }
 
-/// The render callback's body: beat first, then fill from the queue if it is free.
-fn render(out: &mut [f32], queue: &Mutex<VecDeque<f32>>, heartbeat: &AtomicU64, channels: u16) {
-    heartbeat.fetch_add(1, Ordering::Relaxed);
+/// What a stream's callbacks report to the audio thread, one set per stream.
+#[derive(Clone, Default)]
+struct Hooks {
+    /// The render-callback count.
+    beats: Arc<AtomicU64>,
+    /// Set by the stream's error callback.
+    errored: Arc<AtomicBool>,
+    /// Whether this stream plays the queue. A probe (a retry of the chosen device while
+    /// another one plays) renders silence and leaves the queue alone until it takes over.
+    live: Arc<AtomicBool>,
+}
+
+/// The render callback's body: beat first, then fill from the queue if the stream is live
+/// and the queue is free.
+fn render(out: &mut [f32], queue: &Mutex<VecDeque<f32>>, hooks: &Hooks, channels: u16) {
+    hooks.beats.fetch_add(1, Ordering::Relaxed);
+    if !hooks.live.load(Ordering::Relaxed) {
+        out.fill(0.0);
+        return;
+    }
     match queue.try_lock() {
         Ok(mut queue) => fill(out, &mut queue, channels),
         Err(_) => out.fill(0.0),
@@ -275,27 +291,26 @@ fn collapse(controls: impl IntoIterator<Item = Control>) -> Collapsed {
 /// The Core Audio side, behind a seam so the loop runs in tests without hardware.
 trait Backend {
     type Stream;
-    /// Connected output devices as `(raw UID, name)`.
-    fn devices(&mut self) -> Vec<(String, Option<String>)>;
+    /// Connected output devices as `(raw UID, name)`; `None` when listing failed (keep the
+    /// last list rather than read it as "no devices").
+    fn devices(&mut self) -> Option<Vec<(String, Option<String>)>>;
     fn default_uid(&mut self) -> Option<String>;
-    /// Opens and starts a stream on `uid`; its error callback sets `errored`.
-    fn open(&mut self, uid: &str, errored: Arc<AtomicBool>) -> Result<Self::Stream, ()>;
+    /// Opens and starts a stream on `uid` that reports through `hooks`.
+    fn open(&mut self, uid: &str, hooks: Hooks) -> Result<Self::Stream, ()>;
 }
 
 struct CoreAudio {
     host: cpal::Host,
     queue: Queue,
-    heartbeat: Arc<AtomicU64>,
     /// The last enumeration's devices by UID, so `open` needn't enumerate again.
     devices: Vec<(String, cpal::Device)>,
 }
 
 impl CoreAudio {
-    fn new(queue: Queue, heartbeat: Arc<AtomicU64>) -> Self {
+    fn new(queue: Queue) -> Self {
         Self {
             host: cpal::default_host(),
             queue,
-            heartbeat,
             devices: Vec::new(),
         }
     }
@@ -304,33 +319,32 @@ impl CoreAudio {
 impl Backend for CoreAudio {
     type Stream = cpal::Stream;
 
-    fn devices(&mut self) -> Vec<(String, Option<String>)> {
+    fn devices(&mut self) -> Option<Vec<(String, Option<String>)>> {
         self.devices = self
             .host
             .output_devices()
-            .map(|devices| {
-                devices
-                    .filter_map(|device| Some((device.id().ok()?.1, device)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.devices
-            .iter()
-            .map(|(uid, device)| {
-                let name = device
-                    .description()
-                    .ok()
-                    .map(|description| description.name().to_string());
-                (uid.clone(), name)
-            })
-            .collect()
+            .ok()?
+            .filter_map(|device| Some((device.id().ok()?.1, device)))
+            .collect();
+        Some(
+            self.devices
+                .iter()
+                .map(|(uid, device)| {
+                    let name = device
+                        .description()
+                        .ok()
+                        .map(|description| description.name().to_string());
+                    (uid.clone(), name)
+                })
+                .collect(),
+        )
     }
 
     fn default_uid(&mut self) -> Option<String> {
         Some(self.host.default_output_device()?.id().ok()?.1)
     }
 
-    fn open(&mut self, uid: &str, errored: Arc<AtomicBool>) -> Result<cpal::Stream, ()> {
+    fn open(&mut self, uid: &str, hooks: Hooks) -> Result<cpal::Stream, ()> {
         let device = self
             .devices
             .iter()
@@ -348,11 +362,11 @@ impl Backend for CoreAudio {
             buffer_size: cpal::BufferSize::Default,
         };
         let queue = self.queue.clone();
-        let heartbeat = self.heartbeat.clone();
+        let errored = hooks.errored.clone();
         let stream = device
             .build_output_stream(
                 &config,
-                move |out: &mut [f32], _| render(out, &queue, &heartbeat, channels),
+                move |out: &mut [f32], _| render(out, &queue, &hooks, channels),
                 move |_| errored.store(true, Ordering::Relaxed),
                 None,
             )
@@ -365,15 +379,37 @@ impl Backend for CoreAudio {
 struct Active<S> {
     device: OutputDevice,
     _stream: S,
-    errored: Arc<AtomicBool>,
-    built: Instant,
+    hooks: Hooks,
     /// The default when this stream was built, if it was built on the default device:
     /// such a stream is rebuilt on any default change, so a chosen device stays put.
     built_on_default: Option<String>,
     last_beat: u64,
     last_change: Instant,
-    /// Whether any callback has come since the build.
-    beating: bool,
+    /// When the first callback since the build was seen.
+    first_beat: Option<Instant>,
+}
+
+impl<S> Active<S> {
+    /// Reads the callbacks; `true` when the stream errored or stalled.
+    fn observe(&mut self, now: Instant) -> bool {
+        let beat = self.hooks.beats.load(Ordering::Relaxed);
+        if beat != self.last_beat {
+            self.last_beat = beat;
+            self.last_change = now;
+            self.first_beat.get_or_insert(now);
+        }
+        self.hooks.errored.load(Ordering::Relaxed) || now.duration_since(self.last_change) >= STALL
+    }
+
+    fn beating(&self) -> bool {
+        self.first_beat.is_some()
+    }
+
+    /// Callbacks seen over at least `HEALTHY_AFTER`, not just a stream that old.
+    fn steady(&self) -> bool {
+        self.first_beat
+            .is_some_and(|first| self.last_change.duration_since(first) >= HEALTHY_AFTER)
+    }
 }
 
 /// Consecutive failures or stalls of one device.
@@ -395,15 +431,21 @@ fn backoff(count: u32) -> Duration {
     }
 }
 
+/// A failed build waits at least this long, so a device that won't open is set aside at
+/// once rather than retried while nothing plays.
+const BUILD_RETRY: Duration = Duration::from_secs(2);
+
 /// The audio thread's state, driven one tick at a time.
 struct Engine<B: Backend> {
     backend: B,
-    heartbeat: Arc<AtomicU64>,
     chosen: Option<String>,
     devices: Vec<OutputDevice>,
     default_uid: Option<String>,
     enumerated: Option<Instant>,
     stream: Option<Active<B::Stream>>,
+    /// A retry of the chosen device opened beside the playing fallback; it takes over once
+    /// it calls back, so a retry never silences the fallback.
+    probe: Option<Active<B::Stream>>,
     strikes: BTreeMap<String, Strikes>,
     last_rebuild: Option<Instant>,
     /// A person's pick waiting to apply: it skips the rate limit and the backoff.
@@ -411,15 +453,15 @@ struct Engine<B: Backend> {
 }
 
 impl<B: Backend> Engine<B> {
-    fn new(backend: B, heartbeat: Arc<AtomicU64>, chosen: Option<String>) -> Self {
+    fn new(backend: B, chosen: Option<String>) -> Self {
         Self {
             backend,
-            heartbeat,
             chosen,
             devices: Vec::new(),
             default_uid: None,
             enumerated: None,
             stream: None,
+            probe: None,
             strikes: BTreeMap::new(),
             last_rebuild: None,
             picked: true,
@@ -436,42 +478,54 @@ impl<B: Backend> Engine<B> {
 
     fn strike(&mut self, uid: &str, build_failed: bool, now: Instant) {
         let count = self.strikes.get(uid).map_or(0, |strikes| strikes.count) + 1;
+        let wait = if build_failed {
+            backoff(count).max(BUILD_RETRY)
+        } else {
+            backoff(count)
+        };
         self.strikes.insert(
             uid.to_string(),
             Strikes {
                 count,
-                retry_at: now + backoff(count),
+                retry_at: now + wait,
                 build_failed,
             },
         );
     }
 
-    /// Checks the stream; a stall or an error drops it and strikes its device.
+    /// Checks the probe and the stream. A probe that calls back takes over; a stall or an
+    /// error drops a stream and strikes its device; steady callbacks clear the strikes.
     fn check_health(&mut self, now: Instant) {
-        let beat = self.heartbeat.load(Ordering::Relaxed);
+        if let Some(probe) = &mut self.probe {
+            if probe.observe(now) {
+                let uid = probe.device.uid.clone();
+                self.probe = None;
+                self.strike(&uid, false, now);
+            } else if probe.beating() {
+                if let Some(probe) = self.probe.take() {
+                    probe.hooks.live.store(true, Ordering::Relaxed);
+                    // The fallback drops here, after the probe already plays.
+                    self.stream = Some(probe);
+                }
+            }
+        }
         let Some(active) = &mut self.stream else {
             return;
         };
-        if beat != active.last_beat {
-            active.last_beat = beat;
-            active.last_change = now;
-            active.beating = true;
-        }
-        let errored = active.errored.load(Ordering::Relaxed);
-        if !errored && now.duration_since(active.last_change) < STALL {
-            if active.beating && now.duration_since(active.built) >= HEALTHY_AFTER {
-                let uid = active.device.uid.clone();
-                self.strikes.remove(&uid);
-            }
-            return;
-        }
         let uid = active.device.uid.clone();
-        self.stream = None;
-        self.strike(&uid, false, now);
+        if active.observe(now) {
+            self.stream = None;
+            self.strike(&uid, false, now);
+        } else if active.steady() {
+            self.strikes.remove(&uid);
+        }
     }
 
     fn enumerate(&mut self) {
-        self.devices = label_devices(self.backend.devices());
+        let Some(devices) = self.backend.devices() else {
+            return;
+        };
+        self.devices = label_devices(devices);
         self.default_uid = self
             .backend
             .default_uid()
@@ -482,23 +536,35 @@ impl<B: Backend> Engine<B> {
         self.devices.iter().any(|device| device.uid == uid)
     }
 
+    /// The default, or (when the default is `except`, or there is none) the first other
+    /// connected device.
+    fn fallback(&self, except: Option<&str>) -> Option<String> {
+        self.default_uid
+            .as_deref()
+            .filter(|uid| Some(*uid) != except)
+            .or_else(|| {
+                self.devices
+                    .iter()
+                    .map(|device| device.uid.as_str())
+                    .find(|uid| Some(*uid) != except)
+            })
+            .map(str::to_string)
+    }
+
     /// The device to play through now, and whether the chosen one is set aside for failing.
     fn target(&self, now: Instant) -> (Option<String>, bool) {
-        let fallback = self
-            .default_uid
-            .clone()
-            .or_else(|| self.devices.first().map(|device| device.uid.clone()));
         match &self.chosen {
             Some(uid) if self.present(uid) => {
-                let resting = self.strikes.get(uid).is_some_and(|strikes| {
-                    strikes.count >= 2 && strikes.retry_at > now && !self.picked
-                });
-                match fallback.filter(|fallback| resting && fallback != uid) {
+                let resting = !self.picked
+                    && self.strikes.get(uid).is_some_and(|strikes| {
+                        (strikes.count >= 2 || strikes.build_failed) && strikes.retry_at > now
+                    });
+                match self.fallback(Some(uid)).filter(|_| resting) {
                     Some(fallback) => (Some(fallback), true),
                     None => (Some(uid.clone()), false),
                 }
             }
-            _ => (fallback, false),
+            _ => (self.fallback(None), false),
         }
     }
 
@@ -517,6 +583,14 @@ impl<B: Backend> Engine<B> {
         }
     }
 
+    fn waiting(&self, target: Option<&str>, now: Instant) -> bool {
+        target.is_some_and(|uid| {
+            self.strikes
+                .get(uid)
+                .is_some_and(|strikes| strikes.retry_at > now)
+        })
+    }
+
     fn tick(&mut self, now: Instant) -> OutputStatus {
         self.check_health(now);
         let due = self
@@ -526,55 +600,86 @@ impl<B: Backend> Engine<B> {
             self.enumerate();
             self.enumerated = Some(now);
         }
-        let (target, set_aside) = self.target(now);
+        let (mut target, mut set_aside) = self.target(now);
+        if self
+            .probe
+            .as_ref()
+            .is_some_and(|probe| Some(probe.device.uid.as_str()) != target.as_deref())
+        {
+            self.probe = None;
+        }
         if self.needs_rebuild(target.as_deref()) {
             let limited = self
                 .last_rebuild
                 .is_some_and(|last| now.duration_since(last) < REBUILD_LIMIT);
-            let waiting = target.as_ref().is_some_and(|uid| {
-                self.strikes
-                    .get(uid)
-                    .is_some_and(|strikes| strikes.retry_at > now)
-            });
-            if self.picked || (!limited && !waiting) {
+            let waiting = self.waiting(target.as_deref(), now);
+            // A retry of a struck device while another one plays: probe it beside the
+            // playing stream instead of tearing that down.
+            let retry_beside = !self.picked
+                && target
+                    .as_ref()
+                    .is_some_and(|uid| self.strikes.contains_key(uid))
+                && self.stream.as_ref().is_some_and(Active::beating);
+            if retry_beside {
+                if self.probe.is_none() && !limited && !waiting {
+                    if let Some(uid) = target.clone() {
+                        self.probe = self.open(&uid, false, now);
+                    }
+                }
+            } else if self.picked || (!limited && !waiting) {
                 self.rebuild(target.as_deref(), now);
+                if self.stream.is_none() {
+                    // The build failed: play through the fallback at once rather than wait
+                    // out the rate limit in silence.
+                    self.picked = false;
+                    (target, set_aside) = self.target(now);
+                    if self.needs_rebuild(target.as_deref())
+                        && !self.waiting(target.as_deref(), now)
+                    {
+                        self.rebuild(target.as_deref(), now);
+                    }
+                }
             }
         }
         self.picked = false;
         self.status(target.as_deref(), set_aside)
     }
 
-    fn rebuild(&mut self, target: Option<&str>, now: Instant) {
-        // Drop the old stream before opening the next: one AUHAL at a time.
-        self.stream = None;
-        let Some(uid) = target else {
-            return;
-        };
+    /// Opens a stream on `uid`; a failed build strikes the device.
+    fn open(&mut self, uid: &str, live: bool, now: Instant) -> Option<Active<B::Stream>> {
         self.last_rebuild = Some(now);
-        let Some(device) = self.devices.iter().find(|d| d.uid == uid).cloned() else {
-            return;
-        };
-        let errored = Arc::new(AtomicBool::new(false));
-        match self.backend.open(uid, errored.clone()) {
-            Ok(stream) => {
-                self.stream = Some(Active {
-                    built_on_default: (self.default_uid.as_deref() == Some(uid))
-                        .then(|| uid.to_string()),
-                    device,
-                    _stream: stream,
-                    errored,
-                    built: now,
-                    last_beat: self.heartbeat.load(Ordering::Relaxed),
-                    last_change: now,
-                    beating: false,
-                });
+        let device = self.devices.iter().find(|d| d.uid == uid).cloned()?;
+        let hooks = Hooks::default();
+        hooks.live.store(live, Ordering::Relaxed);
+        match self.backend.open(uid, hooks.clone()) {
+            Ok(stream) => Some(Active {
+                built_on_default: (self.default_uid.as_deref() == Some(uid))
+                    .then(|| uid.to_string()),
+                device,
+                _stream: stream,
+                last_beat: hooks.beats.load(Ordering::Relaxed),
+                hooks,
+                last_change: now,
+                first_beat: None,
+            }),
+            Err(()) => {
+                self.strike(uid, true, now);
+                None
             }
-            Err(()) => self.strike(uid, true, now),
+        }
+    }
+
+    fn rebuild(&mut self, target: Option<&str>, now: Instant) {
+        // Drop the old stream before opening the next: one playing AUHAL at a time.
+        self.stream = None;
+        self.probe = None;
+        if let Some(uid) = target {
+            self.stream = self.open(uid, true, now);
         }
     }
 
     fn status(&self, target: Option<&str>, set_aside: bool) -> OutputStatus {
-        let playing = self.stream.as_ref().filter(|active| active.beating);
+        let playing = self.stream.as_ref().filter(|active| active.beating());
         let failing = target.is_some_and(|uid| {
             playing.is_none_or(|active| active.device.uid != uid)
                 && self
@@ -582,15 +687,15 @@ impl<B: Backend> Engine<B> {
                     .get(uid)
                     .is_some_and(|strikes| strikes.build_failed || strikes.count >= 2)
         });
-        // A failing chosen device with another output to fall back on is set aside, not a
-        // stopped output: the next ticks play through the other one.
-        let other_output = self
-            .devices
-            .iter()
-            .any(|device| Some(device.uid.as_str()) != target);
+        // A failing chosen device is set aside, not a stopped output, only while another
+        // device actually plays (or was just opened in its place).
+        let other_playing = self
+            .stream
+            .as_ref()
+            .is_some_and(|active| Some(active.device.uid.as_str()) != target);
         let chosen_target = target.is_some() && target == self.chosen.as_deref();
         let chosen_missing = self.chosen.as_deref().is_some_and(|uid| !self.present(uid));
-        let problem = if failing && chosen_target && other_output {
+        let problem = if failing && chosen_target && other_playing {
             Some(OutputProblem::ChosenFailing)
         } else if failing {
             Some(OutputProblem::Failed)
@@ -651,16 +756,42 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    use std::cell::Cell;
+
+    /// One stream the fake opened: alive until the engine drops it.
+    struct Opened {
+        uid: String,
+        hooks: Hooks,
+        alive: Rc<Cell<bool>>,
+        at_ms: u64,
+    }
+
     #[derive(Default)]
     struct World {
         devices: Vec<(String, Option<String>)>,
         default: Option<String>,
         broken: Vec<String>,
+        /// Open fine but never call back.
+        silent: Vec<String>,
+        /// Streams stop calling back this long after they open.
+        quiet_after_ms: Option<u64>,
+        /// The next listing fails.
+        fail_listing: bool,
         opens: Vec<String>,
+        streams: Vec<Opened>,
+        now_ms: u64,
     }
 
     #[derive(Clone, Default)]
     struct Fake(Rc<RefCell<World>>);
+
+    struct FakeStream(Rc<Cell<bool>>);
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
 
     impl Fake {
         fn with(devices: &[(&str, &str)], default: Option<&str>) -> Self {
@@ -686,27 +817,61 @@ mod tests {
             self.0.borrow_mut().broken.push(uid.into());
         }
 
+        fn silence(&self, uid: &str) {
+            self.0.borrow_mut().silent.push(uid.into());
+        }
+
         fn fix(&self) {
-            self.0.borrow_mut().broken.clear();
+            let mut world = self.0.borrow_mut();
+            world.broken.clear();
+            world.silent.clear();
+        }
+
+        /// Runs every live stream's render callback once, as of `ms`.
+        fn render(&self, ms: u64) {
+            let mut world = self.0.borrow_mut();
+            world.now_ms = ms;
+            world.streams.retain(|opened| opened.alive.get());
+            let world = &*world;
+            for opened in &world.streams {
+                let quiet = world.silent.contains(&opened.uid)
+                    || world
+                        .quiet_after_ms
+                        .is_some_and(|after| ms > opened.at_ms + after);
+                if !quiet {
+                    opened.hooks.beats.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
     impl Backend for Fake {
-        type Stream = ();
-        fn devices(&mut self) -> Vec<(String, Option<String>)> {
-            self.0.borrow().devices.clone()
+        type Stream = FakeStream;
+        fn devices(&mut self) -> Option<Vec<(String, Option<String>)>> {
+            let mut world = self.0.borrow_mut();
+            if std::mem::take(&mut world.fail_listing) {
+                return None;
+            }
+            Some(world.devices.clone())
         }
         fn default_uid(&mut self) -> Option<String> {
             self.0.borrow().default.clone()
         }
-        fn open(&mut self, uid: &str, _: Arc<AtomicBool>) -> Result<(), ()> {
+        fn open(&mut self, uid: &str, hooks: Hooks) -> Result<FakeStream, ()> {
             let mut world = self.0.borrow_mut();
             world.opens.push(uid.into());
             if world.broken.iter().any(|broken| broken == uid) {
-                Err(())
-            } else {
-                Ok(())
+                return Err(());
             }
+            let alive = Rc::new(Cell::new(true));
+            let at_ms = world.now_ms;
+            world.streams.push(Opened {
+                uid: uid.into(),
+                hooks,
+                alive: alive.clone(),
+                at_ms,
+            });
+            Ok(FakeStream(alive))
         }
     }
 
@@ -716,18 +881,15 @@ mod tests {
     struct Rig {
         fake: Fake,
         engine: Engine<Fake>,
-        beat: Arc<AtomicU64>,
         start: Instant,
     }
 
     impl Rig {
         fn new(fake: Fake, chosen: Option<&str>) -> Self {
-            let beat = Arc::new(AtomicU64::new(0));
-            let engine = Engine::new(fake.clone(), beat.clone(), chosen.map(str::to_string));
+            let engine = Engine::new(fake.clone(), chosen.map(str::to_string));
             Self {
                 fake,
                 engine,
-                beat,
                 start: Instant::now(),
             }
         }
@@ -739,7 +901,9 @@ mod tests {
         /// Ticks at `ms`, with the render callback running (`beats`) or not.
         fn tick(&mut self, ms: u64, beats: bool) -> OutputStatus {
             if beats {
-                self.beat.fetch_add(1, Ordering::Relaxed);
+                self.fake.render(ms);
+            } else {
+                self.fake.0.borrow_mut().now_ms = ms;
             }
             let now = self.at(ms);
             self.engine.tick(now)
@@ -896,10 +1060,11 @@ mod tests {
     fn muted_silence_still_counts_as_healthy() {
         // Muted: the queue stays empty, but the callback keeps running and beating.
         let queue = Mutex::new(VecDeque::new());
-        let beat = AtomicU64::new(0);
+        let hooks = Hooks::default();
+        hooks.live.store(true, Ordering::Relaxed);
         let mut out = [1.0; 64];
-        render(&mut out, &queue, &beat, 2);
-        assert_eq!(beat.load(Ordering::Relaxed), 1);
+        render(&mut out, &queue, &hooks, 2);
+        assert_eq!(hooks.beats.load(Ordering::Relaxed), 1);
         assert!(out.iter().all(|sample| *sample == 0.0));
         let mut rig = Rig::new(Fake::with(&[SPEAKERS], Some("BuiltIn")), None);
         rig.run(0, 10_000, true);
@@ -909,12 +1074,13 @@ mod tests {
     #[test]
     fn callback_that_misses_lock_still_beats() {
         let queue = Mutex::new(VecDeque::from(vec![0.5; 8]));
-        let beat = AtomicU64::new(0);
+        let hooks = Hooks::default();
+        hooks.live.store(true, Ordering::Relaxed);
         let held = queue.lock().unwrap();
         let mut out = [1.0; 4];
-        render(&mut out, &queue, &beat, 2);
+        render(&mut out, &queue, &hooks, 2);
         drop(held);
-        assert_eq!(beat.load(Ordering::Relaxed), 1);
+        assert_eq!(hooks.beats.load(Ordering::Relaxed), 1);
         assert_eq!(out, [0.0; 4]);
     }
 
@@ -947,6 +1113,7 @@ mod tests {
             .stream
             .as_ref()
             .unwrap()
+            .hooks
             .errored
             .store(true, Ordering::Relaxed);
         rig.tick(2500, true);
@@ -961,6 +1128,7 @@ mod tests {
             .stream
             .as_ref()
             .unwrap()
+            .hooks
             .errored
             .store(true, Ordering::Relaxed);
         rig.tick(500, true);
@@ -1109,7 +1277,7 @@ mod tests {
         let (statuses_tx, statuses) = mpsc::channel();
         let handle = std::thread::spawn(move || {
             let fake = Fake::with(&[SPEAKERS], Some("BuiltIn"));
-            let engine = Engine::new(fake, Arc::new(AtomicU64::new(0)), None);
+            let engine = Engine::new(fake, None);
             run(engine, &rx, move |status| {
                 let _ = statuses_tx.send(status);
             });
@@ -1127,11 +1295,7 @@ mod tests {
         let (done_tx, done) = mpsc::channel();
         std::thread::spawn(move || {
             let fake = Fake::with(&[SPEAKERS], Some("BuiltIn"));
-            run(
-                Engine::new(fake, Arc::new(AtomicU64::new(0)), None),
-                &rx,
-                |_| {},
-            );
+            run(Engine::new(fake, None), &rx, |_| {});
             let _ = done_tx.send(());
         });
         drop(tx);
@@ -1190,5 +1354,101 @@ mod tests {
             assert!(queue.len().is_multiple_of(2));
             assert!(queue.len() <= QUEUE_LIMIT);
         }
+    }
+
+    #[test]
+    fn a_probe_renders_silence_and_leaves_the_queue() {
+        let queue = Mutex::new(VecDeque::from(vec![0.5; 8]));
+        let hooks = Hooks::default();
+        let mut out = [1.0; 4];
+        render(&mut out, &queue, &hooks, 2);
+        assert_eq!(out, [0.0; 4]);
+        assert_eq!(queue.lock().unwrap().len(), 8);
+        assert_eq!(hooks.beats.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn retrying_a_silent_chosen_device_keeps_the_fallback_playing() {
+        let fake = Fake::with(&[SPEAKERS, ("HDMI", "LG Display")], Some("BuiltIn"));
+        fake.silence("HDMI");
+        let mut rig = Rig::new(fake, Some("HDMI"));
+        rig.run(0, 4000, true);
+        assert_eq!(rig.active().as_deref(), Some("BuiltIn"));
+        let mut ms = 4500;
+        while ms <= 120_000 {
+            let status = rig.tick(ms, true);
+            assert_eq!(rig.active().as_deref(), Some("BuiltIn"), "at {ms}");
+            assert_eq!(
+                status.problem,
+                Some(OutputProblem::ChosenFailing),
+                "at {ms}"
+            );
+            ms += 500;
+        }
+        let opens = rig.fake.opens();
+        assert_eq!(opens.iter().filter(|uid| *uid == "BuiltIn").count(), 1);
+        assert!(
+            opens.iter().filter(|uid| *uid == "HDMI").count() >= 4,
+            "{opens:?}"
+        );
+        // Once it works, the probe takes over.
+        rig.fake.fix();
+        rig.run(120_500, 160_000, true);
+        assert_eq!(rig.active().as_deref(), Some("HDMI"));
+    }
+
+    #[test]
+    fn strikes_clear_only_after_five_seconds_of_callbacks() {
+        // Each stream calls back for 4 s, then goes quiet: that must still back off.
+        let fake = Fake::with(&[SPEAKERS], Some("BuiltIn"));
+        fake.0.borrow_mut().quiet_after_ms = Some(4000);
+        let mut rig = Rig::new(fake, None);
+        let mut failed = false;
+        let mut ms = 0;
+        while ms <= 120_000 {
+            failed |= rig.tick(ms, true).problem == Some(OutputProblem::Failed);
+            ms += 500;
+        }
+        assert!(failed);
+        assert!(rig.fake.opens().len() <= 10, "{:?}", rig.fake.opens().len());
+    }
+
+    #[test]
+    fn a_picked_device_that_wont_open_falls_back_with_a_reason() {
+        let fake = Fake::with(&[SPEAKERS, AIRPODS], Some("BuiltIn"));
+        fake.break_device("AirPods");
+        let mut rig = Rig::new(fake, None);
+        rig.run(0, 1000, true);
+        rig.engine.choose(Some("AirPods".into()));
+        let status = rig.tick(1200, true);
+        assert_eq!(rig.active().as_deref(), Some("BuiltIn"));
+        assert_eq!(status.problem, Some(OutputProblem::ChosenFailing));
+        assert_eq!(status.active.map(|d| d.uid).as_deref(), Some("BuiltIn"));
+    }
+
+    #[test]
+    fn one_failed_listing_keeps_a_healthy_stream() {
+        let mut rig = Rig::new(Fake::with(&[SPEAKERS], Some("BuiltIn")), None);
+        rig.run(0, 1000, true);
+        rig.fake.0.borrow_mut().fail_listing = true;
+        let status = rig.run(1500, 3000, true);
+        assert_eq!(rig.fake.opens().len(), 1);
+        assert_eq!(status.problem, None);
+        assert_eq!(status.devices.len(), 1);
+    }
+
+    #[test]
+    fn a_failing_chosen_default_falls_back_to_another_device() {
+        let fake = Fake::with(&[SPEAKERS, AIRPODS], Some("BuiltIn"));
+        fake.break_device("BuiltIn");
+        let mut rig = Rig::new(fake, Some("BuiltIn"));
+        let status = rig.run(0, 1000, true);
+        assert_eq!(rig.active().as_deref(), Some("AirPods"));
+        assert_eq!(status.problem, Some(OutputProblem::ChosenFailing));
+        // With nothing else to play through, it reads as a stopped output.
+        let fake = Fake::with(&[SPEAKERS], Some("BuiltIn"));
+        fake.break_device("BuiltIn");
+        let mut rig = Rig::new(fake, Some("BuiltIn"));
+        assert_eq!(rig.run(0, 3000, true).problem, Some(OutputProblem::Failed));
     }
 }

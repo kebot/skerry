@@ -270,10 +270,13 @@ impl SessionWindow {
         match event {
             SessionEvent::Audio(enabled) => self.audio = Some(enabled),
             SessionEvent::AudioUnavailable(reason) => self.audio_unavailable = Some(reason),
-            SessionEvent::AudioOutput(status) => {
+            // Audio starts only after the settings arrive, so a status while they are
+            // unknown is a late one from a stream that already ended (an error).
+            SessionEvent::AudioOutput(status) if self.settings.is_some() => {
                 self.remember_output_name(&status, cx);
                 self.audio_output = Some(status);
             }
+            SessionEvent::AudioOutput(_) => {}
             SessionEvent::Video(enabled) => self.video = Some(enabled),
             SessionEvent::Settings(settings) => self.settings = Some(settings),
             SessionEvent::Stats(sample) => {
