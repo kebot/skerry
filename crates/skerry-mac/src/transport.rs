@@ -91,14 +91,25 @@ pub struct JpegStripe {
     pub image: Arc<RenderImage>,
 }
 
-/// Decodes one stripe straight to BGRA into a buffer padded by one repeated row at the top
-/// and bottom. Reads the headers before allocating: the width must be `width`, and the
-/// height not 0 and at most `rows_left`. The decoder is not strict (as in `image`), so scan
-/// data cut short decodes with filler; a stripe cut inside its headers is rejected.
-fn decode_stripe(jpeg: &[u8], width: u16, rows_left: u16) -> Option<(u16, Vec<u8>)> {
+/// Decodes one stripe to BGRA in a buffer padded by one repeated row at the top and
+/// bottom. Reads the headers before allocating: the width must be `width`, and the height
+/// not 0 and at most `rows_left`. The decoder is not strict (as in `image`), so scan data
+/// cut short decodes with filler; a stripe cut inside its headers is rejected. Grayscale
+/// and any chroma subsampling are accepted.
+///
+/// zune converts YCbCr to RGB with NEON (its BGRA output falls back to scalar code that
+/// costs as much as the entropy decode) into `scratch`, which is reused across stripes.
+/// One NEON pass then expands it to BGRA straight into the image's buffer, which is never
+/// zero-filled.
+fn decode_stripe(
+    jpeg: &[u8],
+    width: u16,
+    rows_left: u16,
+    scratch: &mut Vec<u8>,
+) -> Option<(u16, Vec<u8>)> {
     use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
     let options = DecoderOptions::default()
-        .jpeg_set_out_colorspace(ColorSpace::BGRA)
+        .jpeg_set_out_colorspace(ColorSpace::RGB)
         .set_max_width(usize::from(width))
         .set_max_height(usize::from(rows_left));
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg), options);
@@ -108,18 +119,63 @@ fn decode_stripe(jpeg: &[u8], width: u16, rows_left: u16) -> Option<(u16, Vec<u8
     if stripe_width != usize::from(width) || height == 0 || height > rows_left {
         return None;
     }
-    let row = usize::from(width) * 4;
     let rows = usize::from(height);
-    if decoder.output_buffer_size()? != row * rows {
+    let rgb_row = usize::from(width) * 3;
+    if decoder.output_buffer_size()? != rgb_row * rows {
         return None;
     }
-    let mut pixels = vec![0u8; row * (rows + 2)];
-    decoder
-        .decode_into(&mut pixels[row..row * (rows + 1)])
-        .ok()?;
-    pixels.copy_within(row..2 * row, 0);
-    pixels.copy_within(rows * row..(rows + 1) * row, (rows + 1) * row);
-    Some((height, pixels))
+    scratch.resize(rgb_row * rows, 0);
+    let rgb = &mut scratch[..rgb_row * rows];
+    decoder.decode_into(rgb).ok()?;
+    let row = usize::from(width) * 4;
+    let mut bgra = Vec::with_capacity(row * (rows + 2));
+    let out = &mut bgra.spare_capacity_mut()[..row * (rows + 2)];
+    let (top, rest) = out.split_at_mut(row);
+    let (body, bottom) = rest.split_at_mut(row * rows);
+    rgb_to_bgra(&rgb[..rgb_row], top);
+    rgb_to_bgra(rgb, body);
+    rgb_to_bgra(&rgb[rgb_row * (rows - 1)..], bottom);
+    // SAFETY: the three calls above wrote every byte of the first `row * (rows + 2)`.
+    unsafe { bgra.set_len(row * (rows + 2)) };
+    Some((height, bgra))
+}
+
+/// Expands RGB to BGRA with opaque alpha, writing every byte of `out`, which must hold
+/// `rgb.len() / 3 * 4` bytes.
+fn rgb_to_bgra(rgb: &[u8], out: &mut [std::mem::MaybeUninit<u8>]) {
+    let count = rgb.len() / 3;
+    assert_eq!(out.len(), count * 4);
+    #[cfg(target_arch = "aarch64")]
+    let done = {
+        use std::arch::aarch64::{uint8x16x4_t, vdupq_n_u8, vld3q_u8, vst4q_u8};
+        let blocks = count / 16;
+        // SAFETY: NEON is part of the aarch64 baseline. Block `i` reads bytes 48i..48i+48
+        // of `rgb` and writes bytes 64i..64i+64 of `out`, in bounds since i < count / 16.
+        unsafe {
+            let opaque = vdupq_n_u8(255);
+            for i in 0..blocks {
+                let px = vld3q_u8(rgb.as_ptr().add(i * 48));
+                vst4q_u8(
+                    out.as_mut_ptr().add(i * 64).cast::<u8>(),
+                    uint8x16x4_t(px.2, px.1, px.0, opaque),
+                );
+            }
+        }
+        blocks * 16
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let done = 0;
+    for (px, dst) in rgb[done * 3..count * 3]
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(out[done * 4..].as_chunks_mut::<4>().0)
+    {
+        dst[0].write(px[2]);
+        dst[1].write(px[1]);
+        dst[2].write(px[0]);
+        dst[3].write(255);
+    }
 }
 
 #[derive(Default)]
@@ -128,6 +184,8 @@ struct Canvas {
     height: u16,
     /// Keyed by top row; stored stripes never overlap.
     stripes: BTreeMap<u16, JpegStripe>,
+    /// The RGB decode of the last stripe, reused so no stripe allocates for it.
+    scratch: Vec<u8>,
 }
 
 impl Canvas {
@@ -138,25 +196,29 @@ impl Canvas {
         }
         let changed = (self.width, self.height) != (width, height);
         if changed {
-            *self = Self {
-                width,
-                height,
-                stripes: BTreeMap::new(),
-            };
+            self.width = width;
+            self.height = height;
+            self.stripes.clear();
         }
         Ok(changed)
     }
 
     /// Decodes a stripe for row `y` without touching the canvas.
-    fn decode(&self, y: u16, jpeg: &[u8]) -> Option<JpegStripe> {
+    fn decode(&mut self, y: u16, jpeg: &[u8]) -> Option<JpegStripe> {
         let rows_left = self.height.checked_sub(y).filter(|rows| *rows > 0)?;
-        let (height, pixels) = decode_stripe(jpeg, self.width, rows_left)?;
+        let (height, pixels) = decode_stripe(jpeg, self.width, rows_left, &mut self.scratch)?;
         let buffer = image::RgbaImage::from_raw(self.width.into(), u32::from(height) + 2, pixels)?;
         Some(JpegStripe {
             y,
             height,
             image: Arc::new(RenderImage::new(smallvec![image::Frame::new(buffer)])),
         })
+    }
+
+    /// Whether `stripe` ends at the canvas's last row. Selkies sends a frame's changed
+    /// stripes top to bottom, so the bottom stripe completes its frame and presents at once.
+    fn is_bottom(&self, stripe: &JpegStripe) -> bool {
+        stripe.y + stripe.height == self.height
     }
 
     /// Stores a stripe after removing every stored stripe it overlaps, so a change in the
@@ -189,12 +251,20 @@ impl Canvas {
 }
 
 /// How long the stream must be quiet before the stripes gathered so far are shown.
-const SETTLE: Duration = Duration::from_millis(4);
+/// A frame's stripes arrive back to back, so this is only for a frame whose last stripe is
+/// not the bottom one (typing changes one stripe).
+const SETTLE: Duration = Duration::from_millis(2);
+/// How late a tokio `Sleep` wakes: it rounds its deadline up to the next 1 ms tick, and the
+/// driver's park adds about another. QA measured 4 ms sleeps waking after 6.3 ms (p50).
+const TIMER_LATENESS: Duration = Duration::from_millis(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PresentReason {
     /// A stripe of a new frame id arrived, so the previous frame is complete.
     Boundary,
+    /// The bottom stripe arrived: Selkies sends a frame's stripes top to bottom, so the
+    /// frame is complete.
+    Bottom,
     /// No stripe arrived for `SETTLE`.
     Settle,
 }
@@ -204,13 +274,13 @@ struct Present {
     reason: PresentReason,
     /// Whether this shows a frame id not shown before (`ARCH-021` counts frames per id).
     new_frame: bool,
-    /// From the last gathered stripe to this present.
+    /// From the last gathered stripe's arrival (before its decode) to this present.
     delay: Duration,
 }
 
-/// Presents JPEG stripes at frame-id boundaries, like the Selkies web client, with a
-/// `SETTLE` deadline that each stripe pushes back, for the last frame of a burst
-/// (`ARCH-034`).
+/// Presents JPEG stripes once a frame is complete (`ARCH-034`): when its bottom stripe
+/// arrives, when a stripe of a new frame id arrives (like the Selkies web client), or after a
+/// `SETTLE` deadline that each stripe pushes back, for a frame that doesn't reach the bottom.
 #[derive(Default)]
 struct JpegPacer {
     /// The frame id gathered and not yet shown.
@@ -220,8 +290,8 @@ struct JpegPacer {
 }
 
 impl JpegPacer {
-    /// Records a decoded stripe of frame `id`. When it starts a new frame, returns the
-    /// present of the previous one, which is due *before* this stripe is applied.
+    /// Records a decoded stripe of frame `id` that arrived at `now`. When it starts a new
+    /// frame, returns the present of the previous one, due *before* this stripe is applied.
     fn stripe(&mut self, id: u16, now: Instant) -> Option<Present> {
         let boundary = if self.pending.is_some_and(|pending| pending != id) {
             self.present(PresentReason::Boundary, now)
@@ -236,6 +306,17 @@ impl JpegPacer {
     /// When the settle present is due; `None` while nothing is pending.
     fn deadline(&self) -> Option<Instant> {
         self.pending.and(self.last_stripe).map(|last| last + SETTLE)
+    }
+
+    /// When to arm the timer so it wakes near `deadline()`, given `TIMER_LATENESS`.
+    fn timer(&self) -> Option<Instant> {
+        let last = self.last_stripe?;
+        self.deadline().map(|deadline| {
+            deadline
+                .checked_sub(TIMER_LATENESS)
+                .unwrap_or(last)
+                .max(last)
+        })
     }
 
     /// Takes the pending frame for a present.
@@ -917,12 +998,17 @@ pub async fn run(
                             diagnostics.codec = Some(Codec::Jpeg);
                             diagnostics.decode += started.elapsed();
                             let now = Instant::now();
-                            if let Some(present) = pacer.stripe(id, now) {
+                            if let Some(present) = pacer.stripe(id, started) {
                                 present_jpeg(&frames, &frame, &mut diagnostics, present);
                             }
+                            let bottom = frame.is_bottom(&stripe);
                             frame.insert(stripe);
-                            if let Some(deadline) = pacer.deadline() {
-                                settle.as_mut().reset(deadline.into());
+                            if bottom {
+                                if let Some(present) = pacer.present(PresentReason::Bottom, now) {
+                                    present_jpeg(&frames, &frame, &mut diagnostics, present);
+                                }
+                            } else if let Some(timer) = pacer.timer() {
+                                settle.as_mut().reset(timer.into());
                             }
                             seen_video = true;
                         } else {
@@ -2032,7 +2118,7 @@ mod tests {
         let gradient = jpeg_sized(64, 24, 75, |x, y| {
             [(x * 4) as u8, (y * 10) as u8, ((x + y) * 3) as u8]
         });
-        let (_, padded) = decode_stripe(&gradient, 64, 24).unwrap();
+        let (_, padded) = decode_stripe(&gradient, 64, 24, &mut Vec::new()).unwrap();
         let reference = image::load_from_memory_with_format(&gradient, ImageFormat::Jpeg)
             .unwrap()
             .into_rgba8();
@@ -2063,22 +2149,25 @@ mod tests {
         let start = Instant::now();
         let mut pacer = JpegPacer::default();
         assert_eq!(pacer.deadline(), None);
+        assert_eq!(pacer.timer(), None);
         pacer.stripe(1, start);
         assert_eq!(pacer.deadline(), Some(start + SETTLE));
-        // Stripes less than SETTLE apart keep pushing it back.
-        for ms in [2, 5, 8] {
-            pacer.stripe(1, start + Duration::from_millis(ms));
-            assert_eq!(
-                pacer.deadline(),
-                Some(start + Duration::from_millis(ms) + SETTLE)
-            );
+        // Each stripe pushes it back.
+        for ms in [1, 3, 5] {
+            let at = start + Duration::from_millis(ms);
+            pacer.stripe(1, at);
+            assert_eq!(pacer.deadline(), Some(at + SETTLE));
+            // Armed early by the timer's lateness, never before the stripe itself.
+            let timer = pacer.timer().unwrap();
+            assert!(timer >= at && timer <= at + SETTLE);
+            assert_eq!(timer, (at + SETTLE - TIMER_LATENESS).max(at));
         }
-        let present = pacer
-            .present(PresentReason::Settle, start + Duration::from_millis(12))
-            .unwrap();
+        let at = start + Duration::from_millis(5) + SETTLE;
+        let present = pacer.present(PresentReason::Settle, at).unwrap();
         assert_eq!(present.reason, PresentReason::Settle);
         assert_eq!(present.delay, SETTLE);
         assert_eq!(pacer.deadline(), None, "nothing to wake for while static");
+        assert_eq!(pacer.timer(), None);
         assert_eq!(pacer.present(PresentReason::Settle, start), None);
     }
 
@@ -2098,6 +2187,48 @@ mod tests {
         assert!(!rest.new_frame);
         // The first stripe of the next frame after a settle presents nothing extra.
         assert_eq!(pacer.stripe(8, start + Duration::from_millis(20)), None);
+    }
+
+    #[test]
+    fn only_the_bottom_stripe_completes_a_frame() {
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 8).unwrap();
+        let red = jpeg_sized(2, 4, 90, |_, _| [255, 0, 0]);
+        let top = canvas.decode(0, &red).unwrap();
+        let bottom = canvas.decode(4, &red).unwrap();
+        assert!(!canvas.is_bottom(&top));
+        assert!(canvas.is_bottom(&bottom));
+    }
+
+    #[test]
+    fn grayscale_and_subsampled_stripes_decode() {
+        let mut canvas = Canvas::default();
+        canvas.resize(16, 16).unwrap();
+        let mut gray = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut gray, 95)
+            .encode(&[200u8; 16 * 8], 16, 8, image::ExtendedColorType::L8)
+            .unwrap();
+        let stripe = canvas.decode(0, &gray).unwrap();
+        let [b, g, r, a] = pixel(&stripe, 1);
+        assert!(b.abs_diff(200) <= 2 && g == b && r == b && a == 255);
+        let odd = jpeg_sized(16, 7, 90, |x, _| [0, (x * 16) as u8, 255]);
+        let stripe = canvas.decode(9, &odd).unwrap();
+        assert_eq!(stripe.height, 7);
+        assert!(pixel(&stripe, 1)[0] > 240); // blue, BGRA
+    }
+
+    #[test]
+    fn rgb_to_bgra_covers_neon_blocks_and_the_tail() {
+        for count in [0usize, 1, 15, 16, 17, 33, 100] {
+            let rgb: Vec<u8> = (0..count * 3).map(|i| i as u8).collect();
+            let mut out = Vec::with_capacity(count * 4);
+            rgb_to_bgra(&rgb, &mut out.spare_capacity_mut()[..count * 4]);
+            // SAFETY: rgb_to_bgra wrote every byte.
+            unsafe { out.set_len(count * 4) };
+            for (px, bgra) in rgb.chunks(3).zip(out.chunks(4)) {
+                assert_eq!(bgra, [px[2], px[1], px[0], 255]);
+            }
+        }
     }
 
     #[test]
@@ -2210,7 +2341,8 @@ mod tests {
             });
             let new = time(&mut || {
                 for (y, jpeg) in changed {
-                    canvas.insert(canvas.decode(*y, jpeg).unwrap());
+                    let stripe = canvas.decode(*y, jpeg).unwrap();
+                    canvas.insert(stripe);
                 }
                 std::hint::black_box(canvas.snapshot());
             });
