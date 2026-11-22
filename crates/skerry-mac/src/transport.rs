@@ -6,16 +6,14 @@ use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use gpui_kit::RenderImage;
-use image::{ImageDecoder, ImageFormat, ImageReader};
+use image::{ImageFormat, ImageReader};
 use reqwest::Url;
 use serde_json::{json, Value};
 use smallvec::smallvec;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Cursor,
-};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest, protocol::WebSocketConfig, Message,
@@ -71,68 +69,223 @@ pub struct Frame {
 
 #[derive(Clone)]
 pub enum Picture {
-    Jpeg(Arc<RenderImage>),
+    Jpeg(JpegPicture),
     Video(video::Surface),
+}
+
+/// The JPEG stripes on screen, top to bottom (`ARCH-034`). Each stripe is its own
+/// `RenderImage`, so a changed stripe uploads only its own rows, and nothing copies the
+/// whole canvas. The view retires a replaced stripe with `drop_image` four paints after it
+/// leaves the screen.
+#[derive(Clone)]
+pub struct JpegPicture {
+    pub stripes: Arc<[JpegStripe]>,
+}
+
+#[derive(Clone)]
+pub struct JpegStripe {
+    pub y: u16,
+    pub height: u16,
+    /// BGRA, `height + 2` rows: the first and last rows repeat, so linear sampling at a
+    /// non-1:1 scale never reads a neighbouring atlas tile.
+    pub image: Arc<RenderImage>,
+}
+
+/// Decodes one stripe straight to BGRA into a buffer padded by one repeated row at the top
+/// and bottom. Reads the headers before allocating: the width must be `width`, and the
+/// height not 0 and at most `rows_left`. The decoder is not strict (as in `image`), so scan
+/// data cut short decodes with filler; a stripe cut inside its headers is rejected.
+fn decode_stripe(jpeg: &[u8], width: u16, rows_left: u16) -> Option<(u16, Vec<u8>)> {
+    use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
+    let options = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::BGRA)
+        .set_max_width(usize::from(width))
+        .set_max_height(usize::from(rows_left));
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(jpeg), options);
+    decoder.decode_headers().ok()?;
+    let (stripe_width, height) = decoder.dimensions()?;
+    let height = u16::try_from(height).ok()?;
+    if stripe_width != usize::from(width) || height == 0 || height > rows_left {
+        return None;
+    }
+    let row = usize::from(width) * 4;
+    let rows = usize::from(height);
+    if decoder.output_buffer_size()? != row * rows {
+        return None;
+    }
+    let mut pixels = vec![0u8; row * (rows + 2)];
+    decoder
+        .decode_into(&mut pixels[row..row * (rows + 1)])
+        .ok()?;
+    pixels.copy_within(row..2 * row, 0);
+    pixels.copy_within(rows * row..(rows + 1) * row, (rows + 1) * row);
+    Some((height, pixels))
 }
 
 #[derive(Default)]
 struct Canvas {
     width: u16,
     height: u16,
-    pixels: image::RgbaImage,
-    received_image: bool,
+    /// Keyed by top row; stored stripes never overlap.
+    stripes: BTreeMap<u16, JpegStripe>,
 }
 
 impl Canvas {
-    fn resize(&mut self, width: u16, height: u16) -> Result<(), &'static str> {
+    /// Sets the remote size; a new size clears every stripe. Returns whether it changed.
+    fn resize(&mut self, width: u16, height: u16) -> Result<bool, &'static str> {
         if !valid_resolution(width, height) {
             return Err("The remote display resolution is outside the supported range.");
         }
-        if (self.width, self.height) != (width, height) {
+        let changed = (self.width, self.height) != (width, height);
+        if changed {
             *self = Self {
                 width,
                 height,
-                pixels: image::RgbaImage::new(width.into(), height.into()),
-                received_image: false,
+                stripes: BTreeMap::new(),
             };
         }
-        Ok(())
+        Ok(changed)
     }
 
-    fn stripe(&mut self, y: u16, jpeg: &[u8]) -> Option<()> {
-        let decoder = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg)
-            .into_decoder()
-            .ok()?;
-        let (width, height) = decoder.dimensions();
-        let height = u16::try_from(height).ok()?;
-        let end = y.checked_add(height)?;
-        if width != u32::from(self.width) || height == 0 || end > self.height {
-            return None;
+    /// Decodes a stripe for row `y` without touching the canvas.
+    fn decode(&self, y: u16, jpeg: &[u8]) -> Option<JpegStripe> {
+        let rows_left = self.height.checked_sub(y).filter(|rows| *rows > 0)?;
+        let (height, pixels) = decode_stripe(jpeg, self.width, rows_left)?;
+        let buffer = image::RgbaImage::from_raw(self.width.into(), u32::from(height) + 2, pixels)?;
+        Some(JpegStripe {
+            y,
+            height,
+            image: Arc::new(RenderImage::new(smallvec![image::Frame::new(buffer)])),
+        })
+    }
+
+    /// Stores a stripe after removing every stored stripe it overlaps, so a change in the
+    /// server's stripe count or geometry leaves nothing stale.
+    fn insert(&mut self, stripe: JpegStripe) {
+        let (top, bottom) = (stripe.y, stripe.y + stripe.height);
+        if let Some((&y, above)) = self.stripes.range(..top).next_back() {
+            if y + above.height > top {
+                self.stripes.remove(&y);
+            }
         }
-        let mut stripe = image::DynamicImage::from_decoder(decoder)
-            .ok()?
-            .into_rgba8();
-        for pixel in stripe.pixels_mut() {
-            pixel.0.swap(0, 2);
-        } // GPUI expects BGRA.
-        let row = usize::from(self.width) * 4;
-        let pixels: &mut [u8] = &mut self.pixels;
-        pixels[usize::from(y) * row..usize::from(end) * row].copy_from_slice(&stripe);
-        self.received_image = true;
-        Some(())
+        let covered: Vec<u16> = self.stripes.range(top..bottom).map(|(y, _)| *y).collect();
+        for y in covered {
+            self.stripes.remove(&y);
+        }
+        self.stripes.insert(top, stripe);
     }
 
     fn snapshot(&self) -> Frame {
         Frame {
             width: self.width,
             height: self.height,
-            picture: self.received_image.then(|| {
-                Picture::Jpeg(Arc::new(RenderImage::new(smallvec![image::Frame::new(
-                    self.pixels.clone()
-                )])))
+            picture: (!self.stripes.is_empty()).then(|| {
+                Picture::Jpeg(JpegPicture {
+                    stripes: self.stripes.values().cloned().collect(),
+                })
             }),
         }
     }
+}
+
+/// How long the stream must be quiet before the stripes gathered so far are shown.
+const SETTLE: Duration = Duration::from_millis(4);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresentReason {
+    /// A stripe of a new frame id arrived, so the previous frame is complete.
+    Boundary,
+    /// No stripe arrived for `SETTLE`.
+    Settle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Present {
+    reason: PresentReason,
+    /// Whether this shows a frame id not shown before (`ARCH-021` counts frames per id).
+    new_frame: bool,
+    /// From the last gathered stripe to this present.
+    delay: Duration,
+}
+
+/// Presents JPEG stripes at frame-id boundaries, like the Selkies web client, with a
+/// `SETTLE` deadline that each stripe pushes back, for the last frame of a burst
+/// (`ARCH-034`).
+#[derive(Default)]
+struct JpegPacer {
+    /// The frame id gathered and not yet shown.
+    pending: Option<u16>,
+    last_stripe: Option<Instant>,
+    shown: Option<u16>,
+}
+
+impl JpegPacer {
+    /// Records a decoded stripe of frame `id`. When it starts a new frame, returns the
+    /// present of the previous one, which is due *before* this stripe is applied.
+    fn stripe(&mut self, id: u16, now: Instant) -> Option<Present> {
+        let boundary = if self.pending.is_some_and(|pending| pending != id) {
+            self.present(PresentReason::Boundary, now)
+        } else {
+            None
+        };
+        self.pending = Some(id);
+        self.last_stripe = Some(now);
+        boundary
+    }
+
+    /// When the settle present is due; `None` while nothing is pending.
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.and(self.last_stripe).map(|last| last + SETTLE)
+    }
+
+    /// Takes the pending frame for a present.
+    fn present(&mut self, reason: PresentReason, now: Instant) -> Option<Present> {
+        let id = self.pending.take()?;
+        let new_frame = self.shown != Some(id);
+        self.shown = Some(id);
+        Some(Present {
+            reason,
+            new_frame,
+            delay: self
+                .last_stripe
+                .map_or(Duration::ZERO, |last| now.saturating_duration_since(last)),
+        })
+    }
+
+    /// Forgets everything: the stream left JPEG (a hardware frame or codec switch) or
+    /// resized, so a pending settle can never show a stale picture.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Logs a JPEG present and its delay from the last stripe when `SKERRY_PRESENT_TRACE=1`.
+fn trace_present(present: &Present) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED
+        .get_or_init(|| std::env::var("SKERRY_PRESENT_TRACE").is_ok_and(|value| value == "1"));
+    if enabled {
+        eprintln!(
+            "skerry present: {:?} delay_ms={:.3}",
+            present.reason,
+            present.delay.as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// Shows the gathered stripes; a snapshot is only a list of `Arc`s.
+fn present_jpeg(
+    frames: &watch::Sender<Frame>,
+    canvas: &Canvas,
+    diagnostics: &mut Diagnostics,
+    present: Present,
+) {
+    trace_present(&present);
+    let picture = canvas.snapshot();
+    if picture.picture.is_some() && present.new_frame {
+        diagnostics.frames += 1;
+    }
+    frames.send_replace(picture);
 }
 
 #[derive(Clone, Debug)]
@@ -705,11 +858,7 @@ pub async fn run(
     let mut frame = Canvas::default();
     let mut jpeg_size = Resolution(1280, 720);
     let mut active_size = jpeg_size;
-    let mut changed = false;
-    // The JPEG frame id last gathered, and the one last shown, so a frame whose
-    // stripes straddle two flushes is counted once (`ARCH-021`).
-    let mut jpeg_frame = None;
-    let mut shown_jpeg_frame = None;
+    let mut pacer = JpegPacer::default();
     let mut last_frame = None;
     let mut seen_video = false;
     let mut unsupported_video = false;
@@ -737,9 +886,10 @@ pub async fn run(
     tokio::pin!(video_deadline);
     let mut present = tokio::time::interval(Duration::from_millis(33));
     present.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // JPEG stripes gather into one canvas, flushed this often while any changed.
-    let mut jpeg_flush = tokio::time::interval(Duration::from_millis(8));
-    jpeg_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Shows the last frame of a burst; each stripe pushes it back, and it is polled only
+    // while a frame is pending, so a static desktop never wakes for it (`ARCH-034`).
+    let settle = tokio::time::sleep(SETTLE);
+    tokio::pin!(settle);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
     let mut clipboard_in = clipboard::Receiver::default();
@@ -754,18 +904,26 @@ pub async fn run(
                     diagnostics.received_bytes += data.len() as u64;
                     match data.first().copied() {
                     Some(3) if data.len() > 6 && hardware.as_ref().is_none_or(|video| !video.decoded) => {
-                        frame.resize(jpeg_size.0, jpeg_size.1)?;
+                        if frame.resize(jpeg_size.0, jpeg_size.1)? {
+                            pacer.reset();
+                        }
                         active_size = jpeg_size;
                         let id = u16::from_be_bytes([data[2], data[3]]);
                         let y = u16::from_be_bytes([data[4], data[5]]);
                         last_frame = Some(id);
-                        jpeg_frame = Some(id);
                         let started = Instant::now();
-                        if frame.stripe(y, &data[6..]).is_some() {
+                        if let Some(stripe) = frame.decode(y, &data[6..]) {
                             diagnostics.packets += 1;
                             diagnostics.codec = Some(Codec::Jpeg);
                             diagnostics.decode += started.elapsed();
-                            changed = true;
+                            let now = Instant::now();
+                            if let Some(present) = pacer.stripe(id, now) {
+                                present_jpeg(&frames, &frame, &mut diagnostics, present);
+                            }
+                            frame.insert(stripe);
+                            if let Some(deadline) = pacer.deadline() {
+                                settle.as_mut().reset(deadline.into());
+                            }
                             seen_video = true;
                         } else {
                             diagnostics.dropped += 1;
@@ -781,12 +939,12 @@ pub async fn run(
                             let started = Instant::now();
                             if let Some(picture) = packet.as_ref().and_then(|packet| video.decode(packet)) {
                                 frame = Canvas::default();
+                                pacer.reset();
                                 active_size = Resolution(picture.width, picture.height);
                                 // A hardware frame is a whole picture: show it now rather
                                 // than on the next tick, which capped video at 30 fps (`ARCH-021`).
                                 diagnostics.frames += 1;
                                 frames.send_replace(picture);
-                                changed = false;
                                 diagnostics.codec = Some(video.codec);
                                 diagnostics.packets += 1;
                                 diagnostics.decode += started.elapsed();
@@ -850,9 +1008,13 @@ pub async fn run(
                                 }
                                 jpeg_size = Resolution(width, height);
                                 active_size = jpeg_size;
-                                if hardware.as_ref().is_none_or(|video| !video.decoded) {
-                                    frame.resize(width, height)?;
-                                    changed = true;
+                                // A new size presents at once (empty), so the view retires
+                                // the old-size stripes.
+                                if hardware.as_ref().is_none_or(|video| !video.decoded)
+                                    && frame.resize(width, height)?
+                                {
+                                    pacer.reset();
+                                    frames.send_replace(frame.snapshot());
                                 }
                             }
                             Some("server_settings") | Some("display_settings") if primary_display(&data) => {
@@ -870,6 +1032,7 @@ pub async fn run(
                                     if !capabilities.codecs.contains(&codec) {
                                         codec = capabilities.codecs.first().copied().ok_or("This server offers no video codec this Mac can play.")?;
                                         hardware = (codec != Codec::Jpeg).then(|| HardwareVideo::new(codec, Instant::now()));
+                                        pacer.reset();
                                         seen_video = false;
                                         let command = codec_command(codec);
                                         socket.send(command.into()).await.map_err(|_| disconnected)?;
@@ -1058,14 +1221,10 @@ pub async fn run(
                     ping = Some(now);
                 }
             }
-            _ = jpeg_flush.tick(), if changed => {
-                let picture = frame.snapshot();
-                if picture.picture.is_some() && jpeg_frame != shown_jpeg_frame {
-                    diagnostics.frames += 1;
-                    shown_jpeg_frame = jpeg_frame;
+            _ = &mut settle, if pacer.deadline().is_some() => {
+                if let Some(present) = pacer.present(PresentReason::Settle, Instant::now()) {
+                    present_jpeg(&frames, &frame, &mut diagnostics, present);
                 }
-                frames.send_replace(picture);
-                changed = false;
             }
             _ = present.tick() => {
                 if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
@@ -1074,6 +1233,7 @@ pub async fn run(
                     }
                     codec = Codec::Jpeg;
                     hardware = None;
+                    pacer.reset();
                     seen_video = false;
                     unsupported_video = false;
                     video_deadline.as_mut().reset(tokio::time::Instant::now() + WAIT_FOR_VIDEO);
@@ -1726,15 +1886,311 @@ mod tests {
         let red = jpeg([255, 0, 0]);
         let blue = jpeg([0, 0, 255]);
         canvas.stripe(0, &red).unwrap();
-        let unchanged = *canvas.pixels.get_pixel(0, 0);
         canvas.stripe(1, &blue).unwrap();
-        assert_eq!(*canvas.pixels.get_pixel(0, 0), unchanged);
-        assert!(unchanged.0[2] > 240); // BGRA red
-        assert!(canvas.pixels.get_pixel(0, 1).0[0] > 240); // BGRA blue
+        let before = stripes(&canvas.snapshot());
+        canvas.stripe(1, &red).unwrap();
+        let after = stripes(&canvas.snapshot());
+        assert_eq!(after.len(), 2);
+        assert!(Arc::ptr_eq(&before[0].image, &after[0].image));
+        assert!(!Arc::ptr_eq(&before[1].image, &after[1].image));
+        assert!(pixel(&before[0], 1)[2] > 240); // BGRA red
+        assert!(pixel(&before[1], 1)[0] > 240); // BGRA blue
         assert!(canvas.stripe(2, &red).is_none());
+    }
+
+    impl Canvas {
+        fn stripe(&mut self, y: u16, jpeg: &[u8]) -> Option<()> {
+            let stripe = self.decode(y, jpeg)?;
+            self.insert(stripe);
+            Some(())
+        }
+    }
+
+    fn stripes(frame: &Frame) -> Vec<JpegStripe> {
+        match &frame.picture {
+            Some(Picture::Jpeg(picture)) => picture.stripes.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The first pixel of padded row `row` of a stripe, BGRA.
+    fn pixel(stripe: &JpegStripe, row: usize) -> [u8; 4] {
+        let bytes = stripe.image.as_bytes(0).unwrap();
+        let start = row * usize::from(stripe.image.size(0).width.0 as u16) * 4;
+        bytes[start..start + 4].try_into().unwrap()
+    }
+
+    fn jpeg_sized(
+        width: u16,
+        height: u16,
+        quality: u8,
+        pixel: impl Fn(u32, u32) -> [u8; 3],
+    ) -> Vec<u8> {
+        let mut rgb = Vec::with_capacity(usize::from(width) * usize::from(height) * 3);
+        for y in 0..u32::from(height) {
+            for x in 0..u32::from(width) {
+                rgb.extend_from_slice(&pixel(x, y));
+            }
+        }
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode(
+                &rgb,
+                width.into(),
+                height.into(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn a_stripe_replaces_every_overlapping_stripe() {
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 16).unwrap();
+        let red = |height| jpeg_sized(2, height, 90, |_, _| [255, 0, 0]);
+        for y in [0, 4, 8, 12] {
+            canvas.stripe(y, &red(4)).unwrap();
+        }
+        // Eight stripes of two rows: 2..4 overlaps the end of the stripe at 0.
+        canvas.stripe(2, &red(2)).unwrap();
+        let ys: Vec<u16> = stripes(&canvas.snapshot()).iter().map(|s| s.y).collect();
+        assert_eq!(ys, [2, 4, 8, 12]);
+        for y in (0..16).step_by(2) {
+            canvas.stripe(y, &red(2)).unwrap();
+        }
+        let geometry: Vec<(u16, u16)> = stripes(&canvas.snapshot())
+            .iter()
+            .map(|s| (s.y, s.height))
+            .collect();
+        assert_eq!(
+            geometry,
+            (0..16).step_by(2).map(|y| (y, 2)).collect::<Vec<_>>()
+        );
+        // One tall stripe covers several.
+        canvas.stripe(3, &red(6)).unwrap();
+        let ys: Vec<u16> = stripes(&canvas.snapshot()).iter().map(|s| s.y).collect();
+        assert_eq!(ys, [0, 3, 10, 12, 14]);
+    }
+
+    #[test]
+    fn resize_clears_stripes() {
+        let mut canvas = Canvas::default();
+        assert!(canvas.resize(2, 2).unwrap());
+        canvas.stripe(0, &jpeg([255, 0, 0])).unwrap();
+        assert!(!canvas.resize(2, 2).unwrap());
         assert!(canvas.snapshot().picture.is_some());
-        canvas.resize(3, 2).unwrap();
+        assert!(canvas.resize(3, 2).unwrap());
+        let frame = canvas.snapshot();
+        assert!(frame.picture.is_none());
+        assert_eq!((frame.width, frame.height), (3, 2));
+    }
+
+    #[test]
+    fn rejects_wrong_width_overflow_zero_height_and_headers_cut_short() {
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 4).unwrap();
+        let two_rows = jpeg_sized(2, 2, 90, |_, _| [0, 255, 0]);
+        assert!(canvas
+            .decode(0, &jpeg_sized(4, 2, 90, |_, _| [0; 3]))
+            .is_none());
+        assert!(canvas.decode(3, &two_rows).is_none()); // runs past the bottom
+        assert!(canvas.decode(4, &two_rows).is_none());
+        assert!(canvas.decode(u16::MAX, &two_rows).is_none());
+        assert!(canvas.decode(0, &[]).is_none());
+        // Cut inside the headers (before the start of scan) fails; scan data cut short
+        // decodes with filler, since the decoder is not strict.
+        let scan = two_rows.windows(2).position(|w| w == [0xff, 0xda]).unwrap();
+        assert!(canvas.decode(0, &two_rows[..scan]).is_none());
+        assert!(canvas.decode(0, &two_rows[..scan / 2]).is_none());
+        assert!(canvas.decode(2, &two_rows).is_some());
+    }
+
+    #[test]
+    fn decoded_stripe_is_bgra_with_repeated_edge_rows() {
+        let mut canvas = Canvas::default();
+        canvas.resize(8, 16).unwrap();
+        let bands = jpeg_sized(
+            8,
+            8,
+            95,
+            |_, y| if y < 4 { [255, 0, 0] } else { [0, 0, 255] },
+        );
+        let stripe = canvas.decode(8, &bands).unwrap();
+        assert_eq!((stripe.y, stripe.height), (8, 8));
+        assert_eq!(stripe.image.size(0).height.0, 10);
+        assert!(pixel(&stripe, 1)[2] > 240); // red, BGRA
+        assert!(pixel(&stripe, 8)[0] > 240); // blue, BGRA
+        let bytes = stripe.image.as_bytes(0).unwrap();
+        let row = 8 * 4;
+        assert_eq!(bytes[..row], bytes[row..2 * row]);
+        assert_eq!(bytes[9 * row..], bytes[8 * row..9 * row]);
+    }
+
+    #[test]
+    fn zune_bgra_matches_image_crate_decode() {
+        let gradient = jpeg_sized(64, 24, 75, |x, y| {
+            [(x * 4) as u8, (y * 10) as u8, ((x + y) * 3) as u8]
+        });
+        let (_, padded) = decode_stripe(&gradient, 64, 24).unwrap();
+        let reference = image::load_from_memory_with_format(&gradient, ImageFormat::Jpeg)
+            .unwrap()
+            .into_rgba8();
+        let row = 64 * 4;
+        for (bgra, rgba) in padded[row..row * 25].chunks(4).zip(reference.pixels()) {
+            for (ours, theirs) in [(bgra[2], rgba[0]), (bgra[1], rgba[1]), (bgra[0], rgba[2])] {
+                assert!(ours.abs_diff(theirs) <= 1, "{bgra:?} vs {rgba:?}");
+            }
+            assert_eq!(bgra[3], 255);
+        }
+    }
+
+    #[test]
+    fn a_new_frame_id_presents_the_previous_frame_once() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        assert_eq!(pacer.stripe(1, start), None);
+        assert_eq!(pacer.stripe(1, start + Duration::from_millis(1)), None);
+        let present = pacer.stripe(2, start + Duration::from_millis(3)).unwrap();
+        assert_eq!(present.reason, PresentReason::Boundary);
+        assert!(present.new_frame);
+        assert_eq!(present.delay, Duration::from_millis(2));
+        assert_eq!(pacer.stripe(2, start + Duration::from_millis(4)), None);
+    }
+
+    #[test]
+    fn settle_deadline_follows_the_last_stripe() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        assert_eq!(pacer.deadline(), None);
+        pacer.stripe(1, start);
+        assert_eq!(pacer.deadline(), Some(start + SETTLE));
+        // Stripes less than SETTLE apart keep pushing it back.
+        for ms in [2, 5, 8] {
+            pacer.stripe(1, start + Duration::from_millis(ms));
+            assert_eq!(
+                pacer.deadline(),
+                Some(start + Duration::from_millis(ms) + SETTLE)
+            );
+        }
+        let present = pacer
+            .present(PresentReason::Settle, start + Duration::from_millis(12))
+            .unwrap();
+        assert_eq!(present.reason, PresentReason::Settle);
+        assert_eq!(present.delay, SETTLE);
+        assert_eq!(pacer.deadline(), None, "nothing to wake for while static");
+        assert_eq!(pacer.present(PresentReason::Settle, start), None);
+    }
+
+    #[test]
+    fn a_frame_split_over_a_settle_is_counted_once() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        pacer.stripe(7, start);
+        let first = pacer
+            .present(PresentReason::Settle, start + SETTLE)
+            .unwrap();
+        assert!(first.new_frame);
+        pacer.stripe(7, start + Duration::from_millis(9));
+        let rest = pacer
+            .present(PresentReason::Settle, start + Duration::from_millis(13))
+            .unwrap();
+        assert!(!rest.new_frame);
+        // The first stripe of the next frame after a settle presents nothing extra.
+        assert_eq!(pacer.stripe(8, start + Duration::from_millis(20)), None);
+    }
+
+    #[test]
+    fn leaving_jpeg_resets_the_pacer_and_canvas() {
+        let start = Instant::now();
+        let mut pacer = JpegPacer::default();
+        let mut canvas = Canvas::default();
+        canvas.resize(2, 2).unwrap();
+        canvas.stripe(0, &jpeg([255, 0, 0])).unwrap();
+        pacer.stripe(3, start);
+        // A hardware frame (or codec switch) clears both: no settle can send a stale picture.
+        canvas = Canvas::default();
+        pacer.reset();
+        assert_eq!(pacer.deadline(), None);
+        assert_eq!(pacer.present(PresentReason::Settle, start + SETTLE), None);
         assert!(canvas.snapshot().picture.is_none());
+        // After a reset the same id counts as a new frame again.
+        pacer.stripe(3, start);
+        assert!(
+            pacer
+                .present(PresentReason::Settle, start + SETTLE)
+                .unwrap()
+                .new_frame
+        );
+    }
+
+    /// The old path: `image` to RGB, to RGBA, swap R and B, copy into a full canvas, then one
+    /// full clone per flush.
+    fn old_decode(stripes: &[(u16, Vec<u8>)], canvas: &mut image::RgbaImage) -> image::RgbaImage {
+        use image::ImageDecoder as _;
+        let row = canvas.width() as usize * 4;
+        for (y, jpeg) in stripes {
+            let decoder = ImageReader::with_format(Cursor::new(jpeg), ImageFormat::Jpeg)
+                .into_decoder()
+                .unwrap();
+            let height = decoder.dimensions().1 as usize;
+            let mut stripe = image::DynamicImage::from_decoder(decoder)
+                .unwrap()
+                .into_rgba8();
+            for pixel in stripe.pixels_mut() {
+                pixel.0.swap(0, 2);
+            }
+            let start = usize::from(*y) * row;
+            let pixels: &mut [u8] = canvas;
+            pixels[start..start + height * row].copy_from_slice(&stripe);
+        }
+        canvas.clone()
+    }
+
+    /// `cargo test --release -p skerry-mac jpeg_stripe_decode_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark"]
+    fn jpeg_stripe_decode_cost() {
+        let (width, height, count) = (1492u16, 1868u16, 8u16);
+        let rows = height / count;
+        let stripes: Vec<(u16, Vec<u8>)> = (0..count)
+            .map(|i| {
+                let y = i * rows;
+                let h = if i == count - 1 { height - y } else { rows };
+                let jpeg = jpeg_sized(width, h, 75, |x, row| {
+                    let y = u32::from(y) + row;
+                    let noise = (x.wrapping_mul(2654435761) ^ y.wrapping_mul(40503)) >> 27;
+                    [
+                        (x / 6) as u8,
+                        (y / 8) as u8,
+                        ((x ^ y) as u8 & 0xf0) | noise as u8,
+                    ]
+                });
+                (y, jpeg)
+            })
+            .collect();
+        let mut canvas = Canvas::default();
+        canvas.resize(width, height).unwrap();
+        let mut full = image::RgbaImage::new(width.into(), height.into());
+        let frames = 60;
+        let time = |f: &mut dyn FnMut()| {
+            f();
+            let started = Instant::now();
+            for _ in 0..frames {
+                f();
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(frames)
+        };
+        let old = time(&mut || {
+            std::hint::black_box(old_decode(&stripes, &mut full));
+        });
+        let new = time(&mut || {
+            for (y, jpeg) in &stripes {
+                canvas.insert(canvas.decode(*y, jpeg).unwrap());
+            }
+            std::hint::black_box(canvas.snapshot());
+        });
+        println!("jpeg stripes {width}x{height} in {count}: old {old:.2} ms/frame, new {new:.2} ms/frame");
     }
 
     // ---- Session access without a stream (ARCH-028) --------------------------------------
