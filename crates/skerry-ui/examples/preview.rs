@@ -18,8 +18,8 @@ use skerry_ui::{
     },
     controls::{
         self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps,
-        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, SliderUnit,
-        SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, ShortcutRow,
+        ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -106,6 +106,11 @@ enum Story {
     ControlsServerLocked,
     ControlsDropdownOpen,
     ControlsRestoredSections,
+    ControlsShortcutsActive,
+    ControlsShortcutsOff,
+    ControlsShortcutsLocked,
+    ControlsStatsStripOn,
+    ControlsStatsWaiting,
     AudioDefault,
     AudioChosen,
     AudioMissing,
@@ -117,6 +122,12 @@ enum Story {
     SessionOverlays,
     SessionStartupStalled,
     SessionKeepWaiting,
+    SessionStatsStrip,
+    SessionStatsStripWarn,
+    SessionStatsStripNarrow,
+    SessionStatsStripLight,
+    SessionStatsStripWithBanner,
+    SessionStatsStripFullScreen,
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
@@ -182,6 +193,11 @@ impl Story {
         Story::ControlsServerLocked,
         Story::ControlsDropdownOpen,
         Story::ControlsRestoredSections,
+        Story::ControlsShortcutsActive,
+        Story::ControlsShortcutsOff,
+        Story::ControlsShortcutsLocked,
+        Story::ControlsStatsStripOn,
+        Story::ControlsStatsWaiting,
         Story::AudioDefault,
         Story::AudioChosen,
         Story::AudioMissing,
@@ -193,6 +209,12 @@ impl Story {
         Story::SessionOverlays,
         Story::SessionStartupStalled,
         Story::SessionKeepWaiting,
+        Story::SessionStatsStrip,
+        Story::SessionStatsStripWarn,
+        Story::SessionStatsStripNarrow,
+        Story::SessionStatsStripLight,
+        Story::SessionStatsStripWithBanner,
+        Story::SessionStatsStripFullScreen,
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
@@ -257,7 +279,12 @@ impl Story {
             | Story::ControlsJpeg
             | Story::ControlsServerLocked
             | Story::ControlsDropdownOpen
-            | Story::ControlsRestoredSections => "Session Controls",
+            | Story::ControlsRestoredSections
+            | Story::ControlsShortcutsActive
+            | Story::ControlsShortcutsOff
+            | Story::ControlsShortcutsLocked
+            | Story::ControlsStatsStripOn
+            | Story::ControlsStatsWaiting => "Session Controls",
             Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -266,9 +293,15 @@ impl Story {
             | Story::AudioBitrateLocked
             | Story::AudioBitrateHidden
             | Story::AudioOff => "Session Audio",
-            Story::SessionOverlays | Story::SessionStartupStalled | Story::SessionKeepWaiting => {
-                "Session Overlays"
-            }
+            Story::SessionOverlays
+            | Story::SessionStartupStalled
+            | Story::SessionKeepWaiting
+            | Story::SessionStatsStrip
+            | Story::SessionStatsStripWarn
+            | Story::SessionStatsStripNarrow
+            | Story::SessionStatsStripLight
+            | Story::SessionStatsStripWithBanner
+            | Story::SessionStatsStripFullScreen => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
         }
     }
@@ -333,6 +366,11 @@ impl Story {
             Story::ControlsServerLocked => "Server Locked",
             Story::ControlsDropdownOpen => "Dropdown Open",
             Story::ControlsRestoredSections => "Restored Sections",
+            Story::ControlsShortcutsActive => "Shortcuts · Mac",
+            Story::ControlsShortcutsOff => "Shortcuts · To Session",
+            Story::ControlsShortcutsLocked => "Shortcuts · Locked",
+            Story::ControlsStatsStripOn => "Stats · Strip On",
+            Story::ControlsStatsWaiting => "Stats · Waiting",
             Story::AudioDefault => "Default",
             Story::AudioChosen => "Chosen Device",
             Story::AudioMissing => "Saved Device Missing",
@@ -344,6 +382,12 @@ impl Story {
             Story::SessionOverlays => "Waiting + IME + Banner",
             Story::SessionStartupStalled => "Still Starting",
             Story::SessionKeepWaiting => "Waiting to Start",
+            Story::SessionStatsStrip => "Stats Strip",
+            Story::SessionStatsStripWarn => "Stats Strip · Warn",
+            Story::SessionStatsStripNarrow => "Stats Strip · Narrow",
+            Story::SessionStatsStripLight => "Stats Strip · Light",
+            Story::SessionStatsStripWithBanner => "Stats Strip + Banner",
+            Story::SessionStatsStripFullScreen => "Stats Strip · Full Screen",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
@@ -410,6 +454,11 @@ impl Story {
             Story::ControlsServerLocked => "story-controls-locked",
             Story::ControlsDropdownOpen => "story-controls-dropdown-open",
             Story::ControlsRestoredSections => "story-controls-restored-sections",
+            Story::ControlsShortcutsActive => "story-controls-shortcuts-active",
+            Story::ControlsShortcutsOff => "story-controls-shortcuts-off",
+            Story::ControlsShortcutsLocked => "story-controls-shortcuts-locked",
+            Story::ControlsStatsStripOn => "story-controls-stats-strip-on",
+            Story::ControlsStatsWaiting => "story-controls-stats-waiting",
             Story::AudioDefault => "story-audio-default",
             Story::AudioChosen => "story-audio-chosen",
             Story::AudioMissing => "story-audio-missing",
@@ -421,6 +470,12 @@ impl Story {
             Story::SessionOverlays => "story-session-overlays",
             Story::SessionStartupStalled => "story-session-startup-stalled",
             Story::SessionKeepWaiting => "story-session-keep-waiting",
+            Story::SessionStatsStrip => "story-session-stats-strip",
+            Story::SessionStatsStripWarn => "story-session-stats-strip-warn",
+            Story::SessionStatsStripNarrow => "story-session-stats-strip-narrow",
+            Story::SessionStatsStripLight => "story-session-stats-strip-light",
+            Story::SessionStatsStripWithBanner => "story-session-stats-strip-banner",
+            Story::SessionStatsStripFullScreen => "story-session-stats-strip-fullscreen",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
@@ -483,6 +538,11 @@ impl Story {
                 | Story::ControlsServerLocked
                 | Story::ControlsDropdownOpen
                 | Story::ControlsRestoredSections
+                | Story::ControlsShortcutsActive
+                | Story::ControlsShortcutsOff
+                | Story::ControlsShortcutsLocked
+                | Story::ControlsStatsStripOn
+                | Story::ControlsStatsWaiting
         ) || self.is_audio()
     }
 
@@ -572,13 +632,17 @@ impl Story {
             ..ControlsUiState::default()
         };
         match self {
-            // Input and Video open, Screen closed: what a server remembered.
-            Story::ControlsRestoredSections => {
-                ControlsUiState::default().with_sections([true, false, false, true, false, false])
-            }
-            _ if self.is_audio() => {
-                ControlsUiState::default().with_sections([false, false, false, false, true, false])
-            }
+            // Input, Shortcuts and Video open, Screen closed: what a server remembered.
+            Story::ControlsRestoredSections => ControlsUiState::default()
+                .with_sections([true, true, false, false, true, false, false]),
+            _ if self.is_audio() => ControlsUiState::default()
+                .with_sections([false, false, false, false, false, true, false]),
+            Story::ControlsShortcutsActive
+            | Story::ControlsShortcutsOff
+            | Story::ControlsShortcutsLocked => ControlsUiState::default()
+                .with_sections([false, true, false, false, false, false, false]),
+            Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
+                .with_sections([false, false, false, false, false, false, true]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()
@@ -918,6 +982,11 @@ impl PreviewApp {
         }
         if story == Story::LibraryLongServer {
             self.canvas_width = Some(700.);
+        }
+        if story == Story::SessionStatsStripLight {
+            // The pill stays dark whatever the theme.
+            self.appearance = Appearance::Light;
+            Theme::change(ThemeMode::Light, Some(window), cx);
         }
         if story.is_controls() {
             self.controls_props = Self::fixture_controls(story);
@@ -1928,6 +1997,12 @@ impl PreviewApp {
             ControlsAction::CopyStats => {
                 self.controls_props.stats_copied = !self.controls_props.stats_copied;
             }
+            ControlsAction::SetStatsStrip(on) => self.controls_props.stats_strip = on,
+            ControlsAction::SetMacShortcuts(active) => {
+                if !self.controls_props.shortcuts.locked {
+                    self.controls_props.shortcuts.mac_active = active;
+                }
+            }
             ControlsAction::Reconnect
             | ControlsAction::OpenFiles
             | ControlsAction::Disconnect
@@ -2065,6 +2140,8 @@ impl PreviewApp {
                 }),
                 stats: Some(Self::fixture_stats(false)),
                 stats_copied: false,
+                stats_strip: false,
+                shortcuts: Self::fixture_shortcuts(true, false),
             },
             Story::ControlsServerLocked => ControlsProps {
                 app_name: "Locked Enterprise Desktop".into(),
@@ -2094,6 +2171,8 @@ impl PreviewApp {
                 video_settings: None,
                 stats: None,
                 stats_copied: false,
+                stats_strip: false,
+                shortcuts: Self::fixture_shortcuts(true, false),
             },
             _ if story.is_audio() => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
@@ -2106,6 +2185,25 @@ impl PreviewApp {
                 };
                 if story == Story::AudioOff {
                     props.audio = None;
+                }
+                props
+            }
+            Story::ControlsShortcutsActive
+            | Story::ControlsShortcutsOff
+            | Story::ControlsShortcutsLocked => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.shortcuts = match story {
+                    Story::ControlsShortcutsOff => Self::fixture_shortcuts(false, false),
+                    Story::ControlsShortcutsLocked => Self::fixture_shortcuts(false, true),
+                    _ => Self::fixture_shortcuts(true, false),
+                };
+                props
+            }
+            Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.stats_strip = story == Story::ControlsStatsStripOn;
+                if story == Story::ControlsStatsWaiting {
+                    props.stats = None;
                 }
                 props
             }
@@ -2199,6 +2297,8 @@ impl PreviewApp {
                 }),
                 stats: Some(Self::fixture_stats(true)),
                 stats_copied: false,
+                stats_strip: false,
+                shortcuts: Self::fixture_shortcuts(true, false),
             },
         }
     }
@@ -2333,6 +2433,60 @@ impl PreviewApp {
     /// Stats as a session shows them a minute after the section opened:
     /// `hardware` is an H.265 stream on a GPU host, else a JPEG stream whose
     /// capture fell back to a readback and whose rate overshoots its target.
+    /// The Shortcuts card as `skerry-mac` builds it from `shortcuts::CHORDS`.
+    fn fixture_shortcuts(mac_active: bool, locked: bool) -> ShortcutsProps {
+        let row = |label: &str, modifiers: &str, key: &str, remote: Option<&str>| ShortcutRow {
+            label: label.into(),
+            modifiers: modifiers.into(),
+            key: key.into(),
+            remote: remote.map(|sent| format!("Sent as {sent}")),
+            always_local: remote.is_none(),
+        };
+        ShortcutsProps {
+            mac_active,
+            locked,
+            rows: vec![
+                row("Session Controls", "⇧⌘", "M", Some("Ctrl+Shift+M")),
+                row("Full Screen", "⌃⌘", "F", Some("Ctrl+F")),
+                row("Files", "⇧⌘", "F", Some("Ctrl+Shift+F")),
+                row("Library", "⌘", "0", Some("Ctrl+0")),
+                row("Quit", "⌘", "Q", None),
+            ],
+        }
+    }
+
+    /// The strip over the stream: all good, or the warn case (throttled, over target,
+    /// nothing sent lately, no decoder yet).
+    fn fixture_strip(warn: bool) -> stats::StripProps {
+        use stats::{Status, StripFigure, StripProps};
+        let figure = |value: &str, caption: &str, warn: bool| StripFigure {
+            value: value.into(),
+            caption: caption.into(),
+            warn,
+        };
+        if warn {
+            StripProps {
+                marks: vec![Status::Good, Status::Good, Status::Neutral, Status::Warn],
+                figures: vec![
+                    figure("41 fps", "FPS", false),
+                    figure("9.4 / 8 Mbps", "Video rate", true),
+                    figure("idle", "Capture to sent", false),
+                    figure("38 ms", "Latency", false),
+                ],
+            }
+        } else {
+            StripProps {
+                marks: vec![Status::Good; 4],
+                figures: vec![
+                    figure("60 fps", "FPS", false),
+                    figure("7.8 / 8 Mbps", "Video rate", false),
+                    figure("12 ms", "Capture to sent", false),
+                    figure("24 ms", "Latency", false),
+                ],
+            }
+        }
+    }
+
     fn fixture_stats(hardware: bool) -> stats::StatsProps {
         use stats::{Graph, Meter, Series, StatRow, StatsProps, Status, Tile};
         let wave = |base: f32, swing: f32, seed: f32| -> Vec<f32> {
@@ -2711,6 +2865,11 @@ impl PreviewApp {
             | Story::ControlsServerLocked
             | Story::ControlsDropdownOpen
             | Story::ControlsRestoredSections
+            | Story::ControlsShortcutsActive
+            | Story::ControlsShortcutsOff
+            | Story::ControlsShortcutsLocked
+            | Story::ControlsStatsStripOn
+            | Story::ControlsStatsWaiting
             | Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -2869,7 +3028,76 @@ impl PreviewApp {
                 .relative()
                 .bg(rgb(0x111318))
                 .child(session::waiting_overlay("Waiting for Firefox to start…")),
+            Story::SessionStatsStrip
+            | Story::SessionStatsStripWarn
+            | Story::SessionStatsStripLight
+            | Story::SessionStatsStripWithBanner
+            | Story::SessionStatsStripFullScreen => {
+                let (width, height) = match self.story {
+                    Story::SessionStatsStripFullScreen => (1512., 982.),
+                    _ => (1280., 800.),
+                };
+                let strip = Self::fixture_strip(self.story == Story::SessionStatsStripWarn);
+                let mut frame = Self::session_frame(width, height, &strip);
+                if self.story == Story::SessionStatsStripWithBanner {
+                    frame = frame
+                        .child(session::controls_trigger(
+                            point(px(width - 40.), px(8.)),
+                            px(32.),
+                            move |_, _, cx| {
+                                entity.update(cx, |this, cx| {
+                                    this.record_event("Session: Open Controls Trigger", cx);
+                                });
+                            },
+                        ))
+                        .child(session::status_banner(
+                            theme,
+                            "Reconnecting to Selkies stream (attempt 2)…",
+                        ));
+                }
+                Self::strip_stage(frame)
+            }
+            Story::SessionStatsStripNarrow => {
+                let strip = Self::fixture_strip(false);
+                Self::strip_stage(
+                    div()
+                        .h_flex()
+                        .items_start()
+                        .gap_4()
+                        .child(Self::session_frame(640., 400., &strip))
+                        .child(Self::session_frame(480., 400., &strip)),
+                )
+            }
         }
+    }
+
+    /// Session frames larger than the stage scroll inside it.
+    fn strip_stage(content: impl IntoElement) -> gpui_kit::Div {
+        div().size_full().child(
+            div()
+                .id("session-strip-stage")
+                .size_full()
+                .overflow_scroll()
+                .p_4()
+                .child(content),
+        )
+    }
+
+    /// A session window `width` × `height` pt over a picture-like gradient (a light top
+    /// band, to stress the strip's contrast), with the strip over it.
+    fn session_frame(width: f32, height: f32, strip: &stats::StripProps) -> gpui_kit::Div {
+        div()
+            .relative()
+            .flex_none()
+            .w(px(width))
+            .h(px(height))
+            .overflow_hidden()
+            .bg(gpui_kit::linear_gradient(
+                180.,
+                gpui_kit::linear_color_stop(rgb(0xe9eef4), 0.),
+                gpui_kit::linear_color_stop(rgb(0x1b2430), 0.55),
+            ))
+            .child(stats::strip(strip, px(width)))
     }
 
     fn library_handlers(&self, cx: &mut Context<Self>) -> LibraryHandlers {
