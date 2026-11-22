@@ -5,6 +5,8 @@ mod apps;
 #[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
+mod camera;
+#[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
 mod clipboard;
