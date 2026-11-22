@@ -70,7 +70,7 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - The gate is WebSockets mode plus an authorised `api/sessions`.
   - The Library shows one Desktop card and a server menu. SealSkin-only features (catalog, launch, Stop, account, Delete) are hidden.
 - `multi-window-sessions` (settled: `ARCH-010`, `ARCH-022`):
-  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it.
+  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it for that, though its Display 2 window has its own connection (`ARCH-039`).
   - The Library window can close while sessions stream. **Window → Library** (`cmd-0`) or a Dock-icon click reopens it. `cmd-q` disconnects every session and stops none.
   - A session window closes from its own buttons, which appear when the pointer enters the top-left corner, or from **Window → Disconnect Session**. `cmd-w` stays with the remote app.
   - Codec, input, clipboard, and video changes are saved per server for the next session. Other open windows keep theirs. Display mode, resolution, mute, and pause are per window.

@@ -102,6 +102,12 @@ subject: skerry
   - Delete Home rechecks sessions after the confirm, and the storage pane is not in the Files registry.
   - A body cut off mid-download resumes, but a partial whose tag doesn't match restarts from 0, and a truncated folder walk fails.
   - Upload retries carry the upload_id key, and Open in… filters apps.
+- Task N tests pass (`ARCH-039`):
+  - `Wire` stamps and overwrites `displayId` on every Display 2 frame. The fake-Selkies harness checks both roles, and that mic frames go only on the primary.
+  - Placement handles negative display origins.
+  - Late events from a dropped stream are ignored, and a primary error puts Display 2 in Waiting.
+  - When its owner closes Display 2, keys are released.
+  - A direct-server target works.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

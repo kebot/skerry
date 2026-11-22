@@ -264,6 +264,8 @@
 
 ## ARCH-022: Multi-Window Session Behaviour (`ARCH-GAP-LS-08`)
 
+- **Amended by `ARCH-039`:** a session may now have a second connection, its Display 2 window. "Never a second connection" still holds for resuming an open session.
+
 - **Status:** settled (decided and verified live 2026-11-22). Settles `ARCH-GAP-LS-08` and builds on `ARCH-010`.
 - **Decision:**
   - **Window ownership:** a `SessionWindow` entity (`app/session.rs`) owns one session's stream, settings, stats, display mode, resize, policies, and Session Controls. The `Launcher` owns only the Library and a list of open session windows `(AnyWindowHandle, WeakEntity<SessionWindow>, session_id)`. Session Controls' `Owner` pairs the session window's handle with `Entity<SessionWindow>` (`ARCH-006`). Session windows open through `cx.defer` outside `Launcher` updates.
@@ -788,13 +790,47 @@
   - Not verified: anything on screen.
 - **Affected Rust:** `storage.rs`, `app/files_backend.rs`, `app/storage_window.rs` (new), `sealskin.rs`, `app/files_window.rs`, `app/account.rs`, `app.rs`, `crates/skerry-ui/src/{storage.rs,files.rs,library.rs,account.rs}`, `examples/preview.rs`.
 
+## ARCH-039: Second Display Window (Task N)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-01`. Amends `ARCH-022`: Skerry now opens a second connection to a session, for its `display2` only. Cross-window drag is deferred as `ARCH-GAP-VS-07`.
+- **Process:** plan → design → review (12 required changes; drag deferred) → build → QA (1 medium) → code review (2 rounds, MERGE; merged after K, M1 and L1) by subagents (`ARCH-025`). Branch `task-n-display2`.
+- **Protocol (Selkies 715df7c):**
+  - A second `/api/websockets` connection claims `displayId:"display2"` with `displayPosition` in its first `SETTINGS`, and resizes are `r,WxH,display2`. Layout arrives in `DISPLAY_CONFIG_UPDATE`.
+  - Any `SETTINGS` without `displayId` counts as the primary (`protocol.rs:280`, `handler.rs:779`), so one unstamped message from Display 2 would kill the main stream. The web client has this bug itself.
+  - `KILL <reason>` comes with close code 1008. Gated by `second_screen`.
+  - The server adds each display's offset to input. Display 2 gets no audio or stats, but it does get the print replay on connect.
+- **Decision:**
+  - **Transport:** `transport::run` gets a role (primary or secondary) instead of being forked, and is split into connect plus `stream()`.
+    - Every outgoing frame goes through `transport/role.rs::Wire`. On Display 2 its only text send stamps, and overwrites, `displayId`, so a raw send doesn't compile. `send_binary` sends only on the primary (mic, `ARCH-038`).
+    - The primary's bytes on the wire are unchanged.
+  - **What Display 2 drops:** print events, audio and audio bitrate, stats, colour scheme, DPI, `js,`, mic, and incoming clipboard. Audio, stats, gamepad, print, file and Apps events never reach its window. It has no stats strip, print notices, capture hint or drop target.
+  - **Window:** "{App} — Display 2", opened from **Add Screen +** in the Screen card or View → Second Display, shown when `second_screen` is true.
+    - Placement follows the web dashboard's `addScreen`, using `CGDisplayBounds`, because GPUI display origins are always zero. With exactly one Mac display beside the session window, Display 2 opens there. Otherwise a side picker (Left, Right, Above, Below, with a diagram) asks.
+    - Full screen is ⌃⌘F on whichever display it's on.
+  - **Lifecycle:**
+    - Display 2 resumes on the primary's first picture, including when `second_screen` becomes true later.
+    - It goes to Waiting when the primary errors, is killed, or reconnects.
+    - It closes with the primary, releasing keys and dropping its stream first, and ignores late events by generation.
+    - Each stream has its own 10 s silence timeout.
+    - On direct Selkies servers it uses the primary's `SessionTarget` (`ARCH-036`).
+  - **KILL:** "Display 2 isn't available. {reason}" with Try Again and Close. A takeover of the primary reads "This session was opened somewhere else."
+  - Pointer capture hands off to the primary. Gamepads stay on the primary's stream, with a 120 ms focus hand-off.
+- **QA (live, `sealskin.kebot.me`, real transport, primary plus Display 2):**
+  - Both streamed, with Display 2 placed at x=1024.
+  - Every `SETTINGS` Display 2 sent carried `displayId` (resize, HiDPI, codec, position), and the primary was never killed.
+  - Takeovers gave Superseded, and Display 2 resumed after the primary reconnected. Key releases went out before close, and no print, file or audio events reached Display 2.
+  - SealSkin's proxy accepts the second WebSocket (R10).
+  - Not verified: the GUI, placement across two Mac displays, and a server refusal.
+- **Affected Rust:** `transport/role.rs` (new), `transport.rs`, `app/second_display.rs` (new), `app/session_window.rs`, `app/display.rs`, `app.rs`, `crates/skerry-ui/src/{session.rs,controls.rs,components.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
 
 | ID | Owning Contract | Concept | Status | Summary |
 |---|---|---|---|---|
-| `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | unresolved (backlog) | Open a second remote display in its own GPUI window following server display placement while primary session owns audio. |
+| `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | settled (`ARCH-039`) | A Display 2 window on a stamped second connection, with no audio, placed beside the session window. |
+| `ARCH-GAP-VS-07` | `video-and-screen` | `cross-display-drag` | deferred (`ARCH-039`) | Map a drag that crosses from one display window into the other. |
 | `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
 | `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Launch options, plus staged progress via `launch_id`, idempotent retries, timeout recovery, and one-click remembered launch. |

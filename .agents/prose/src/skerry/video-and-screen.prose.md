@@ -7,7 +7,7 @@ id: 067NC4KG01SKERRY0000000002
 # Video and Screen Domain
 
 <!-- compose:status=partially-settled provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-VS-01 concept="second-display" question="Follow server second-screen capability and display placement model in a dedicated GPUI window while keeping audio owned by the primary session view." -->
+<!-- compose:unresolved id=ARCH-GAP-VS-07 concept="cross-display-drag" question="Second display settled (ARCH-039). Deferred: mapping a drag that crosses between the two display windows." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-02 concept="webrtc-transport" question="Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, data-channel input, and SealSkin session handoff before adding a transport selector alongside WebSockets." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-03 concept="extended-codecs-and-tuning" question="Evaluate VP8/VP9 decode paths where VideoToolbox lacks hardware decode, plus 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder tuning." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-05 concept="session-controls-ux" question="Section memory, scroll position, and dropdown shadow are settled (ARCH-026). Still open: the web sidebar's stream-toggle tile row (ARCH-020)." -->
@@ -36,7 +36,10 @@ Deliver low-latency hardware-accelerated or JPEG-fallback remote desktop video, 
   - Explicit video pause/resume, server-acknowledged audio mute/unmute, startup audio policy handling, and clear unavailability reasons.
   - 1-second Stream Diagnostics reporting client FPS, received bitrate, decode time, rejected stripes, WebSocket ping RTT, remote resolution, and active client/server codec.
   - Web-sidebar Stats (settled: `ARCH-019`): the Stats section shows Encoder/Capture/Decoder/Connection status rows, FPS/Bandwidth/Latency history graphs, figure tiles, and host CPU/GPU/memory meters from the server's `stream_stats`, subscribed with `_stats,1` only while the section is open; a copy button copies a plain-text report.
-- `second-display-window` (unresolved: `ARCH-GAP-VS-01`): open a second remote display in its own GPUI window following the server's display placement model, coordinate boundaries, and fullscreen lifecycle while primary session owns audio.
+- `second-display-window` (settled: `ARCH-039`; drag across windows deferred in `ARCH-GAP-VS-07`):
+  - **Add Screen +** opens a Display 2 window on a second connection that claims `display2`. Every outgoing frame is stamped through `Wire`, so it can never take over the primary.
+  - It is placed beside the session window using `CGDisplayBounds`, or with a side picker.
+  - No audio, stats or print on Display 2. It waits while the primary reconnects and closes with it.
 - `jpeg-cpu-cost` (settled: `ARCH-034`): each JPEG stripe is its own RenderImage (zune-jpeg with NEON to BGRA, padded and pixel-snapped, retired after 4 paints). A frame presents on its bottom stripe or after a 2 ms settle, and input arms come before the socket. Hardware codecs stay the default.
 - `session-controls-ux` (mostly settled: `ARCH-026`; tile row open in `ARCH-GAP-VS-05`): which sections are open is saved per server, scroll position is kept per session window across closing the panel and reconnecting, and Session Controls dropdowns use `menu_dropdown` with a theme-aware shadow.
   - Web-sidebar look (settled: `ARCH-018`): sections are separate rounded cards 10px apart; settings are a label above a full-width dropdown, slider (value in the label, requested on release), switch, or button, as in the Selkies web sidebar.
