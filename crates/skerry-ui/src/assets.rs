@@ -39,6 +39,7 @@ gpui_kit::assets::icon_assets!(
         Sparkles,
         Shapes,
         Video,
+        FolderHeart,
         X
     ]
 );
@@ -108,6 +109,8 @@ mod tests {
             gpui_kit::assets::IconName::Sparkles,
             gpui_kit::assets::IconName::Shapes,
             gpui_kit::assets::IconName::Video,
+            gpui_kit::assets::IconName::FolderHeart,
+            gpui_kit::assets::IconName::HardDrive,
             gpui_kit::assets::IconName::X,
             // In the default bundle already.
             gpui_kit::assets::IconName::Globe,

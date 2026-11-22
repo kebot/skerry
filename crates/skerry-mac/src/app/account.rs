@@ -374,7 +374,7 @@ impl Launcher {
             None
         };
         let previous = self.recovery.take();
-        self.leave_server();
+        self.leave_server(cx);
         self.wake_poll = keep_poll;
         self.status = None;
         self.key_hint = None;

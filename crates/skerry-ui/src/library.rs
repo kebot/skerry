@@ -108,6 +108,8 @@ pub struct UploadProgress {
 pub enum OpeningKind {
     Link,
     File,
+    /// A top-level Shared Files file, opened on the server (`ARCH-037`).
+    Stored,
 }
 
 /// The "Open … in…" chooser under the omnibar (`ARCH-028`).
@@ -244,6 +246,8 @@ pub struct LibraryProps {
     /// The header's account menu (`ARCH-029`), and whether it is open.
     pub account: crate::account::AccountProps,
     pub account_open: bool,
+    /// The header's Storage button (`ARCH-037`): SealSkin with persistent storage only.
+    pub storage_button: bool,
 }
 
 /// The widest the Library's content column grows; wider windows centre it.
@@ -289,6 +293,8 @@ pub struct OpenHandlers {
     pub on_drop: Option<DropHandler>,
     /// Finder items dropped on one session card.
     pub on_drop_to_session: Option<SessionDropHandler>,
+    /// The header's Storage button and the account menu's Manage Storage… (`ARCH-037`).
+    pub on_open_storage: Option<ActionHandler>,
 }
 
 /// What the Library shows, worked out from the props alone.
@@ -534,6 +540,22 @@ pub fn render(
                         .disabled(!enabled)
                         .on_click(move |event, window, cx| on_refresh(event, window, cx)),
                 )
+                .when_some(
+                    open.on_open_storage
+                        .clone()
+                        .filter(|_| props.storage_button),
+                    |bar, on_open_storage| {
+                        bar.child(
+                            Button::new("storage")
+                                .outline()
+                                .xsmall()
+                                .icon(gpui_kit::assets::IconName::HardDrive)
+                                .label("Storage")
+                                .tooltip("Storage (⇧⌘I)")
+                                .on_click(move |_, window, cx| on_open_storage(window, cx)),
+                        )
+                    },
+                )
                 // Sign Out lives in the account menu, at the trailing edge (`ARCH-029`).
                 .child(crate::account::render_menu(
                     &props.account,
@@ -543,6 +565,13 @@ pub fn render(
                         on_open_change: on_account_open,
                         on_open_web: Rc::from(on_open_web),
                         on_sign_out: Rc::from(on_sign_out),
+                        on_manage_storage: open
+                            .on_open_storage
+                            .clone()
+                            .filter(|_| props.storage_button)
+                            .map(|open| -> crate::account::ActionHandler {
+                                Rc::new(move |_, window, cx| open(window, cx))
+                            }),
                     },
                 )),
         );
@@ -1106,10 +1135,12 @@ fn render_chooser(
         match opening.kind {
             OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
             OpeningKind::File => Icon::new(IconName::FileText),
+            OpeningKind::Stored => Icon::new(gpui_kit::assets::IconName::FolderHeart),
         }
     };
     let name = match opening.kind {
         OpeningKind::File => format!("“{}”", opening.label),
+        OpeningKind::Stored => format!("“{}” from Shared Files", opening.label),
         OpeningKind::Link => opening.label.clone(),
     };
     let tooltip = opening.tooltip.clone();
@@ -1191,7 +1222,7 @@ fn render_chooser(
     };
     let (running_label, action_label) = match opening.kind {
         OpeningKind::Link => ("Open in a running session", "Open Here"),
-        OpeningKind::File => ("Copy to a running session", "Copy to Desktop"),
+        OpeningKind::File | OpeningKind::Stored => ("Copy to a running session", "Copy to Desktop"),
     };
     let key_hint = || {
         div()
@@ -1831,6 +1862,7 @@ fn render_launching_card(
         let icon = match kind {
             OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
             OpeningKind::File => Icon::new(IconName::FileText),
+            OpeningKind::Stored => Icon::new(gpui_kit::assets::IconName::FolderHeart),
         };
         div().pt_2().h_flex().child(
             div()

@@ -71,6 +71,8 @@ input-driven
 - The application key is attached only to requests whose resolved path is under `/companion/api/`; every other fetch (logos, icons) uses a client with no key (`ARCH-026`).
 - Preference and key files are written only by the `persist.rs` queue, never from the GPUI main thread (`ARCH-026`).
 - TLS uses rustls with the ring provider only; aws-lc-rs must not enter the dependency tree (`ARCH-036`).
+- Microphone and camera devices are opened only after a granted Start, and every stream end closes them (`ARCH-038`).
+- Every frame a session socket sends goes through `transport::role::Wire`. On a Display 2 connection it always carries `displayId:"display2"` (`ARCH-039`).
 - Skerry supports SealSkin `0.5.0` or newer (`ARCH-009`): it refuses to connect to a server whose `GET /companion/api/ui/version` reports an older or unparseable version, or that has no such route. Changing the minimum is a new superseding `ARCH-*` decision.
 
 ### Execution

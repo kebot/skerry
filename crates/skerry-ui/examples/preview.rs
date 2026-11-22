@@ -24,8 +24,8 @@ use skerry_ui::{
         self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureDeviceProps, CaptureProps,
         ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
         GamepadsProps, MediaCaptureProps, PadRow, PadStatus, PrintJobRow, PrintRowKind,
-        PrintingProps, ScreenProps, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem,
-        VideoProps, VideoSettingControl, VideoSettingRow,
+        PrintingProps, ScreenProps, SecondScreenProps, ShortcutRow, ShortcutsProps, SliderUnit,
+        SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -164,9 +164,18 @@ enum Story {
     SessionCaptureHintWithBanner,
     SessionCaptureHintNarrow,
     SessionCaptureHintLight,
+    ControlsSecondScreen,
+    ControlsSecondScreenOpen,
+    SessionPlacementAllSides,
+    SessionPlacementTwoSides,
+    SecondDisplayWaiting,
+    SecondDisplayRefused,
+    SessionSupersededPill,
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
+    StorageSharedFiles,
+    StorageHomeProtected,
     PrintNoticeStates,
     PrintNoticeLongName,
     PrintNoticeStack,
@@ -304,9 +313,18 @@ impl Story {
         Story::SessionCaptureHintWithBanner,
         Story::SessionCaptureHintNarrow,
         Story::SessionCaptureHintLight,
+        Story::ControlsSecondScreen,
+        Story::ControlsSecondScreenOpen,
+        Story::SessionPlacementAllSides,
+        Story::SessionPlacementTwoSides,
+        Story::SecondDisplayWaiting,
+        Story::SecondDisplayRefused,
+        Story::SessionSupersededPill,
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
+        Story::StorageSharedFiles,
+        Story::StorageHomeProtected,
         Story::PrintNoticeStates,
         Story::PrintNoticeLongName,
         Story::PrintNoticeStack,
@@ -397,6 +415,8 @@ impl Story {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsSecondScreen
+            | Story::ControlsSecondScreenOpen
             | Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
             | Story::ControlsInputCaptureUnavailable
@@ -443,8 +463,14 @@ impl Story {
             | Story::SessionCaptureHintWithStrip
             | Story::SessionCaptureHintWithBanner
             | Story::SessionCaptureHintNarrow
-            | Story::SessionCaptureHintLight => "Session Overlays",
+            | Story::SessionCaptureHintLight
+            | Story::SessionPlacementAllSides
+            | Story::SessionPlacementTwoSides
+            | Story::SecondDisplayWaiting
+            | Story::SecondDisplayRefused
+            | Story::SessionSupersededPill => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
+            Story::StorageSharedFiles | Story::StorageHomeProtected => "Storage",
             Story::PrintNoticeStates
             | Story::PrintNoticeLongName
             | Story::PrintNoticeStack
@@ -579,9 +605,18 @@ impl Story {
             Story::SessionCaptureHintWithBanner => "Capture Hint + Banner",
             Story::SessionCaptureHintNarrow => "Capture Hint · Narrow",
             Story::SessionCaptureHintLight => "Capture Hint · Light",
+            Story::ControlsSecondScreen => "Screen · Add Screen",
+            Story::ControlsSecondScreenOpen => "Screen · Screen 2 Open",
+            Story::SessionPlacementAllSides => "Display 2 Picker · All Sides",
+            Story::SessionPlacementTwoSides => "Display 2 Picker · Two Sides",
+            Story::SecondDisplayWaiting => "Display 2 · Waiting",
+            Story::SecondDisplayRefused => "Display 2 · Refused",
+            Story::SessionSupersededPill => "Superseded + Pill",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
+            Story::StorageSharedFiles => "Shared Files + Open in…",
+            Story::StorageHomeProtected => "Home + Protected Desktop",
             Story::ControlsPrintingEmpty => "Printing · Empty",
             Story::ControlsPrintingJobs => "Printing · Jobs, Auto Off",
             Story::ControlsPrintingOff => "Printing · Off by Server",
@@ -721,9 +756,18 @@ impl Story {
             Story::SessionCaptureHintWithBanner => "story-session-capture-hint-banner",
             Story::SessionCaptureHintNarrow => "story-session-capture-hint-narrow",
             Story::SessionCaptureHintLight => "story-session-capture-hint-light",
+            Story::ControlsSecondScreen => "story-controls-second-screen",
+            Story::ControlsSecondScreenOpen => "story-controls-second-screen-open",
+            Story::SessionPlacementAllSides => "story-session-placement-all-sides",
+            Story::SessionPlacementTwoSides => "story-session-placement-two-sides",
+            Story::SecondDisplayWaiting => "story-second-display-waiting",
+            Story::SecondDisplayRefused => "story-second-display-refused",
+            Story::SessionSupersededPill => "story-session-superseded-pill",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
+            Story::StorageSharedFiles => "story-storage-shared-files",
+            Story::StorageHomeProtected => "story-storage-home-protected",
             Story::ControlsPrintingEmpty => "story-controls-printing-empty",
             Story::ControlsPrintingJobs => "story-controls-printing-jobs",
             Story::ControlsPrintingOff => "story-controls-printing-off",
@@ -816,6 +860,8 @@ impl Story {
                 | Story::ControlsShortcutsLocked
                 | Story::ControlsStatsStripOn
                 | Story::ControlsStatsWaiting
+                | Story::ControlsSecondScreen
+                | Story::ControlsSecondScreenOpen
                 | Story::ControlsInputCapture
                 | Story::ControlsInputCaptureOn
                 | Story::ControlsInputCaptureUnavailable
@@ -1716,6 +1762,7 @@ impl PreviewApp {
             modified: modified.into(),
             size: size.into(),
             selected: false,
+            locked: false,
         };
         let mut rows = vec![
             row("Projects", true, "Yesterday at 18:02", "--"),
@@ -1762,6 +1809,7 @@ impl PreviewApp {
                 transfers: Vec::new(),
                 creating_folder: true,
                 selected: 0,
+                storage: None,
             },
             Story::FilesDownloadOnly => FilesProps {
                 crumbs,
@@ -1785,7 +1833,58 @@ impl PreviewApp {
                 transfers: Vec::new(),
                 creating_folder: false,
                 selected: 0,
+                storage: None,
             },
+            Story::StorageSharedFiles | Story::StorageHomeProtected => {
+                let home = story == Story::StorageHomeProtected;
+                let mut rows = if home {
+                    vec![
+                        row("Desktop", true, "Today at 09:12", "--"),
+                        row("Documents", true, "Yesterday at 18:40", "--"),
+                        row(".bashrc", false, "12 Nov 2026 at 08:00", "3 KB"),
+                    ]
+                } else {
+                    vec![
+                        row("Reports", true, "Today at 09:12", "--"),
+                        row("report.pdf", false, "Yesterday at 18:40", "2.4 MB"),
+                        row("notes.txt", false, "12 Nov 2026 at 10:04", "3 KB"),
+                    ]
+                };
+                rows[0].locked = home;
+                rows[1].selected = true;
+                let total = rows.len();
+                FilesProps {
+                    crumbs: vec![Crumb {
+                        label: if home { "work" } else { "Shared Files" }.into(),
+                        path: String::new(),
+                    }],
+                    can_back: false,
+                    can_forward: false,
+                    can_upload: true,
+                    can_download: true,
+                    can_delete: true,
+                    rows: Rc::new(rows),
+                    sort: SortColumn::Name,
+                    ascending: true,
+                    loading: false,
+                    error: None,
+                    notice: None,
+                    busy: None,
+                    transfers_open: true,
+                    focused: true,
+                    transfers: Vec::new(),
+                    creating_folder: false,
+                    selected: 1,
+                    storage: Some(files_ui::StoragePaneProps {
+                        open_in: (!home).then_some(true),
+                        total,
+                        filter: String::new(),
+                        empty_text: "This folder is empty.".into(),
+                        narrow: false,
+                        delete_enabled: true,
+                    }),
+                }
+            }
             _ => FilesProps {
                 crumbs,
                 can_back: true,
@@ -1843,6 +1942,7 @@ impl PreviewApp {
                 ],
                 creating_folder: false,
                 selected: 2,
+                storage: None,
             },
         }
     }
@@ -2289,6 +2389,7 @@ impl PreviewApp {
             busy: None,
             account: Self::fixture_account(self.story, server),
             account_open: self.account_open,
+            storage_button: true,
             omnibar: match story {
                 Story::LibraryOpenLink
                 | Story::LibraryOpenLinkPending
@@ -2751,6 +2852,11 @@ impl PreviewApp {
             ControlsAction::ToggleSection(section) => {
                 self.controls_ui.toggle(section);
             }
+            ControlsAction::SecondScreen => {
+                let second = &mut self.controls_props.screen.second_screen;
+                second.open = !second.open;
+                second.note = second.open.then(|| "Screen 2 · Connecting…".into());
+            }
             ControlsAction::SetGamepadInput(on) => {
                 if let Some(gamepads) = self.controls_props.gamepads.as_mut() {
                     gamepads.input = on;
@@ -3044,6 +3150,7 @@ impl PreviewApp {
                     dpi_override: None,
                     preset_label: "Match Window".into(),
                     scale_locally: false,
+                    second_screen: SecondScreenProps::default(),
                 },
                 video_settings: Some(VideoProps {
                     codecs: vec![
@@ -3145,6 +3252,7 @@ impl PreviewApp {
                     dpi_override: None,
                     preset_label: "1280 × 720".into(),
                     scale_locally: true,
+                    second_screen: SecondScreenProps::default(),
                 },
                 video_settings: None,
                 stats: None,
@@ -3217,6 +3325,16 @@ impl PreviewApp {
                 };
                 props
             }
+            Story::ControlsSecondScreen | Story::ControlsSecondScreenOpen => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.screen.second_screen = SecondScreenProps {
+                    available: true,
+                    open: story == Story::ControlsSecondScreenOpen,
+                    note: (story == Story::ControlsSecondScreenOpen)
+                        .then(|| "Screen 2 · Right · 1920 × 1080".into()),
+                };
+                props
+            }
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
                 props.stats_strip = story == Story::ControlsStatsStripOn;
@@ -3250,6 +3368,7 @@ impl PreviewApp {
                     dpi_override: None,
                     preset_label: "Match Window".into(),
                     scale_locally: false,
+                    second_screen: SecondScreenProps::default(),
                 },
                 video_settings: Some(VideoProps {
                     codecs: vec![
@@ -4338,6 +4457,8 @@ impl PreviewApp {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsSecondScreen
+            | Story::ControlsSecondScreenOpen
             | Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
             | Story::ControlsInputCaptureUnavailable
@@ -4462,9 +4583,83 @@ impl PreviewApp {
                             theme,
                             &self.files_props,
                             &self.folder_name,
+                            None,
                             &self.files_scroll,
                             handler,
                         )),
+                )
+            }
+            Story::StorageSharedFiles | Story::StorageHomeProtected => {
+                use skerry_ui::storage::{self as storage_ui, HomesState, QuotaState, QuotaTone};
+                let home = self.story == Story::StorageHomeProtected;
+                let sidebar = storage_ui::SidebarProps {
+                    selected: if home {
+                        storage_ui::SidebarRow::Home("work".into())
+                    } else {
+                        storage_ui::SidebarRow::Shared
+                    },
+                    homes: HomesState::Ready {
+                        named: vec!["default".into(), "work".into()],
+                        app: vec!["auto-firefox".into(), "auto-zen".into()],
+                    },
+                    deleting: None,
+                    focused: true,
+                    quota: QuotaState::Ready {
+                        text: if home {
+                            "42.6 GB of 50 GB used".into()
+                        } else {
+                            "12.3 GB of 50 GB used".into()
+                        },
+                        fraction: Some(if home { 0.85 } else { 0.25 }),
+                        tone: if home {
+                            QuotaTone::Warning
+                        } else {
+                            QuotaTone::Normal
+                        },
+                    },
+                    quota_tooltip: "Measured just now".into(),
+                };
+                let record = entity.clone();
+                let on_storage: storage_ui::StorageHandler = Rc::new(move |action, _, cx| {
+                    record.update(cx, |this, cx| {
+                        this.record_event(format!("Storage: {action:?}"), cx)
+                    });
+                });
+                let record = entity.clone();
+                let handler: files_ui::FilesHandler = Rc::new(move |action, _, cx| {
+                    if !matches!(action, FilesAction::DragOut(_) | FilesAction::Press(_)) {
+                        record.update(cx, |this, cx| {
+                            this.record_event(format!("Storage pane: {action:?}"), cx)
+                        });
+                    }
+                });
+                div().size_full().p_6().child(
+                    div()
+                        .size_full()
+                        .max_w(px(900.))
+                        .max_h(px(580.))
+                        .rounded_xl()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .text_color(theme.foreground)
+                        .text_sm()
+                        .h_flex()
+                        .child(storage_ui::render_sidebar(
+                            theme,
+                            &sidebar,
+                            on_storage,
+                            Rc::new(|menu, _| menu),
+                        ))
+                        .child(div().flex_1().min_w_0().h_full().child(files_ui::render(
+                            theme,
+                            &self.files_props,
+                            &self.folder_name,
+                            Some(&self.apps_search),
+                            &self.files_scroll,
+                            handler,
+                        ))),
                 )
             }
             Story::AppsLoading
@@ -4643,6 +4838,79 @@ impl PreviewApp {
                     ));
                 }
                 Self::strip_stage(frame.child(Self::capture_hint_overlay(hint, 1280., banner)))
+            }
+            Story::SessionPlacementAllSides | Story::SessionPlacementTwoSides => {
+                let all = self.story == Story::SessionPlacementAllSides;
+                let (width, height) = if all { (1280., 800.) } else { (800., 500.) };
+                let strip = stats::StripProps {
+                    marks: Vec::new(),
+                    figures: Vec::new(),
+                };
+                let sides = if all {
+                    [true; 4]
+                } else {
+                    [true, false, true, false]
+                };
+                let picker = session::screen_placement(
+                    theme,
+                    sides,
+                    all.then_some(1),
+                    Rc::new(move |side, _, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.record_event(format!("Display 2: Pick side {side}"), cx)
+                        });
+                    }),
+                    Rc::new(|_, _, _| {}),
+                    |_, _, _| {},
+                );
+                Self::strip_stage(Self::session_frame(width, height, &strip).child(picker))
+            }
+            Story::SecondDisplayWaiting | Story::SecondDisplayRefused => {
+                // Display 2 shows no strip and no notices, whatever the session has.
+                let frame = div()
+                    .relative()
+                    .flex_none()
+                    .w(px(1280.))
+                    .h(px(800.))
+                    .bg(rgb(0x000000))
+                    .child(session::controls_trigger(
+                        point(px(1240.), px(8.)),
+                        px(32.),
+                        |_, _, _| {},
+                    ));
+                let frame = if self.story == Story::SecondDisplayWaiting {
+                    frame.child(session::waiting_overlay("Waiting for the main display…"))
+                } else {
+                    frame.child(session::status_banner_labeled(
+                        theme,
+                        "Display 2 isn’t available. The host compositor has a single output, so a second display has nothing to capture.",
+                        ("Try Again", Box::new(|_, _, _| {})),
+                        ("Close", Box::new(|_, _, _| {})),
+                    ))
+                };
+                Self::strip_stage(frame)
+            }
+            Story::SessionSupersededPill => {
+                let strip = stats::StripProps {
+                    marks: Vec::new(),
+                    figures: Vec::new(),
+                };
+                Self::strip_stage(
+                    Self::session_frame(1280., 800., &strip)
+                        .child(session::status_banner_with_actions(
+                            theme,
+                            "This session was opened somewhere else.",
+                            |_, _, _| {},
+                            |_, _, _| {},
+                        ))
+                        .child(session::notice_pill(
+                            "This session doesn’t allow a second display.",
+                            session::capture_hint_bottom(true),
+                            px(1280.),
+                            session::HintFade::None,
+                            0,
+                        )),
+                )
             }
             Story::SessionCaptureBadge => {
                 // Microphone and camera badge at the left, the strip on one line (top 52), the
@@ -4962,6 +5230,7 @@ impl PreviewApp {
             on_clear_opening: Some(action("Chooser: Cancel")),
             on_skip_opening: Some(action("Chooser: Skip")),
             on_toggle_opening_apps: Some(action("Chooser: Show All")),
+            on_open_storage: Some(action("Library: Storage")),
             on_files: Some(Rc::new(move |id, _, cx| {
                 files_entity.update(cx, |this, cx| this.record_event(format!("Files: {id}"), cx));
             })),

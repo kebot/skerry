@@ -167,7 +167,10 @@ impl<M: MicHandle, C: CamHandle> Default for MediaCapture<M, C> {
 
 /// Events that end the stream without `end_stream`: they stop capture at once.
 fn ends_stream(event: &SessionEvent) -> bool {
-    matches!(event, SessionEvent::Error(_) | SessionEvent::StartupTimeout)
+    matches!(
+        event,
+        SessionEvent::Error(_) | SessionEvent::StartupTimeout | SessionEvent::Killed(_)
+    )
 }
 
 impl<M: MicHandle, C: CamHandle> MediaCapture<M, C> {
@@ -735,6 +738,13 @@ mod tests {
     }
 
     #[test]
+    fn a_kill_stops_capture() {
+        let (mut capture, log, _frames, _events) = capturing();
+        capture.on_stream_event(&SessionEvent::Killed(crate::transport::Kill::Superseded));
+        assert_eq!(log.borrow().dropped, 1);
+    }
+
+    #[test]
     fn startup_timeout_stops_capture() {
         let (mut capture, log, _frames, _events) = capturing();
         capture.on_stream_event(&SessionEvent::StartupTimeout);
@@ -983,6 +993,11 @@ mod tests {
         let (mut capture, log, _camera, _events) = filming();
         capture.on_stream_event(&SessionEvent::StartupTimeout);
         assert_eq!(log.borrow().dropped, 1);
+        // And a KILL (superseded, or refused by the server, `ARCH-039`).
+        let (mut capture, log, camera, _events) = filming();
+        capture.on_stream_event(&SessionEvent::Killed(crate::transport::Kill::Superseded));
+        assert_eq!(log.borrow().dropped, 1);
+        assert!(camera.frames.is_closed());
     }
 
     #[test]

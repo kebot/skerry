@@ -264,6 +264,8 @@
 
 ## ARCH-022: Multi-Window Session Behaviour (`ARCH-GAP-LS-08`)
 
+- **Amended by `ARCH-039`:** a session may now have a second connection, its Display 2 window. "Never a second connection" still holds for resuming an open session.
+
 - **Status:** settled (decided and verified live 2026-11-22). Settles `ARCH-GAP-LS-08` and builds on `ARCH-010`.
 - **Decision:**
   - **Window ownership:** a `SessionWindow` entity (`app/session.rs`) owns one session's stream, settings, stats, display mode, resize, policies, and Session Controls. The `Launcher` owns only the Library and a list of open session windows `(AnyWindowHandle, WeakEntity<SessionWindow>, session_id)`. Session Controls' `Owner` pairs the session window's handle with `Entity<SessionWindow>` (`ARCH-006`). Session windows open through `cx.defer` outside `Launcher` updates.
@@ -713,20 +715,130 @@
 - **QA (live):** run against `selkies/desktop:latest-ubuntu26.04` on a remote host by the builder, and against a local Selkies 2.2.1 by QA. Basic login, Files, first-trust pin, pin mismatch after the container was recreated, wrong password, needs-token, bad token (no loop), WebRTC refused, and the `config.toml` rules all passed. No request reached another origin under redirects. Not verified: anything on screen (screen locked), and plain-HTTP localhost.
 - **Affected Rust:** `tls.rs` (new), `config_store.rs` (moved out of `sealskin.rs`), `direct.rs`, `app/selkies_home.rs`, `selkies.rs`, `transport.rs`, `persist.rs`, `app.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{connect.rs,selkies.rs,library.rs}`, `Cargo.toml`, `examples/preview.rs`.
 
+## ARCH-038: Microphone Uplink (Task M1; camera follows as M2)
+
+- **Status:** microphone settled 2026-11-22. `ARCH-GAP-DC-05` stays open for the camera (M2, being built) until M2 merges. Echo cancellation is deferred, as `ARCH-GAP-DC-16`.
+- **Process:** plan → design → review (which cut echo cancellation and split the camera off) → build → QA (1 high, 1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-m-mic`.
+- **Protocol (Selkies 715df7c):**
+  - Binary `0x02` plus one Opus packet: mono, 24 kHz, 20 ms.
+  - The server sends `MICROPHONE_DISABLED` and `CAPTURE_DEMAND microphone <0|1>`.
+  - Settings: `microphone_enabled` and `microphone_on_start` (true, false, or demand). "Not enabled but not locked" still allows the mic, as in the web client.
+- **Decision:**
+  - **Encoding:** macOS's own AudioToolbox Opus encoder (streaming `AudioConverterFillComplexBuffer` with a private "no data yet" status and per-packet descriptions), 32 kbps. It resamples and downmixes in the same step. No C library is added; the bindings would need cmake.
+  - **Capture thread:** a per-session `skerry-mic` thread, following `ARCH-030`'s model. It exists only from a granted Start to Stop and opens the cpal device by UID.
+  - **Device list:** comes from plain CoreAudio properties (`input_devices.rs`). Nothing touches the microphone or triggers a macOS privacy request before capture is asked for and granted.
+  - **Starting:** on `on_start` true, on `CAPTURE_DEMAND`, or on the person's switch.
+    - PM decision: a mic the server locks on starts like `on_start` (after permission), with the switch shown on and disabled.
+    - The start policy runs only on the first `server_settings`.
+    - Late permission answers are ignored.
+    - PM decision: after a lock or `MICROPHONE_DISABLED`, the person's earlier "on" is not restored (the safe direction).
+  - **Stopping:** one `stop()` runs on every stream end: Error, StartupTimeout, `end_stream` (Reconnect, close, disconnect), teardown, and quit.
+    - The thread also stops itself when its sink closes, or when its frame channel stays full for 2 s.
+    - A blocked thread is detached, never stacked.
+    - A 10 s silence from the server (no message or pong) ends the stream, so a dead network can't keep the mic open.
+  - **UI:**
+    - A **Microphone & Camera** card after Audio, with a switch, a picker, a 5-segment level meter, the locked and denied states, and Open Privacy Settings.
+    - An in-window badge (left 12, top 48/52/88, with no hitbox) shows while the device is open.
+    - `NSMicrophoneUsageDescription` is in the bundle, and `bundle.sh` fails if the key is missing.
+  - **Echo cancellation deferred (`ARCH-GAP-DC-16`):** VoiceProcessingIO would have to take over playback on the `ARCH-030` thread, losing its health checks, device-return swap and default-following, and its spike could pass falsely.
+- **QA (fake-server harness, real AudioToolbox):**
+  - `0x02` frames decode as 24 kHz mono, 480 samples, 53–123 B, and none are sent before ready.
+  - `on_start`, demand, `MICROPHONE_DISABLED`, and locks all behave.
+  - Every stream end closes the stream and ends `skerry-mic`, and 15 cycles leaked no threads.
+  - Connecting causes no microphone privacy request (`preflight=true` only).
+  - Not verified: real capture and the menu-bar indicator (permission was undetermined with the screen locked), the card on screen, a real Selkies with the mic enabled, and macOS 13 (Opus encoder availability). The encoder emits Hybrid TOC `0x68`.
+- **Known:** a Start that lands while the old thread is still exiting stays at "Starting…" with no capture (safe). It is being fixed in M2.
+- **Affected Rust:** `capture.rs`, `microphone.rs`, `permissions.rs`, `input_devices.rs`, `app/media_capture.rs` (all new), `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `crates/skerry-ui/src/{controls.rs,session.rs}`, `scripts/bundle.sh`, `Cargo.toml` (`objc2-av-foundation`).
+
+## ARCH-037: Storage Window for SealSkin Homes and Shared Files (Task L1; public links deferred)
+
+- **Status:** L1 settled 2026-11-22. `ARCH-GAP-LS-05` stays open only for public share links (L2), now tracked as `ARCH-GAP-LS-14`.
+- **Process:** plan → design → review (17 required changes) → build → QA (1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-l-storage`.
+- **Server facts (SealSkin 0.5.0):**
+  - There is no search route, so Skerry filters the folder shown, as the web UI does.
+  - Transfers are 2 MiB base64 chunks, and uploads never overwrite.
+  - `launch/file_path` opens only top-level Shared Files (`_sealskin_shared_files`) and refuses Cleanroom.
+  - `DELETE /homedirs/_sealskin_shared_files` would wipe Shared Files.
+  - A bad home name answers 409, not 422.
+  - There is no upload-abort route, so a cancelled upload holds one of the 16 upload slots for 24 h.
+- **Decision:**
+  - **Window:** one **Storage** window per SealSkin server, hidden for direct Selkies servers (`ARCH-036`). It opens from a Library header button, **Manage Storage…** in the account menu, or Window → Storage ⇧⌘I (Library only).
+    - The sidebar shows Shared Files, Homes, App Homes (with the `auto-` prefix hidden), and a quota meter.
+    - The right side is the session Files pane, with its I/O behind `FilesBackend` (Selkies or SealSkin storage), so transfers, Quick Look, drags and ⌘C carry over.
+    - The pane stays out of `OpenWindows.files`, and the window closes on Sign Out.
+  - **Safety:**
+    - No DELETE is ever sent for Shared Files or Cleanroom (names compared ignoring case, refused before any request).
+    - Delete Home re-reads sessions and transfers both before and after the confirm, counting meta-app and in-flight launch homes, and refuses while a session uses the home.
+    - Uploads into a home's `/Desktop/files` go to Shared Files, and mkdir there is refused.
+    - Storage 403s (quota, storage off) never turn uploads off.
+  - **Transfers:**
+    - Streamed in chunks of at most 2 MiB. A retried upload finalize carries `X-Idempotency-Key = upload_id`.
+    - A download cut off mid-body is treated as a network error and resumes.
+    - A kept partial resumes only when its `com.skerry.partial` xattr (home, path, size, server mtime) matches the listing, and the final size is checked.
+    - A folder whose listing is truncated (over 10,000 entries) fails rather than downloading part of it.
+  - **Open in…:** Shared Files top level only, through `ARCH-028`'s chooser and Launch Dialog. It offers only apps with `home_directories`, or meta apps, then calls `launch/file_path` with a `launch_id` (`ARCH-027`).
+  - **Public links (L2) deferred (`ARCH-GAP-LS-14`):** split off at review to keep L1 reviewable. A link would serve a copy of the file as it was when made, with password, expiry and revoke, where the server permits.
+- **QA (live, harness):**
+  - A QA home was created, filled and deleted.
+  - Uploads: 2.6 MB in 0.48 s and 200 MB in 29.9 s (debug build), plus a nested folder, and cancel followed by upload.
+  - Downloads ran at 21.5 MB/s with matching md5.
+  - Quota matched `admin/status?storage=1`.
+  - Open in… a PDF reached the session's `Desktop/files`.
+  - Delete Home was refused while a session ran on the home.
+  - A 571-request log had no Shared Files DELETE.
+  - The session Files window still uploads and downloads (md5 checked).
+  - Not verified: anything on screen.
+- **Affected Rust:** `storage.rs`, `app/files_backend.rs`, `app/storage_window.rs` (new), `sealskin.rs`, `app/files_window.rs`, `app/account.rs`, `app.rs`, `crates/skerry-ui/src/{storage.rs,files.rs,library.rs,account.rs}`, `examples/preview.rs`.
+
+## ARCH-039: Second Display Window (Task N)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-01`. Amends `ARCH-022`: Skerry now opens a second connection to a session, for its `display2` only. Cross-window drag is deferred as `ARCH-GAP-VS-07`.
+- **Process:** plan → design → review (12 required changes; drag deferred) → build → QA (1 medium) → code review (2 rounds, MERGE; merged after K, M1 and L1) by subagents (`ARCH-025`). Branch `task-n-display2`.
+- **Protocol (Selkies 715df7c):**
+  - A second `/api/websockets` connection claims `displayId:"display2"` with `displayPosition` in its first `SETTINGS`, and resizes are `r,WxH,display2`. Layout arrives in `DISPLAY_CONFIG_UPDATE`.
+  - Any `SETTINGS` without `displayId` counts as the primary (`protocol.rs:280`, `handler.rs:779`), so one unstamped message from Display 2 would kill the main stream. The web client has this bug itself.
+  - `KILL <reason>` comes with close code 1008. Gated by `second_screen`.
+  - The server adds each display's offset to input. Display 2 gets no audio or stats, but it does get the print replay on connect.
+- **Decision:**
+  - **Transport:** `transport::run` gets a role (primary or secondary) instead of being forked, and is split into connect plus `stream()`.
+    - Every outgoing frame goes through `transport/role.rs::Wire`. On Display 2 its only text send stamps, and overwrites, `displayId`, so a raw send doesn't compile. `send_binary` sends only on the primary (mic, `ARCH-038`).
+    - The primary's bytes on the wire are unchanged.
+  - **What Display 2 drops:** print events, audio and audio bitrate, stats, colour scheme, DPI, `js,`, mic, and incoming clipboard. Audio, stats, gamepad, print, file and Apps events never reach its window. It has no stats strip, print notices, capture hint or drop target.
+  - **Window:** "{App} — Display 2", opened from **Add Screen +** in the Screen card or View → Second Display, shown when `second_screen` is true.
+    - Placement follows the web dashboard's `addScreen`, using `CGDisplayBounds`, because GPUI display origins are always zero. With exactly one Mac display beside the session window, Display 2 opens there. Otherwise a side picker (Left, Right, Above, Below, with a diagram) asks.
+    - Full screen is ⌃⌘F on whichever display it's on.
+  - **Lifecycle:**
+    - Display 2 resumes on the primary's first picture, including when `second_screen` becomes true later.
+    - It goes to Waiting when the primary errors, is killed, or reconnects.
+    - It closes with the primary, releasing keys and dropping its stream first, and ignores late events by generation.
+    - Each stream has its own 10 s silence timeout.
+    - On direct Selkies servers it uses the primary's `SessionTarget` (`ARCH-036`).
+  - **KILL:** "Display 2 isn't available. {reason}" with Try Again and Close. A takeover of the primary reads "This session was opened somewhere else."
+  - Pointer capture hands off to the primary. Gamepads stay on the primary's stream, with a 120 ms focus hand-off.
+- **QA (live, `sealskin.kebot.me`, real transport, primary plus Display 2):**
+  - Both streamed, with Display 2 placed at x=1024.
+  - Every `SETTINGS` Display 2 sent carried `displayId` (resize, HiDPI, codec, position), and the primary was never killed.
+  - Takeovers gave Superseded, and Display 2 resumed after the primary reconnected. Key releases went out before close, and no print, file or audio events reached Display 2.
+  - SealSkin's proxy accepts the second WebSocket (R10).
+  - Not verified: the GUI, placement across two Mac displays, and a server refusal.
+- **Affected Rust:** `transport/role.rs` (new), `transport.rs`, `app/second_display.rs` (new), `app/session_window.rs`, `app/display.rs`, `app.rs`, `crates/skerry-ui/src/{session.rs,controls.rs,components.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
 
 | ID | Owning Contract | Concept | Status | Summary |
 |---|---|---|---|---|
-| `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | unresolved (backlog) | Open a second remote display in its own GPUI window following server display placement while primary session owns audio. |
+| `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | settled (`ARCH-039`) | A Display 2 window on a stamped second connection, with no audio, placed beside the session window. |
+| `ARCH-GAP-VS-07` | `video-and-screen` | `cross-display-drag` | deferred (`ARCH-039`) | Map a drag that crosses from one display window into the other. |
 | `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
 | `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Launch options, plus staged progress via `launch_id`, idempotent retries, timeout recovery, and one-click remembered launch. |
 | `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | settled (`ARCH-013`, `ARCH-028`) | Thumbnails, confirmed Stop, and a Files button that opens a session's Files window with no stream. |
 | `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | settled (`ARCH-028`) | Omnibar link chooser, ⌘O/⌘L, drops, Finder Open With and Dock, `skerry:` scheme, launch/url, launch/file, open_url. |
 | `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Search, icons, categories, favorites, hidden apps, recents (saved per server), and reuse of a matching running session. |
-| `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
+| `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | settled except links (`ARCH-037`) | Storage window: homes, Shared Files, quota, transfers with resume, and Open in…. |
+| `ARCH-GAP-LS-14` | `launcher-and-sessions` | `public-share-links` | deferred (`ARCH-037`) | Public links with password, expiry and revoke, where the server permits (L2). |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | settled (`ARCH-029`) | Account menu with limits and meters, plus dormant / revoked / expired / disabled / held key recovery that keeps the old key until a new one connects. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
 | `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | settled (`ARCH-022`) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
@@ -737,7 +849,8 @@
 | `ARCH-GAP-DC-15` | `desktop-and-collaboration` | `remote-rename-move` | blocked (server) | Delete settled via SealSkin storage (`ARCH-024`); no server offers rename or move, and Cleanroom/direct-Selkies sessions cannot delete. |
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
 | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
-| `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
+| `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | microphone settled (`ARCH-038`); camera in progress (M2) | Mic: AudioToolbox Opus `0x02` uplink, TCC-safe listing, stops on every stream end. Camera: VideoToolbox H.264 `0x06` uplink, being built. |
+| `ARCH-GAP-DC-16` | `desktop-and-collaboration` | `mic-echo-cancellation` | deferred (`ARCH-038`) | VoiceProcessingIO would have to own playback, which breaks `ARCH-030`'s output thread guarantees. |
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |

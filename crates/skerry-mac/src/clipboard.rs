@@ -159,6 +159,15 @@ impl Policy {
             seamless_locked: settings["clipboard_seamless"]["locked"].as_bool() == Some(true),
         }
     }
+
+    /// Display 2's copy (`ARCH-039`): the Mac still sends over its socket, but only the
+    /// primary writes the session's clipboard to the Mac pasteboard.
+    pub fn for_secondary(self) -> Self {
+        Self {
+            outbound: false,
+            ..self
+        }
+    }
 }
 
 /// The person's per-server clipboard switches, within [`Policy`].
@@ -354,6 +363,18 @@ impl Receiver {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn secondary_policy_never_writes_the_mac_pasteboard() {
+        let policy = Policy::from_server(&json!({
+            "clipboard_in_enabled": {"value": true},
+            "clipboard_out_enabled": {"value": true},
+        }));
+        let second = policy.for_secondary();
+        assert!(!second.outbound);
+        assert!(second.inbound);
+        assert_eq!(second.seamless, policy.seamless);
+    }
 
     fn decode_frames(frames: &[String]) -> (Option<String>, Vec<u8>) {
         let mut bytes = Vec::new();

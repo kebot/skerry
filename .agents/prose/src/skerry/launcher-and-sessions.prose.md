@@ -7,7 +7,7 @@ id: 067NC4KG01SKERRY0000000003
 # Launcher and Sessions Domain
 
 <!-- compose:status=provisional provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
+<!-- compose:unresolved id=ARCH-GAP-LS-14 concept="public-share-links" question="Storage window settled (ARCH-037). Still open: public share links with password, expiry, and revocation (L2)." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-09 concept="native-mac-app-presence" question="Give remote applications first-class native macOS app presence (separate Dock icon, Cmd+Tab entry, and optionally Spotlight); decide in a future compose turn between generated .app shims, automatic per-app helper processes, or both, and how relaunch behaves when a session is already running." -->
 
@@ -57,8 +57,11 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - The Library content is a centred column capped at 1200 pt. Success toasts ("Library refreshed", "Link copied") show for 3 s at the bottom centre. "Started … ago" updates every 30 s while the Library is visible.
   - The application key is attached only to requests under `/companion/api/`. Logos and icons use a client with no key.
   - Preference and key writes go through the single first-in-first-out write queue in `persist.rs` on Tokio. Its in-memory copy serves every read, it flushes within 1 s on quit, and an unreadable file is backed up before it is overwritten.
-- `persistent-storage-and-shares` (unresolved: `ARCH-GAP-LS-05`):
-  - Manage SealSkin homes, shared files, direct remote file opening without re-upload, and public share links (password, expiry, revocation).
+- `persistent-storage-and-shares` (settled: `ARCH-037`; public links open in `ARCH-GAP-LS-14`):
+  - A per-server **Storage** window (⇧⌘I, Manage Storage…) browses Shared Files and homes through the Files pane on a SealSkin `FilesBackend`, and shows quota.
+  - Homes can be created, and deleted only when no session uses them. Skerry never deletes Shared Files.
+  - Transfers use 2 MiB chunks, resume only from a matching partial, and are idempotent on retry.
+  - **Open in…** launches a stored Shared File in a compatible app via `launch/file_path`.
 - `cluster-and-session-origins` (unresolved: `ARCH-GAP-LS-07`):
   - Automatic/pool/node placement, storage move evaluation, and validated token handoff to isolated per-session origins without leaking the control-plane application key.
 - `direct-selkies-sessions` (settled: `ARCH-036`):
@@ -67,7 +70,7 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - The gate is WebSockets mode plus an authorised `api/sessions`.
   - The Library shows one Desktop card and a server menu. SealSkin-only features (catalog, launch, Stop, account, Delete) are hidden.
 - `multi-window-sessions` (settled: `ARCH-010`, `ARCH-022`):
-  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it.
+  - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it for that, though its Display 2 window has its own connection (`ARCH-039`).
   - The Library window can close while sessions stream. **Window → Library** (`cmd-0`) or a Dock-icon click reopens it. `cmd-q` disconnects every session and stops none.
   - A session window closes from its own buttons, which appear when the pointer enters the top-left corner, or from **Window → Disconnect Session**. `cmd-w` stays with the remote app.
   - Codec, input, clipboard, and video changes are saved per server for the next session. Other open windows keep theirs. Display mode, resolution, mute, and pause are per window.

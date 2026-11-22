@@ -91,6 +91,23 @@ subject: skerry
   - The secure-mode probe, the 401 classification, and Close 4001 being fatal.
   - The `[[selkies]]` rules: at most 5, `0600`, the pin kept with Remember off.
   - `cargo tree -i aws-lc-rs` is empty.
+- Task M1 tests pass (`ARCH-038`):
+  - The real AudioToolbox Opus encoder makes 20 ms packets that decode with `opus-decoder`.
+  - Error, StartupTimeout, Reconnect, close, quit, and closing the sink all stop capture.
+  - Late permission answers are ignored, and the start policy runs only once.
+  - Reconnects don't stack threads while permission is undetermined.
+  - The 10 s no-traffic timeout fires.
+- Task L1 tests pass (`ARCH-037`):
+  - Shared Files and Cleanroom never get a DELETE (case-insensitive, zero requests sent).
+  - Delete Home rechecks sessions after the confirm, and the storage pane is not in the Files registry.
+  - A body cut off mid-download resumes, but a partial whose tag doesn't match restarts from 0, and a truncated folder walk fails.
+  - Upload retries carry the upload_id key, and Open in… filters apps.
+- Task N tests pass (`ARCH-039`):
+  - `Wire` stamps and overwrites `displayId` on every Display 2 frame. The fake-Selkies harness checks both roles, and that mic frames go only on the primary.
+  - Placement handles negative display origins.
+  - Late events from a dropped stream are ignored, and a primary error puts Display 2 in Waiting.
+  - When its owner closes Display 2, keys are released.
+  - A direct-server target works.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
