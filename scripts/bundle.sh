@@ -33,6 +33,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <!-- Without it, TCC ends the app at its first microphone access (ARCH-038). -->
   <key>NSMicrophoneUsageDescription</key><string>SealSkin Native sends your microphone to a remote session only while you turn it on or the session asks for it.</string>
+  <!-- The same for the camera; without the Continuity key, an iPhone camera is listed as a
+       built-in one (ARCH-038). -->
+  <key>NSCameraUsageDescription</key><string>SealSkin Native sends your camera to a remote session only while you turn it on or the session asks for it.</string>
+  <key>NSCameraUseContinuityCameraDeviceType</key><true/>
   <!-- Finder Open With and Dock drops for any file, never as the default app (ARCH-028). -->
   <key>CFBundleDocumentTypes</key>
   <array>
@@ -60,6 +64,17 @@ PLIST
 plutil -lint "$APP/Contents/Info.plist" >/dev/null || { echo "error: Info.plist is invalid" >&2; exit 1; }
 plutil -extract NSMicrophoneUsageDescription raw "$APP/Contents/Info.plist" >/dev/null \
   || { echo "error: Info.plist has no microphone usage string" >&2; exit 1; }
+plutil -extract NSCameraUsageDescription raw "$APP/Contents/Info.plist" >/dev/null \
+  || { echo "error: Info.plist has no camera usage string" >&2; exit 1; }
+plutil -extract NSCameraUseContinuityCameraDeviceType raw "$APP/Contents/Info.plist" >/dev/null \
+  || { echo "error: Info.plist has no Continuity Camera key" >&2; exit 1; }
+# The floor is macOS 13 (LSMinimumSystemVersion): Rust links framework symbols strongly, so a
+# reference to one added later stops the whole app from launching there. The camera resolves
+# its macOS 14 constants at run time (ARCH-038); keep it that way.
+if nm -u "$APP/Contents/MacOS/$name" | grep -E '^_AVCaptureDeviceType(External|ContinuityCamera|DeskViewCamera|Microphone)$'; then
+  echo "error: the binary links a macOS 14+ AVFoundation symbol strongly" >&2
+  exit 1
+fi
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc codesign failed"
 # Register at once so Open With and skerry: links work without a re-login.
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
