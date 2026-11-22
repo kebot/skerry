@@ -1,6 +1,7 @@
 use crate::clipboard::ClipboardSettings;
 use crate::input::InputSettings;
 use crate::launch_options::LaunchMemory;
+use crate::shortcuts::ShortcutPolicy;
 use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -90,6 +91,8 @@ pub struct Settings {
     pub codecs: Vec<Codec>,
     /// The server's audio bitrate choices; `None` when it doesn't expose them.
     pub audio_bitrate: Option<AudioBitrate>,
+    /// The server's `keyboard_shortcuts` (`ARCH-031`).
+    pub keyboard_shortcuts: ShortcutPolicy,
 }
 
 impl Default for Settings {
@@ -101,6 +104,7 @@ impl Default for Settings {
                 .filter(|codec| codec.supported())
                 .collect(),
             audio_bitrate: None,
+            keyboard_shortcuts: ShortcutPolicy::default(),
         }
     }
 }
@@ -141,6 +145,7 @@ impl Settings {
             }
         }
         self.audio_bitrate = AudioBitrate::from_server(&payload[AudioBitrate::WIRE]);
+        self.keyboard_shortcuts = ShortcutPolicy::from_server(payload);
     }
 
     pub fn live(&mut self, payload: &Value) {
@@ -346,6 +351,7 @@ pub type VideoSettings = BTreeMap<Key, u32>;
 #[serde(default)]
 pub struct ControlsSections {
     pub input: bool,
+    pub shortcuts: bool,
     pub clipboard: bool,
     pub screen: bool,
     pub video: bool,
@@ -357,6 +363,7 @@ impl Default for ControlsSections {
     fn default() -> Self {
         Self {
             input: false,
+            shortcuts: false,
             clipboard: false,
             screen: true,
             video: false,
@@ -371,10 +378,11 @@ impl ControlsSections {
         *self == Self::default()
     }
 
-    /// In Session Controls order: Input, Clipboard, Screen, Video, Audio, Stats.
-    pub fn to_array(self) -> [bool; 6] {
+    /// In Session Controls order: Input, Shortcuts, Clipboard, Screen, Video, Audio, Stats.
+    pub fn to_array(self) -> [bool; 7] {
         [
             self.input,
+            self.shortcuts,
             self.clipboard,
             self.screen,
             self.video,
@@ -383,9 +391,12 @@ impl ControlsSections {
         ]
     }
 
-    pub fn from_array([input, clipboard, screen, video, audio, stats]: [bool; 6]) -> Self {
+    pub fn from_array(
+        [input, shortcuts, clipboard, screen, video, audio, stats]: [bool; 7],
+    ) -> Self {
         Self {
             input,
+            shortcuts,
             clipboard,
             screen,
             video,
@@ -567,6 +578,12 @@ pub struct Preferences {
     pub library: LibraryOrganization,
     #[serde(default, skip_serializing_if = "AudioPreferences::is_default")]
     pub audio: AudioPreferences,
+    /// **Mac shortcuts active** as the person set it; `None` follows the server (`ARCH-031`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_shortcuts: Option<bool>,
+    /// **Show over the stream**: the stats strip (`ARCH-031`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stats_strip: bool,
     #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
@@ -679,6 +696,8 @@ fn read_file(path: &Path) -> Loaded {
             "controls" => field(value, &mut prefs.controls),
             "library" => field(value, &mut prefs.library),
             "audio" => field(value, &mut prefs.audio),
+            "mac_shortcuts" => field(value, &mut prefs.mac_shortcuts),
+            "stats_strip" => field(value, &mut prefs.stats_strip),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
                     .map(|number| {
@@ -885,16 +904,71 @@ mod tests {
     #[test]
     fn controls_sections_round_trip_beside_video_settings() {
         let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
-        prefs.controls = ControlsSections::from_array([true, false, false, true, true, false]);
+        prefs.controls =
+            ControlsSections::from_array([true, false, false, false, true, true, false]);
         let saved = serde_json::to_value(&prefs).unwrap();
         let restored: Preferences = serde_json::from_value(saved).unwrap();
         // `controls` is read as the struct, not swallowed by the flattened video map.
         assert_eq!(
             restored.controls.to_array(),
-            [true, false, false, true, true, false]
+            [true, false, false, false, true, true, false]
         );
         assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
         assert_eq!(restored.video.len(), 1);
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_shortcuts() {
+        for bits in 0..128u8 {
+            let open: [bool; 7] = std::array::from_fn(|i| bits & (1 << i) != 0);
+            assert_eq!(ControlsSections::from_array(open).to_array(), open);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"controls": {"stats": true}}"#).unwrap();
+        let old = load_at(&path).controls;
+        assert!(old.stats && !old.shortcuts && old.screen);
+    }
+
+    #[test]
+    fn shortcut_and_strip_preferences_round_trip() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("mac_shortcuts").is_none(), "{saved}");
+        assert!(saved.get("stats_strip").is_none(), "{saved}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| {
+            p.mac_shortcuts = Some(false);
+            p.stats_strip = true;
+        })
+        .unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.mac_shortcuts, Some(false));
+        assert!(loaded.stats_strip);
+
+        // A value of the wrong shape loads as the default and the file is backed up.
+        std::fs::write(&path, r#"{"stats_strip": "yes", "mac_shortcuts": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.damaged);
+        assert!(!loaded.preferences.stats_strip);
+        assert_eq!(loaded.preferences.mac_shortcuts, Some(true));
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn announce_reads_keyboard_shortcuts() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.keyboard_shortcuts, ShortcutPolicy::default());
+        settings.announce(&json!({"keyboard_shortcuts": {"value": false, "locked": true}}));
+        assert_eq!(
+            settings.keyboard_shortcuts,
+            ShortcutPolicy {
+                value: false,
+                locked: true
+            }
+        );
     }
 
     #[test]
@@ -1213,7 +1287,7 @@ mod tests {
         let saved = load_at(&path);
         assert_eq!(
             saved.controls.to_array(),
-            [true, false, false, true, false, true]
+            [true, false, false, false, true, false, true]
         );
     }
 

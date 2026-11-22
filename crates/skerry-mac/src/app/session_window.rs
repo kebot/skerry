@@ -8,7 +8,7 @@ use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
-    ToggleFiles, ToggleFullScreen, ToggleSessionControls, APP_NAME,
+    ToggleFiles, ToggleFullScreen, ToggleSessionControls, ToggleStatsStrip, APP_NAME,
 };
 use crate::audio::OutputStatus;
 use crate::input::InputFeature;
@@ -138,10 +138,11 @@ pub(super) struct SessionWindow {
     /// the panel while this window stays open.
     pub(super) controls_scroll: ScrollHandle,
     pub(super) stats: Option<StreamSample>,
-    /// Whether the Stats section is open in Session Controls, which is what
-    /// subscribes the session to the server's `stream_stats` (`ARCH-019`).
-    stats_open: bool,
-    /// Every second since the Stats section opened, up to `stats::HISTORY_MAX`.
+    /// The Stats section is open, or the strip is shown: either subscribes the session to
+    /// the server's `stream_stats` (`ARCH-019`, `ARCH-031`).
+    stats_interest: stats::StatsInterest,
+    /// Every second since the subscription started (on this stream), up to
+    /// `stats::HISTORY_MAX`.
     pub(super) stats_history: VecDeque<StreamSample>,
     pub(super) stream_info: Option<StreamInfo>,
     pub(super) display_mode: DisplayMode,
@@ -201,7 +202,7 @@ impl SessionWindow {
             controls: None,
             controls_scroll: ScrollHandle::new(),
             stats: None,
-            stats_open: false,
+            stats_interest: stats::StatsInterest::new(preferences.stats_strip),
             stats_history: VecDeque::new(),
             stream_info: None,
             display_mode: DisplayMode::default(),
@@ -275,7 +276,7 @@ impl SessionWindow {
                     dark: dark_appearance(window),
                     muted: self.muted,
                     codec: self.preferences.codec,
-                    stats: self.stats_open,
+                    stats: self.stats_interest.wanted(),
                     startup_grace: if self.keep_waiting {
                         KEEP_WAITING_GRACE
                     } else {
@@ -307,6 +308,8 @@ impl SessionWindow {
                 }
                 stream.set_input_settings(self.preferences.input, window, cx);
                 stream.set_clipboard_settings(self.preferences.clipboard, window, cx);
+                // The saved choice until the server's settings arrive (a lock may follow).
+                stream.set_mac_shortcuts(self.mac_shortcuts(), cx);
                 self.current = Some(stream);
                 // Session events update this window's entity through this window's handle
                 // (ARCH-015): Session Controls also renders it.
@@ -348,9 +351,13 @@ impl SessionWindow {
                 // The session answered: later reconnects get the normal 45 s grace.
                 self.keep_waiting = false;
                 self.settings = Some(settings);
+                // The server's keyboard_shortcuts, possibly locked (`ARCH-031`).
+                if let Some(stream) = &self.current {
+                    stream.set_mac_shortcuts(self.mac_shortcuts(), cx);
+                }
             }
             SessionEvent::Stats(sample) => {
-                if self.stats_open {
+                if self.stats_interest.wanted() {
                     if self.stats_history.len() == stats::HISTORY_MAX {
                         self.stats_history.pop_front();
                     }
@@ -824,17 +831,72 @@ impl SessionWindow {
         }
     }
 
-    /// The Stats section opened or shut: a fresh history, and the session
-    /// subscribes to the server's figures only while it is open.
+    /// The Stats section opened or shut. The session subscribes to the server's figures
+    /// while it is open or the strip is shown (`ARCH-031`).
     pub(super) fn set_stats_open(&mut self, open: bool) {
-        if open == self.stats_open {
-            return;
+        let change = self.stats_interest.set_section(open);
+        self.apply_interest(change);
+    }
+
+    /// **Show over the stream** switched, from the Stats card or the View menu; saved for
+    /// this server.
+    pub(super) fn set_stats_strip(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.preferences.stats_strip != on {
+            self.preferences.stats_strip = on;
+            self.save(
+                "the stats strip preference",
+                move |p| p.stats_strip = on,
+                cx,
+            );
         }
-        self.stats_open = open;
+        let change = self.stats_interest.set_strip(on);
+        self.apply_interest(change);
+        cx.notify();
+    }
+
+    /// The subscription started or stopped: a fresh history, and the stream is told.
+    fn apply_interest(&mut self, change: Option<bool>) {
+        let Some(wanted) = change else {
+            return;
+        };
         self.stats_history.clear();
         if let Some(stream) = &self.current {
-            stream.set_stats(open);
+            stream.set_stats(wanted);
         }
+    }
+
+    /// Whether Skerry's chords act on the Mac (`ARCH-031`): a server lock wins, then the
+    /// saved choice, then the server's value.
+    pub(super) fn mac_shortcuts(&self) -> bool {
+        crate::shortcuts::effective(
+            self.settings
+                .as_ref()
+                .map(|settings| settings.keyboard_shortcuts),
+            self.preferences.mac_shortcuts,
+        )
+    }
+
+    pub(super) fn shortcuts_locked(&self) -> bool {
+        self.settings
+            .as_ref()
+            .is_some_and(|settings| settings.keyboard_shortcuts.locked)
+    }
+
+    /// **Mac shortcuts active** switched; ignored while the server locks it.
+    pub(super) fn change_mac_shortcuts(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.shortcuts_locked() {
+            return;
+        }
+        self.preferences.mac_shortcuts = Some(active);
+        self.save(
+            "the Mac shortcuts preference",
+            move |p| p.mac_shortcuts = Some(active),
+            cx,
+        );
+        if let Some(stream) = &self.current {
+            stream.set_mac_shortcuts(self.mac_shortcuts(), cx);
+        }
+        cx.notify();
     }
 
     fn remove_controls(&mut self, cx: &mut App) -> bool {
@@ -921,8 +983,19 @@ fn output_name_to_save(
 }
 
 impl Render for SessionWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
+        // Hidden until the first sample, as the web's strip is. Built only while shown: this
+        // window re-renders on every cursor event.
+        let strip = (self.preferences.stats_strip && !self.stats_history.is_empty()).then(|| {
+            let start = self
+                .stats_history
+                .len()
+                .saturating_sub(stats::STRIP_SAMPLES);
+            let recent: Vec<_> = self.stats_history.range(start..).cloned().collect();
+            stats::strip(self.stream_info.as_ref(), &recent)
+        });
+        let viewport_width = window.viewport_size().width;
         div()
             .size_full()
             .relative()
@@ -942,8 +1015,16 @@ impl Render for SessionWindow {
                 this.release_keys(cx);
                 window.toggle_fullscreen();
             }))
+            .on_action(cx.listener(|this, _: &ToggleStatsStrip, _, cx| {
+                this.set_stats_strip(!this.preferences.stats_strip, cx);
+            }))
             .when_some(self.current.as_ref(), |root, stream| {
                 root.child(stream.view())
+            })
+            // Over the picture and the ⋯ trigger, but with no hitbox: clicks reach the
+            // desktop and the trigger under it (`ARCH-031`).
+            .when_some(strip, |root, strip| {
+                root.child(skerry_ui::stats::strip(&strip, viewport_width))
             })
             .when_some(self.status.clone(), |root, status| {
                 root.child(session::status_banner_with_actions(

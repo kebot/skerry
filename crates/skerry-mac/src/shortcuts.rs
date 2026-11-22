@@ -65,9 +65,10 @@ pub const CHORDS: [SkerryChord; 5] = [
 ];
 
 /// The flag the session desktop adds to its key context while Mac shortcuts are off.
-pub const REMOTE_FLAG: &str = "remote_shortcuts";
+#[cfg(test)]
+const REMOTE_FLAG: &str = "remote_shortcuts";
 /// The desktop's key context while Mac shortcuts are off (`view::DESKTOP_CONTEXT` plus
-/// [`REMOTE_FLAG`]).
+/// the `remote_shortcuts` flag).
 pub const REMOTE_DESKTOP_CONTEXT: &str = "SessionDesktop remote_shortcuts";
 /// The predicate the suppressing bindings match.
 pub const REMOTE_PREDICATE: &str = "SessionDesktop && remote_shortcuts";
