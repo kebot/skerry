@@ -242,7 +242,7 @@
 | **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
-| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
+| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
 | **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
 | Footer | "Cite our paper academically" link | — | Excluded |
@@ -576,6 +576,46 @@
   - Not verified (screen locked): the notices, the card, and the print sheet on screen.
 - **Affected Rust:** `print_jobs.rs` (new), `print_dialog.rs` (new), `selkies.rs`, `transport.rs`, `settings.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{session.rs,controls.rs}`, `examples/preview.rs`.
 
+## ARCH-032: Pointer Capture and Gamepads (Task G)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-06`. Custom chords were dropped, following `ARCH-031`.
+- **Process:** plan → design → review (13 required changes) → build (G1 pointer capture, G2 gamepads) → QA (2 medium, 3 low) → code review (4 rounds; one high found in rounds 2 and 3, fixed) by subagents (`ARCH-025`). Branch `task-g-gaming`, merged after Task H.
+- **Protocol (Selkies 715df7c):**
+  - Relative motion is `m2,<dx>,<dy>,<mask>,<magnitude>,<seq>`, integers only, so Skerry carries fractions forward.
+  - Pointer lock is `p,0|1` plus `SET_NATIVE_CURSOR_RENDERING,0|1`.
+  - Gamepads use `js,c,<idx>,<b64 name>,<axes>,<buttons>`, `js,d`, `js,b`/`js,a`, and a `js,h` heartbeat. Mapping follows the W3C standard layout.
+  - Rumble comes back as the system frame `rumble,<slot>,<strong>,<weak>,<ms>`.
+  - Everything is gated by `gamepad_enabled`, read as `{value, locked}`.
+- **Pointer capture (G1):**
+  - **Capture Pointer** lives in the Input card and in the View menu. ⌃⌥⇧Z (Moonlight's chord) captures and releases. It joins `shortcuts::CHORDS` as always-local, and a held chord toggles only once. VMware's ⌃⌘ clashes with ⌃⌘F, and Parallels' ⌃⌥ is a common Linux chord.
+  - **Capturing:**
+    - An app-wide AppKit monitor (`view/capture.rs`, built like `pinch.rs`) sends raw deltas to the input channel as scaled `m2` with carry.
+    - Skerry sends `p,1`, warps the cursor to the picture centre (primary-display flip), drops the first motion after the warp, dissociates the mouse from the cursor, and hides the cursor.
+  - **Releasing:** on the chord, on blur or deactivation, on child windows (including a print sheet, `ARCH-033`), on full screen, on disconnect, and on drop.
+    - Release shows "Pointer released". Errors release with no hint.
+    - Modifiers are lifted before they are muted.
+    - The transport sends `p,0`, `SET_NATIVE_CURSOR_RENDERING,0`, and `js,d` on close, because the server's cursor setting outlives the connection.
+  - Server pointer-lock requests are not honoured: Selkies sends none.
+  - Hint pill: "Pointer captured · ⌃⌥⇧Z releases it" at the bottom centre for 3 s.
+- **Gamepads (G2):**
+  - Apple's GameController framework (`objc2-game-controller` 0.3.2) and CoreHaptics (`objc2-core-haptics` 0.3.2; `createEngineWithLocality` is called through `msg_send!` because the crate gates it to iOS).
+  - **Slots:** an app-wide table gives each pad the lowest free slot 0–3. Drivers are keyed by session (host + session id), because each Selkies session has its own slot table.
+  - **Sending:** only changes are sent, plus `js,h` every 100 ms from the transport.
+    - Pads send only while the session window is key, as in Moonlight. When the window loses key, its slots return to rest.
+    - A window sends `js,d` only for the slots it drove.
+  - **Rumble:** each message starts a fresh haptics player, capped at 5 s. Engines stop with their players, and a start that races a stop is retried once.
+  - **Gamepads card:** four fixed slot rows, each with a numbered badge (Sending / Ready / Not sent), the name, and "· No rumble" when the pad has none. Battery display was cut.
+  - Skerry drives up to four slots; the web client drives one.
+- **Risks recorded:**
+  - Every `p` change makes the server reconfigure its displays.
+  - If the main thread hangs while the pointer is captured, the cursor stays frozen until ⌥⌘Esc.
+  - In collaboration rooms (master token set), the server drops Skerry's `js,` messages (`ARCH-GAP-DC-07`).
+- **QA:**
+  - The app launched with GameController and CoreHaptics loaded and didn't crash.
+  - A fake-server harness confirmed every message, the 100 ms heartbeat, and rumble reaching the haptics path.
+  - Not verified (screen locked, no controller): capture and warp on screen, `kill -9` while captured, real pads and haptics, and the server's display restart.
+- **Affected Rust:** `view/capture.rs` (new), `gamepad/` (new, `native.rs`), `view.rs`, `view/keys.rs`, `transport.rs`, `settings.rs`, `shortcuts.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{controls.rs,session.rs,assets.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -601,7 +641,7 @@
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
 | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
-| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
+| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
 | `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |

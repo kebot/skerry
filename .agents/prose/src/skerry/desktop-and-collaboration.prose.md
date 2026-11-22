@@ -10,7 +10,6 @@ id: 067NC4KG01SKERRY0000000004
 <!-- compose:unresolved id=ARCH-GAP-DC-14 concept="session-file-mount" question="Future scope: mount the session's files in Finder through a File Provider extension, a local WebDAV server, or a local NFS server. Not started; revisit after the Files window ships." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-15 concept="remote-rename-move" question="Delete is settled through SealSkin home storage (ARCH-024). Neither Selkies 715df7c nor SealSkin has a rename or move file route, and Cleanroom or direct Selkies sessions have no delete at all; revisit when a server offers them." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-05 concept="microphone-and-webcam" question="Negotiate audio/video uplink formats, request macOS capture permissions on demand, show active capture indicators, and stop capture on disconnect." -->
-<!-- compose:unresolved id=ARCH-GAP-DC-06 concept="gaming-controls" question="Add relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-07 concept="session-sharing-and-rooms" question="Support Selkies view-only and player-slot roles and evaluate SealSkin collaboration rooms (room API, token handoff, control transfer)." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-08 concept="multitouch-trackpad" question="Keep raw multitouch contact forwarding deferred until gesture-to-display latency in Chrome matches native macOS pinch/pan and contact release on focus loss is proven." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-11 concept="apps-catalog" question="Bring the web's Apps panel (proot-apps catalog with install/remove/update/launch and job consoles, gated by command_enabled) into Session Controls (ARCH-020)?" -->
@@ -53,6 +52,10 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
   - Audio output (settled: `ARCH-030`): each session has its own `skerry-audio` thread. Output follows the macOS default, or a chosen **Output Device** saved per server by UID that falls back while missing or failing. The stream opens at 48 kHz f32 with Core Audio converting. Skerry rebuilds after errors, stalls, or sleep/wake, with backoff and a probe that leaves the fallback playing. **Audio Bitrate** sends `SETTINGS {audio_bitrate, picked}` and is hidden or locked as the server says.
   - Unresolved frontier (`ARCH-GAP-DC-05`): microphone and webcam capture uplinks with macOS permission prompts and disconnect teardown.
 - `printing-gaming-and-sharing` (unresolved: `ARCH-GAP-DC-04`, `ARCH-GAP-DC-06`, `ARCH-GAP-DC-07`):
+  - Gaming (settled: `ARCH-032`):
+    - **Capture Pointer** (⌃⌥⇧Z, the Input card, the View menu) locks and hides the Mac cursor, sends relative `m2` motion with `p,1`, and releases on the chord, blur, child windows, full screen, and disconnect. The transport always sends `p,0` on close.
+    - GameController pads take slots 0–3 per Selkies session, with W3C mapping, changes only, and a 100 ms `js,h` heartbeat.
+    - Pads send only while the window is key, with CoreHaptics rumble, all gated by `gamepad_enabled`.
   - Printing (settled: `ARCH-033`):
     - `print_document` jobs are fetched once from `GET /api/print/{name}`, capped at 1 GiB and checked as PDF, into a cache.
     - Each job shows a notice with Print… (the PDFKit print sheet on the session window), Open, and Save…, and the Printing card lists the session's jobs.

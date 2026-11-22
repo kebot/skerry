@@ -66,6 +66,11 @@ subject: skerry
   - Failures before a 200 and SealSkin's 403 read as reconnect.
   - A re-announce replaces a failed job, and the connect burst auto-opens only the newest fresh job.
   - A closed window fetches nothing, and cleanup keeps any file under a sheet.
+- Task G tests pass (`ARCH-032`):
+  - `m2` carry and scaling, a held chord toggling once, a stale motion not using up the first-motion drop, and modifiers lifted before muting.
+  - The `js,c/d/b/a/h` encodings, the W3C mapping, slots per session and slot number, and rumble capped at 5 s.
+  - Closing while captured lifts buttons and sends `p,0`.
+  - A pending print sheet skips a pending capture.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
