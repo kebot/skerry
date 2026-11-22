@@ -725,7 +725,7 @@ pub fn certificate_sheet(
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("On the server, run: openssl x509 -noout -fingerprint -sha256 -in <cert>"),
+                                .child("On the server, run: openssl x509 -noout -fingerprint -sha256 -in ~/.local/state/selkies/selkies.pem (or the file passed to --https-cert)"),
                         ),
                 )
                 .child(
@@ -809,6 +809,8 @@ pub struct SelkiesHomeProps {
     pub menu_open: bool,
     /// Files waiting to be copied to the Desktop (Open…, Finder): the one-row chooser.
     pub pending_copy: Option<String>,
+    /// Open in Browser: hidden for a token-only server, whose page would answer 401.
+    pub can_open_web: bool,
 }
 
 #[derive(Clone)]
@@ -965,16 +967,18 @@ fn server_menu(
                     div()
                         .v_flex()
                         .gap_0p5()
-                        .child(
-                            Button::new("menu-open-web")
-                                .ghost()
-                                .small()
-                                .w_full()
-                                .justify_start()
-                                .icon(IconName::ExternalLink)
-                                .label("Open in Browser")
-                                .on_click(move |e, w, cx| on_web(e, w, cx)),
-                        )
+                        .when(props.can_open_web, |rows| {
+                            rows.child(
+                                Button::new("menu-open-web")
+                                    .ghost()
+                                    .small()
+                                    .w_full()
+                                    .justify_start()
+                                    .icon(IconName::ExternalLink)
+                                    .label("Open in Browser")
+                                    .on_click(move |e, w, cx| on_web(e, w, cx)),
+                            )
+                        })
                         .child(
                             Button::new("menu-disconnect")
                                 .ghost()

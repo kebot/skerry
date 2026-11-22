@@ -379,6 +379,44 @@ mod tests {
         assert_eq!(rejected.take(), None);
     }
 
+    /// The path a real Mac takes: roots are loaded (an unrelated CA here), so `inner` exists,
+    /// refuses the self-signed leaf first, and checks the handshake signature.
+    #[tokio::test]
+    async fn with_roots_loaded_a_pinned_leaf_passes_and_its_signature_is_still_checked() {
+        let unrelated = ca();
+        let leaf = self_signed(&["localhost"]);
+        let address = serve(vec![leaf.der.clone()], &leaf.key, ok).await;
+        let (unpinned, rejected) = client_config_with_roots(roots_of(Some(&unrelated)), None);
+        assert!(handshake(unpinned, address.port(), "localhost")
+            .await
+            .is_err());
+        assert_eq!(rejected.take(), Some(fingerprint(&leaf.der)));
+        let (pinned, _) =
+            client_config_with_roots(roots_of(Some(&unrelated)), Some(fingerprint(&leaf.der)));
+        handshake(pinned, address.port(), "desktop.example")
+            .await
+            .unwrap();
+
+        let impostor = rcgen::KeyPair::generate().unwrap();
+        let forged = serve(vec![leaf.der.clone()], &impostor, ok).await;
+        let (pinned, _) =
+            client_config_with_roots(roots_of(Some(&unrelated)), Some(fingerprint(&leaf.der)));
+        assert!(handshake(pinned, forged.port(), "localhost").await.is_err());
+
+        let other = self_signed(&["localhost"]);
+        let (wrong_pin, _) =
+            client_config_with_roots(roots_of(Some(&unrelated)), Some(fingerprint(&other.der)));
+        assert!(handshake(wrong_pin, address.port(), "localhost")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn native_roots_build_an_inner_verifier() {
+        // On a Mac the system roots load, so the pinned path is the one tested above.
+        assert!(!native_roots().is_empty());
+    }
+
     #[tokio::test]
     async fn a_different_leaf_is_refused_despite_a_pin() {
         let leaf = self_signed(&["localhost"]);

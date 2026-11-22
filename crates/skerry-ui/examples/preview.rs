@@ -1225,6 +1225,7 @@ impl PreviewApp {
             others: usize::from(open),
             thumbnail: open.then(|| self.assets.thumb_zen.clone()),
             accepts_drop: true,
+            can_open_web: true,
             menu_open: self.story == Story::SelkiesHomeMenu,
             ..SelkiesHomeProps::default()
         };

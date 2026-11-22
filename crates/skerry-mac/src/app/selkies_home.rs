@@ -59,6 +59,8 @@ pub(super) struct SelkiesForm {
     pub(super) remember: bool,
     /// The session token a pasted link carried (the chip).
     pub(super) token: Option<String>,
+    /// The base of the address the token came with: it is sent only there.
+    pub(super) token_base: Option<String>,
     pub(super) problem: Option<SelkiesProblem>,
     pub(super) status: Option<String>,
     /// The host the gate is checking, for "Checking <host>…".
@@ -86,12 +88,58 @@ pub(super) enum Focus {
     Launcher,
 }
 
+/// Whether a token that came with `token_base` may go to `base`: only the server whose
+/// link carried it (K-QA-2). A token with no recorded base is kept.
+pub(super) fn token_belongs(token_base: Option<&str>, base: &str) -> bool {
+    token_base.is_none_or(|from| from == base)
+}
+
+/// Drops `token` (and its chip's error) unless it came with `base`.
+pub(super) fn retarget_token(
+    token: &mut Option<String>,
+    token_base: &mut Option<String>,
+    problem: &mut Option<SelkiesProblem>,
+    base: &str,
+) {
+    if token_belongs(token_base.as_deref(), base) {
+        return;
+    }
+    *token = None;
+    *token_base = None;
+    if matches!(
+        problem,
+        Some(SelkiesProblem::Field {
+            field: SelkiesField::Token,
+            ..
+        })
+    ) {
+        *problem = None;
+    }
+}
+
 impl SelkiesForm {
+    /// A token from a link (or a saved entry) for `base`.
+    pub(super) fn set_token(&mut self, token: Option<String>, base: &str) {
+        self.token_base = token.as_ref().map(|_| base.to_string());
+        self.token = token;
+    }
+
+    /// Drops the token when the address now names another server.
+    pub(super) fn retarget(&mut self, base: &str) {
+        retarget_token(
+            &mut self.token,
+            &mut self.token_base,
+            &mut self.problem,
+            base,
+        );
+    }
+
     pub(super) fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             inputs: ui::new_selkies_inputs(window, cx),
             remember: true,
             token: None,
+            token_base: None,
             problem: None,
             status: None,
             checking: None,
@@ -100,6 +148,30 @@ impl SelkiesForm {
             fill: None,
             focus: None,
         }
+    }
+}
+
+/// The SealSkin Connect state a Selkies connect clears (review 11). `startup_credential`
+/// isn't here: the saved key stays for the SealSkin tab's empty Connect.
+pub(super) struct SealSkinLeftovers<'a> {
+    pub(super) key_problem: &'a mut Option<skerry_ui::connect::KeyProblem>,
+    pub(super) refused_server: &'a mut Option<String>,
+    pub(super) key_hint: &'a mut Option<String>,
+    pub(super) different_key: &'a mut bool,
+    pub(super) pending_save: &'a mut Option<crate::sealskin::Credential>,
+    pub(super) retry_api: &'a mut Option<crate::sealskin::SealSkinClient>,
+    pub(super) status: &'a mut Option<String>,
+}
+
+impl SealSkinLeftovers<'_> {
+    pub(super) fn clear(self) {
+        *self.key_problem = None;
+        *self.refused_server = None;
+        *self.key_hint = None;
+        *self.different_key = false;
+        *self.pending_save = None;
+        *self.retry_api = None;
+        *self.status = None;
     }
 }
 
@@ -268,6 +340,41 @@ fn input_text(input: &Entity<InputState>, cx: &App) -> String {
     input.read(cx).value().to_string()
 }
 
+impl SelkiesHome {
+    fn new(server: SelkiesServer, report: GateReport) -> Self {
+        Self {
+            server,
+            report,
+            thumbnail: None,
+            thumbnail_loading: false,
+            thumbnail_generation: 0,
+            menu_open: false,
+            pending_forget: false,
+            pending_copy: Vec::new(),
+            status: None,
+        }
+    }
+
+    /// Items for the connected server: files wait for Copy to Desktop, links get the notice.
+    fn receive(&mut self, items: Vec<Incoming>) {
+        let plan = plan_receive(items);
+        self.pending_copy.extend(plan.files);
+        self.pending_copy.truncate(crate::open_target::QUEUE_CAP);
+        self.status = if plan.links > 0 {
+            Some(LINKS_NOTICE.into())
+        } else if plan.folders > 0 {
+            Some(folder_notice(plan.folders, !self.pending_copy.is_empty()))
+        } else {
+            None
+        };
+    }
+
+    /// Takes everything that queued before the connect (review 11: nothing waits forever).
+    fn take_queued(&mut self, queued: &mut Vec<Incoming>) {
+        self.receive(std::mem::take(queued));
+    }
+}
+
 impl Launcher {
     /// The saved servers, read again after every queued write.
     pub(super) fn reload_recent(&mut self, cx: &mut Context<Self>) {
@@ -321,10 +428,13 @@ impl Launcher {
         if let Ok(address) = direct::parse_address(&text) {
             let carried =
                 address.token.is_some() || address.username.is_some() || address.password.is_some();
+            let base = address.base.to_string();
+            if address.token.is_some() {
+                form.set_token(address.token.clone(), &base);
+            } else {
+                form.retarget(&base);
+            }
             if carried {
-                if address.token.is_some() {
-                    form.token = address.token;
-                }
                 form.fill = Some(Fill {
                     address: Some(address.base.to_string()),
                     username: address.username,
@@ -387,8 +497,12 @@ impl Launcher {
                 return;
             }
         };
+        let base = address.base.to_string();
         if address.token.is_some() {
-            form.token = address.token.clone();
+            form.set_token(address.token.clone(), &base);
+        } else {
+            // A token from another server's link never goes here.
+            form.retarget(&base);
         }
         let typed_user = input_text(&form.inputs.username, cx);
         let typed_password = input_text(&form.inputs.password, cx);
@@ -432,7 +546,7 @@ impl Launcher {
         let form = &mut self.selkies_form;
         form.problem = None;
         form.status = None;
-        form.token = saved.token.clone();
+        form.set_token(saved.token.clone(), &saved.url);
         form.remember = saved.password.is_some() || saved.token.is_some() || form.remember;
         form.fill = Some(Fill {
             address: Some(saved.url.clone()),
@@ -529,7 +643,7 @@ impl Launcher {
         self.clear_sealskin_for_selkies();
         self.selkies_form.cert = None;
         self.selkies_form.problem = None;
-        self.selkies_form.token = None;
+        self.selkies_form.set_token(None, "");
         self.selkies_form.fill = Some(Fill {
             address: Some(String::new()),
             username: Some(String::new()),
@@ -552,21 +666,11 @@ impl Launcher {
             );
             self.reload_recent(cx);
         }
-        self.selkies = Some(SelkiesHome {
-            server,
-            report,
-            thumbnail: None,
-            thumbnail_loading: false,
-            thumbnail_generation: 0,
-            menu_open: false,
-            pending_forget: false,
-            pending_copy: Vec::new(),
-            status: None,
-        });
-        self.fetch_selkies_thumbnail(cx);
+        let mut home = SelkiesHome::new(server, report);
         // Items that arrived before this connect.
-        let pending = std::mem::take(&mut self.pending_opens);
-        self.receive(pending, cx);
+        home.take_queued(&mut self.pending_opens);
+        self.selkies = Some(home);
+        self.fetch_selkies_thumbnail(cx);
     }
 
     /// What connecting to a direct server clears of the SealSkin side (review 11): a
@@ -574,13 +678,16 @@ impl Launcher {
     /// as `startup_credential`, so the SealSkin tab's empty Connect still retries it.
     pub(super) fn clear_sealskin_for_selkies(&mut self) {
         self.clear_recovery();
-        self.key_problem = None;
-        self.refused_server = None;
-        self.key_hint = None;
-        self.different_key = false;
-        self.pending_save = None;
-        self.retry_api = None;
-        self.status = None;
+        SealSkinLeftovers {
+            key_problem: &mut self.key_problem,
+            refused_server: &mut self.refused_server,
+            key_hint: &mut self.key_hint,
+            different_key: &mut self.different_key,
+            pending_save: &mut self.pending_save,
+            retry_api: &mut self.retry_api,
+            status: &mut self.status,
+        }
+        .clear();
     }
 
     fn selkies_refreshed(&mut self, report: GateReport, kind: LoadKind, cx: &mut Context<Self>) {
@@ -615,7 +722,8 @@ impl Launcher {
             close_library_files(cx, |id| id.starts_with("selkies|"));
             self.connect_tab = ConnectTab::Selkies;
             let auth = server.auth();
-            self.selkies_form.token = auth.token.clone();
+            self.selkies_form
+                .set_token(auth.token.clone(), server.base().as_str());
             self.selkies_form.fill = Some(Fill {
                 address: Some(server.base().to_string()),
                 username: auth.basic.as_ref().map(|login| login.username.clone()),
@@ -816,19 +924,9 @@ impl Launcher {
 
     /// `receive` while a direct server is connected.
     pub(super) fn receive_on_selkies(&mut self, items: Vec<Incoming>, cx: &mut Context<Self>) {
-        let plan = plan_receive(items);
-        let Some(home) = self.selkies.as_mut() else {
-            return;
-        };
-        home.pending_copy.extend(plan.files);
-        home.pending_copy.truncate(crate::open_target::QUEUE_CAP);
-        home.status = if plan.links > 0 {
-            Some(LINKS_NOTICE.into())
-        } else if plan.folders > 0 {
-            Some(folder_notice(plan.folders, !home.pending_copy.is_empty()))
-        } else {
-            None
-        };
+        if let Some(home) = self.selkies.as_mut() {
+            home.receive(items);
+        }
         cx.notify();
     }
 
@@ -929,7 +1027,7 @@ impl Launcher {
             on_recent_remove,
             on_remember,
             on_drop_token: Rc::new(cx.listener(|this, _, _, cx| {
-                this.selkies_form.token = None;
+                this.selkies_form.set_token(None, "");
                 if matches!(
                     this.selkies_form.problem,
                     Some(SelkiesProblem::Field {
@@ -1039,6 +1137,8 @@ impl Launcher {
             status: home.status.clone(),
             menu_open: home.menu_open,
             pending_copy: pending_copy_label(&home.pending_copy, &server.host_port()),
+            // A token-only server's page would only answer 401 in a browser.
+            can_open_web: server.auth().basic.is_some() || server.auth().token.is_none(),
         };
         let pending_forget = home.pending_forget;
         let display_name = server.display_name();
@@ -1186,55 +1286,109 @@ mod tests {
         );
     }
 
+    fn test_server() -> SelkiesServer {
+        SelkiesServer::new(
+            "https://h.example/".parse().unwrap(),
+            SelkiesAuth::default(),
+            None,
+            ServerSource::Typed,
+            false,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn opens_queued_before_a_selkies_connect_are_handled_after_it() {
-        // `selkies_connected` hands `pending_opens` to `receive`, which on a direct server
-        // plans them like this: files to Copy to Desktop, links to the notice.
-        let queued = vec![
+        let mut queued = vec![
             Incoming::Target(OpenTarget::File("/tmp/a.pdf".into())),
+            Incoming::Target(OpenTarget::Url("https://example.com/".parse().unwrap())),
             Incoming::Target(OpenTarget::File("/tmp/b.pdf".into())),
         ];
-        let plan = plan_receive(queued);
-        assert_eq!(plan.files.len(), 2);
+        let mut home = SelkiesHome::new(test_server(), GateReport::default());
+        home.take_queued(&mut queued);
+        assert!(queued.is_empty(), "the queue is drained, not left waiting");
         assert_eq!(
-            pending_copy_label(&plan.files, "h").as_deref(),
+            home.pending_copy,
+            vec![PathBuf::from("/tmp/a.pdf"), PathBuf::from("/tmp/b.pdf")]
+        );
+        assert_eq!(home.status.as_deref(), Some(LINKS_NOTICE));
+        assert_eq!(
+            pending_copy_label(&home.pending_copy, "h").as_deref(),
             Some("Copy 2 files to the Desktop of h?")
         );
-        let source = include_str!("selkies_home.rs");
-        let connected = source
-            .split("fn selkies_connected")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
-            .unwrap();
-        assert!(connected.contains("std::mem::take(&mut self.pending_opens)"));
-        assert!(connected.contains("self.receive(pending, cx)"));
+        // Later items join the same chooser.
+        home.receive(vec![Incoming::Target(OpenTarget::File(
+            "/tmp/c.pdf".into(),
+        ))]);
+        assert_eq!(home.pending_copy.len(), 3);
+        assert_eq!(home.status, None);
     }
 
     #[test]
     fn connecting_to_selkies_clears_sealskin_recovery_and_pending_save() {
-        let source = include_str!("selkies_home.rs");
-        let clears = source
-            .split("fn clear_sealskin_for_selkies")
-            .nth(1)
-            .and_then(|rest| rest.split("\n    fn ").next())
-            .unwrap();
-        for field in [
-            "clear_recovery()",
-            "key_problem = None",
-            "refused_server = None",
-            "key_hint = None",
-            "different_key = false",
-            "pending_save = None",
-            "retry_api = None",
-        ] {
-            assert!(clears.contains(field), "{field}");
+        let credential = crate::sealskin::Credential::parse("ssk_id_secret@seal.example").unwrap();
+        let mut key_problem = Some(skerry_ui::connect::KeyProblem {
+            kind: skerry_ui::connect::ProblemKind::Revoked,
+            env_note: None,
+        });
+        let mut refused_server = Some("seal.example".to_string());
+        let mut key_hint = Some("Paste a new application key.".to_string());
+        let mut different_key = true;
+        let mut pending_save = Some(credential.clone());
+        let mut retry_api = Some(crate::sealskin::SealSkinClient::new(&credential).unwrap());
+        let mut status = Some("old".to_string());
+        SealSkinLeftovers {
+            key_problem: &mut key_problem,
+            refused_server: &mut refused_server,
+            key_hint: &mut key_hint,
+            different_key: &mut different_key,
+            pending_save: &mut pending_save,
+            retry_api: &mut retry_api,
+            status: &mut status,
         }
+        .clear();
+        assert!(key_problem.is_none() && refused_server.is_none() && key_hint.is_none());
+        assert!(!different_key);
         assert!(
-            !clears.contains("startup_credential"),
-            "the saved key stays for retries"
+            pending_save.is_none(),
+            "a pending save never lands after the switch"
         );
-        let connected = source.split("fn selkies_connected").nth(1).unwrap();
-        assert!(connected.contains("self.clear_sealskin_for_selkies()"));
+        assert!(retry_api.is_none() && status.is_none());
+    }
+
+    #[test]
+    fn a_link_token_is_dropped_when_the_address_names_another_server() {
+        assert!(token_belongs(
+            Some("https://a.example/"),
+            "https://a.example/"
+        ));
+        assert!(!token_belongs(
+            Some("https://a.example/"),
+            "https://b.example/"
+        ));
+        assert!(!token_belongs(
+            Some("https://a.example/"),
+            "https://a.example/other/"
+        ));
+        assert!(token_belongs(None, "https://b.example/"));
+        let a = direct::parse_address("https://a.example/#token=T").unwrap();
+        let mut token = a.token.clone();
+        let mut token_base = Some(a.base.to_string());
+        let mut problem = Some(SelkiesProblem::Field {
+            field: SelkiesField::Token,
+            text: "bad".into(),
+        });
+        // Same server: kept.
+        retarget_token(&mut token, &mut token_base, &mut problem, a.base.as_str());
+        assert_eq!(token.as_deref(), Some("T"));
+        let b = direct::parse_address("https://b.example/").unwrap();
+        retarget_token(&mut token, &mut token_base, &mut problem, b.base.as_str());
+        assert_eq!(token, None, "T is never sent to b.example");
+        assert_eq!(problem, None);
+        assert_eq!(token_base, None);
+        // Nor does it ride b's requests: the auth built for b has no token.
+        let auth = SelkiesAuth::new("ubuntu", "pw", token);
+        assert!(auth.http_headers().get("cookie").is_none());
     }
 
     #[test]

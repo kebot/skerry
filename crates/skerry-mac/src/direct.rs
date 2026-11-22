@@ -36,6 +36,17 @@ pub const DIRECT_LOGIN_ERROR: &str =
     "Selkies didn’t accept the login. Open the Library to sign in again.";
 pub const DIRECT_WEBRTC_ERROR: &str =
     "This server streams over WebRTC now. Skerry needs the WebSockets mode.";
+/// The session-window error when the server's certificate isn't the pinned one, or isn't
+/// trusted at all: never retried, the Library's certificate prompt decides.
+pub const DIRECT_CERT_ERROR: &str =
+    "The server’s certificate changed since you trusted it, or isn’t trusted. Open the Library to check it.";
+/// The comment written above the `[[selkies]]` entries.
+const SECRETS_WARNING: &str = "# The [[selkies]] entries below hold passwords and session tokens. Keep this file\n# private: don't commit it to a dotfiles repository or sync it. (Skerry, ARCH-036)\n";
+
+/// Errors a session window can't recover from by reconnecting: Disconnect only.
+pub fn is_fatal_session_error(status: &str) -> bool {
+    status == DIRECT_LOGIN_ERROR || status == DIRECT_CERT_ERROR
+}
 
 // ---------------------------------------------------------------------------------------
 // Addresses
@@ -91,13 +102,22 @@ pub fn parse_address(raw: &str) -> Result<SelkiesAddress, AddressError> {
     if raw.starts_with("ssk_") || crate::sealskin::Credential::parse(raw).is_ok() {
         return Err(AddressError::LooksLikeKey);
     }
-    let text = if raw.contains("://") {
+    let has_scheme = raw.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    let text = if has_scheme {
         raw.to_string()
     } else {
         format!("https://{raw}")
     };
     let mut url = Url::parse(&text).map_err(|_| AddressError::Invalid)?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none_or(str::is_empty)
+        || url.port() == Some(0)
+    {
         return Err(AddressError::Invalid);
     }
     // The fragment beats the query, as `session-token.ts::getSessionToken` reads them.
@@ -711,7 +731,20 @@ struct Answer {
 }
 
 impl SelkiesServer {
+    /// The leaf a failed handshake on this server's clients recorded, cleared. Read right
+    /// after the failure it belongs to.
+    pub fn take_rejected(&self) -> Option<Pin> {
+        self.net.rejected.take()
+    }
+
+    /// Forgets a leaf an earlier, unrelated failure recorded (a screenshot, a WebSocket).
+    pub fn clear_rejected(&self) {
+        let _ = self.net.rejected.take();
+    }
+
     async fn get(&self, route: &str, headers: HeaderMap) -> Result<Answer, GateError> {
+        // A leaf recorded by an earlier failure must not explain this one.
+        self.clear_rejected();
         let request = self
             .net
             .http
@@ -1020,9 +1053,25 @@ fn write_entries(document: &mut DocumentMut, tables: Vec<Table>) {
         return;
     }
     let mut array = ArrayOfTables::new();
-    for mut table in tables {
+    for (index, mut table) in tables.into_iter().enumerate() {
         // Rendered in list order: a kept table's old position would put it back in place.
         table.set_position(None);
+        // The warning sits above the first entry only; other comments are kept.
+        let prefix = table
+            .decor()
+            .prefix()
+            .and_then(|prefix| prefix.as_str())
+            .unwrap_or_default()
+            .replace(SECRETS_WARNING, "");
+        let prefix = if index == 0 {
+            match prefix.trim_matches('\n') {
+                "" => format!("\n{SECRETS_WARNING}"),
+                other => format!("\n{other}\n{SECRETS_WARNING}"),
+            }
+        } else {
+            prefix
+        };
+        table.decor_mut().set_prefix(prefix);
         array.push(table);
     }
     document.insert(SELKIES_KEY, Item::ArrayOfTables(array));
@@ -1090,13 +1139,19 @@ pub fn forget_server_at(path: &Path, url: &str) -> Result<(), String> {
             return false;
         };
         let key = normalised(url);
-        let before = tables.len();
-        tables.retain(|table| string(table, "url").is_none_or(|saved| normalised(&saved) != key));
-        let removed = tables.len() != before;
-        if removed {
-            write_entries(document, tables);
+        let Some(index) = tables
+            .iter()
+            .position(|table| string(table, "url").is_some_and(|saved| normalised(&saved) == key))
+        else {
+            return false;
+        };
+        tables.remove(index);
+        write_entries(document, tables);
+        // Only the startup server (the first entry) takes `start_with` with it.
+        if index == 0 {
+            config_store::set_start_with_in(document, None);
         }
-        config_store::set_start_with_in(document, None) | removed
+        true
     })
     .map_err(|_| failed())?;
     if failure {

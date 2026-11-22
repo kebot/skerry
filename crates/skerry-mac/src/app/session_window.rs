@@ -1845,7 +1845,7 @@ impl Render for SessionWindow {
             .when_some(
                 self.status
                     .clone()
-                    .filter(|status| status == crate::direct::DIRECT_LOGIN_ERROR),
+                    .filter(|status| crate::direct::is_fatal_session_error(status)),
                 |root, status| {
                     root.child(session::fatal_banner(
                         &theme,
@@ -1857,7 +1857,7 @@ impl Render for SessionWindow {
             .when_some(
                 self.status
                     .clone()
-                    .filter(|status| status != crate::direct::DIRECT_LOGIN_ERROR),
+                    .filter(|status| !crate::direct::is_fatal_session_error(status)),
                 |root, status| {
                     root.child(session::status_banner_with_actions(
                         &theme,

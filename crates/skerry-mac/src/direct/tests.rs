@@ -93,6 +93,18 @@ fn userinfo_is_percent_decoded() {
 }
 
 #[test]
+fn refuses_port_zero_and_reads_a_scheme_only_at_the_start() {
+    assert_eq!(
+        parse_address("https://h.example:0/"),
+        Err(AddressError::Invalid)
+    );
+    assert_eq!(
+        address("h.example:8080/?next=http://x").base.as_str(),
+        "https://h.example:8080/"
+    );
+}
+
+#[test]
 fn refuses_plain_http_off_loopback() {
     assert_eq!(
         parse_address("http://desktop.example.com/"),
@@ -809,7 +821,7 @@ fn remember_off_on_an_existing_entry_removes_its_password_and_token() {
     save_server_at(&path, &saved("https://h.example/"), false).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
-        !text.contains("password") && !text.contains("token ="),
+        !text.contains("password =") && !text.contains("token ="),
         "{text}"
     );
     assert!(text.contains("note = \"mine\""), "{text}");
@@ -820,11 +832,39 @@ fn forgetting_a_server_removes_only_that_entry() {
     let (_home, path) = config_path();
     save_server_at(&path, &saved("https://a.example/"), true).unwrap();
     save_server_at(&path, &saved("https://b.example/"), true).unwrap();
+    save_server_at(&path, &saved("https://c.example/"), true).unwrap();
+    // Not the startup server (c is first): `start_with` stays.
     forget_server_at(&path, "https://b.example").unwrap();
     let left = saved_servers_at(&path).unwrap();
-    assert_eq!(left.len(), 1);
-    assert_eq!(left[0].url, "https://a.example/");
+    assert_eq!(left.len(), 2);
+    assert_eq!(left[1].url, "https://a.example/");
+    assert_eq!(
+        config_store::start_with(&path).unwrap(),
+        Some(StartWith::Selkies)
+    );
+    // The startup server takes it with it.
+    forget_server_at(&path, "https://c.example/").unwrap();
+    assert_eq!(saved_servers_at(&path).unwrap().len(), 1);
     assert_eq!(config_store::start_with(&path).unwrap(), None);
+}
+
+#[test]
+fn config_toml_warns_once_above_the_selkies_entries() {
+    let (_home, path) = config_path();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "application_key = \"ssk_id_secret@seal.example\"\n").unwrap();
+    for host in ["a", "b", "a", "c"] {
+        save_server_at(&path, &saved(&format!("https://{host}.example/")), true).unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        text.matches("hold passwords and session tokens").count(),
+        1,
+        "{text}"
+    );
+    let warning = text.find("hold passwords").unwrap();
+    assert!(warning < text.find("\n[[selkies]]").unwrap(), "{text}");
+    assert_eq!(saved_servers_at(&path).unwrap().len(), 3);
 }
 
 #[test]

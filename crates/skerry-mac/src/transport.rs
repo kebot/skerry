@@ -753,6 +753,12 @@ pub async fn run(
     mut cancel: watch::Receiver<bool>,
 ) -> Result<(), RunError> {
     let direct = matches!(target, SessionTarget::Selkies(_));
+    // A direct server's verifier records a refused leaf: that failure is fatal, not a
+    // session still starting (tokio-rustls reports it as an I/O error).
+    let direct_server = match &target {
+        SessionTarget::Selkies(server) => Some(server.clone()),
+        SessionTarget::SealSkin(_) => None,
+    };
     let Some(requested) = unless_cancelled(&mut cancel, socket_request(target)).await else {
         return Ok(());
     };
@@ -771,6 +777,9 @@ pub async fn run(
             .into_client_request()
             .map_err(|_| "Couldn’t connect to the Selkies WebSocket.")?;
         request.headers_mut().extend(template.headers().clone());
+        if let Some(server) = &direct_server {
+            server.clear_rejected();
+        }
         let attempt = tokio::time::timeout(
             Duration::from_secs(10),
             tokio_tungstenite::connect_async_tls_with_config(
@@ -785,6 +794,13 @@ pub async fn run(
         };
         let transient = match attempt {
             Ok(Ok((socket, _))) => break socket,
+            Ok(Err(_))
+                if direct_server
+                    .as_ref()
+                    .is_some_and(|s| s.take_rejected().is_some()) =>
+            {
+                return Err(RunError::Other(crate::direct::DIRECT_CERT_ERROR));
+            }
             Ok(Err(error)) if direct && direct_upgrade_error(&error).is_some() => {
                 return Err(RunError::Other(
                     direct_upgrade_error(&error).unwrap_or_default(),
@@ -1919,6 +1935,61 @@ mod tests {
         );
         let _ = cancel_tx.send(true);
         stream.abort();
+    }
+
+    #[tokio::test]
+    async fn a_certificate_failure_on_a_direct_socket_is_fatal_not_retried() {
+        use crate::tls::test_server;
+        let leaf = test_server::self_signed(&["localhost"]);
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = attempts.clone();
+        let address = test_server::serve(vec![leaf.der.clone()], &leaf.key, move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            String::new()
+        })
+        .await;
+        let base = Url::parse(&format!("https://localhost:{}/", address.port())).unwrap();
+        // A changed certificate (a stale pin), then one that was never trusted.
+        for pin in [Some([7u8; 32]), None] {
+            let server = crate::direct::SelkiesServer::new(
+                base.clone(),
+                crate::direct::SelkiesAuth::new("ubuntu", "pw", None),
+                pin,
+                crate::direct::ServerSource::Typed,
+                false,
+            )
+            .unwrap();
+            let (frames, _) = watch::channel(Frame::default());
+            let (_input_tx, input) = mpsc::unbounded_channel();
+            let (_pointer_tx, pointer) = watch::channel(None);
+            let (events, _events_rx) = mpsc::unbounded_channel();
+            let (_cancel_tx, cancel) = watch::channel(false);
+            let started = Instant::now();
+            let ended = tokio::time::timeout(
+                Duration::from_secs(5),
+                run(
+                    SessionTarget::Selkies(server),
+                    frames,
+                    input,
+                    pointer,
+                    test_options(),
+                    &events,
+                    cancel,
+                ),
+            )
+            .await
+            .expect("fails at once, no start-up retries");
+            assert_eq!(
+                ended,
+                Err(RunError::Other(crate::direct::DIRECT_CERT_ERROR))
+            );
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(crate::direct::is_fatal_session_error(
+                crate::direct::DIRECT_CERT_ERROR
+            ));
+        }
+        // The handshake never completed, so no request (and no login) reached the server.
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
