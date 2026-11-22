@@ -78,6 +78,8 @@ pub struct Feedback {
     bitrate: AtomicU32,
     frame_cap: AtomicU32,
     key_unsent: AtomicBool,
+    /// The frame guard cut the bitrate (the writer's climb waits).
+    cut: AtomicBool,
 }
 
 impl Default for Feedback {
@@ -87,6 +89,7 @@ impl Default for Feedback {
             bitrate: AtomicU32::new(START_BITRATE),
             frame_cap: AtomicU32::new(START_FRAME_CAP),
             key_unsent: AtomicBool::new(false),
+            cut: AtomicBool::new(false),
         }
     }
 }
@@ -123,6 +126,16 @@ impl Feedback {
 
     pub fn set_frame_cap(&self, bytes: u32) {
         self.frame_cap.store(bytes, Ordering::Release);
+    }
+
+    /// The camera cut its own bitrate (an oversized keyframe).
+    pub fn note_cut(&self) {
+        self.cut.store(true, Ordering::Release);
+    }
+
+    /// Takes a cut noted since the writer last looked.
+    pub fn take_cut(&self) -> bool {
+        self.cut.swap(false, Ordering::AcqRel)
     }
 
     pub fn key_unsent(&self) -> bool {
@@ -224,6 +237,7 @@ impl FrameGuard {
         if len > cap + cap / 4 {
             self.gap = true;
             feedback.set_bitrate(feedback.bitrate() / 2);
+            feedback.note_cut();
             feedback.request_keyframe();
             return false;
         }
@@ -938,6 +952,10 @@ mod tests {
         assert!(!guard.admit(true, 80_000, &feedback));
         assert_eq!(feedback.bitrate(), 500_000);
         assert!(feedback.keyframe_requested());
+        assert!(
+            feedback.take_cut(),
+            "the writer's climb restarts its calm timer"
+        );
         assert!(!guard.admit(false, 2_000, &feedback), "no reference: waits");
         assert!(guard.admit(true, 9_000, &feedback));
         assert!(guard.admit(false, 2_000, &feedback));
