@@ -287,12 +287,15 @@ struct JpegPacer {
     pending: Option<u16>,
     last_stripe: Option<Instant>,
     shown: Option<u16>,
+    /// The pending frame's stripe rows in arrival order, kept only while tracing.
+    rows: Vec<u16>,
 }
 
 impl JpegPacer {
-    /// Records a decoded stripe of frame `id` that arrived at `now`. When it starts a new
-    /// frame, returns the present of the previous one, due *before* this stripe is applied.
-    fn stripe(&mut self, id: u16, now: Instant) -> Option<Present> {
+    /// Records a decoded stripe of frame `id` at row `y` that arrived at `now`. When it
+    /// starts a new frame, returns the present of the previous one, due *before* this stripe
+    /// is applied.
+    fn stripe(&mut self, id: u16, y: u16, now: Instant) -> Option<Present> {
         let boundary = if self.pending.is_some_and(|pending| pending != id) {
             self.present(PresentReason::Boundary, now)
         } else {
@@ -300,6 +303,9 @@ impl JpegPacer {
         };
         self.pending = Some(id);
         self.last_stripe = Some(now);
+        if present_trace_enabled() {
+            self.rows.push(y);
+        }
         boundary
     }
 
@@ -324,13 +330,23 @@ impl JpegPacer {
         let id = self.pending.take()?;
         let new_frame = self.shown != Some(id);
         self.shown = Some(id);
-        Some(Present {
+        let present = Present {
             reason,
             new_frame,
             delay: self
                 .last_stripe
                 .map_or(Duration::ZERO, |last| now.saturating_duration_since(last)),
-        })
+        };
+        if present_trace_enabled() {
+            let rows: Vec<String> = self.rows.drain(..).map(|y| y.to_string()).collect();
+            eprintln!(
+                "skerry present: {:?} delay_ms={:.3} id={id} rows={}",
+                present.reason,
+                present.delay.as_secs_f64() * 1000.0,
+                rows.join(",")
+            );
+        }
+        Some(present)
     }
 
     /// Forgets everything: the stream left JPEG (a hardware frame or codec switch) or
@@ -340,18 +356,12 @@ impl JpegPacer {
     }
 }
 
-/// Logs a JPEG present and its delay from the last stripe when `SKERRY_PRESENT_TRACE=1`.
-fn trace_present(present: &Present) {
+/// Whether `SKERRY_PRESENT_TRACE=1` asks for one stderr line per JPEG present: its reason,
+/// delay from the last stripe, frame id, and the frame's stripe rows in arrival order (so
+/// QA can confirm Selkies sends them top to bottom). Read once.
+fn present_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED
-        .get_or_init(|| std::env::var("SKERRY_PRESENT_TRACE").is_ok_and(|value| value == "1"));
-    if enabled {
-        eprintln!(
-            "skerry present: {:?} delay_ms={:.3}",
-            present.reason,
-            present.delay.as_secs_f64() * 1000.0
-        );
-    }
+    *ENABLED.get_or_init(|| std::env::var("SKERRY_PRESENT_TRACE").is_ok_and(|value| value == "1"))
 }
 
 /// Shows the gathered stripes; a snapshot is only a list of `Arc`s.
@@ -361,7 +371,6 @@ fn present_jpeg(
     diagnostics: &mut Diagnostics,
     present: Present,
 ) {
-    trace_present(&present);
     let picture = canvas.snapshot();
     if picture.picture.is_some() && present.new_frame {
         diagnostics.frames += 1;
@@ -979,11 +988,121 @@ pub async fn run(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
-            // In source order: a stripe already waiting on the socket is always read before
-            // the settle timer can fire, so the settle never splits a frame that is still
-            // arriving back to back (`ARCH-034`). Input comes next, so a stripe burst delays
-            // it by at most the burst's decode.
+            // In source order. Input and key heartbeats come first, so a burst of stripes
+            // never delays them. A stripe already waiting on the socket is read before the
+            // settle timer can fire, so the settle never splits a frame that is still
+            // arriving back to back (`ARCH-034`).
             biased;
+            command = input.recv() => {
+                let text = match command {
+                    Some(Input::Command(text)) => text,
+                    Some(Input::Pointer(position)) => {
+                        let Some(text) = position.command_for(active_size) else { continue; };
+                        text
+                    }
+                    Some(Input::Zoom(notches, position)) => {
+                        let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
+                        for command in zoom_commands(notches, position, active_size, control_held) {
+                            trace_input(&command);
+                            socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Video(enabled)) => {
+                        if let Some(video) = &mut hardware {
+                            video.decoder = Decoder::default();
+                            video.deadline = enabled.then(|| Instant::now() + WAIT_FOR_VIDEO);
+                        }
+                        if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
+                    }
+                    Some(Input::Audio(enabled)) => {
+                        if let Some(audio) = &mut audio { audio.clear(); }
+                        if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
+                    }
+                    Some(Input::AudioOutput(chosen)) => {
+                        if let Some(audio) = &audio { audio.set_output(chosen.clone()); }
+                        audio_pick = Some(chosen);
+                        continue;
+                    }
+                    Some(Input::AudioBitrate(bps)) => {
+                        let Some((command, applied)) = audio_bitrate_command(&capabilities, bps) else { continue; };
+                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        // Selkies may not echo it to the controller that asked.
+                        capabilities.live(&applied);
+                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
+                    }
+                    Some(Input::Settings(changes)) => {
+                        let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
+                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        // Some Selkies versions only echo changes to other controllers.
+                        capabilities.live(&applied);
+                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
+                    }
+                    Some(Input::Screen(change)) => {
+                        if let Some(settings) = screen_policy.apply(change) {
+                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
+                            let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
+                        }
+                        continue;
+                    }
+                    Some(Input::Resolution(request)) => {
+                        if resize_allowed {
+                            let Resolution(width, height) = request.resolution;
+                            let settings = request.settings();
+                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
+                            socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Appearance(next)) => {
+                        dark = next;
+                        if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
+                            socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
+                            sent_scheme = Some(scheme);
+                        }
+                        continue;
+                    }
+                    Some(Input::Clipboard(content)) => {
+                        clipboard_transfer += 1;
+                        for frame in clipboard::encode(&content, clipboard_transfer) {
+                            socket.send(frame.into()).await.map_err(|_| disconnected)?;
+                        }
+                        continue;
+                    }
+                    Some(Input::Stats(on)) => {
+                        if on == diagnostics.stats_on { continue; }
+                        diagnostics.set_stats(on);
+                        if !ready { continue; }
+                        format!("_stats,{}", u8::from(on))
+                    }
+                    // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
+                    // an explicit close: release held keys, then close cleanly.
+                    Some(Input::Close) | None => {
+                        for command in closing_commands(&held) {
+                            trace_input(&command);
+                            let _ = socket.send(command.into()).await;
+                        }
+                        trace_input_event("close frame");
+                        let _ = socket.close(None).await;
+                        return Ok(());
+                    }
+                };
+                if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
+                    held.insert(key);
+                } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
+                    held.remove(&key);
+                }
+                trace_input(&text);
+                socket.send(text.into()).await.map_err(|_| disconnected)?;
+            }
+            _ = heartbeat.tick(), if !held.is_empty() => {
+                let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+                let text = format!("kh,{keys}");
+                trace_input(&text);
+                socket.send(text.into()).await.map_err(|_| disconnected)?;
+            }
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
@@ -1003,7 +1122,7 @@ pub async fn run(
                             diagnostics.codec = Some(Codec::Jpeg);
                             diagnostics.decode += started.elapsed();
                             let now = Instant::now();
-                            if let Some(present) = pacer.stripe(id, started) {
+                            if let Some(present) = pacer.stripe(id, y, started) {
                                 present_jpeg(&frames, &frame, &mut diagnostics, present);
                             }
                             let bottom = frame.is_bottom(&stripe);
@@ -1192,116 +1311,6 @@ pub async fn run(
                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(disconnected.into()),
                 _ => {}
             },
-            command = input.recv() => {
-                let text = match command {
-                    Some(Input::Command(text)) => text,
-                    Some(Input::Pointer(position)) => {
-                        let Some(text) = position.command_for(active_size) else { continue; };
-                        text
-                    }
-                    Some(Input::Zoom(notches, position)) => {
-                        let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
-                        for command in zoom_commands(notches, position, active_size, control_held) {
-                            trace_input(&command);
-                            socket.send(command.into()).await.map_err(|_| disconnected)?;
-                        }
-                        continue;
-                    }
-                    Some(Input::Video(enabled)) => {
-                        if let Some(video) = &mut hardware {
-                            video.decoder = Decoder::default();
-                            video.deadline = enabled.then(|| Instant::now() + WAIT_FOR_VIDEO);
-                        }
-                        if enabled { "START_VIDEO" } else { "STOP_VIDEO" }.to_string()
-                    }
-                    Some(Input::Audio(enabled)) => {
-                        if let Some(audio) = &mut audio { audio.clear(); }
-                        if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
-                    }
-                    Some(Input::AudioOutput(chosen)) => {
-                        if let Some(audio) = &audio { audio.set_output(chosen.clone()); }
-                        audio_pick = Some(chosen);
-                        continue;
-                    }
-                    Some(Input::AudioBitrate(bps)) => {
-                        let Some((command, applied)) = audio_bitrate_command(&capabilities, bps) else { continue; };
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
-                        // Selkies may not echo it to the controller that asked.
-                        capabilities.live(&applied);
-                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
-                        continue;
-                    }
-                    Some(Input::Settings(changes)) => {
-                        let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
-                        socket.send(command.into()).await.map_err(|_| disconnected)?;
-                        // Some Selkies versions only echo changes to other controllers.
-                        capabilities.live(&applied);
-                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
-                        continue;
-                    }
-                    Some(Input::Screen(change)) => {
-                        if let Some(settings) = screen_policy.apply(change) {
-                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
-                            let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
-                        }
-                        continue;
-                    }
-                    Some(Input::Resolution(request)) => {
-                        if resize_allowed {
-                            let Resolution(width, height) = request.resolution;
-                            let settings = request.settings();
-                            socket.send(format!("SETTINGS,{settings}").into()).await.map_err(|_| disconnected)?;
-                            socket.send(format!("r,{width}x{height},primary").into()).await.map_err(|_| disconnected)?;
-                        }
-                        continue;
-                    }
-                    Some(Input::Appearance(next)) => {
-                        dark = next;
-                        if let Some(scheme) = requested_scheme(&appearance, dark).filter(|scheme| Some(*scheme) != sent_scheme) {
-                            socket.send(color_command(scheme).into()).await.map_err(|_| disconnected)?;
-                            sent_scheme = Some(scheme);
-                        }
-                        continue;
-                    }
-                    Some(Input::Clipboard(content)) => {
-                        clipboard_transfer += 1;
-                        for frame in clipboard::encode(&content, clipboard_transfer) {
-                            socket.send(frame.into()).await.map_err(|_| disconnected)?;
-                        }
-                        continue;
-                    }
-                    Some(Input::Stats(on)) => {
-                        if on == diagnostics.stats_on { continue; }
-                        diagnostics.set_stats(on);
-                        if !ready { continue; }
-                        format!("_stats,{}", u8::from(on))
-                    }
-                    // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
-                    // an explicit close: release held keys, then close cleanly.
-                    Some(Input::Close) | None => {
-                        for command in closing_commands(&held) {
-                            trace_input(&command);
-                            let _ = socket.send(command.into()).await;
-                        }
-                        trace_input_event("close frame");
-                        let _ = socket.close(None).await;
-                        return Ok(());
-                    }
-                };
-                if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
-                    held.insert(key);
-                } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
-                    held.remove(&key);
-                }
-                trace_input(&text);
-                socket.send(text.into()).await.map_err(|_| disconnected)?;
-            }
-            _ = heartbeat.tick(), if !held.is_empty() => {
-                let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-                let text = format!("kh,{keys}");
-                trace_input(&text);
-                socket.send(text.into()).await.map_err(|_| disconnected)?;
-            }
             _ = sample_tick.tick() => {
                 let now = Instant::now();
                 let sample = diagnostics.sample(now.duration_since(sample_start), active_size.0, active_size.1);
@@ -2140,13 +2149,15 @@ mod tests {
     fn a_new_frame_id_presents_the_previous_frame_once() {
         let start = Instant::now();
         let mut pacer = JpegPacer::default();
-        assert_eq!(pacer.stripe(1, start), None);
-        assert_eq!(pacer.stripe(1, start + Duration::from_millis(1)), None);
-        let present = pacer.stripe(2, start + Duration::from_millis(3)).unwrap();
+        assert_eq!(pacer.stripe(1, 0, start), None);
+        assert_eq!(pacer.stripe(1, 0, start + Duration::from_millis(1)), None);
+        let present = pacer
+            .stripe(2, 0, start + Duration::from_millis(3))
+            .unwrap();
         assert_eq!(present.reason, PresentReason::Boundary);
         assert!(present.new_frame);
         assert_eq!(present.delay, Duration::from_millis(2));
-        assert_eq!(pacer.stripe(2, start + Duration::from_millis(4)), None);
+        assert_eq!(pacer.stripe(2, 0, start + Duration::from_millis(4)), None);
     }
 
     #[test]
@@ -2155,12 +2166,12 @@ mod tests {
         let mut pacer = JpegPacer::default();
         assert_eq!(pacer.deadline(), None);
         assert_eq!(pacer.timer(), None);
-        pacer.stripe(1, start);
+        pacer.stripe(1, 0, start);
         assert_eq!(pacer.deadline(), Some(start + SETTLE));
         // Each stripe pushes it back.
         for ms in [1, 3, 5] {
             let at = start + Duration::from_millis(ms);
-            pacer.stripe(1, at);
+            pacer.stripe(1, 0, at);
             assert_eq!(pacer.deadline(), Some(at + SETTLE));
             // Armed early by the timer's lateness, never before the stripe itself.
             let timer = pacer.timer().unwrap();
@@ -2180,18 +2191,18 @@ mod tests {
     fn a_frame_split_over_a_settle_is_counted_once() {
         let start = Instant::now();
         let mut pacer = JpegPacer::default();
-        pacer.stripe(7, start);
+        pacer.stripe(7, 0, start);
         let first = pacer
             .present(PresentReason::Settle, start + SETTLE)
             .unwrap();
         assert!(first.new_frame);
-        pacer.stripe(7, start + Duration::from_millis(9));
+        pacer.stripe(7, 0, start + Duration::from_millis(9));
         let rest = pacer
             .present(PresentReason::Settle, start + Duration::from_millis(13))
             .unwrap();
         assert!(!rest.new_frame);
         // The first stripe of the next frame after a settle presents nothing extra.
-        assert_eq!(pacer.stripe(8, start + Duration::from_millis(20)), None);
+        assert_eq!(pacer.stripe(8, 0, start + Duration::from_millis(20)), None);
     }
 
     #[test]
@@ -2243,7 +2254,7 @@ mod tests {
         let mut canvas = Canvas::default();
         canvas.resize(2, 2).unwrap();
         canvas.stripe(0, &jpeg([255, 0, 0])).unwrap();
-        pacer.stripe(3, start);
+        pacer.stripe(3, 0, start);
         // A hardware frame (or codec switch) clears both: no settle can send a stale picture.
         canvas = Canvas::default();
         pacer.reset();
@@ -2251,7 +2262,7 @@ mod tests {
         assert_eq!(pacer.present(PresentReason::Settle, start + SETTLE), None);
         assert!(canvas.snapshot().picture.is_none());
         // After a reset the same id counts as a new frame again.
-        pacer.stripe(3, start);
+        pacer.stripe(3, 0, start);
         assert!(
             pacer
                 .present(PresentReason::Settle, start + SETTLE)
