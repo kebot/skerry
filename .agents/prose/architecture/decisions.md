@@ -242,7 +242,7 @@
 | **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
-| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
+| **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
 | **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
 | Footer | "Cite our paper academically" link | — | Excluded |
@@ -250,6 +250,8 @@
 - **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/desktop-and-collaboration.prose.md`
 
 ## ARCH-021: Decoded Frames Are Presented as They Arrive, Not on a 30 Hz Tick
+
+- **Amended by `ARCH-034`:** JPEG frames are presented on their bottom stripe or after a 2 ms settle, as per-stripe images, instead of an 8 ms full-canvas flush.
 
 - **Status:** settled — amends the presentation pacing of `ARCH-003` (`codec-and-rate-control`)
 - **Finding (2026-11-21):** the Stats FPS graph (`ARCH-019`) showed the client at 30 fps while the server encoded 60. `transport::run` handed frames to the window only on its 33 ms `present` tick, which the first client (`e0835a5`) used to gather a JPEG frame's stripes into one picture. A hardware frame decoded between ticks waited in `decoded`, and a second one replaced it unseen, so H.264/H.265/AV1 were shown, and counted, at 30 fps at most.
@@ -576,6 +578,69 @@
   - Not verified (screen locked): the notices, the card, and the print sheet on screen.
 - **Affected Rust:** `print_jobs.rs` (new), `print_dialog.rs` (new), `selkies.rs`, `transport.rs`, `settings.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{session.rs,controls.rs}`, `examples/preview.rs`.
 
+## ARCH-032: Pointer Capture and Gamepads (Task G)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-06`. Custom chords were dropped, following `ARCH-031`.
+- **Process:** plan → design → review (13 required changes) → build (G1 pointer capture, G2 gamepads) → QA (2 medium, 3 low) → code review (4 rounds; one high found in rounds 2 and 3, fixed) by subagents (`ARCH-025`). Branch `task-g-gaming`, merged after Task H.
+- **Protocol (Selkies 715df7c):**
+  - Relative motion is `m2,<dx>,<dy>,<mask>,<magnitude>,<seq>`, integers only, so Skerry carries fractions forward.
+  - Pointer lock is `p,0|1` plus `SET_NATIVE_CURSOR_RENDERING,0|1`.
+  - Gamepads use `js,c,<idx>,<b64 name>,<axes>,<buttons>`, `js,d`, `js,b`/`js,a`, and a `js,h` heartbeat. Mapping follows the W3C standard layout.
+  - Rumble comes back as the system frame `rumble,<slot>,<strong>,<weak>,<ms>`.
+  - Everything is gated by `gamepad_enabled`, read as `{value, locked}`.
+- **Pointer capture (G1):**
+  - **Capture Pointer** lives in the Input card and in the View menu. ⌃⌥⇧Z (Moonlight's chord) captures and releases. It joins `shortcuts::CHORDS` as always-local, and a held chord toggles only once. VMware's ⌃⌘ clashes with ⌃⌘F, and Parallels' ⌃⌥ is a common Linux chord.
+  - **Capturing:**
+    - An app-wide AppKit monitor (`view/capture.rs`, built like `pinch.rs`) sends raw deltas to the input channel as scaled `m2` with carry.
+    - Skerry sends `p,1`, warps the cursor to the picture centre (primary-display flip), drops the first motion after the warp, dissociates the mouse from the cursor, and hides the cursor.
+  - **Releasing:** on the chord, on blur or deactivation, on child windows (including a print sheet, `ARCH-033`), on full screen, on disconnect, and on drop.
+    - Release shows "Pointer released". Errors release with no hint.
+    - Modifiers are lifted before they are muted.
+    - The transport sends `p,0`, `SET_NATIVE_CURSOR_RENDERING,0`, and `js,d` on close, because the server's cursor setting outlives the connection.
+  - Server pointer-lock requests are not honoured: Selkies sends none.
+  - Hint pill: "Pointer captured · ⌃⌥⇧Z releases it" at the bottom centre for 3 s.
+- **Gamepads (G2):**
+  - Apple's GameController framework (`objc2-game-controller` 0.3.2) and CoreHaptics (`objc2-core-haptics` 0.3.2; `createEngineWithLocality` is called through `msg_send!` because the crate gates it to iOS).
+  - **Slots:** an app-wide table gives each pad the lowest free slot 0–3. Drivers are keyed by session (host + session id), because each Selkies session has its own slot table.
+  - **Sending:** only changes are sent, plus `js,h` every 100 ms from the transport.
+    - Pads send only while the session window is key, as in Moonlight. When the window loses key, its slots return to rest.
+    - A window sends `js,d` only for the slots it drove.
+  - **Rumble:** each message starts a fresh haptics player, capped at 5 s. Engines stop with their players, and a start that races a stop is retried once.
+  - **Gamepads card:** four fixed slot rows, each with a numbered badge (Sending / Ready / Not sent), the name, and "· No rumble" when the pad has none. Battery display was cut.
+  - Skerry drives up to four slots; the web client drives one.
+- **Risks recorded:**
+  - Every `p` change makes the server reconfigure its displays.
+  - If the main thread hangs while the pointer is captured, the cursor stays frozen until ⌥⌘Esc.
+  - In collaboration rooms (master token set), the server drops Skerry's `js,` messages (`ARCH-GAP-DC-07`).
+- **QA:**
+  - The app launched with GameController and CoreHaptics loaded and didn't crash.
+  - A fake-server harness confirmed every message, the 100 ms heartbeat, and rumble reaching the haptics path.
+  - Not verified (screen locked, no controller): capture and warp on screen, `kill -9` while captured, real pads and haptics, and the server's display restart.
+- **Affected Rust:** `view/capture.rs` (new), `gamepad/` (new, `native.rs`), `view.rs`, `view/keys.rs`, `transport.rs`, `settings.rs`, `shortcuts.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{controls.rs,session.rs,assets.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
+## ARCH-034: JPEG Stripes as Their Own Images, Presented per Frame (Task I)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-04`. Amends `ARCH-021`: JPEG frames are now presented on the bottom stripe, or after a 2 ms settle, not flushed every 8 ms. Amends `ARCH-003`: the JPEG path no longer composites into a full canvas.
+- **Process:** plan → (no visible UI, so design N/A) → review (8 required changes) → build → QA (3 medium, 1 low, against targets) → fix round → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-i-jpeg`.
+- **Findings:**
+  - Since `ARCH-021`, the whole 11 MB canvas was cloned every 8 ms, and each flush built a new full-size RenderImage. That meant a new Metal texture and an 11 MB upload, even when one stripe changed.
+  - VideoToolbox JPEG decoding is not hardware on Apple Silicon: it moves the work to VTDecoderXPCService. ImageIO was slower than zune-jpeg.
+  - libjpeg-turbo needs cmake, which isn't available.
+- **Decision:**
+  - Each stripe becomes its own RenderImage. Only changed stripes are uploaded, and the canvas buffer is gone.
+  - Decoding: zune-jpeg decodes to RGB with NEON into a reused scratch buffer, then one NEON pass makes BGRA. It compiles only on aarch64, with a scalar fallback elsewhere. Grayscale stripes are accepted.
+  - Each stripe gets one padding row top and bottom, and every edge is snapped to whole device pixels, so there are no seams at any scale.
+  - Replaced stripes are retired with `window.drop_image` 4 paints later, because GPUI does not wait for the GPU (`metal_renderer.rs`). Every exit (resize, codec switch, fallback, stream end, reconnect) goes through the retirer.
+  - **Presentation:** a frame shows as soon as its bottom stripe arrives, since pixelflux sends stripes top to bottom. Otherwise it shows 2 ms after the last stripe, with the timer armed early to absorb tokio's rounding. The pacer resets on hardware frames, codec switch, and resize.
+  - The transport's biased select runs input, gamepad heartbeat, key heartbeat, socket, then settle, so stripes never starve input.
+  - `SKERRY_PRESENT_TRACE=1` logs each present's reason, delay, frame id, and stripe rows.
+- **Measured** (QA's headless harness: the real transport against a fake server replaying real stripes; release builds; excludes GPUI/Metal, so the removed 11 MB texture upload per flush is extra savings on top):
+  - Motion: instructions −27 %, cycles −27 to −30 %, CPU median about 27 % → 17–29 % (noisy).
+  - Typing: cycles −38 %, and last-stripe-to-present p50 1.6 ms against a 0.7–1.9 ms baseline (target ≤ baseline + 1 ms, met).
+  - Footprint 55 MB → 12–35 MB.
+- **Not verified live** (screen locked): real-app CPU, WindowServer and VTDecoder deltas, GPU memory, visual seams and tearing, and the top-to-bottom stripe order on a live server (use the trace).
+- **Affected Rust:** `transport.rs`, `view.rs`, `view/stripes.rs` (new), `Cargo.toml` (zune-jpeg 0.5).
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -601,10 +666,10 @@
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
 | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
-| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
+| `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
-| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
+| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | settled (`ARCH-034`) | Per-stripe RenderImages, NEON decode, present on the bottom stripe or after a 2 ms settle; about 27–30 % fewer cycles. |
 | `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | mostly settled (`ARCH-018`, `ARCH-026`) | Settled: web-sidebar cards, section memory per server, scroll per window, theme-aware dropdown shadow. Open: the web's stream-toggle tile row (`ARCH-020`). |
 | `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | settled (`ARCH-026`) | Sign Out… with confirmation, 1200 pt Library column, success toasts, live "Started … ago". |
 | `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | unresolved (goal) | Connect to a standalone Selkies server with no SealSkin, through `SelkiesClient` alone (`ARCH-024`). |

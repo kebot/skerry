@@ -6211,6 +6211,8 @@ dependencies = [
  "tokio-tungstenite",
  "toml_edit 0.25.20+spec-1.1.0",
  "uuid",
+ "zune-core 0.5.3",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

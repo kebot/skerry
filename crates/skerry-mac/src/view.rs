@@ -1,6 +1,7 @@
 mod capture;
 mod keys;
 mod pinch;
+mod stripes;
 
 pub use capture::CaptureHint;
 
@@ -18,15 +19,14 @@ use gpui_kit::{
     canvas, div, point, prelude::*, px, size, AnyView, App, Bounds, ContentMask, Context, Corners,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, HitboxBehavior,
     KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent,
-    SharedString, Task, UTF16Selection, Window,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, SharedString, Task,
+    UTF16Selection, Window,
 };
 use reqwest::Url;
 use skerry_ui::session;
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::{
     runtime::Handle,
@@ -336,7 +336,7 @@ impl NativeSession {
             if let Some(RemoteCursor::Image { image, .. }) = desktop.cursor.take() {
                 let _ = window.drop_image(image);
             }
-            if let Some(image) = desktop.painted.borrow_mut().take() {
+            for image in desktop.painted.borrow_mut().take_all() {
                 let _ = window.drop_image(image);
             }
         });
@@ -371,7 +371,7 @@ struct Desktop {
     waiting: SharedString,
     scale_locally: bool,
     frame: Frame,
-    painted: Rc<RefCell<Option<Arc<RenderImage>>>>,
+    painted: Rc<RefCell<stripes::StripeRetirer>>,
     painted_display: Option<PaintedDisplay>,
     pinch_target: pinch::Target,
     input: mpsc::UnboundedSender<Input>,
@@ -1050,19 +1050,29 @@ impl Render for Desktop {
                         });
                     }
                 });
-                let mut jpeg = None;
+                let mut shown = Vec::new();
                 if let (Some(display), Some(picture)) = (display, &frame.picture) {
                     match picture {
-                        Picture::Jpeg(image) => {
-                            let _ = window.paint_image(
-                                display.bounds,
-                                display.bounds,
-                                Corners::default(),
-                                image.clone(),
-                                0,
-                                false,
-                            );
-                            jpeg = Some(image.clone());
+                        Picture::Jpeg(jpeg) => {
+                            let scale_factor = window.scale_factor();
+                            for stripe in jpeg.stripes.iter() {
+                                let (bounds, image_bounds) = stripes::stripe_bounds(
+                                    display.bounds,
+                                    scale_factor,
+                                    frame.height,
+                                    stripe.y,
+                                    stripe.height,
+                                );
+                                let _ = window.paint_image(
+                                    bounds,
+                                    image_bounds,
+                                    Corners::default(),
+                                    stripe.image.clone(),
+                                    0,
+                                    false,
+                                );
+                                shown.push(stripe.image.clone());
+                            }
                         }
                         Picture::Video(surface) => {
                             window.paint_surface(display.bounds, surface.pixel_buffer())
@@ -1120,10 +1130,8 @@ impl Render for Desktop {
                         }
                     }
                 }
-                if let Some(old) = painted.replace(jpeg.clone()) {
-                    if !jpeg.as_ref().is_some_and(|new| Arc::ptr_eq(new, &old)) {
-                        let _ = window.drop_image(old);
-                    }
+                for old in painted.borrow_mut().painted(&shown) {
+                    let _ = window.drop_image(old);
                 }
             },
         )
