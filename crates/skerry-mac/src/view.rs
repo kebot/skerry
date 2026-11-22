@@ -622,9 +622,11 @@ impl Desktop {
     }
 
     fn modifiers(&mut self, next: Modifiers) {
-        let commands = self
-            .keys
-            .mac_modifiers(next, self.settings.command_as_control);
+        let commands = self.keys.mac_modifiers_with(
+            next,
+            self.settings.command_as_control,
+            &keys::physically_down,
+        );
         self.commands(commands);
     }
 

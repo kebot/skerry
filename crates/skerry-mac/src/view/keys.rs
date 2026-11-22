@@ -133,12 +133,26 @@ impl KeyLedger {
         self.latch.engage();
     }
 
-    /// Follows the Mac's modifiers. When ⌘ lifts, first every key pressed under it is
-    /// released (AppKit never sent their key-ups), then the latch clears and the modifiers
-    /// move, so Control comes up last.
+    /// [`Self::mac_modifiers_with`] with no physical key state: only keys pressed under ⌘
+    /// are released when it lifts.
+    #[cfg(test)]
     pub fn mac_modifiers(&mut self, next: Modifiers, command_as_control: bool) -> Vec<String> {
+        self.mac_modifiers_with(next, command_as_control, &|_| None)
+    }
+
+    /// Follows the Mac's modifiers. AppKit drops every key-up while ⌘ is down, so when ⌘
+    /// lifts each held key is checked against `is_down` (the keyboard's real state; `None`
+    /// when unknown): one no longer down is released, one still down stays held. A key of
+    /// unknown state is released only if it went down under ⌘. Then the latch clears and the
+    /// modifiers move, so Control comes up last.
+    pub fn mac_modifiers_with(
+        &mut self,
+        next: Modifiers,
+        command_as_control: bool,
+        is_down: &dyn Fn(&str) -> Option<bool>,
+    ) -> Vec<String> {
         let mut commands = if self.command_held && !next.platform {
-            self.release_command_keys()
+            self.release_lifted_keys(is_down)
         } else {
             Vec::new()
         };
@@ -151,9 +165,19 @@ impl KeyLedger {
         commands
     }
 
-    /// Releases the held keys that went down while ⌘ was held.
-    pub fn release_command_keys(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.command_keys)
+    /// Releases the held keys that are no longer down (see [`Self::mac_modifiers_with`]).
+    fn release_lifted_keys(&mut self, is_down: &dyn Fn(&str) -> Option<bool>) -> Vec<String> {
+        let command_keys = std::mem::take(&mut self.command_keys);
+        let lifted: Vec<String> = self
+            .keys
+            .keys()
+            .filter(|code| match is_down(code) {
+                Some(down) => !down,
+                None => command_keys.contains(*code),
+            })
+            .cloned()
+            .collect();
+        lifted
             .into_iter()
             .filter_map(|code| self.keys.remove(&code))
             .map(|keysym| format!("ku,{keysym}"))
@@ -204,6 +228,68 @@ pub fn claims_library_shortcut(modifiers: Modifiers, key: &str) -> bool {
         && !modifiers.alt
         && !modifiers.shift
         && matches!(key, "o" | "l")
+}
+
+/// The macOS virtual key code (`kVK_*`, ANSI layout positions) of a GPUI key name, for the
+/// keys a held-key check needs; `None` for the rest.
+pub fn virtual_key(code: &str) -> Option<u16> {
+    const LETTERS: [u16; 26] = [
+        0x00, 0x0B, 0x08, 0x02, 0x0E, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2E, 0x2D, 0x1F,
+        0x23, 0x0C, 0x0F, 0x01, 0x11, 0x20, 0x09, 0x0D, 0x07, 0x10, 0x06,
+    ];
+    const DIGITS: [u16; 10] = [0x1D, 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1A, 0x1C, 0x19];
+    let mut chars = code.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        if ch.is_ascii_lowercase() {
+            return Some(LETTERS[(ch as u8 - b'a') as usize]);
+        }
+        if ch.is_ascii_digit() {
+            return Some(DIGITS[(ch as u8 - b'0') as usize]);
+        }
+    }
+    Some(match code {
+        "-" => 0x1B,
+        "=" => 0x18,
+        "[" => 0x21,
+        "]" => 0x1E,
+        "\\" => 0x2A,
+        ";" => 0x29,
+        "'" => 0x27,
+        "," => 0x2B,
+        "." => 0x2F,
+        "/" => 0x2C,
+        "`" => 0x32,
+        "space" => 0x31,
+        "enter" => 0x24,
+        "tab" => 0x30,
+        "backspace" => 0x33,
+        "escape" => 0x35,
+        "delete" => 0x75,
+        "left" => 0x7B,
+        "right" => 0x7C,
+        "down" => 0x7D,
+        "up" => 0x7E,
+        "home" => 0x73,
+        "end" => 0x77,
+        "pageup" => 0x74,
+        "pagedown" => 0x79,
+        _ => return None,
+    })
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+}
+
+/// `kCGEventSourceStateHIDSystemState`: the keyboard's hardware state.
+const HID_SYSTEM_STATE: i32 = 1;
+
+/// Whether the key is physically down right now; `None` for a key with no known code.
+pub fn physically_down(code: &str) -> Option<bool> {
+    let key = virtual_key(code)?;
+    // A read-only query of the HID key state; safe from any thread.
+    Some(unsafe { CGEventSourceKeyState(HID_SYSTEM_STATE, key) })
 }
 
 #[cfg(test)]
@@ -448,6 +534,47 @@ mod tests {
         );
         assert_eq!(ledger.release("a"), ["ku,97"]);
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_letter_released_under_command_is_released_when_command_lifts() {
+        // Hold a, press ⌘, release a (AppKit drops that key-up), then release ⌘.
+        let mut ledger = KeyLedger::default();
+        ledger.press("a".into(), 0x61);
+        ledger.mac_modifiers_with(mac(false, false, false, true), true, &|_| Some(true));
+        let up = |_: &str| Some(false);
+        assert_eq!(
+            ledger.mac_modifiers_with(mac(false, false, false, false), true, &up),
+            ["ku,97", "ku,65507"]
+        );
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn keys_still_down_when_command_lifts_stay_held() {
+        // A letter held before the chord, still held: kept. A ⌘ key let go: released.
+        let mut ledger = KeyLedger::default();
+        ledger.press("a".into(), 0x61);
+        ledger.mac_modifiers_with(mac(false, false, false, true), true, &|_| Some(true));
+        ledger.press("c".into(), 0x63);
+        let real = |code: &str| Some(code == "a");
+        assert_eq!(
+            ledger.mac_modifiers_with(mac(false, false, false, false), true, &real),
+            ["ku,99", "ku,65507"]
+        );
+        assert_eq!(ledger.release("a"), ["ku,97"]);
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn gpui_key_names_map_to_ansi_virtual_keys() {
+        assert_eq!(virtual_key("a"), Some(0x00));
+        assert_eq!(virtual_key("m"), Some(0x2E));
+        assert_eq!(virtual_key("z"), Some(0x06));
+        assert_eq!(virtual_key("0"), Some(0x1D));
+        assert_eq!(virtual_key("9"), Some(0x19));
+        assert_eq!(virtual_key("escape"), Some(0x35));
+        assert_eq!(virtual_key("f13"), None);
     }
 
     #[test]
