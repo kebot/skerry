@@ -233,7 +233,7 @@ fn write_saved_key(path: &Path, raw: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RemoteApp {
     pub id: String,
     pub name: String,
