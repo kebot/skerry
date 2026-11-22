@@ -464,12 +464,42 @@ pub fn file_targets<'a>(
     }
 }
 
+/// Where a top-level Shared Files file can open (`ARCH-037`): only apps that mount Shared
+/// Files (they keep homes, or are meta apps; any other app gets an ephemeral
+/// `Desktop/files`), the ones listing the extension first; every such app (`true`) when none
+/// lists it. No running session: those already have the file in `Desktop › files`.
+pub fn stored_targets<'a>(apps: &'a [RemoteApp], ext: Option<&str>) -> (Vec<&'a RemoteApp>, bool) {
+    let mounts: Vec<&RemoteApp> = apps
+        .iter()
+        .filter(|app| app.home_directories || app.is_meta_app)
+        .collect();
+    let matching: Vec<&RemoteApp> = mounts
+        .iter()
+        .copied()
+        .filter(|app| ext.is_some_and(|ext| app_opens_extension(&app.extensions, ext)))
+        .collect();
+    if matching.is_empty() {
+        let fallback = !mounts.is_empty();
+        (mounts, fallback)
+    } else {
+        (matching, false)
+    }
+}
+
 /// What the chooser is about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject {
     Link(String),
     File(PathBuf),
-    Rejected { label: String, reason: RejectReason },
+    Rejected {
+        label: String,
+        reason: RejectReason,
+    },
+    /// A top-level file of Shared Files, from the Storage window's Open in… (`ARCH-037`).
+    Stored {
+        filename: String,
+        size: u64,
+    },
 }
 
 impl From<OpenTarget> for Subject {
@@ -953,6 +983,42 @@ mod tests {
         let (running, apps) = url_targets(&apps, &sessions);
         assert_eq!(ids_of_sessions(&running), ["s2", "s1"]);
         assert_eq!(ids_of_apps(&apps), ["zen", "chromium"]);
+    }
+
+    fn stored_app(id: &str, homes: bool, meta: bool, extensions: &[&str]) -> RemoteApp {
+        serde_json::from_value(json!({
+            "id": id, "name": id, "home_directories": homes, "is_meta_app": meta,
+            "extensions": extensions,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn stored_files_offer_apps_by_extension_and_no_sessions() {
+        let apps = [
+            stored_app("office", true, false, &["pdf"]),
+            stored_app("zen", true, false, &[]),
+            stored_app("desk", false, true, &["pdf"]),
+        ];
+        let (offered, fallback) = stored_targets(&apps, Some("pdf"));
+        assert_eq!(ids_of_apps(&offered), ["office", "desk"]);
+        assert!(!fallback);
+        let (offered, fallback) = stored_targets(&apps, Some("xyz"));
+        assert_eq!(ids_of_apps(&offered), ["office", "zen", "desk"]);
+        assert!(fallback);
+    }
+
+    #[test]
+    fn stored_files_skip_apps_without_homes() {
+        let apps = [
+            stored_app("kiosk", false, false, &["pdf"]),
+            stored_app("office", true, false, &["docx"]),
+        ];
+        let (offered, _) = stored_targets(&apps, Some("pdf"));
+        assert_eq!(ids_of_apps(&offered), ["office"]);
+        let none = [stored_app("kiosk", false, false, &["pdf"])];
+        let (offered, fallback) = stored_targets(&none, Some("pdf"));
+        assert!(offered.is_empty() && !fallback, "never every app");
     }
 
     #[test]

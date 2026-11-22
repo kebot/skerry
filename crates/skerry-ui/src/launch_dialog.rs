@@ -376,14 +376,27 @@ pub fn render_card(
                 .pt_1()
                 .v_flex()
                 .gap_3()
-                .child(
-                    Checkbox::new("launch-collaborative")
-                        .label("Collaborative Session")
-                        .checked(props.collaborative)
-                        .disabled(!enabled)
-                        .on_click(move |checked, window, cx| {
-                            on_collab(LaunchDialogAction::SetCollaborative(*checked), window, cx)
-                        }),
+                // `launch/file_path` has no room flag (`ARCH-037`).
+                .when(
+                    props
+                        .opening
+                        .as_ref()
+                        .is_none_or(|opening| opening.kind != OpeningKind::Stored),
+                    |column| {
+                        column.child(
+                            Checkbox::new("launch-collaborative")
+                                .label("Collaborative Session")
+                                .checked(props.collaborative)
+                                .disabled(!enabled)
+                                .on_click(move |checked, window, cx| {
+                                    on_collab(
+                                        LaunchDialogAction::SetCollaborative(*checked),
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        )
+                    },
                 )
                 .child(
                     Checkbox::new("launch-wayland")
@@ -501,9 +514,11 @@ fn opening_strip(theme: &Theme, opening: &OpeningLabel) -> gpui_kit::Stateful<Di
     let icon = match opening.kind {
         OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
         OpeningKind::File => Icon::new(IconName::FileText),
+        OpeningKind::Stored => Icon::new(gpui_kit::assets::IconName::FolderHeart),
     };
     let name = match opening.kind {
         OpeningKind::File => format!("“{}”", opening.label),
+        OpeningKind::Stored => format!("“{}” from Shared Files", opening.label),
         OpeningKind::Link => opening.label.clone(),
     };
     let tooltip = opening.tooltip.clone();

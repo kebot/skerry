@@ -2,6 +2,7 @@ mod account;
 mod apps_window;
 mod controls;
 mod display;
+mod files_backend;
 mod files_model;
 mod files_window;
 mod gamepads;
@@ -10,6 +11,7 @@ mod promise;
 mod second_display;
 mod selkies_home;
 mod session_window;
+mod storage_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchMemory, LaunchSelection};
 use crate::launch_progress::{self, Flight, FlightRoute, Outcome, RowState};
@@ -143,6 +145,8 @@ pub fn run() {
                 launcher.focus_omnibar(window, cx)
             });
         });
+        let storage_handle = handle.clone();
+        cx.on_action(move |_: &ShowStorage, cx| show_storage(&storage_handle, cx));
         let drain_handle = handle.clone();
         cx.spawn(async move |cx| {
             while let Some(urls) = open_rx.recv().await {
@@ -176,8 +180,13 @@ pub fn run() {
                     MenuItem::separator(),
                     MenuItem::action("Open", files_window::OpenSelection),
                     MenuItem::action("Quick Look", files_window::QuickLook),
+                    // The Storage window's (`ARCH-037`).
+                    MenuItem::action("Open in…", files_window::OpenIn),
                     MenuItem::separator(),
                     MenuItem::action("Delete…", files_window::DeleteSelection),
+                    MenuItem::separator(),
+                    MenuItem::action("New Home…", storage_window::NewHome),
+                    MenuItem::action("Delete Home…", storage_window::DeleteHome),
                     MenuItem::separator(),
                     MenuItem::action("Close Window", files_window::CloseFiles),
                 ],
@@ -198,6 +207,8 @@ pub fn run() {
                     MenuItem::action("Back", files_window::GoBack),
                     MenuItem::action("Forward", files_window::GoForward),
                     MenuItem::action("Enclosing Folder", files_window::OpenParent),
+                    MenuItem::separator(),
+                    MenuItem::action("Shared Files", storage_window::GoShared),
                 ],
                 disabled: false,
             },
@@ -221,6 +232,7 @@ pub fn run() {
                 name: "Window".into(),
                 items: vec![
                     MenuItem::action("Library", ShowLibrary),
+                    MenuItem::action("Storage", ShowStorage),
                     MenuItem::action("Disconnect Session", DisconnectSession),
                 ],
                 disabled: false,
@@ -291,7 +303,9 @@ actions!(
         ToggleStatsStrip,
         TogglePointerCapture,
         /// Opens Display 2 for the key session, or closes it (`ARCH-039`). No key chord.
-        ToggleSecondDisplay
+        ToggleSecondDisplay,
+        /// Opens the Storage window or brings it forward (`ARCH-037`); ⇧⌘I in the Library.
+        ShowStorage
     ]
 );
 
@@ -303,6 +317,7 @@ pub(crate) fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = global_bindings();
     bindings.extend(files_window::key_bindings());
     bindings.extend(apps_window::key_bindings());
+    bindings.extend(storage_window::key_bindings());
     bindings.extend(library_key_bindings());
     bindings.extend(crate::shortcuts::suppress_bindings());
     bindings
@@ -334,13 +349,98 @@ fn global_bindings() -> Vec<KeyBinding> {
 /// The Library window's key context.
 const LIBRARY_CONTEXT: &str = "Library";
 
-/// ⌘O and ⌘L belong to the Library only: in a session window the remote app gets them
-/// (`ARCH-014`, `ARCH-028`). The menu items still work from anywhere.
+/// ⌘O, ⌘L and ⇧⌘I belong to the Library only: in a session window the remote app gets them
+/// (`ARCH-014`, `ARCH-028`, `ARCH-031`, `ARCH-037`). The menu items still work from anywhere.
 fn library_key_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-o", OpenFile, Some(LIBRARY_CONTEXT)),
         KeyBinding::new("cmd-l", OpenLocation, Some(LIBRARY_CONTEXT)),
+        KeyBinding::new("cmd-shift-i", ShowStorage, Some(LIBRARY_CONTEXT)),
     ]
+}
+
+/// Opens the Storage window for the Library's SealSkin server, if it has persistent storage
+/// (never for a direct Selkies server, `ARCH-036`). Outside any update (`ARCH-006`).
+fn show_storage(rt: &Handle, cx: &mut App) {
+    let Some((window, launcher)) = cx
+        .try_global::<OpenWindows>()
+        .and_then(|windows| windows.library.clone())
+    else {
+        return;
+    };
+    let Some(client) = launcher
+        .upgrade()
+        .and_then(|launcher| launcher.read(cx).storage_client())
+    else {
+        return;
+    };
+    let near = window.update(cx, |_, window, _| window.bounds()).ok();
+    let rt = rt.clone();
+    cx.defer(move |cx| storage_window::open(client, rt, near, cx));
+}
+
+/// The Storage window's homes changed: the Library's homes (and so the Launch Dialog) follow.
+fn set_library_homes(homes: Vec<String>, cx: &mut App) {
+    cx.defer(move |cx| {
+        with_launcher(cx, move |launcher, _, cx| {
+            launcher.edit_library(|library| library.homes = homes);
+            cx.notify();
+        })
+    });
+}
+
+/// Open in… from the Storage window: the Library comes forward with the chooser for this
+/// top-level Shared Files file (`ARCH-028`, `ARCH-037`).
+fn open_stored(filename: String, size: u64, cx: &mut App) {
+    let library = cx
+        .try_global::<OpenWindows>()
+        .and_then(|windows| windows.library.clone());
+    let Some((window, _)) = library else {
+        return;
+    };
+    let _ = window.update(cx, |_, window, _| window.activate_window());
+    cx.activate(true);
+    with_launcher(cx, move |launcher, _, cx| {
+        launcher.opening_apps_expanded = false;
+        let dropped = launcher
+            .opening
+            .push_external(Subject::Stored { filename, size });
+        if dropped > 0 {
+            launcher.status = Some(format!("Skipped {dropped} items; open fewer at once."));
+        }
+        cx.notify();
+    });
+}
+
+/// The Library's apps and the homes its launches in flight will use, for the Storage
+/// window's in-use check (`ARCH-037`).
+fn library_launch_snapshot(cx: &mut App) -> (Vec<RemoteApp>, Vec<(String, String)>) {
+    let Some(launcher) = cx
+        .try_global::<OpenWindows>()
+        .and_then(|windows| windows.library.clone())
+        .and_then(|(_, launcher)| launcher.upgrade())
+    else {
+        return (Vec::new(), Vec::new());
+    };
+    let launcher = launcher.read(cx);
+    let apps = launcher
+        .library
+        .as_ref()
+        .map(|library| library.apps.clone())
+        .unwrap_or_default();
+    let launching = launcher
+        .flights
+        .iter()
+        .filter(|flight| flight.in_flight())
+        .filter_map(|flight| {
+            flight
+                .params
+                .home_name
+                .clone()
+                .map(|home| (flight.app.name.clone(), home))
+        })
+        .collect();
+    (apps, launching)
 }
 
 /// Runs `f` on the Launcher in its own window, if the Library is open.
@@ -427,6 +527,8 @@ struct UploadJob {
 /// dialog for a file too large for `/launch/file`.
 struct DialogOpening {
     target: Option<OpenTarget>,
+    /// A top-level Shared Files file, opened through `launch/file_path` (`ARCH-037`).
+    stored: Option<String>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -942,6 +1044,7 @@ impl Launcher {
                         this.preferences = cx.global::<WriteQueue>().read(api.server());
                         // One server at a time (`ARCH-036`).
                         this.drop_selkies_home();
+                        storage_window::close_other(api.server().to_string(), cx);
                         this.api = Some(api.clone());
                         this.set_library(Some(library));
                         if let Some(credential) = save {
@@ -955,7 +1058,7 @@ impl Launcher {
                         // ARCH-009: a server that fails the version gate is never used, even
                         // on Refresh, so drop back to Connect. Connect (empty field) retries.
                         this.retry_api = Some(api.clone());
-                        this.leave_server();
+                        this.leave_server(cx);
                         close_library_files(cx, |_| true);
                         this.clear_recovery();
                         this.status = Some(error);
@@ -1103,7 +1206,7 @@ impl Launcher {
         // An environment or .env key is never written, but don't reconnect with it silently.
         self.startup_credential = None;
         self.retry_api = None;
-        self.leave_server();
+        self.leave_server(cx);
         // Files windows the Library opened go too; session windows keep streaming.
         close_library_files(cx, |_| true);
         self.clear_recovery();
@@ -1270,8 +1373,10 @@ impl Launcher {
         }
     }
 
-    /// Returns to the Connect screen, dropping the Library and its textures.
-    fn leave_server(&mut self) {
+    /// Returns to the Connect screen, dropping the Library and its textures. The Storage
+    /// window goes too (`ARCH-037`).
+    fn leave_server(&mut self, cx: &mut App) {
+        storage_window::close(cx);
         self.api = None;
         self.drop_selkies_home();
         self.set_library(None);
@@ -1307,6 +1412,21 @@ impl Launcher {
         self.files_pending.clear();
     }
 
+    /// The client the Storage window works through: a SealSkin server whose account has
+    /// persistent storage. Never a direct Selkies server (`ARCH-036`, `ARCH-037`).
+    fn storage_client(&self) -> Option<SealSkinClient> {
+        if self.selkies.is_some() {
+            return None;
+        }
+        let library = self.library.as_ref()?;
+        library
+            .status
+            .settings
+            .persistent_storage
+            .then(|| self.api.clone())
+            .flatten()
+    }
+
     fn find_app(&self, app_id: &str) -> Option<RemoteApp> {
         let library = self.library.as_ref()?;
         library.apps.iter().find(|app| app.id == app_id).cloned()
@@ -1333,6 +1453,18 @@ impl Launcher {
     }
 
     fn open_launch_dialog(&mut self, app: RemoteApp, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_launch_dialog_with(app, false, window, cx);
+    }
+
+    /// The Launch Dialog; `stored` when it opens a Shared Files file: no Cleanroom (a
+    /// remembered one reads Auto) and no collaborative launch (`ARCH-037`).
+    fn open_launch_dialog_with(
+        &mut self,
+        app: RemoteApp,
+        stored: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A new dialog never inherits an old Launch & Open target (`ARCH-028`); the chooser
         // sets one again after this, when it opened the dialog.
         self.close_launch_dialog();
@@ -1344,7 +1476,10 @@ impl Launcher {
             .cloned()
             .unwrap_or_default();
         let default_language = launch_options::default_language(&launch_options::mac_locale());
-        let selection = context.selection(&app, &memory, &default_language);
+        let mut selection = context.selection(&app, &memory, &default_language);
+        if stored {
+            selection = context.stored_selection(&app, selection);
+        }
         let language_options = self
             .language_options
             .get_or_insert_with(|| {
@@ -1357,7 +1492,11 @@ impl Launcher {
             app_icon: self.app_icons.get(&app.id).cloned(),
             favorite: self.preferences.library.is_favorite(&app.id),
             hidden: self.preferences.library.is_hidden(&app.id),
-            storage_options: context.storage_options(&app),
+            storage_options: if stored {
+                context.stored_storage_options(&app)
+            } else {
+                context.storage_options(&app)
+            },
             selected_storage: selection.home_dir,
             gpu_options: context.gpu_options(&app),
             selected_gpu: selection.gpu,
@@ -1530,7 +1669,7 @@ impl Launcher {
             LaunchDialogAction::Launch => {
                 if let Some((app, dialog, _)) = self.launch_dialog.take() {
                     let selection = selection_of(&dialog);
-                    let params = self.launch_context().params(
+                    let mut params = self.launch_context().params(
                         &app,
                         &selection,
                         launch_options::mac_timezone(),
@@ -1538,6 +1677,18 @@ impl Launcher {
                     // The target captured when the dialog opened, never the chooser's
                     // current context, which may have changed since (`ARCH-028`).
                     let route = match self.dialog_opening.take() {
+                        Some(DialogOpening {
+                            stored: Some(filename),
+                            ..
+                        }) => {
+                            self.opening_acted();
+                            params = self.launch_context().stored_params(
+                                &app,
+                                &selection,
+                                launch_options::mac_timezone(),
+                            );
+                            FlightRoute::Stored(filename)
+                        }
                         Some(opening) => {
                             self.opening_acted();
                             match opening.target {
@@ -1777,6 +1928,11 @@ impl Launcher {
                 (FlightRoute::File(_), None) => Err(LaunchError::Server(
                     "The file wasn’t uploaded. Try again.".into(),
                 )),
+                // Nothing to upload: a retry sends the same request again (`ARCH-037`).
+                (FlightRoute::Stored(filename), _) => {
+                    api.launch(app, params, LaunchRoute::FilePath(filename), on_send)
+                        .await
+                }
             }
         });
         // Applied through the Library window's handle: gpui-pre's `update_in` uses the
@@ -2222,6 +2378,18 @@ impl Launcher {
                         .collect(),
                 )
             }
+            // Apps that mount Shared Files only, and no running session: those have the file
+            // in Desktop › files already (`ARCH-037`).
+            Subject::Stored { filename, .. } => {
+                let ext = open_target::extension_of(std::path::Path::new(filename));
+                let (matching, _) = open_target::stored_targets(&library.apps, ext.as_deref());
+                (
+                    Vec::new(),
+                    apps.into_iter()
+                        .filter(|app| matching.iter().any(|m| m.id == app.id))
+                        .collect(),
+                )
+            }
             Subject::File(path) => {
                 let ext = open_target::extension_of(path);
                 let (sessions, matching, _) =
@@ -2336,6 +2504,22 @@ impl Launcher {
                 }
                 (OpeningKind::Link, label.clone(), None, None, true)
             }
+            Subject::Stored { filename, size } => {
+                if note.is_none() {
+                    note = info(if apps.is_empty() {
+                        "No app here keeps files between sessions.".into()
+                    } else {
+                        "Sessions with storage already have it in Desktop › files.".into()
+                    });
+                }
+                (
+                    OpeningKind::Stored,
+                    filename.clone(),
+                    Some(format!("Shared Files › {filename}")),
+                    Some(stored_detail(filename, *size)),
+                    false,
+                )
+            }
         };
         let enter_hint = self
             .opening
@@ -2438,7 +2622,7 @@ impl Launcher {
                 self.show_toast(format!("Copying “{name}” to {}", session.app_name), cx);
                 self.open_library_files(&session.session_id, vec![path], window, cx);
             }
-            Subject::Rejected { .. } => {}
+            Subject::Rejected { .. } | Subject::Stored { .. } => {}
         }
         cx.notify();
     }
@@ -2496,12 +2680,34 @@ impl Launcher {
                 }
             }
             Subject::Rejected { .. } => return,
+            Subject::Stored { filename, size } => {
+                let label = OpeningLabel {
+                    kind: OpeningKind::Stored,
+                    label: filename.clone(),
+                    detail: Some(stored_detail(&filename, size)),
+                    tooltip: Some(format!("Shared Files › {filename}")),
+                };
+                self.open_launch_dialog_with(app, true, window, cx);
+                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+                    dialog.opening = Some(label);
+                }
+                self.dialog_opening = Some(DialogOpening {
+                    target: None,
+                    stored: Some(filename),
+                });
+                self.opening.set_locked(true);
+                cx.notify();
+                return;
+            }
         };
         self.open_launch_dialog(app, window, cx);
         if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
             dialog.opening = label;
         }
-        self.dialog_opening = Some(DialogOpening { target });
+        self.dialog_opening = Some(DialogOpening {
+            target,
+            stored: None,
+        });
         // While the dialog is up, nothing from outside replaces the context.
         self.opening.set_locked(true);
         cx.notify();
@@ -2731,6 +2937,9 @@ impl Launcher {
             on_files: Some(on_files),
             on_drop: Some(on_drop),
             on_drop_to_session: Some(on_drop_to_session),
+            on_open_storage: Some(Rc::new(|window, cx| {
+                window.dispatch_action(Box::new(ShowStorage), cx)
+            })),
         }
     }
 
@@ -2999,6 +3208,7 @@ impl Render for Launcher {
             drop_preview: None,
             account: self.account_menu(),
             account_open: self.account_open,
+            storage_button: self.storage_client().is_some(),
         };
 
         // Handlers capture only the entity and look the app or flight up by id (ARCH-026).
@@ -3473,6 +3683,7 @@ fn launching_item(
         FlightRoute::Simple => None,
         FlightRoute::Url(url) => Some((OpeningKind::Link, open_target::display_link(url).0)),
         FlightRoute::File(path) => Some((OpeningKind::File, file_name(path))),
+        FlightRoute::Stored(name) => Some((OpeningKind::Stored, name.clone())),
     };
     let uploading = upload.is_some() && flight.in_flight();
     LaunchingItem {
@@ -3503,6 +3714,14 @@ fn launching_item(
 }
 
 /// A path's file name, for display.
+/// "PDF · 2.4 MB" for a Shared Files file.
+fn stored_detail(filename: &str, size: u64) -> String {
+    match open_target::extension_of(std::path::Path::new(filename)) {
+        Some(ext) => format!("{} · {}", ext.to_uppercase(), files_model::size_label(size)),
+        None => files_model::size_label(size),
+    }
+}
+
 fn file_name(path: &std::path::Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -3995,8 +4214,8 @@ mod tests {
                 chord.keystroke
             );
         }
-        // The Library's ⌘O / ⌘L act there, and only there: not chords of a session window.
-        for source in ["cmd-o", "cmd-l"] {
+        // The Library's ⌘O / ⌘L / ⇧⌘I act there, and only there: not chords of a session window.
+        for source in ["cmd-o", "cmd-l", "cmd-shift-i"] {
             let keys = Keystroke::parse(source).unwrap();
             let actions = resolve_in(&keymap, &keys, &["Root", LIBRARY_CONTEXT]);
             assert_eq!(actions.len(), 1, "{source}");
@@ -4030,6 +4249,7 @@ mod tests {
             "cmd-w",
             "escape",
             "m",
+            "cmd-shift-i",
         ];
         for source in CHORDS.iter().map(|chord| chord.keystroke).chain(others) {
             let keys = delivered(source);
@@ -4072,14 +4292,50 @@ mod tests {
             resolve("cmd-l", &[LIBRARY_CONTEXT]),
             ["sealskin::OpenLocation"]
         );
-        for key in ["cmd-o", "cmd-l"] {
+        assert_eq!(
+            resolve("cmd-shift-i", &[LIBRARY_CONTEXT]),
+            ["sealskin::ShowStorage"]
+        );
+        for key in ["cmd-o", "cmd-l", "cmd-shift-i"] {
             assert!(
                 resolve(key, &[crate::view::DESKTOP_CONTEXT]).is_empty(),
                 "{key}"
             );
             assert!(resolve(key, &["FilesWindow"]).is_empty(), "{key}");
+            assert!(
+                resolve(key, &[storage_window::STORAGE_CONTEXT]).is_empty(),
+                "{key}"
+            );
             assert!(resolve(key, &[]).is_empty(), "{key}");
         }
+    }
+
+    #[test]
+    fn storage_shortcut_is_library_only() {
+        // In the full keymap too: ⇧⌘I passes to the session desktop (`ARCH-031`).
+        let keymap = gpui_kit::Keymap::new(key_bindings());
+        let keys = delivered("cmd-shift-i");
+        assert_eq!(
+            resolve_in(&keymap, &keys, &["Root", LIBRARY_CONTEXT]),
+            ["sealskin::ShowStorage"]
+        );
+        assert!(resolve_in(&keymap, &keys, &MAC).is_empty());
+        assert!(resolve_in(&keymap, &keys, &REMOTE).is_empty());
+        assert!(!crate::shortcuts::CHORDS
+            .iter()
+            .any(|chord| chord.keystroke == "cmd-shift-i"));
+    }
+
+    #[test]
+    fn a_stored_launch_card_names_the_shared_file() {
+        let flight = test_flight("office").with_route(FlightRoute::Stored("report.pdf".into()));
+        let item = launching_item(&flight, None, None, Instant::now());
+        assert_eq!(
+            item.subject,
+            Some((OpeningKind::Stored, "report.pdf".to_string()))
+        );
+        assert!(item.upload.is_none() && !item.cancellable);
+        assert_eq!(stored_detail("report.pdf", 2_400_000), "PDF · 2.4 MB");
     }
 
     #[test]

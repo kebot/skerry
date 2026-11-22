@@ -46,6 +46,8 @@ mod settings;
 mod shortcuts;
 mod stats;
 #[cfg(target_os = "macos")]
+mod storage;
+#[cfg(target_os = "macos")]
 mod tls;
 #[cfg(target_os = "macos")]
 mod transport;
