@@ -1,4 +1,4 @@
-use crate::audio::Playback;
+use crate::audio::{OutputStatus, Playback};
 use crate::clipboard;
 use crate::selkies;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
@@ -337,7 +337,10 @@ impl RemoteCursor {
 
 pub enum SessionEvent {
     Audio(bool),
+    /// No audio this session: the server turned it off, or it couldn't start on this Mac.
     AudioUnavailable(&'static str),
+    /// The output devices and where sound plays (`ARCH-GAP-DC-03`).
+    AudioOutput(OutputStatus),
     Video(bool),
     Settings(Settings),
     Stats(StreamSample),
@@ -397,6 +400,10 @@ pub enum Input {
     Pointer(Pointer),
     Zoom(i8, Pointer),
     Audio(bool),
+    /// Play through this output device's Core Audio UID; `None` follows the Mac's default.
+    AudioOutput(Option<String>),
+    /// Ask the server for this audio bitrate (bps).
+    AudioBitrate(u32),
     Video(bool),
     Settings(Vec<(Key, u32)>),
     Resolution(DisplayRequest),
@@ -473,6 +480,10 @@ pub struct SessionOptions {
     pub display: Option<DisplayRequest>,
     /// Whether the Stats section is open, so the session subscribes once ready.
     pub stats: bool,
+    /// The saved output device's Core Audio UID; `None` follows the Mac's default.
+    pub audio_output: Option<String>,
+    /// The saved audio bitrate (bps), requested once ready if the server offers it.
+    pub audio_bitrate: Option<u32>,
 }
 
 struct HardwareVideo {
@@ -636,7 +647,9 @@ pub async fn run(
     let mut last_frame = None;
     let mut seen_video = false;
     let mut unsupported_video = false;
-    let mut audio = None;
+    let mut audio: Option<Playback> = None;
+    // The last output picked during this stream, so a pick made before audio starts counts.
+    let mut audio_pick: Option<Option<String>> = None;
     let mut ready = false;
     let mut diagnostics = Diagnostics::default();
     diagnostics.set_stats(options.stats);
@@ -818,14 +831,22 @@ pub async fn run(
                                         capabilities.live(&applied);
                                         let _ = events.send(SessionEvent::Settings(capabilities.clone()));
                                     }
+                                    if let Some((command, applied)) = options.audio_bitrate.and_then(|bps| audio_bitrate_command(&capabilities, bps)) {
+                                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                                        capabilities.live(&applied);
+                                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                                    }
                                     if data["settings"]["audio_enabled"]["value"].as_bool() == Some(false) {
-                                        let _ = events.send(SessionEvent::AudioUnavailable("Audio is disabled by the server."));
+                                        let _ = events.send(SessionEvent::AudioUnavailable("Audio turned off by the server"));
                                     } else {
-                                        audio = Playback::new();
+                                        let statuses = events.clone();
+                                        audio = Playback::new(starting_output(options.audio_output.as_ref(), audio_pick.as_ref()), move |status| {
+                                            let _ = statuses.send(SessionEvent::AudioOutput(status));
+                                        });
                                         match audio_start(&data["settings"], audio.is_some(), options.muted) {
                                             AudioStart::Play => socket.send("START_AUDIO".into()).await.map_err(|_| disconnected)?,
                                             AudioStart::Muted => { let _ = events.send(SessionEvent::Audio(false)); }
-                                            AudioStart::Unavailable => { let _ = events.send(SessionEvent::AudioUnavailable("No compatible 48 kHz stereo audio output is available.")); }
+                                            AudioStart::Unavailable => { let _ = events.send(SessionEvent::AudioUnavailable("Audio couldn’t start on this Mac.")); }
                                         }
                                     }
                                 }
@@ -876,6 +897,19 @@ pub async fn run(
                     Some(Input::Audio(enabled)) => {
                         if let Some(audio) = &mut audio { audio.clear(); }
                         if enabled { "START_AUDIO" } else { "STOP_AUDIO" }.to_string()
+                    }
+                    Some(Input::AudioOutput(chosen)) => {
+                        if let Some(audio) = &audio { audio.set_output(chosen.clone()); }
+                        audio_pick = Some(chosen);
+                        continue;
+                    }
+                    Some(Input::AudioBitrate(bps)) => {
+                        let Some((command, applied)) = audio_bitrate_command(&capabilities, bps) else { continue; };
+                        socket.send(command.into()).await.map_err(|_| disconnected)?;
+                        // Selkies may not echo it to the controller that asked.
+                        capabilities.live(&applied);
+                        let _ = events.send(SessionEvent::Settings(capabilities.clone()));
+                        continue;
                     }
                     Some(Input::Settings(changes)) => {
                         let Some((command, applied)) = settings_command(&capabilities, changes) else { continue; };
@@ -1001,6 +1035,26 @@ pub async fn run(
     }
 }
 
+/// The output a new `Playback` starts with: the last pick this stream saw (System Default
+/// included), else the saved device.
+fn starting_output(saved: Option<&String>, picked: Option<&Option<String>>) -> Option<String> {
+    picked.map_or_else(|| saved.cloned(), Clone::clone)
+}
+
+/// The web client's audio bitrate message, `SETTINGS,{"audio_bitrate":<bps>,"picked":[…]}`
+/// (`picked` makes a non-owner controller's change count), and the value to apply locally.
+/// `None` unless the server offers `bps` and it differs from the current value.
+fn audio_bitrate_command(settings: &Settings, bps: u32) -> Option<(String, Value)> {
+    let bps = settings.audio_bitrate.as_ref()?.request(bps)?;
+    Some((
+        format!(
+            "SETTINGS,{}",
+            json!({"audio_bitrate": bps, "picked": ["audio_bitrate"]})
+        ),
+        json!({"audio_bitrate": bps}),
+    ))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum AudioStart {
     Play,
@@ -1008,8 +1062,9 @@ enum AudioStart {
     Unavailable,
 }
 
-fn audio_start(settings: &Value, output: bool, muted: bool) -> AudioStart {
-    if !output {
+/// `decoder`: whether `Playback` started (it fails only when the Opus decoder can't).
+fn audio_start(settings: &Value, decoder: bool, muted: bool) -> AudioStart {
+    if !decoder {
         return AudioStart::Unavailable;
     }
     if muted || settings["audio_on_start"]["value"].as_bool() == Some(false) {
@@ -1193,7 +1248,57 @@ mod tests {
             codec: Codec::Jpeg,
             display: None,
             stats: false,
+            audio_output: None,
+            audio_bitrate: None,
         }
+    }
+
+    fn selkies_audio_settings(value: &str) -> Settings {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": {
+            "value": value,
+            "allowed": ["32000", "64000", "96000", "128000", "320000"]
+        }}));
+        settings
+    }
+
+    #[test]
+    fn audio_bitrate_command_matches_web_settings_message() {
+        let settings = selkies_audio_settings("128000");
+        let (command, applied) = audio_bitrate_command(&settings, 96_000).unwrap();
+        assert_eq!(
+            command,
+            r#"SETTINGS,{"audio_bitrate":96000,"picked":["audio_bitrate"]}"#
+        );
+        assert_eq!(applied, json!({"audio_bitrate": 96000}));
+    }
+
+    #[test]
+    fn saved_audio_bitrate_is_sent_on_ready_only_when_allowed_and_different() {
+        let settings = selkies_audio_settings("128000");
+        assert!(audio_bitrate_command(&settings, 320_000).is_some());
+        assert!(audio_bitrate_command(&settings, 128_000).is_none());
+        assert!(audio_bitrate_command(&settings, 100_000).is_none());
+        assert!(audio_bitrate_command(&Settings::default(), 96_000).is_none());
+    }
+
+    #[test]
+    fn saved_bitrate_skipped_when_locked() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": {
+            "value": "128000", "locked": true, "allowed": ["64000", "128000"]
+        }}));
+        assert!(audio_bitrate_command(&settings, 64_000).is_none());
+    }
+
+    #[test]
+    fn a_pick_before_audio_starts_wins_over_the_saved_device() {
+        let saved = Some("AirPods".to_string());
+        assert_eq!(starting_output(saved.as_ref(), None), saved);
+        assert_eq!(starting_output(saved.as_ref(), Some(&None)), None);
+        let usb = Some("USB".to_string());
+        assert_eq!(starting_output(saved.as_ref(), Some(&usb)), usb);
+        assert_eq!(starting_output(None, None), None);
     }
 
     /// Runs a stream against `listener` with `cancel`, and returns how it ended and every
