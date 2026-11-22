@@ -465,6 +465,46 @@
   - Not verified: anything on screen (screen locked) and the wake flow in a real browser.
 - **Affected Rust:** `app/account.rs` (new), `crates/skerry-ui/src/account.rs` (new), `sealskin.rs`, `app.rs`, `launch_progress.rs`, `app/files_window.rs`, `crates/skerry-ui/src/{library.rs,connect.rs,assets.rs}`, `examples/preview.rs`.
 
+## ARCH-028: Open Links and Files in Remote Apps, and Files from the Launcher (Task C)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-03` and `ARCH-GAP-LS-02`. Amends `ARCH-023`: a Files window can now be opened from the Library without a stream.
+- **Process:** plan → design → review (17 required changes) → build → QA (4 minor, 2 trivial) → code review (1 medium; 2 rounds, MERGE), all by subagents (`ARCH-025`). Branch `task-c-open`, rebased over Task D.
+- **Server facts** (sealskin `1ba09a7`):
+  - Apps declare `url_support` and `extensions` (`models.py::Application`).
+  - `POST /companion/api/launch/url` takes the `launch/simple` body plus `url`, checked against `^(?:(?:https?|ftp)://|magnet:\?)[^\s\x00-\x1f\x7f]+$`, at most 8192 characters.
+  - `launch/file` works as `upload/initiate` → `upload/chunk` (base64, at most 8 MiB; Skerry sends 1 MiB) → `launch/file`.
+  - `POST /companion/api/sessions/<id>/open_url` answers 200 `opened`, 409 when nothing took the link, and 404 when the session isn't the caller's.
+  - The session cookie comes from a plain GET that answers 303, and the access token is not used up by it.
+- **Links:**
+  - Text typed or pasted into the Library search becomes a link by the web launcher's rule, plus `ftp` and space-free `magnet`. A bare host gets `https://`, and the scheme is lower-cased.
+  - The chooser above the results offers **Open Here** for compatible running sessions (`open_url`) and **Launch & Open** for apps with `url_support`. If a session refuses, Skerry shows a notice and never launches anything by itself.
+  - The chooser shows the real host and drops userinfo.
+  - Return acts only on text the user typed that has a scheme or one of 32 common TLDs. Links from Finder, `skerry:`, drops or ⌘O always need a click.
+  - ⌘L (Open Location…) works only while the Library is key.
+- **Files:**
+  - Files arrive by ⌘O (Library only), a drop on the Library or on a session card (blue ring and pill), Finder **Open With**, or the Dock icon. The bundle declares `public.data` at Alternate rank, so Skerry is never the default app, plus a `skerry://open?url=` scheme. Skerry doesn't register for http or https.
+  - The chooser filters apps by extension, and shows every app when none matches. A running session gets **Copy to Desktop** (an upload through its Files window).
+  - Uploads open the file once and stream 1 MiB chunks. They stop if the file changes, and Cancel aborts the Tokio task.
+  - Files over 4 GiB and folders are refused, and several files go one at a time.
+  - Errors map from the response status: 403 means storage is full, 413 too large, 429 too many uploads.
+  - Uploads ride Task B's launching card. A long upload never shows the stall notice.
+- **Launch & Open dialog:** it keeps its own copy of the target, so a link that arrives mid-dialog joins the queue instead of replacing it. It shows "Opens “report.pdf” · PDF · 2.4 MB", hides Copy link and B's Open Running Session, and its button reads **Launch & Open**.
+- **Files from the launcher (`LS-02`):**
+  - Each running-session card has an icon-only Files button. It opens that session's Files window with no stream window, using `transport::session_access`, which does the cookie exchange on its own client and never sends the application key.
+  - There is one Files window per session, shared between the Library and the session window. Windows the Library opened close on Stop and on Sign Out.
+  - With no stream, Skerry assumes both directions are allowed and turns one off if the server answers 403.
+  - A session that is still starting reads "The session is still starting. Try again in a moment."
+- **Refusals** from launch/url, launch/file, uploads and `open_url` go through `ARCH-029`'s key classification.
+- **⌘O/⌘L in session windows:** these are bound only in the Library's key context, and the session desktop (the `SessionDesktop` key context) claims them, so a remote app gets them when Command sends Control is on. When it is off, they do nothing, like every other ⌘ key. File → Open… does nothing unless the Library is key.
+- **QA (live):**
+  - launch/url worked. launch/file sent a 2.6 MB file as 3 chunks and it reached the session.
+  - `open_url` refusals mapped as expected (422 → refused, 404/409 → not taken). A successful `open_url` was not shown live: Zen answered 409 on its first-run screen.
+  - `session_access` got the cookie with no WebSocket, and `SelkiesClient` listed and uploaded.
+  - `plutil -lint` passed on the bundle.
+  - Not verified: anything on screen, Finder Open With, Dock drops, and 413/429.
+- **Known:** the TLD list includes `app` and `ai`, so "Zen.app" followed by Return opens `https://zen.app`. A key refusal clears the chooser.
+- **Affected Rust:** `open_target.rs` (new), `sealskin.rs`, `transport.rs`, `selkies.rs`, `launch_progress.rs`, `app.rs`, `app/files_window.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,files.rs,assets.rs}`, `scripts/bundle.sh`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -475,8 +515,8 @@
 | `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
 | `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Launch options, plus staged progress via `launch_id`, idempotent retries, timeout recovery, and one-click remembered launch. |
-| `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | partially settled (`ARCH-013`) | Settled: thumbnails and confirmed Stop. Open: Send File. |
-| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
+| `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | settled (`ARCH-013`, `ARCH-028`) | Thumbnails, confirmed Stop, and a Files button that opens a session's Files window with no stream. |
+| `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | settled (`ARCH-028`) | Omnibar link chooser, ⌘O/⌘L, drops, Finder Open With and Dock, `skerry:` scheme, launch/url, launch/file, open_url. |
 | `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Search, icons, categories, favorites, hidden apps, recents (saved per server), and reuse of a matching running session. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | settled (`ARCH-029`) | Account menu with limits and meters, plus dormant / revoked / expired / disabled / held key recovery that keeps the old key until a new one connects. |

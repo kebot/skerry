@@ -7,8 +7,6 @@ id: 067NC4KG01SKERRY0000000003
 # Launcher and Sessions Domain
 
 <!-- compose:status=provisional provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-LS-02 concept="session-management" question="Thumbnails and Stop with a data-loss confirmation are settled (ARCH-013). Still open: Send File from the launcher." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-03 concept="open-links-and-files" question="Accept pasted URLs in the omnibar and local files via native macOS mechanisms (File -> Open... Cmd+O, window drag-and-drop, and .app bundle CFBundleDocumentTypes / on_open_urls Finder 'Open With' handler — no web-style 'Upload a file' omnibar button), filter apps by declared URL/extension support, and launch with open-or-stage progress via SealSkin 0.5.0 /api/launch/url|file|file_path, or hand a URL to a running session via POST /api/sessions/<id>/open_url; send only http, https, ftp, or space-free magnet addresses." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-09 concept="native-mac-app-presence" question="Give remote applications first-class native macOS app presence (separate Dock icon, Cmd+Tab entry, and optionally Spotlight); decide in a future compose turn between generated .app shims, automatic per-app helper processes, or both, and how relaunch behaves when a session is already running." -->
@@ -46,12 +44,15 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
     - The card offers Keep Waiting / Retry on a stall and Retry / Dismiss on a failure, without ever starting a second container.
     - A session window that is still waiting offers Keep Waiting / Retry / Disconnect.
     - Tiles with remembered options launch in one click (hover ▶ or Option-click).
-  - Unresolved frontier (`ARCH-GAP-LS-03`): open pasted URLs and local files in compatible remote apps.
+  - Open links and files (settled: `ARCH-028`):
+    - A typed or pasted link offers **Open Here** in compatible running sessions (`POST /companion/api/sessions/<id>/open_url`) or **Launch & Open** in `url_support` apps (`launch/url`). Only http, https, ftp, and space-free magnet links are sent.
+    - Files from ⌘O, drops, Finder Open With, or the Dock go to apps filtered by extension (`launch/file`, streamed in 1 MiB chunks) or to a running session's Desktop.
+    - Nothing launches without a click.
 - `running-sessions-supervision` (list/resume/disconnect, thumbnails, and Stop settled in `ARCH-013`; Send File open in `ARCH-GAP-LS-02`):
   - Lists sessions via `GET /companion/api/sessions` and resumes over Selkies WebSocket; disconnecting leaves the remote session running. Session cards show a thumbnail (`GET /companion/api/sessions/<id>/screenshot`, downscaled to 960 px), the app icon, start time, a GPU pill, and a storage pill ("Cleanroom" when the session has no home).
   - **Stop** (labelled button) asks for confirmation that explains the remote app ends and cleanroom data is deleted, then calls the session stop API; Escape or Cancel keeps the session.
   - A just-launched session's WebSocket is retried for up to 45 s while it answers 404/502/503/504 or refuses connections (`ARCH-014`).
-  - Unresolved frontier (`ARCH-GAP-LS-02`): Send File from the launcher.
+  - Files from the launcher (settled: `ARCH-028`): each running-session card has a Files button that opens that session's Files window with no stream. It gets the session cookie through `transport::session_access`, without sending the application key, and there is one Files window per session.
 - `launcher-polish-and-hardening` (settled: `ARCH-026`):
   - **Sign Out…** (was Disconnect Server) asks for confirmation. The wording names where the key came from (`config.toml`, environment, `.env`) and says open session windows stay connected. `application_key` is removed only when `config.toml` holds the active key.
   - The Library content is a centred column capped at 1200 pt. Success toasts ("Library refreshed", "Link copied") show for 3 s at the bottom centre. "Started … ago" updates every 30 s while the Library is visible.

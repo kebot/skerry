@@ -51,6 +51,12 @@ subject: skerry
   - Wake and web URLs carry no key.
   - The wake poll sends nothing after it is cancelled and puts `Authorization` only on the control-plane host.
   - `WakeState` never blocks the next poll.
+- Task C tests pass (`ARCH-028`):
+  - `open_target::tests::*`: URL acceptance follows the server pattern (schemes, magnet spaces, 8192 characters, userinfo dropped, uppercase schemes), and Return acts only on typed links.
+  - The upload streams 1 MiB chunks and stops if the file changes.
+  - Error mapping: 403 storage full, 413, 429.
+  - ⌘O/⌘L don't resolve under the `SessionDesktop` or `FilesWindow` key contexts.
+  - No stall notice shows while uploading.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
