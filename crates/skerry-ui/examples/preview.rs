@@ -13,9 +13,9 @@ use skerry_ui::{
     components::{self, Toast, ToastKind},
     connect::{self, ConnectProps},
     controls::{
-        self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps,
-        ControlsUiState, ScreenProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl,
-        VideoSettingRow,
+        self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps,
+        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, SliderUnit,
+        SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, SortColumn,
@@ -59,6 +59,14 @@ enum Story {
     ControlsServerLocked,
     ControlsDropdownOpen,
     ControlsRestoredSections,
+    AudioDefault,
+    AudioChosen,
+    AudioMissing,
+    AudioNoDevice,
+    AudioRetrying,
+    AudioBitrateLocked,
+    AudioBitrateHidden,
+    AudioOff,
     SessionOverlays,
     FilesBrowsing,
     FilesEmpty,
@@ -87,6 +95,14 @@ impl Story {
         Story::ControlsServerLocked,
         Story::ControlsDropdownOpen,
         Story::ControlsRestoredSections,
+        Story::AudioDefault,
+        Story::AudioChosen,
+        Story::AudioMissing,
+        Story::AudioNoDevice,
+        Story::AudioRetrying,
+        Story::AudioBitrateLocked,
+        Story::AudioBitrateHidden,
+        Story::AudioOff,
         Story::SessionOverlays,
         Story::FilesBrowsing,
         Story::FilesEmpty,
@@ -113,6 +129,14 @@ impl Story {
             | Story::ControlsServerLocked
             | Story::ControlsDropdownOpen
             | Story::ControlsRestoredSections => "Session Controls",
+            Story::AudioDefault
+            | Story::AudioChosen
+            | Story::AudioMissing
+            | Story::AudioNoDevice
+            | Story::AudioRetrying
+            | Story::AudioBitrateLocked
+            | Story::AudioBitrateHidden
+            | Story::AudioOff => "Session Audio",
             Story::SessionOverlays => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
         }
@@ -140,6 +164,14 @@ impl Story {
             Story::ControlsServerLocked => "Server Locked",
             Story::ControlsDropdownOpen => "Dropdown Open",
             Story::ControlsRestoredSections => "Restored Sections",
+            Story::AudioDefault => "Default",
+            Story::AudioChosen => "Chosen Device",
+            Story::AudioMissing => "Saved Device Missing",
+            Story::AudioNoDevice => "No Output Device",
+            Story::AudioRetrying => "Output Stopped · Retrying",
+            Story::AudioBitrateLocked => "Bitrate Locked",
+            Story::AudioBitrateHidden => "Bitrate Hidden + Long Names",
+            Story::AudioOff => "Turned Off by Server",
             Story::SessionOverlays => "Waiting + IME + Banner",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
@@ -169,6 +201,14 @@ impl Story {
             Story::ControlsServerLocked => "story-controls-locked",
             Story::ControlsDropdownOpen => "story-controls-dropdown-open",
             Story::ControlsRestoredSections => "story-controls-restored-sections",
+            Story::AudioDefault => "story-audio-default",
+            Story::AudioChosen => "story-audio-chosen",
+            Story::AudioMissing => "story-audio-missing",
+            Story::AudioNoDevice => "story-audio-no-device",
+            Story::AudioRetrying => "story-audio-retrying",
+            Story::AudioBitrateLocked => "story-audio-bitrate-locked",
+            Story::AudioBitrateHidden => "story-audio-bitrate-hidden",
+            Story::AudioOff => "story-audio-off",
             Story::SessionOverlays => "story-session-overlays",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
@@ -195,7 +235,12 @@ impl Story {
                 | Story::ControlsServerLocked
                 | Story::ControlsDropdownOpen
                 | Story::ControlsRestoredSections
-        )
+        ) || self.is_audio()
+    }
+
+    /// Session Audio stories: Session Controls with only Audio Settings open.
+    fn is_audio(self) -> bool {
+        self.group() == "Session Audio"
     }
 
     /// The Sign Out confirmation a story shows, if any.
@@ -219,7 +264,10 @@ impl Story {
         match self {
             // Input and Video open, Screen closed: what a server remembered.
             Story::ControlsRestoredSections => {
-                ControlsUiState::default().with_sections([true, false, false, true, false])
+                ControlsUiState::default().with_sections([true, false, false, true, false, false])
+            }
+            _ if self.is_audio() => {
+                ControlsUiState::default().with_sections([false, false, false, false, true, false])
             }
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
@@ -902,6 +950,33 @@ impl PreviewApp {
                     }
                 }
             }
+            ControlsAction::SelectAudioOutput(uid) => {
+                if let Some(audio) = self.controls_props.audio_settings.as_mut() {
+                    // Choosing anything replaces a missing saved device, and its note.
+                    if audio.outputs.iter().any(|item| !item.connected) {
+                        audio.outputs.retain(|item| item.connected);
+                        audio.note = None;
+                    }
+                    for item in &mut audio.outputs {
+                        item.checked = item.uid == uid;
+                    }
+                    if let Some(item) = audio.outputs.iter().find(|item| item.checked) {
+                        audio.output_label = item.label.clone();
+                    }
+                    self.last_event = Some(format!("Audio: Output → {}", audio.output_label));
+                }
+            }
+            ControlsAction::SetAudioBitrate(bps) => {
+                if let Some(bitrate) = self
+                    .controls_props
+                    .audio_settings
+                    .as_mut()
+                    .and_then(|audio| audio.bitrate.as_mut())
+                {
+                    bitrate.value = bps;
+                }
+                self.last_event = Some(format!("Audio: Bitrate → {}", controls::kbps_label(bps)));
+            }
             ControlsAction::CopyStats => {
                 self.controls_props.stats_copied = !self.controls_props.stats_copied;
             }
@@ -955,6 +1030,7 @@ impl PreviewApp {
                 audio: Some(true),
                 video: Some(true),
                 audio_unavailable: None,
+                audio_settings: Some(Self::fixture_audio(Story::AudioDefault)),
                 input_switches: base_inputs,
                 chords,
                 clipboard: Some(ClipboardProps {
@@ -1045,9 +1121,10 @@ impl PreviewApp {
             Story::ControlsServerLocked => ControlsProps {
                 app_name: "Locked Enterprise Desktop".into(),
                 fullscreen: true,
-                audio: None,
+                audio: Some(true),
                 video: Some(false),
-                audio_unavailable: Some("Audio is disabled by server policy.".into()),
+                audio_unavailable: None,
+                audio_settings: Some(Self::fixture_audio(Story::AudioBitrateLocked)),
                 input_switches: base_inputs,
                 chords,
                 clipboard: Some(ClipboardProps {
@@ -1070,12 +1147,27 @@ impl PreviewApp {
                 stats: None,
                 stats_copied: false,
             },
+            _ if story.is_audio() => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.audio_settings = Some(Self::fixture_audio(story));
+                props.audio_unavailable = match story {
+                    Story::AudioNoDevice => Some("No audio output".into()),
+                    Story::AudioRetrying => Some("Audio output stopped".into()),
+                    Story::AudioOff => Some("Audio turned off by the server".into()),
+                    _ => None,
+                };
+                if story == Story::AudioOff {
+                    props.audio = None;
+                }
+                props
+            }
             _ => ControlsProps {
                 app_name: "Visual Studio Code".into(),
                 fullscreen: false,
                 audio: Some(true),
                 video: Some(true),
                 audio_unavailable: None,
+                audio_settings: Some(Self::fixture_audio(Story::AudioDefault)),
                 input_switches: base_inputs,
                 chords,
                 clipboard: Some(ClipboardProps {
@@ -1160,6 +1252,133 @@ impl PreviewApp {
                 stats: Some(Self::fixture_stats(true)),
                 stats_copied: false,
             },
+        }
+    }
+
+    /// The Audio Settings card each Session Audio story shows, as `skerry-mac` builds it.
+    fn fixture_audio(story: Story) -> AudioProps {
+        let item = |uid: Option<&str>, label: &str, checked: bool| AudioOutputItem {
+            uid: uid.map(str::to_string),
+            label: label.into(),
+            checked,
+            connected: true,
+        };
+        let selkies = vec![
+            32_000, 48_000, 64_000, 96_000, 128_000, 192_000, 256_000, 320_000, 384_000, 510_000,
+        ];
+        let bitrate = |value: u32| {
+            Some(AudioBitrateProps {
+                value,
+                choices: selkies.clone(),
+                locked: false,
+            })
+        };
+        // MacBook Pro Speakers is the default; `chosen` is checked.
+        let outputs = |chosen: Option<&str>| {
+            vec![
+                item(
+                    None,
+                    "System Default (MacBook Pro Speakers)",
+                    chosen.is_none(),
+                ),
+                item(Some("airpods"), "AirPods Pro", chosen == Some("airpods")),
+                item(
+                    Some("builtin"),
+                    "MacBook Pro Speakers",
+                    chosen == Some("builtin"),
+                ),
+                item(
+                    Some("studio"),
+                    "Studio Display Speakers",
+                    chosen == Some("studio"),
+                ),
+            ]
+        };
+        let card = |output_label: &str, outputs, note: Option<&str>, bitrate| AudioProps {
+            output_label: output_label.into(),
+            outputs,
+            note: note.map(str::to_string),
+            bitrate,
+            unavailable: None,
+        };
+        match story {
+            Story::AudioChosen => card(
+                "AirPods Pro",
+                outputs(Some("airpods")),
+                None,
+                bitrate(320_000),
+            ),
+            Story::AudioMissing => {
+                let mut list: Vec<_> = outputs(Some("airpods"))
+                    .into_iter()
+                    .filter(|item| item.uid.as_deref() != Some("airpods"))
+                    .collect();
+                list.push(AudioOutputItem {
+                    uid: Some("airpods".into()),
+                    label: "AirPods Pro (not connected)".into(),
+                    checked: true,
+                    connected: false,
+                });
+                card(
+                    "AirPods Pro (not connected)",
+                    list,
+                    Some("AirPods Pro isn’t connected. Playing through MacBook Pro Speakers until it’s back."),
+                    bitrate(128_000),
+                )
+            }
+            Story::AudioNoDevice => card(
+                "System Default",
+                vec![item(None, "System Default", true)],
+                Some("No audio output is connected. Audio resumes when one is."),
+                bitrate(128_000),
+            ),
+            Story::AudioRetrying => card(
+                "System Default (MacBook Pro Speakers)",
+                outputs(None),
+                Some("Audio output stopped. Trying again…"),
+                bitrate(128_000),
+            ),
+            Story::AudioBitrateLocked => card(
+                "System Default (MacBook Pro Speakers)",
+                outputs(None),
+                None,
+                Some(AudioBitrateProps {
+                    value: 96_000,
+                    choices: vec![96_000],
+                    locked: true,
+                }),
+            ),
+            Story::AudioBitrateHidden => card(
+                "Elgato Wave XLR Studio Monitor Output",
+                vec![
+                    item(None, "System Default (LG UltraFine Display Audio)", false),
+                    item(
+                        Some("elgato"),
+                        "Elgato Wave XLR Studio Monitor Output",
+                        true,
+                    ),
+                    item(Some("lg"), "LG UltraFine Display Audio", false),
+                    item(Some("builtin"), "MacBook Pro Speakers", false),
+                    item(Some("unnamed"), "Output Device 1", false),
+                    item(Some("usb-a"), "USB Audio Device", false),
+                    item(Some("usb-b"), "USB Audio Device (2)", false),
+                ],
+                None,
+                None,
+            ),
+            Story::AudioOff => AudioProps {
+                output_label: String::new(),
+                outputs: Vec::new(),
+                note: None,
+                bitrate: None,
+                unavailable: Some("Audio turned off by the server".into()),
+            },
+            _ => card(
+                "System Default (MacBook Pro Speakers)",
+                outputs(None),
+                None,
+                bitrate(128_000),
+            ),
         }
     }
 
@@ -1581,7 +1800,15 @@ impl PreviewApp {
             | Story::ControlsJpeg
             | Story::ControlsServerLocked
             | Story::ControlsDropdownOpen
-            | Story::ControlsRestoredSections => {
+            | Story::ControlsRestoredSections
+            | Story::AudioDefault
+            | Story::AudioChosen
+            | Story::AudioMissing
+            | Story::AudioNoDevice
+            | Story::AudioRetrying
+            | Story::AudioBitrateLocked
+            | Story::AudioBitrateHidden
+            | Story::AudioOff => {
                 let handler = Rc::new(
                     move |action: ControlsAction, window: &mut Window, cx: &mut App| {
                         entity.update(cx, |this, cx| {

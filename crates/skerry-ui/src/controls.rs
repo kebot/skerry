@@ -23,16 +23,18 @@ pub enum Section {
     Clipboard,
     Screen,
     Video,
+    Audio,
     Stats,
 }
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Input,
         Self::Clipboard,
         Self::Screen,
         Self::Video,
+        Self::Audio,
         Self::Stats,
     ];
 }
@@ -43,6 +45,7 @@ pub struct ControlsUiState {
     pub clipboard_open: bool,
     pub screen_open: bool,
     pub video_open: bool,
+    pub audio_open: bool,
     pub stats_open: bool,
     pub size_error: bool,
     /// Focus returned to once a dropdown menu closes: the panel's, so Escape and cmd-w
@@ -59,6 +62,7 @@ impl Default for ControlsUiState {
             clipboard_open: false,
             screen_open: true,
             video_open: false,
+            audio_open: false,
             stats_open: false,
             size_error: false,
             return_focus: None,
@@ -74,6 +78,7 @@ impl ControlsUiState {
             Section::Clipboard => self.clipboard_open,
             Section::Screen => self.screen_open,
             Section::Video => self.video_open,
+            Section::Audio => self.audio_open,
             Section::Stats => self.stats_open,
         }
     }
@@ -85,6 +90,7 @@ impl ControlsUiState {
             Section::Clipboard => &mut self.clipboard_open,
             Section::Screen => &mut self.screen_open,
             Section::Video => &mut self.video_open,
+            Section::Audio => &mut self.audio_open,
             Section::Stats => &mut self.stats_open,
         };
         *open = !*open;
@@ -92,12 +98,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 5] {
+    pub fn sections(&self) -> [bool; 6] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 5]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 6]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -149,6 +155,10 @@ pub enum ControlsAction {
         value: u32,
     },
     ResetVideo,
+    /// Play through this output device (its Core Audio UID); `None` follows the Mac.
+    SelectAudioOutput(Option<String>),
+    /// Ask the server for this audio bitrate (bps).
+    SetAudioBitrate(u32),
     CopyStats,
 }
 
@@ -252,6 +262,41 @@ pub struct VideoProps {
     pub rows: Vec<VideoSettingRow>,
 }
 
+/// One entry of the Output Device menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioOutputItem {
+    /// `None` is System Default.
+    pub uid: Option<String>,
+    /// Already formatted: "System Default (MacBook Pro Speakers)", "AirPods Pro (not connected)".
+    pub label: String,
+    pub checked: bool,
+    /// `false` only for the saved device that isn't connected: shown checked but disabled.
+    pub connected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioBitrateProps {
+    pub value: u32,
+    pub choices: Vec<u32>,
+    /// Locked by the server or a single choice: shown, disabled.
+    pub locked: bool,
+}
+
+/// The Audio Settings card (`ARCH-GAP-DC-03`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioProps {
+    pub output_label: String,
+    /// System Default, the connected devices, then the missing saved device if any;
+    /// `skerry-ui` draws the separators.
+    pub outputs: Vec<AudioOutputItem>,
+    /// Shown under the Output Device dropdown.
+    pub note: Option<String>,
+    /// `None` hides the Audio Bitrate field.
+    pub bitrate: Option<AudioBitrateProps>,
+    /// When set, the card shows only this.
+    pub unavailable: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControlsProps {
     pub app_name: String,
@@ -265,6 +310,8 @@ pub struct ControlsProps {
     pub clipboard: Option<ClipboardProps>,
     pub screen: ScreenProps,
     pub video_settings: Option<VideoProps>,
+    /// The Audio Settings card; `None` until the session is ready.
+    pub audio_settings: Option<AudioProps>,
     /// The Stats section; `None` until the first reading arrives.
     pub stats: Option<crate::stats::StatsProps>,
     /// Shows the copy button's check for a moment after a copy.
@@ -273,6 +320,16 @@ pub struct ControlsProps {
 
 pub fn dpi_label(dpi: u16) -> String {
     format!("{}%", (u32::from(dpi) * 100 + 48) / 96)
+}
+
+/// An audio bitrate in bps as the menu reads it: "128 kbps", or "96.5 kbps" when it isn't a
+/// whole number of kbps.
+pub fn kbps_label(bps: u32) -> String {
+    if bps.is_multiple_of(1000) {
+        format!("{} kbps", bps / 1000)
+    } else {
+        format!("{:.1} kbps", f64::from(bps) / 1000.0)
+    }
 }
 
 pub fn render(
@@ -415,6 +472,13 @@ pub fn render(
                         )
                     },
                     toggle(Section::Video),
+                ))
+                .child(section(
+                    theme,
+                    "Audio Settings",
+                    state.audio_open,
+                    || render_audio(theme, props.audio_settings.as_ref(), &on_action, menus),
+                    toggle(Section::Audio),
                 ))
                 .child(section(
                     theme,
@@ -792,6 +856,76 @@ fn render_video(
     ))
 }
 
+fn render_audio(
+    theme: &Theme,
+    audio: Option<&AudioProps>,
+    on_action: &ControlsHandler,
+    menus: &MenuContext,
+) -> Div {
+    let note = |text: String| div().text_color(theme.muted_foreground).child(text);
+    let Some(audio) = audio else {
+        return div().child(note("Waiting for the session…".into()));
+    };
+    if let Some(reason) = &audio.unavailable {
+        return div().child(note(reason.clone()));
+    }
+    let (default, devices): (Vec<_>, Vec<_>) =
+        audio.outputs.iter().partition(|item| item.uid.is_none());
+    let entry = |item: &AudioOutputItem| MenuItem::Action {
+        label: item.label.clone(),
+        checked: item.checked,
+        disabled: !item.connected,
+        action: ControlsAction::SelectAudioOutput(item.uid.clone()),
+    };
+    let mut items: Vec<MenuItem> = default.into_iter().map(entry).collect();
+    if !devices.is_empty() {
+        items.push(MenuItem::Separator);
+        items.extend(devices.into_iter().map(entry));
+    }
+    // Never disabled: the menu always holds System Default.
+    let output = div()
+        .v_flex()
+        .gap(px(FIELD_GAP))
+        .child(field(
+            "Output Device",
+            menu_select(
+                "audio-output",
+                audio.output_label.clone(),
+                items,
+                false,
+                on_action,
+                menus,
+            ),
+        ))
+        .when_some(audio.note.clone(), |output, text| output.child(note(text)));
+    div().v_flex().gap(px(STACK_GAP)).child(output).when_some(
+        audio.bitrate.as_ref(),
+        |panel, bitrate| {
+            let items = bitrate
+                .choices
+                .iter()
+                .map(|&bps| MenuItem::Action {
+                    label: kbps_label(bps),
+                    checked: bps == bitrate.value,
+                    disabled: false,
+                    action: ControlsAction::SetAudioBitrate(bps),
+                })
+                .collect();
+            panel.child(field(
+                "Audio Bitrate",
+                menu_select(
+                    "audio-bitrate",
+                    kbps_label(bitrate.value),
+                    items,
+                    bitrate.locked,
+                    on_action,
+                    menus,
+                ),
+            ))
+        },
+    )
+}
+
 fn render_stats(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
     let Some(stats) = props.stats.as_ref() else {
         return div()
@@ -881,6 +1015,27 @@ fn dropdown(
     on_action: &ControlsHandler,
     menus: &MenuContext,
 ) -> AnyElement {
+    let items = items
+        .into_iter()
+        .map(|(label, checked, action)| MenuItem::Action {
+            label,
+            checked,
+            disabled: false,
+            action,
+        })
+        .collect();
+    menu_select(id, current, items, disabled, on_action, menus)
+}
+
+/// `dropdown` with separators and disabled entries.
+fn menu_select(
+    id: impl Into<SharedString>,
+    current: String,
+    items: Vec<MenuItem>,
+    disabled: bool,
+    on_action: &ControlsHandler,
+    menus: &MenuContext,
+) -> AnyElement {
     let id = id.into();
     let trigger = Button::new(id.clone())
         .outline()
@@ -893,25 +1048,32 @@ fn dropdown(
     menu_dropdown(id, trigger, Rc::new(items), Rc::clone(on_action), menus)
 }
 
+/// One row of a dropdown's menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MenuItem {
+    Action {
+        label: String,
+        checked: bool,
+        /// Greyed out and unclickable; a checked one still shows its check.
+        disabled: bool,
+        action: ControlsAction,
+    },
+    Separator,
+}
+
 /// The menu a dropdown opens, kept across renders so its highlighted row survives.
 #[derive(Default)]
 struct MenuState {
     menu: Option<Entity<PopupMenu>>,
-    /// The labels and checks the menu was built with.
-    built_for: Vec<(String, bool)>,
+    /// The items the menu was built with.
+    built_for: Vec<MenuItem>,
 }
 
 /// Whether a menu built for `built_for` still shows `items`. A menu can close without a
 /// `DismissEvent` (the popover's own Escape or trigger click), so the cache is checked
 /// against the current items instead of trusting the dismissal to clear it.
-fn menu_is_current(built_for: &[(String, bool)], items: &[(String, bool, ControlsAction)]) -> bool {
-    built_for.len() == items.len()
-        && built_for
-            .iter()
-            .zip(items)
-            .all(|((label, checked), (item, item_checked, _))| {
-                label == item && checked == item_checked
-            })
+fn menu_is_current(built_for: &[MenuItem], items: &[MenuItem]) -> bool {
+    built_for == items
 }
 
 /// gpui-kit's `dropdown_menu`, rebuilt so the popup gets `elevated_shadow` (gpui-kit's own
@@ -927,7 +1089,7 @@ fn menu_is_current(built_for: &[(String, bool)], items: &[(String, bool, Control
 fn menu_dropdown(
     id: SharedString,
     trigger: Button,
-    items: Rc<Vec<(String, bool, ControlsAction)>>,
+    items: Rc<Vec<MenuItem>>,
     on_action: ControlsHandler,
     menus: &MenuContext,
 ) -> AnyElement {
@@ -957,24 +1119,28 @@ fn menu_dropdown(
                     let menu_items = Rc::clone(&items);
                     let on_action = Rc::clone(&on_action);
                     let menu = PopupMenu::build(window, cx, move |menu, _, _| {
-                        menu_items
-                            .iter()
-                            .fold(menu, |menu, (label, checked, action)| {
+                        menu_items.iter().fold(menu, |menu, item| match item {
+                            MenuItem::Separator => menu.separator(),
+                            MenuItem::Action {
+                                label,
+                                checked,
+                                disabled,
+                                action,
+                            } => {
                                 let on_action = Rc::clone(&on_action);
                                 let action = action.clone();
                                 menu.item(
                                     PopupMenuItem::new(label.clone())
                                         .checked(*checked)
+                                        .disabled(*disabled)
                                         .on_click(move |_, window, cx| {
                                             on_action(action.clone(), window, cx)
                                         }),
                                 )
-                            })
+                            }
+                        })
                     });
-                    let built_for = items
-                        .iter()
-                        .map(|(label, checked, _)| (label.clone(), *checked))
-                        .collect();
+                    let built_for = items.as_ref().clone();
                     menu_state.update(cx, |state, _| {
                         state.menu = Some(menu.clone());
                         state.built_for = built_for;
@@ -1175,17 +1341,40 @@ mod tests {
 
     #[test]
     fn a_menu_is_rebuilt_when_its_items_change() {
-        let item = |label: &str, checked| (label.to_string(), checked, ControlsAction::SetFitMode);
+        let item = |label: &str, checked, disabled| MenuItem::Action {
+            label: label.to_string(),
+            checked,
+            disabled,
+            action: ControlsAction::SetFitMode,
+        };
         let built = vec![
-            ("1280 × 720".to_string(), true),
-            ("1920 × 1080".to_string(), false),
+            item("1280 × 720", true, false),
+            MenuItem::Separator,
+            item("1920 × 1080", false, false),
         ];
-        let same = [item("1280 × 720", true), item("1920 × 1080", false)];
-        let moved_check = [item("1280 × 720", false), item("1920 × 1080", true)];
+        let same = built.clone();
+        let moved_check = [
+            item("1280 × 720", false, false),
+            MenuItem::Separator,
+            item("1920 × 1080", true, false),
+        ];
+        let now_disabled = [
+            item("1280 × 720", true, false),
+            MenuItem::Separator,
+            item("1920 × 1080", false, true),
+        ];
         assert!(menu_is_current(&built, &same));
         assert!(!menu_is_current(&built, &moved_check));
+        assert!(!menu_is_current(&built, &now_disabled));
         assert!(!menu_is_current(&built, &same[..1]));
         assert!(!menu_is_current(&[], &same));
+    }
+
+    #[test]
+    fn kbps_label_reads_whole_kbps() {
+        assert_eq!(kbps_label(128_000), "128 kbps");
+        assert_eq!(kbps_label(6_000), "6 kbps");
+        assert_eq!(kbps_label(96_500), "96.5 kbps");
     }
 
     #[test]
@@ -1203,14 +1392,14 @@ mod tests {
 
     #[test]
     fn sections_round_trip_in_section_order() {
-        // Input and Video open, Screen closed.
-        let open = [true, false, false, true, false];
+        // Input, Video and Audio open, Screen closed.
+        let open = [true, false, false, true, true, false];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
-        assert!(state.input_open && state.video_open && !state.screen_open);
+        assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, true, false, false]
+            [false, false, true, false, false, false]
         );
     }
 }
