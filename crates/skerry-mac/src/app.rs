@@ -5,6 +5,7 @@ mod files_model;
 mod files_window;
 mod gamepads;
 mod promise;
+mod selkies_home;
 mod session_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchMemory, LaunchSelection};
@@ -69,6 +70,8 @@ pub fn run() {
     // The registered value is a property-list boolean and lasts only for this run.
     unsafe { NSUserDefaults::standardUserDefaults().registerDefaults(&defaults) };
 
+    // One TLS provider for the whole process (ring); direct Selkies configs name it too.
+    crate::tls::install_default();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -539,6 +542,13 @@ struct Launcher {
     /// A pasted key that was refused but kept (dormant, held, a policy refusal): saved
     /// once its kept client connects.
     pending_save: Option<Credential>,
+    /// The connected direct Selkies server (`ARCH-036`); never set together with `api`.
+    selkies: Option<selkies_home::SelkiesHome>,
+    /// Which Connect tab shows: the last-used kind (`start_with`), SealSkin by default.
+    connect_tab: skerry_ui::selkies::ConnectTab,
+    selkies_form: selkies_home::SelkiesForm,
+    /// A key typed on the Selkies tab, moved to the key field on the next render.
+    move_to_key: Option<String>,
 }
 
 impl Launcher {
@@ -547,13 +557,50 @@ impl Launcher {
         cx.subscribe_in(
             &key_input,
             window,
-            |this, _, event: &InputEvent, window, cx| {
-                if matches!(event, InputEvent::PressEnter { .. }) {
-                    this.submit_key(window, cx);
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_key(window, cx),
+                InputEvent::Change => {
+                    // A browser link pasted where a key goes: it belongs on the Selkies tab.
+                    let text = input.read(cx).value().trim().to_string();
+                    if text.starts_with("https://") || text.starts_with("http://") {
+                        input.update(cx, |state, cx| state.set_value("", window, cx));
+                        this.selkies_form
+                            .inputs
+                            .address
+                            .update(cx, |state, cx| state.set_value(text, window, cx));
+                        this.set_connect_tab(skerry_ui::selkies::ConnectTab::Selkies, cx);
+                    }
                 }
+                _ => {}
             },
         )
         .detach();
+        let selkies_form = selkies_home::SelkiesForm::new(window, cx);
+        cx.subscribe_in(
+            &selkies_form.inputs.address,
+            window,
+            |this, _, event: &InputEvent, _, cx| match event {
+                InputEvent::PressEnter { .. } => this.submit_selkies(cx),
+                InputEvent::Change => this.selkies_address_changed(cx),
+                _ => {}
+            },
+        )
+        .detach();
+        for login in [
+            selkies_form.inputs.username.clone(),
+            selkies_form.inputs.password.clone(),
+        ] {
+            cx.subscribe_in(
+                &login,
+                window,
+                |this, _, event: &InputEvent, _, cx| match event {
+                    InputEvent::PressEnter { .. } => this.submit_selkies(cx),
+                    InputEvent::Change => this.selkies_login_changed(cx),
+                    _ => {}
+                },
+            )
+            .detach();
+        }
         let search_input = library::new_search_input(window, cx);
         cx.subscribe_in(
             &search_input,
@@ -623,6 +670,10 @@ impl Launcher {
             wake_poll: None,
             wake: account::WakeState::default(),
             pending_save: None,
+            selkies: None,
+            connect_tab: skerry_ui::selkies::ConnectTab::SealSkin,
+            selkies_form,
+            move_to_key: None,
         };
         // Back from the browser: check a pending wake at once.
         cx.observe_window_activation(window, |this, window, cx| {
@@ -663,15 +714,75 @@ impl Launcher {
             cx.notify();
         })
         .detach();
-        match Credential::startup() {
-            Ok(Some(credential)) => {
-                launcher.startup_credential = Some(credential.clone());
-                launcher.connect(credential, false, cx)
-            }
-            Ok(None) => {}
-            Err(error) => launcher.status = Some(error),
-        }
+        launcher.start(cx);
         launcher
+    }
+
+    /// Startup (`ARCH-011`, `ARCH-036`): a SealSkin key from the environment or `.env` wins;
+    /// then `SKERRY_SELKIES_URL`; then, after a Selkies connect (`start_with`), the first
+    /// saved server; otherwise a saved SealSkin key.
+    fn start(&mut self, cx: &mut Context<Self>) {
+        use crate::direct::{self, Startup};
+        use skerry_ui::selkies::ConnectTab;
+        let credential = Credential::startup();
+        let environment = direct::environment();
+        let config = crate::config_store::config_file();
+        let start_with = config
+            .as_ref()
+            .ok()
+            .and_then(|path| crate::config_store::start_with(path).ok().flatten());
+        let saved = match config
+            .clone()
+            .and_then(|path| direct::saved_servers_at(&path))
+        {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.selkies_form.status = Some(error);
+                Vec::new()
+            }
+        };
+        if start_with == Some(crate::config_store::StartWith::Selkies) {
+            self.connect_tab = ConnectTab::Selkies;
+        }
+        let source = credential
+            .as_ref()
+            .ok()
+            .and_then(|c| c.as_ref())
+            .map(Credential::source);
+        let choice =
+            direct::startup_choice(source, environment.is_some(), start_with, !saved.is_empty());
+        self.selkies_form.recent = saved.clone();
+        // A SealSkin key that doesn't connect now still waits for an empty Connect.
+        match credential {
+            Ok(Some(credential)) => self.startup_credential = Some(credential),
+            Ok(None) => {}
+            Err(error) => self.status = Some(error),
+        }
+        match choice {
+            Startup::SealSkin => {
+                if let Some(credential) = self.startup_credential.clone() {
+                    self.connect(credential, false, cx);
+                }
+            }
+            Startup::SelkiesEnvironment => {
+                self.connect_tab = ConnectTab::Selkies;
+                match environment {
+                    Some(Ok(server)) => self.connect_selkies(server, LoadKind::Connect, cx),
+                    Some(Err(error)) => self.selkies_form.status = Some(error),
+                    None => {}
+                }
+            }
+            Startup::SelkiesSaved => {
+                self.connect_tab = ConnectTab::Selkies;
+                match saved.first().and_then(direct::SelkiesServer::from_saved) {
+                    Some(server) => self.connect_selkies(server, LoadKind::Connect, cx),
+                    None => {
+                        self.selkies_form.status = Some(direct::AddressError::Invalid.to_string())
+                    }
+                }
+            }
+            Startup::Nothing => {}
+        }
     }
 
     fn submit_key(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -734,6 +845,10 @@ impl Launcher {
 
     /// Reloads the Library; `manual` (the Refresh button) confirms success with a toast.
     fn refresh(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.selkies.is_some() {
+            self.refresh_selkies(manual, cx);
+            return;
+        }
         if let Some(api) = self.api.clone() {
             let kind = if manual {
                 LoadKind::ManualRefresh
@@ -811,6 +926,8 @@ impl Launcher {
                         // Launch options remembered per app live with the other preferences.
                         // Through the queue's copy, which includes writes not yet on disk.
                         this.preferences = cx.global::<WriteQueue>().read(api.server());
+                        // One server at a time (`ARCH-036`).
+                        this.drop_selkies_home();
                         this.api = Some(api.clone());
                         this.set_library(Some(library));
                         if let Some(credential) = save {
@@ -1142,6 +1259,7 @@ impl Launcher {
     /// Returns to the Connect screen, dropping the Library and its textures.
     fn leave_server(&mut self) {
         self.api = None;
+        self.drop_selkies_home();
         self.set_library(None);
         self.media_generation += 1;
         self.server_generation += 1;
@@ -1987,6 +2105,12 @@ impl Launcher {
         if items.is_empty() {
             return;
         }
+        // A direct server has no Library: files wait for Copy to Desktop, links get a
+        // notice. Never queued, so nothing waits forever (`ARCH-036`).
+        if self.selkies.is_some() {
+            self.receive_on_selkies(items, cx);
+            return;
+        }
         if self.library.is_none() {
             self.pending_opens.extend(
                 items
@@ -2770,7 +2894,11 @@ impl Render for Launcher {
                 state.focus(window, cx);
             });
         }
+        self.apply_selkies_form(window, cx);
         let theme = cx.theme().clone();
+        if self.selkies.is_some() {
+            return self.render_selkies_home(&theme, window, cx);
+        }
         self.ensure_age_tick(window.is_visible(), cx);
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
             return self.render_connect(&theme, window, cx);

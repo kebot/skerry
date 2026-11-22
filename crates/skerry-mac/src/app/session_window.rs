@@ -163,10 +163,6 @@ impl SessionServer {
             Self::Selkies(_) => None,
         }
     }
-
-    pub(super) fn is_direct(&self) -> bool {
-        matches!(self, Self::Selkies(_))
-    }
 }
 
 pub(super) struct SessionWindow {

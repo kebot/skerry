@@ -21,7 +21,6 @@ use gpui_kit::{
     MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent,
     SharedString, Task, UTF16Selection, Window,
 };
-use reqwest::Url;
 use skerry_ui::session;
 use std::cell::RefCell;
 use std::ops::Range;

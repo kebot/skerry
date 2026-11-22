@@ -231,6 +231,10 @@ impl Credential {
         self
     }
 
+    pub fn source(&self) -> KeySource {
+        self.source
+    }
+
     /// The key as pasted, for the write queue to save.
     pub(crate) fn raw(&self) -> &str {
         &self.raw

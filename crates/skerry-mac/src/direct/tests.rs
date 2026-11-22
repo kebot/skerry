@@ -561,14 +561,11 @@ async fn gate_reports_bad_token_even_when_basic_is_accepted() {
         Err(GateError::BadToken)
     );
     // The token was checked alone, with Bearer and no Basic.
-    let heads = heads.lock().unwrap();
-    assert!(
-        heads
-            .iter()
-            .any(|h| target(h) == "/api/sessions"
-                && authorization(h).as_deref() == Some("Bearer bad"))
-    );
-    drop(heads);
+    let checked_alone =
+        heads.lock().unwrap().iter().any(|h| {
+            target(h) == "/api/sessions" && authorization(h).as_deref() == Some("Bearer bad")
+        });
+    assert!(checked_alone);
     assert!(gate(&at(
         &base,
         SelkiesAuth::new("ubuntu", "mypasswd", Some("good".into()))
@@ -645,8 +642,7 @@ async fn a_refused_connection_is_a_network_error_that_keeps_the_library() {
 async fn an_untrusted_certificate_is_reported_with_its_fingerprint() {
     use crate::tls::test_server;
     let leaf = test_server::self_signed(&["localhost"]);
-    let address =
-        test_server::serve(vec![leaf.der.clone()], &leaf.key, |head| legacy_basic(head)).await;
+    let address = test_server::serve(vec![leaf.der.clone()], &leaf.key, legacy_basic).await;
     let base = Url::parse(&format!("https://localhost:{}/", address.port())).unwrap();
     let unpinned = at(&base, SelkiesAuth::new("ubuntu", "mypasswd", None));
     let expected = crate::tls::fingerprint(&leaf.der);
