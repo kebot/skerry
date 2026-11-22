@@ -17,6 +17,8 @@ mod pasteboard;
 #[cfg(target_os = "macos")]
 mod persist;
 #[cfg(target_os = "macos")]
+mod print_dialog;
+#[cfg(target_os = "macos")]
 mod print_jobs;
 #[cfg(target_os = "macos")]
 mod sealskin;
