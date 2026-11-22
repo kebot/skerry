@@ -741,7 +741,7 @@ fn saving_a_server_keeps_the_application_key_and_comments() {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         &path,
-        "# my notes\napplication_key = \"ssk_id_secret@seal.example\"\n",
+        "# my notes\ntheme = \"dark\"\napplication_key = \"ssk_id_secret@seal.example\"\n",
     )
     .unwrap();
     save_server_at(&path, &saved("https://h.example/"), true).unwrap();
@@ -749,8 +749,14 @@ fn saving_a_server_keeps_the_application_key_and_comments() {
     assert!(text.contains("# my notes"), "{text}");
     assert!(text.contains("application_key = \"ssk_id_secret@seal.example\""));
     assert!(text.contains("[[selkies]]"));
-    // Forgetting the SealSkin key leaves the servers alone.
+    // Forgetting the SealSkin key leaves the servers alone, byte for byte.
+    let before = std::fs::read_to_string(&path).unwrap();
     crate::sealskin::forget_key_at(&path, "ssk_id_secret@seal.example").unwrap();
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        after,
+        before.replace("application_key = \"ssk_id_secret@seal.example\"\n", "")
+    );
     assert_eq!(saved_servers_at(&path).unwrap().len(), 1);
 }
 

@@ -1848,6 +1848,79 @@ mod tests {
         assert_eq!(attempts, 1);
     }
 
+    /// Live check against a real Selkies server (`ARCH-036` QA): `SKERRY_SELKIES_URL` (with
+    /// `_USERNAME`, `_PASSWORD`, `_CERT_SHA256`). Gate, screenshot, Files, then a stream
+    /// that must reach `server_settings` and a picture. Run with `--ignored`.
+    #[tokio::test]
+    #[ignore = "needs a live Selkies server in SKERRY_SELKIES_URL"]
+    async fn live_direct_server_streams() {
+        let Some(server) = crate::direct::environment() else {
+            panic!("set SKERRY_SELKIES_URL");
+        };
+        let server = server.unwrap();
+        let report = crate::direct::gate(&server).await;
+        if let Err(crate::direct::GateError::Untrusted(leaf)) = &report {
+            panic!(
+                "untrusted certificate; set SKERRY_SELKIES_CERT_SHA256={}",
+                crate::tls::fingerprint_text(leaf)
+            );
+        }
+        let report = report.unwrap();
+        eprintln!("gate ok: {} page(s) connected", report.pages.len());
+        let png = crate::direct::screenshot(&server).await;
+        eprintln!("screenshot: {:?} bytes", png.as_ref().map(Vec::len));
+        let listing = server.selkies_client().browse("").await.unwrap();
+        eprintln!("files: {} entries at the root", listing.entries.len());
+        let (frames, mut frame_rx) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (cancel_tx, cancel) = watch::channel(false);
+        let stream = tokio::spawn(async move {
+            run(
+                SessionTarget::Selkies(server),
+                frames,
+                input,
+                pointer,
+                SessionOptions {
+                    codec: Codec::Jpeg,
+                    ..test_options()
+                },
+                &events,
+                cancel,
+            )
+            .await
+        });
+        let mut settings = false;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && !settings {
+            match tokio::time::timeout(Duration::from_secs(1), events_rx.recv()).await {
+                Ok(Some(SessionEvent::Settings(_))) => settings = true,
+                Ok(Some(SessionEvent::Error(error))) => panic!("stream error: {error}"),
+                Ok(Some(_)) | Err(_) => {}
+                Ok(None) => break,
+            }
+        }
+        assert!(settings, "no server_settings within 30 s");
+        let picture = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                frame_rx.changed().await.unwrap();
+                if frame_rx.borrow().width > 0 {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(picture.is_ok(), "no picture within 20 s");
+        eprintln!(
+            "stream ok: {}x{}",
+            frame_rx.borrow().width,
+            frame_rx.borrow().height
+        );
+        let _ = cancel_tx.send(true);
+        stream.abort();
+    }
+
     #[tokio::test]
     async fn a_held_direct_handshake_keeps_connecting_without_counting_a_failure() {
         // Secure mode holds the stream after the 101 until its token table arrives: the
