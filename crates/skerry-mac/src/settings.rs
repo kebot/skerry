@@ -657,6 +657,10 @@ pub struct Preferences {
         skip_serializing_if = "PrintingPreferences::is_default"
     )]
     pub printing: PrintingPreferences,
+    /// The Apps window's last source-list choice: `"Installed"`, `"All"`, or a category
+    /// (`ARCH-035`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps_category: Option<String>,
     #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
@@ -773,6 +777,7 @@ fn read_file(path: &Path) -> Loaded {
             "stats_strip" => field(value, &mut prefs.stats_strip),
             "gamepads" => field(value, &mut prefs.gamepads),
             "printing" => field(value, &mut prefs.printing),
+            "apps_category" => field(value, &mut prefs.apps_category),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
                     .map(|number| {
@@ -1060,6 +1065,30 @@ mod tests {
         assert!(loaded.extra.contains_key("future_key"));
         let written = serde_json::to_value(&loaded.preferences).unwrap();
         assert!(written.get("printing").is_none(), "{written}");
+    }
+
+    #[test]
+    fn apps_category_round_trips_and_old_files_load_without_it() {
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("apps_category").is_none(), "{saved}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"codec": "jpeg", "stats_strip": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(!loaded.damaged);
+        assert_eq!(loaded.preferences.apps_category, None);
+        update_at(&path, |p| p.apps_category = Some("AudioVideo".into())).unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.apps_category.as_deref(), Some("AudioVideo"));
+        assert!(loaded.stats_strip, "other keys kept");
+        std::fs::write(&path, r#"{"apps_category": 4, "stats_strip": true}"#).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.damaged);
+        assert_eq!(loaded.preferences.apps_category, None);
+        assert!(
+            loaded.preferences.stats_strip,
+            "one bad value costs only that value"
+        );
     }
 
     #[test]

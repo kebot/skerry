@@ -269,6 +269,12 @@ impl NativeSession {
         }
     }
 
+    /// Sends an `apps,` request (`ARCH-035`). It holds no secrets, so the input trace may
+    /// print it as is.
+    pub fn send_apps(&self, request: String) {
+        let _ = self.input.send(Input::Command(request));
+    }
+
     /// Sends each command in order (the gamepads' `js,…`).
     pub fn send_commands(&self, commands: Vec<String>) {
         for command in commands {
