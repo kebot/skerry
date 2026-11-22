@@ -82,10 +82,11 @@
 
 ## ARCH-010: Multi-Window Session Architecture & Native Mac App Presence Scope
 
-- **Status:** settled (scope & multi-window model; implementation tracked in `ARCH-GAP-LS-08`, native Mac app presence mechanism deferred to `ARCH-GAP-LS-09`)
+- **Status:** settled (scope & multi-window model; implemented in `ARCH-022`, native Mac app presence mechanism deferred to `ARCH-GAP-LS-09`)
 - **Decision:**
   - **Multi-window sessions (`ARCH-GAP-LS-08`):** Adopt an always-separate-windows model. The Launcher stays open in its own window, and every launched or resumed remote session opens in its own dedicated native macOS (`gpui-kit` `Root`-wrapped) window. Multiple concurrent sessions—including multiple sessions of the same remote application—can run side by side, each with independent stream/audio/controls lifecycle.
   - **Native Mac app presence (`ARCH-GAP-LS-09`):** Add per-app native macOS identity (separate Dock icon, `Cmd+Tab` entry, and optionally Spotlight) to Skerry's scope. The delivery mechanism (on-demand generated `.app` shims vs. automatic per-app helper processes vs. both) and relaunch behavior when a session for that app is already running are intentionally left open for a future compose decision.
+  - **Prior art for `ARCH-GAP-LS-09` (research note, 2026-11-22; no decision):** [tw93/Pake](https://github.com/tw93/pake) (Tauri 2, system WKWebView) is a working "generated `.app` shim" example. Its `pake` CLI writes a per-app `src-tauri/.pake/tauri.conf.json` (name, URL, window, icon, `identifier` such as `com.pake.weekly`) and runs `tauri build` for each app. So every app is its own bundle with its own Dock icon and `Cmd+Tab` entry, but making one needs a Rust toolchain and recompiling. Its `Cargo.toml` also has an unused `runtime-template` feature: one prebuilt binary that reads its config from `Contents/Resources` at launch. That suggests a cheaper path for Skerry: copy a prebuilt stub `.app`, rewrite `Info.plist` (bundle id, name) and the `.icns`, and have the stub hand off to Skerry (e.g. a `skerry://` URL). The mechanism and the relaunch behaviour stay open.
   - **Protocol boundary:** Because Selkies streams a whole virtual framebuffer rather than rootless per-window surfaces, individual Linux windows opened inside a single remote application stay inside that session's virtual display (a second virtual monitor remains tracked in `ARCH-GAP-VS-01`).
 - **Affected Contracts:** `src/skerry/index.prose.md`, `src/skerry/launcher-and-sessions.prose.md`
 
@@ -257,6 +258,18 @@
 - **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/skerry.test.prose.md`
 - **Affected Rust:** `crates/skerry-mac/src/transport.rs`
 
+## ARCH-022: Multi-Window Session Behaviour (`ARCH-GAP-LS-08`)
+
+- **Status:** settled (decided and verified live 2026-11-22). Settles `ARCH-GAP-LS-08` and builds on `ARCH-010`.
+- **Decision:**
+  - **Window ownership:** a `SessionWindow` entity (`app/session.rs`) owns one session's stream, settings, stats, display mode, resize, policies, and Session Controls. The `Launcher` owns only the Library and a list of open session windows `(AnyWindowHandle, WeakEntity<SessionWindow>, session_id)`. Session Controls' `Owner` pairs the session window's handle with `Entity<SessionWindow>` (`ARCH-006`). Session windows open through `cx.defer` outside `Launcher` updates.
+  - **Resume of an already open session:** brings its existing window to the front. Skerry never opens a second connection to a session it is already showing.
+  - **Closing the Library:** the Library window closes and session windows keep streaming. **Window → Library** (`cmd-0`) or a Dock-icon click (app reopen) opens it again. Skerry quits only on `cmd-q` or when the last window closes. `cmd-q` disconnects every session and stops none.
+  - **Preferences across windows:** codec, input, clipboard, and video changes are saved per server for the next session that opens. Other open windows keep what they have. Display mode, resolution, mute, and pause are per window, and each session plays its own audio.
+  - **Closing a session window:** the title bar and window buttons stay hidden over the picture (`ARCH-014`). Moving the pointer into the window's top-left corner reveals the close / minimize / zoom buttons, and **Window → Disconnect Session** closes the key session window. `cmd-w` stays with the remote app.
+  - **Teardown:** closing a session window (or the status banner's **Disconnect**) ends only that session's stream, releases its held keys, closes its Session Controls, and refreshes the Library. It never calls the stop API.
+- **Affected Contracts:** `src/skerry/launcher-and-sessions.prose.md`, `src/skerry/index.prose.md`, `src/skerry/skerry.test.prose.md`, `src/skerry/skerry.qa.test.prose.md`
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -273,7 +286,7 @@
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
 | `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
-| `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | unresolved (todo) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
+| `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | settled (`ARCH-022`) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
 | `ARCH-GAP-LS-09` | `launcher-and-sessions` | `native-mac-app-presence` | unresolved (backlog) | Per-app native macOS presence (Dock icon, `Cmd+Tab`, optionally Spotlight); mechanism (`.app` shims vs. helper processes vs. both) and existing-session relaunch behavior deferred to future compose decision. |
 | `ARCH-GAP-DC-01` | `desktop-and-collaboration` | `clipboard-sync` | settled (`ARCH-017`) | Bridge Selkies clipboard messages to `NSPasteboard` honoring server direction policy, Unicode, focus changes, and loop prevention. |
 | `ARCH-GAP-DC-02` | `desktop-and-collaboration` | `file-transfers` | unresolved (todo) | In-session Selkies file upload/download with native macOS Open/Save dialogs, progress, cancel, and folder/ZIP support. |

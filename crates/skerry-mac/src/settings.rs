@@ -4,7 +4,11 @@ use crate::launch_options::LaunchMemory;
 use crate::video::Codec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, io, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    io,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -289,19 +293,37 @@ fn path(server: &str) -> Option<PathBuf> {
 
 pub fn load(server: &str) -> Preferences {
     path(server)
-        .and_then(|path| std::fs::read(path).ok())
+        .map(|path| load_from(&path))
+        .unwrap_or_default()
+}
+
+/// Re-reads the saved preferences, applies `change`, and saves them, so that windows
+/// changing different preferences never overwrite each other's (`ARCH-022`).
+pub fn update(server: &str, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
+    let path = path(server).ok_or_else(|| io::Error::other("Home directory unavailable"))?;
+    update_at(&path, change)
+}
+
+fn update_at(path: &Path, change: impl FnOnce(&mut Preferences)) -> io::Result<()> {
+    let mut preferences = load_from(path);
+    change(&mut preferences);
+    save_to(path, &preferences)
+}
+
+fn load_from(path: &Path) -> Preferences {
+    std::fs::read(path)
+        .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
 }
 
-pub fn save(server: &str, preferences: &Preferences) -> io::Result<()> {
-    let path = path(server).ok_or_else(|| io::Error::other("Home directory unavailable"))?;
+fn save_to(path: &Path, preferences: &Preferences) -> io::Result<()> {
     let dir = path.parent().expect("preferences directory");
     std::fs::create_dir_all(dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     serde_json::to_writer(&mut file, preferences)?;
     file.as_file().sync_all()?;
-    file.persist(&path)?;
+    file.persist(path)?;
     Ok(())
 }
 
@@ -309,6 +331,20 @@ pub fn save(server: &str, preferences: &Preferences) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn updates_keep_what_other_windows_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        update_at(&path, |p| {
+            p.video.insert(Key::Fps, 30);
+        })
+        .unwrap();
+        let saved = load_from(&path);
+        assert_eq!(saved.codec, Codec::Hevc);
+        assert_eq!(saved.video.get(&Key::Fps), Some(&30));
+    }
 
     #[test]
     fn reconciles_saved_values_with_server_policy_and_live_updates() {

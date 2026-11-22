@@ -256,6 +256,8 @@ struct Desktop {
     /// The pointer is in the top-right hot corner, so the Session Controls trigger is shown
     /// even when the picture fills the window and leaves no margin for it.
     hot_corner: bool,
+    /// The pointer is in the top-left corner, so the window's own buttons are shown.
+    buttons_corner: bool,
     clipboard: ClipboardBridge,
 }
 
@@ -364,6 +366,7 @@ impl Desktop {
             ime_click: None,
             ime_bounds: None,
             hot_corner: false,
+            buttons_corner: false,
             clipboard: ClipboardBridge::default(),
         }
     }
@@ -774,7 +777,12 @@ impl Render for Desktop {
                         let hovered = hb.is_hovered(window);
                         let viewport = Bounds::new(point(px(0.), px(0.)), window.viewport_size());
                         let hot = in_hot_corner(viewport, event.position);
+                        let buttons = in_buttons_corner(viewport, event.position);
                         v.update(cx, |desktop, cx| {
+                            if desktop.buttons_corner != buttons && !window.is_fullscreen() {
+                                desktop.buttons_corner = buttons;
+                                crate::app::reveal_window_buttons(window, buttons);
+                            }
                             if desktop.settings.remote_cursor || desktop.hot_corner != hot {
                                 desktop.hot_corner = hot;
                                 cx.notify();
@@ -1014,6 +1022,11 @@ fn corner_position(viewport: Bounds<Pixels>) -> Point<Pixels> {
 fn in_hot_corner(viewport: Bounds<Pixels>, position: Point<Pixels>) -> bool {
     let reach = (MENU_SIZE + MENU_MARGIN * 2.) * 2.;
     position.x >= viewport.right() - reach && position.y <= viewport.top() + reach
+}
+
+/// Top-left area over the hidden close / minimize / zoom buttons that reveals them.
+fn in_buttons_corner(viewport: Bounds<Pixels>, position: Point<Pixels>) -> bool {
+    position.x <= viewport.left() + px(96.) && position.y <= viewport.top() + px(40.)
 }
 
 fn menu_position(viewport: Bounds<Pixels>, picture: Bounds<Pixels>) -> Option<Point<Pixels>> {
