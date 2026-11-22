@@ -950,7 +950,7 @@ impl SessionWindow {
                         if this.capture.wants_inputs() {
                             this.capture.refresh_inputs();
                         }
-                        if this.capture.wants_cameras() {
+                        if this.capture.cameras_due() {
                             this.capture.refresh_cameras();
                         }
                         if this.capture.has_pending() {

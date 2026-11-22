@@ -140,7 +140,9 @@ pub(super) struct MediaCapture<M: MicHandle = Microphone, C: CamHandle = Camera>
     sink: Option<mpsc::Sender<Vec<u8>>>,
     cam_sink: Option<mpsc::Sender<Vec<u8>>>,
     /// The stream's camera keyframe request (`WEBCAM_KEYFRAME`, or a dropped frame).
-    cam_keyframe: Arc<AtomicBool>,
+    cam_feedback: Arc<camera::Feedback>,
+    /// Ticker seconds since the stream began, for the camera list's cadence.
+    cam_ticks: u32,
     events: Option<mpsc::UnboundedSender<SessionEvent>>,
 }
 
@@ -159,11 +161,15 @@ impl<M: MicHandle, C: CamHandle> Default for MediaCapture<M, C> {
             stream_id: 0,
             sink: None,
             cam_sink: None,
-            cam_keyframe: Arc::default(),
+            cam_feedback: Arc::default(),
+            cam_ticks: 0,
             events: None,
         }
     }
 }
+
+/// Ticker seconds between camera listings while the camera is off.
+const CAMERA_LIST_EVERY: u32 = 5;
 
 /// Events that end the stream without `end_stream`: they stop capture at once.
 fn ends_stream(event: &SessionEvent) -> bool {
@@ -184,11 +190,12 @@ impl<M: MicHandle, C: CamHandle> MediaCapture<M, C> {
         self.stream_id += 1;
         self.sink = Some(sink);
         self.cam_sink = Some(cam_sink);
-        self.cam_keyframe = Arc::default();
+        self.cam_feedback = Arc::default();
+        self.cam_ticks = 0;
         self.events = Some(events);
         let camera = CameraFrames {
             frames: cam_frames,
-            keyframe: self.cam_keyframe.clone(),
+            feedback: self.cam_feedback.clone(),
         };
         (frames, camera)
     }
@@ -303,7 +310,8 @@ impl<M: MicHandle, C: CamHandle> MediaCapture<M, C> {
             .state
             .policy
             .map_or(capture::DEFAULT_CAM_SIZE, |policy| policy.cam_size);
-        let uplink = camera::Uplink::new(sink, self.cam_keyframe.clone());
+        let size = camera::capture_size(size);
+        let uplink = camera::Uplink::new(sink, self.cam_feedback.clone());
         self.cam.handle = make(uplink, size, report);
         if self.cam.handle.is_some() {
             self.cam.id = id;
@@ -371,7 +379,7 @@ impl<M: MicHandle, C: CamHandle> MediaCapture<M, C> {
     /// the policy.
     pub(super) fn on_reply(&mut self, reply: Reply, auth: capture::Auth) -> Vec<Effect> {
         if reply == Reply::Keyframe {
-            self.cam_keyframe.store(true, Ordering::Release);
+            self.cam_feedback.request_keyframe();
         }
         self.state.on_reply(reply, auth)
     }
@@ -406,7 +414,7 @@ impl<M: MicHandle, C: CamHandle> MediaCapture<M, C> {
         let effects = self.state.on_policy(policy, auth);
         if size.is_some_and(|size| size != policy.cam_size) {
             if let Some(cam) = &self.cam.handle {
-                cam.set_size(policy.cam_size);
+                cam.set_size(camera::capture_size(policy.cam_size));
             }
         }
         effects
@@ -430,6 +438,17 @@ impl<M: MicHandle, C: CamHandle> MediaCapture<M, C> {
     /// permission).
     pub(super) fn wants_cameras(&self) -> bool {
         self.events.is_some() && self.state.permitted(Subject::Camera)
+    }
+
+    /// One ticker second: whether to list cameras now. Not while the camera runs (its
+    /// thread's list wins), and only every 5 s while it is off, at once on a new stream.
+    pub(super) fn cameras_due(&mut self) -> bool {
+        if !self.wants_cameras() || self.cam.handle.is_some() {
+            return false;
+        }
+        let due = self.cam_ticks.is_multiple_of(CAMERA_LIST_EVERY);
+        self.cam_ticks += 1;
+        due
     }
 
     /// Lists on a named thread unless one of the same kind is still running (blocked or
@@ -982,7 +1001,7 @@ mod tests {
     #[test]
     fn the_camera_starts_with_the_servers_size_and_stops_on_every_stream_end() {
         let (mut capture, log, camera, _events) = filming();
-        assert_eq!(log.borrow().calls, ["made (1280, 720)"]);
+        assert_eq!(log.borrow().calls, ["made (640, 360)"]);
         capture.on_cam_status(1, cam_live());
         assert_eq!(capture.badge(), Some((false, true)));
         capture.on_stream_event(&SessionEvent::Error("closed".into()));
@@ -1003,11 +1022,11 @@ mod tests {
     #[test]
     fn webcam_keyframe_reply_sets_camera_flag() {
         let (mut capture, _log, camera, _events) = filming();
-        assert!(!camera.keyframe.load(Ordering::Acquire));
+        assert!(!camera.feedback.keyframe_requested());
         assert!(capture
             .on_reply(Reply::Keyframe, Auth::Authorized)
             .is_empty());
-        assert!(camera.keyframe.load(Ordering::Acquire));
+        assert!(camera.feedback.keyframe_requested());
         // WEBCAM_DISABLED stops the camera through the policy.
         let effects = capture.on_reply(Reply::Disabled(Subject::Camera), Auth::Authorized);
         assert_eq!(effects, [Effect::Stop(Subject::Camera)]);
@@ -1017,9 +1036,9 @@ mod tests {
     fn a_new_camera_size_reaches_the_running_camera() {
         let (mut capture, log, _camera, _events) = filming();
         let mut bigger = cam_policy(true);
-        bigger.cam_size = (1920, 1080);
+        bigger.cam_size = (1024, 768);
         capture.on_policy(bigger, Auth::Authorized);
-        assert_eq!(log.borrow().calls.last().unwrap(), "size (1920, 1080)");
+        assert_eq!(log.borrow().calls.last().unwrap(), "size (640, 480)");
         // The same size again: nothing more.
         capture.on_policy(bigger, Auth::Authorized);
         assert_eq!(log.borrow().calls.len(), 2);
@@ -1129,6 +1148,23 @@ mod tests {
         // A stream end forgets a pending start.
         capture.stop();
         assert!(!capture.has_pending());
+    }
+
+    #[test]
+    fn cameras_are_listed_every_5_s_while_off_and_never_while_running() {
+        let mut capture = MediaCapture::<FakeMic, FakeCam>::default();
+        let (events, _rx) = mpsc::unbounded_channel();
+        let _frames = capture.begin_stream(events);
+        capture.on_policy(cam_policy(false), Auth::Authorized);
+        let due: Vec<bool> = (0..11).map(|_| capture.cameras_due()).collect();
+        assert_eq!(due.iter().filter(|due| **due).count(), 3, "{due:?}");
+        assert!(due[0] && due[5] && due[10]);
+        let log = Rc::new(RefCell::new(Log::default()));
+        let effects = capture
+            .state
+            .on_toggle(Subject::Camera, true, Auth::Authorized);
+        capture.apply_with(effects, no_mic(), cam_maker(&log, false));
+        assert!((0..10).all(|_| !capture.cameras_due()));
     }
 
     #[test]

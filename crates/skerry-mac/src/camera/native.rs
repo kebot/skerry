@@ -15,8 +15,8 @@
 //! complete and invalidate the encoder and mark the pipeline closed, then drop the session.
 //! The VT output callback's refcon is an `Arc` released only after `Invalidate` returns.
 
-use super::{avcc_to_annexb, pick_format, CamBackend, Health, KeyframeGate, Uplink};
-use super::{BITRATE, FRAME_RATE, KEYFRAME_EVERY};
+use super::{avcc_to_annexb, pick_format, CamBackend, FrameGuard, Health, KeyframeGate, Uplink};
+use super::{FRAME_RATE, KEYFRAME_EVERY, START_BITRATE, START_FRAME_CAP};
 use crate::capture::{self, Auth, Subject};
 use crate::input_devices::InputList;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -28,7 +28,9 @@ use objc2_av_foundation::{
     AVCaptureDevicePosition, AVCaptureOutput, AVCaptureSession, AVCaptureVideoDataOutput,
     AVCaptureVideoDataOutputSampleBufferDelegate, AVMediaTypeVideo,
 };
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType};
+use objc2_core_foundation::{
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType,
+};
 use objc2_core_media::{
     kCMSampleAttachmentKey_NotSync, kCMTimeInvalid, kCMVideoCodecType_H264, CMSampleBuffer, CMTime,
     CMVideoFormatDescriptionGetDimensions, CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
@@ -42,7 +44,7 @@ use objc2_foundation::{
 };
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_ExpectedFrameRate,
+    kVTCompressionPropertyKey_DataRateLimits, kVTCompressionPropertyKey_ExpectedFrameRate,
     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kVTCompressionPropertyKey_ProfileLevel,
     kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
     kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
@@ -64,6 +66,9 @@ const CONTINUITY: &CStr = c"AVCaptureDeviceTypeContinuityCamera";
 const EXTERNAL_UNKNOWN: &CStr = c"AVCaptureDeviceTypeExternalUnknown";
 /// `kCVPixelBufferPixelFormatTypeKey`'s value.
 const PIXEL_FORMAT_KEY: &str = "PixelFormatType";
+/// `kCVPixelBufferWidthKey` / `kCVPixelBufferHeightKey`: the output scales to them.
+const WIDTH_KEY: &str = "Width";
+const HEIGHT_KEY: &str = "Height";
 
 fn at_least_sonoma() -> bool {
     NSProcessInfo::processInfo().isOperatingSystemAtLeastVersion(NSOperatingSystemVersion {
@@ -171,7 +176,7 @@ impl CamBackend for AvfCamera {
     }
 
     fn encoder_ok(&mut self) -> bool {
-        Encoder::new(640, 480, |_, _| {}).is_ok()
+        Encoder::new(640, 480, Rate::START, |_, _| {}).is_ok()
     }
 
     fn open(&mut self, uid: &str, size: (u32, u32), uplink: Uplink) -> Result<Session, Health> {
@@ -199,6 +204,34 @@ struct EncoderOutput {
     deliver: Box<dyn Fn(bool, Vec<u8>) + Send + Sync>,
 }
 
+/// The encoder's rate: its average bitrate (bits/s), and the most bytes any 1/8 s may hold,
+/// which bounds a keyframe too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Rate {
+    pub bitrate: u32,
+    pub frame_cap: u32,
+}
+
+impl Rate {
+    pub const START: Rate = Rate {
+        bitrate: START_BITRATE,
+        frame_cap: START_FRAME_CAP,
+    };
+
+    fn of(feedback: &super::Feedback) -> Self {
+        Self {
+            bitrate: feedback.bitrate(),
+            frame_cap: feedback.frame_cap(),
+        }
+    }
+
+    /// Worth changing the live session for: more than 10% apart.
+    fn differs(self, other: Self) -> bool {
+        let apart = |a: u32, b: u32| a.abs_diff(b) * 10 > a.max(b);
+        apart(self.bitrate, other.bitrate) || apart(self.frame_cap, other.frame_cap)
+    }
+}
+
 /// One hardware H.264 compression session: Constrained Baseline, real time, no reordering.
 pub(super) struct Encoder {
     session: Owned<CFRetained<VTCompressionSession>>,
@@ -206,6 +239,7 @@ pub(super) struct Encoder {
     /// `Arc::into_raw` of the callback's state, released after `Invalidate` returns.
     output: *const EncoderOutput,
     size: (usize, usize),
+    rate: Rate,
 }
 
 // SAFETY: see `Owned`; `output` is an `Arc` whose target is `Sync`.
@@ -221,6 +255,7 @@ impl Encoder {
     pub(super) fn new(
         width: usize,
         height: usize,
+        rate: Rate,
         deliver: impl Fn(bool, Vec<u8>) + Send + Sync + 'static,
     ) -> Result<Self, ()> {
         let output = Arc::into_raw(Arc::new(EncoderOutput {
@@ -253,15 +288,23 @@ impl Encoder {
                 NonNull::from(&mut session),
             )
         };
-        let Some(session) = NonNull::new(session).filter(|_| status == 0) else {
+        let Some(session) = NonNull::new(session) else {
             // SAFETY: the Arc from above, never handed to a live session.
             drop(unsafe { Arc::from_raw(output) });
             return Err(());
         };
         // SAFETY: a +1 session from the Create call.
         let session = unsafe { CFRetained::from_raw(session) };
-        let bitrate = CFNumber::new_i32(BITRATE as i32);
-        let rate = CFNumber::new_i32(FRAME_RATE as i32);
+        if status != 0 {
+            // A session returned with an error: invalidate it before its refcon goes.
+            // SAFETY: after Invalidate returns, VT calls the output callback no more.
+            unsafe { session.invalidate() };
+            drop(session);
+            // SAFETY: the Arc from above, released after the session is invalidated.
+            drop(unsafe { Arc::from_raw(output) });
+            return Err(());
+        }
+        let frame_rate = CFNumber::new_i32(FRAME_RATE as i32);
         let interval = CFNumber::new_f64(KEYFRAME_EVERY.as_secs_f64());
         // SAFETY: framework constants (all macOS 12 or older).
         let configured = unsafe {
@@ -272,8 +315,11 @@ impl Encoder {
                     kVTCompressionPropertyKey_ProfileLevel,
                     kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
                 )
-                & set(&session, kVTCompressionPropertyKey_AverageBitRate, &bitrate)
-                & set(&session, kVTCompressionPropertyKey_ExpectedFrameRate, &rate)
+                & set(
+                    &session,
+                    kVTCompressionPropertyKey_ExpectedFrameRate,
+                    &frame_rate,
+                )
                 & set(
                     &session,
                     kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
@@ -289,17 +335,52 @@ impl Encoder {
                 &[yes],
             )
         };
-        let encoder = Self {
+        let mut encoder = Self {
             session: Owned(session),
             force_key: Owned(force_key),
             output,
             size: (width, height),
+            rate,
         };
         // The profile is what the server expects; without it, give up (Drop invalidates).
-        if !configured || !prepared {
+        if !configured || !prepared || !encoder.apply_rate(rate) {
             return Err(());
         }
         Ok(encoder)
+    }
+
+    /// Sets the average bitrate, and the data-rate limits: at most `frame_cap` bytes in any
+    /// 1/8 s (a keyframe included) and 1.5× the average over 1 s.
+    fn apply_rate(&mut self, rate: Rate) -> bool {
+        let bitrate = CFNumber::new_i32(rate.bitrate as i32);
+        let limits = [
+            CFNumber::new_i32(rate.frame_cap as i32),
+            CFNumber::new_f64(0.125),
+            CFNumber::new_i32((u64::from(rate.bitrate) * 3 / 16) as i32),
+            CFNumber::new_f64(1.0),
+        ];
+        let limits = CFArray::from_retained_objects(&limits);
+        // SAFETY: framework keys (10.8) with a CFNumber and a CFArray of CFNumbers.
+        let ok = unsafe {
+            set(
+                &self.session.0,
+                kVTCompressionPropertyKey_AverageBitRate,
+                &bitrate,
+            ) & set(
+                &self.session.0,
+                kVTCompressionPropertyKey_DataRateLimits,
+                limits.as_opaque(),
+            )
+        };
+        self.rate = rate;
+        ok
+    }
+
+    /// Follows the writer's measurement when it moved by more than 10%.
+    pub(super) fn follow(&mut self, rate: Rate) {
+        if rate.differs(self.rate) {
+            self.apply_rate(rate);
+        }
     }
 
     /// Queues one frame; the output arrives through `deliver`.
@@ -494,8 +575,15 @@ impl Pipeline {
         {
             self.encoder = None;
             let uplink = self.uplink.clone();
-            match Encoder::new(size.0, size.1, move |key, frame| {
-                uplink.send(capture::webcam_frame(key, &frame));
+            let rate = Rate::of(self.uplink.feedback());
+            let guard = Mutex::new(FrameGuard::default());
+            match Encoder::new(size.0, size.1, rate, move |key, frame| {
+                let admit = guard
+                    .lock()
+                    .is_ok_and(|mut guard| guard.admit(key, frame.len(), uplink.feedback()));
+                if admit {
+                    uplink.send(capture::webcam_frame(key, &frame));
+                }
             }) {
                 Ok(encoder) => {
                     self.encoder = Some(encoder);
@@ -511,9 +599,11 @@ impl Pipeline {
             self.gate.request();
         }
         let key = self.gate.take(now);
-        let Some(encoder) = &self.encoder else {
+        let rate = Rate::of(self.uplink.feedback());
+        let Some(encoder) = &mut self.encoder else {
             return;
         };
+        encoder.follow(rate);
         if encoder.encode(image, pts, key).is_err() {
             self.encoder = None;
             self.failed.store(true, Ordering::Release);
@@ -672,12 +762,23 @@ impl Session {
         configure(&device, size);
         // SAFETY: a new output; the dictionary holds a pixel format number.
         let output = unsafe { AVCaptureVideoDataOutput::new() };
-        let format = NSNumber::new_u32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        let number = |value: u32| -> Retained<objc2::runtime::AnyObject> {
+            Retained::into_super(Retained::into_super(Retained::into_super(
+                NSNumber::new_u32(value),
+            )))
+        };
+        // The output scales to the capture size whatever format the camera runs.
         let settings = NSDictionary::from_retained_objects(
-            &[&*NSString::from_str(PIXEL_FORMAT_KEY)],
-            &[Retained::into_super(Retained::into_super(
-                Retained::into_super(format),
-            ))],
+            &[
+                &*NSString::from_str(PIXEL_FORMAT_KEY),
+                &*NSString::from_str(WIDTH_KEY),
+                &*NSString::from_str(HEIGHT_KEY),
+            ],
+            &[
+                number(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                number(size.0),
+                number(size.1),
+            ],
         );
         unsafe {
             output.setVideoSettings(Some(&settings));
@@ -813,6 +914,98 @@ mod tests {
         buffer
     }
 
+    /// A camera-like 640×480-class picture: soft lighting, textured surfaces with fine
+    /// detail, sensor noise and slow motion, so VideoToolbox spends real bits on it.
+    fn scene(width: usize, height: usize, frame: usize) -> CFRetained<CVPixelBuffer> {
+        let buffer = nv12(width, height, 0);
+        let flags = CVPixelBufferLockFlags(0);
+        let mut seed = 0x9e37_79b9_u32 ^ (frame as u32).wrapping_mul(2_654_435_761);
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let texture = |x: usize, y: usize| -> u32 {
+            let mut h = (x as u32).wrapping_mul(374_761_393) ^ (y as u32).wrapping_mul(668_265_263);
+            h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
+            h ^ (h >> 16)
+        };
+        // SAFETY: the planes are writable for the lock's lifetime.
+        unsafe {
+            assert_eq!(CVPixelBufferLockBaseAddress(&buffer, flags), 0);
+            let shift = frame * 2;
+            for plane in 0..2 {
+                let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane).cast::<u8>();
+                let stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane);
+                let rows = CVPixelBufferGetHeightOfPlane(&buffer, plane);
+                for row in 0..rows {
+                    for column in 0..stride {
+                        let value = if plane == 0 {
+                            let x = column + shift;
+                            let light =
+                                60 + (row * 80 / rows) as u32 + (column * 40 / stride) as u32;
+                            // Surfaces: coarse blocks with fine texture inside.
+                            let block = texture(x / 24, row / 24) % 60;
+                            let fine = texture(x, row) % 28;
+                            let grain = noise() % 7;
+                            (light + block + fine + grain).min(235)
+                        } else {
+                            let x = column / 2 + shift / 2;
+                            110 + texture(x / 12, row / 12) % 36
+                        };
+                        *base.add(row * stride + column) = value as u8;
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(&buffer, flags);
+        }
+        buffer
+    }
+
+    /// Encodes 3 s of [`scene`] at `rate` with a forced keyframe each second; returns the
+    /// keyframe sizes and the mean P frame size.
+    fn encode_scene(width: usize, height: usize, rate: Rate) -> (Vec<usize>, usize) {
+        let frames = Arc::new(Mutex::new(Vec::<(bool, usize)>::new()));
+        let sink = frames.clone();
+        let encoder = Encoder::new(width, height, rate, move |key, frame| {
+            sink.lock().unwrap().push((key, frame.len()));
+        })
+        .unwrap();
+        for frame in 0..90 {
+            let buffer = scene(width, height, frame);
+            // SAFETY: a plain CMTime.
+            let pts = unsafe { CMTime::new(frame as i64, 30) };
+            encoder.encode(&buffer, pts, frame % 30 == 0).unwrap();
+        }
+        encoder.flush();
+        drop(encoder);
+        let frames = frames.lock().unwrap();
+        let keys = frames.iter().filter(|f| f.0).map(|f| f.1).collect();
+        let deltas: Vec<usize> = frames.iter().filter(|f| !f.0).map(|f| f.1).collect();
+        (keys, deltas.iter().sum::<usize>() / deltas.len().max(1))
+    }
+
+    #[test]
+    fn realistic_keyframes_follow_the_bitrate() {
+        // Measured on this Mac's hardware encoder with camera-like content: at the starting
+        // 500 kbps every keyframe fits the starting 16 KB cap; at 2.5 Mbps (the old fixed
+        // rate) a cold session opens with a keyframe of about 100 KB, which the frame guard
+        // drops on any link slower than about 6 Mbps.
+        let (keys, delta) = encode_scene(640, 480, Rate::START);
+        assert!(keys.iter().all(|key| *key <= 16 * 1024), "{keys:?}");
+        assert!(delta <= 4096, "mean P {delta}");
+        let (keys, _) = encode_scene(
+            640,
+            480,
+            Rate {
+                bitrate: 2_500_000,
+                frame_cap: 1 << 20,
+            },
+        );
+        assert!(keys[0] >= 60_000, "{keys:?}");
+    }
+
     /// The NAL unit types of an Annex B access unit.
     fn nal_types(annexb: &[u8]) -> Vec<u8> {
         let mut types = Vec::new();
@@ -858,6 +1051,14 @@ mod tests {
                 objc2_core_video::kCVPixelBufferPixelFormatTypeKey.to_string(),
                 PIXEL_FORMAT_KEY
             );
+            assert_eq!(
+                objc2_core_video::kCVPixelBufferWidthKey.to_string(),
+                WIDTH_KEY
+            );
+            assert_eq!(
+                objc2_core_video::kCVPixelBufferHeightKey.to_string(),
+                HEIGHT_KEY
+            );
         }
         assert!(framework_string(c"SkerryNoSuchConstant").is_none());
         assert_eq!(device_types(false), [WIDE_ANGLE, EXTERNAL_UNKNOWN]);
@@ -879,7 +1080,7 @@ mod tests {
     fn vt_h264_encoder_produces_annexb_keyframe() {
         let frames = Arc::new(Mutex::new(Vec::<(bool, Vec<u8>)>::new()));
         let sink = frames.clone();
-        let encoder = Encoder::new(320, 240, move |key, frame| {
+        let encoder = Encoder::new(320, 240, Rate::START, move |key, frame| {
             sink.lock().unwrap().push((key, frame));
         })
         .expect("VideoToolbox makes an H.264 session");
@@ -929,7 +1130,7 @@ mod tests {
         // dispatch_sync completes and invalidates the encoder there.
         for round in 0..20 {
             let (sink, mut frames) = tokio::sync::mpsc::channel(64);
-            let keyframe = Arc::new(AtomicBool::new(false));
+            let keyframe = Arc::new(super::super::Feedback::default());
             let pipeline = Arc::new(Mutex::new(Pipeline::new(Uplink::new(sink, keyframe))));
             let queue = DispatchQueue::new("dev.kebot.skerry.camera.test", None);
             for frame in 0..6 {
@@ -962,7 +1163,7 @@ mod tests {
     #[test]
     fn pipeline_paces_to_30fps_and_honours_keyframe_requests() {
         let (sink, mut frames) = tokio::sync::mpsc::channel(64);
-        let keyframe = Arc::new(AtomicBool::new(false));
+        let keyframe = Arc::new(super::super::Feedback::default());
         let mut pipeline = Pipeline::new(Uplink::new(sink, keyframe.clone()));
         let start = Instant::now();
         // 60 fps in: only every other frame is admitted.
@@ -971,7 +1172,7 @@ mod tests {
             // SAFETY: a plain CMTime.
             let pts = unsafe { CMTime::new(frame as i64, 60) };
             if frame == 8 {
-                keyframe.store(true, Ordering::Release);
+                keyframe.request_keyframe();
             }
             pipeline.push(
                 &buffer,
@@ -987,6 +1188,6 @@ mod tests {
             .map(|frame| capture::webcam_keyframe(frame))
             .collect();
         assert_eq!(keys, [true, false, false, false, true, false]);
-        assert!(!keyframe.load(Ordering::Acquire));
+        assert!(!keyframe.keyframe_requested());
     }
 }

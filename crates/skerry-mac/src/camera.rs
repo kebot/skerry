@@ -9,14 +9,22 @@
 //! out as `0x06, 0x01, flags, payload`.
 //!
 //! A keyframe is sent on the first frame, every 4 s, on `WEBCAM_KEYFRAME`, and after any
-//! frame dropped for back-pressure; forced ones at most every 500 ms, so drop → keyframe →
-//! bigger frame → drop can't spiral (M-review change 9).
+//! frame dropped for back-pressure. Forced ones wait while a keyframe is still unsent, come
+//! at most every 500 ms, and that interval doubles on each repeat, so drop → keyframe →
+//! bigger frame → drop can't spiral (M-review change 9, M2-QA-1).
+//!
+//! **Input latency wins over camera quality** (PM, M2): a WebSocket message can't be split,
+//! so every camera frame delays input by its own wire time. The camera therefore starts small
+//! (at most 640×480, about 500 kbps) and follows the [`Feedback`] the socket writer measures:
+//! the encoder's average bitrate steps down on backlog and back up slowly, and its data-rate
+//! limit holds any frame, keyframes included, to about 1/8 s of the measured uplink.
 //!
 //! The thread exists only while the camera captures: the window starts it after macOS
 //! granted the permission and drops it to stop. Nothing lists or opens a camera before that.
 //! It stops its own session as soon as the session's frame channel closes, or while the
-//! channel has stayed full for 2 s, so the camera goes off even if the window misses the
-//! stream's end. Dropping `Camera` never blocks: it sends `Shutdown` and detaches the thread.
+//! channel has stayed full for 2 s (the socket writer takes camera frames only while its own
+//! small queue has room, so a stalled uplink fills the channel), so the camera goes off even
+//! if the window misses the stream's end. Dropping `Camera` never blocks: it sends `Shutdown` and detaches the thread.
 
 mod native;
 
@@ -24,7 +32,7 @@ pub use native::list_cameras;
 
 use crate::audio::{self, OutputDevice};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,12 +43,96 @@ pub type CameraDevice = OutputDevice;
 
 /// The longest gap between keyframes.
 pub const KEYFRAME_EVERY: Duration = Duration::from_secs(4);
-/// The shortest gap before a *forced* keyframe (a request or a drop).
+/// The shortest gap before a *forced* keyframe (a request or a drop); it doubles on each
+/// repeat up to [`KEYFRAME_EVERY`].
 pub const FORCED_KEYFRAME_GAP: Duration = Duration::from_millis(500);
 /// The frame rate the camera is set to and frames are admitted at.
 pub const FRAME_RATE: u32 = 30;
-/// The encoder's average bitrate, as the Selkies web client's.
-pub const BITRATE: u32 = 2_500_000;
+/// The encoder's starting average bitrate, before the writer has measured the uplink.
+pub const START_BITRATE: u32 = 500_000;
+/// The bitrate range the writer adapts within.
+pub const MIN_BITRATE: u32 = 100_000;
+pub const MAX_BITRATE: u32 = 1_500_000;
+/// The largest frame before the uplink is measured (bytes): 1/8 s of 1 Mbps.
+pub const START_FRAME_CAP: u32 = 16 * 1024;
+/// The largest capture size: bigger server sizes are scaled down to fit.
+pub const MAX_SIZE: (u32, u32) = (640, 480);
+
+/// The size to capture for the server's `webcam_width` × `webcam_height`: the same aspect,
+/// no larger than [`MAX_SIZE`], with even sides.
+pub fn capture_size(server: (u32, u32)) -> (u32, u32) {
+    let (width, height) = (server.0.max(2), server.1.max(2));
+    let scale = (f64::from(MAX_SIZE.0) / f64::from(width))
+        .min(f64::from(MAX_SIZE.1) / f64::from(height))
+        .min(1.0);
+    let even = |side: u32| ((f64::from(side) * scale) as u32 / 2 * 2).max(2);
+    (even(width), even(height))
+}
+
+/// What the socket writer and the window tell the camera: a keyframe request, the bitrate
+/// the uplink carries, the largest frame it carries in 1/8 s, and whether a keyframe is
+/// still waiting to be written.
+#[derive(Debug)]
+pub struct Feedback {
+    keyframe: AtomicBool,
+    bitrate: AtomicU32,
+    frame_cap: AtomicU32,
+    key_unsent: AtomicBool,
+}
+
+impl Default for Feedback {
+    fn default() -> Self {
+        Self {
+            keyframe: AtomicBool::new(false),
+            bitrate: AtomicU32::new(START_BITRATE),
+            frame_cap: AtomicU32::new(START_FRAME_CAP),
+            key_unsent: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Feedback {
+    /// `WEBCAM_KEYFRAME`, a dropped frame, or a new session.
+    pub fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::Release);
+    }
+
+    /// Whether a request is pending (it stays pending until taken).
+    #[cfg(test)]
+    pub fn keyframe_requested(&self) -> bool {
+        self.keyframe.load(Ordering::Acquire)
+    }
+
+    /// Takes a pending request, unless a keyframe is still unsent: that one answers it.
+    pub fn take_keyframe_request(&self) -> bool {
+        !self.key_unsent() && self.keyframe.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate.load(Ordering::Acquire)
+    }
+
+    pub fn set_bitrate(&self, bitrate: u32) {
+        self.bitrate
+            .store(bitrate.clamp(MIN_BITRATE, MAX_BITRATE), Ordering::Release);
+    }
+
+    pub fn frame_cap(&self) -> u32 {
+        self.frame_cap.load(Ordering::Acquire)
+    }
+
+    pub fn set_frame_cap(&self, bytes: u32) {
+        self.frame_cap.store(bytes, Ordering::Release);
+    }
+
+    pub fn key_unsent(&self) -> bool {
+        self.key_unsent.load(Ordering::Acquire)
+    }
+
+    pub fn set_key_unsent(&self, unsent: bool) {
+        self.key_unsent.store(unsent, Ordering::Release);
+    }
+}
 
 /// How often the thread checks its session while capturing.
 const CAPTURE_TICK: Duration = Duration::from_millis(100);
@@ -112,11 +204,53 @@ pub fn pick_format(formats: &[(u32, u32, f64)], want: (u32, u32)) -> Option<usiz
         .or_else(|| all.max_by_key(area))
 }
 
-/// When the next frame must be a keyframe.
+/// Holds encoded frames to the uplink's frame cap. VideoToolbox's hardware encoder doesn't
+/// honour `DataRateLimits` for keyframes (measured: a cold 1.5 Mbps session opens with an
+/// 80 KB IDR whatever the limit), so an oversized keyframe is dropped here, the bitrate
+/// steps down and a new keyframe is asked for; P frames wait for it (they can't decode
+/// without their reference).
 #[derive(Clone, Copy, Debug, Default)]
+pub struct FrameGuard {
+    gap: bool,
+}
+
+impl FrameGuard {
+    /// Whether an encoded frame of `len` bytes goes on to the socket.
+    pub fn admit(&mut self, key: bool, len: usize, feedback: &Feedback) -> bool {
+        if !key {
+            return !self.gap;
+        }
+        let cap = feedback.frame_cap() as usize;
+        if len > cap + cap / 4 {
+            self.gap = true;
+            feedback.set_bitrate(feedback.bitrate() / 2);
+            feedback.request_keyframe();
+            return false;
+        }
+        self.gap = false;
+        true
+    }
+}
+
+/// When the next frame must be a keyframe.
+#[derive(Clone, Copy, Debug)]
 pub struct KeyframeGate {
     force: bool,
     last: Option<Instant>,
+    /// The last forced keyframe, and the gap the next forced one waits.
+    last_forced: Option<Instant>,
+    gap: Duration,
+}
+
+impl Default for KeyframeGate {
+    fn default() -> Self {
+        Self {
+            force: false,
+            last: None,
+            last_forced: None,
+            gap: FORCED_KEYFRAME_GAP,
+        }
+    }
 }
 
 impl KeyframeGate {
@@ -127,31 +261,53 @@ impl KeyframeGate {
     }
 
     /// Whether the frame at `now` is a keyframe: the first, one 4 s after the last, or a
-    /// forced one at least 500 ms after the last (a forced request waits until then).
+    /// forced one at least the current gap after the last (a forced request waits until
+    /// then). A forced keyframe within 4 s of the previous forced one doubles the gap (500 ms,
+    /// 1 s, 2 s, 4 s); one after a quiet 4 s resets it.
     pub fn take(&mut self, now: Instant) -> bool {
-        let due = self.last.is_none_or(|last| {
-            let since = now.saturating_duration_since(last);
-            since >= KEYFRAME_EVERY || (self.force && since >= FORCED_KEYFRAME_GAP)
-        });
-        if due {
+        let Some(last) = self.last else {
             self.last = Some(now);
             self.force = false;
+            return true;
+        };
+        let since = now.saturating_duration_since(last);
+        let periodic = since >= KEYFRAME_EVERY;
+        let forced = !periodic && self.force && since >= self.gap;
+        if !periodic && !forced {
+            return false;
         }
-        due
+        if forced {
+            let repeat = self
+                .last_forced
+                .is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_EVERY);
+            self.gap = if repeat {
+                (self.gap * 2).min(KEYFRAME_EVERY)
+            } else {
+                FORCED_KEYFRAME_GAP
+            };
+            self.last_forced = Some(now);
+        }
+        self.last = Some(now);
+        self.force = false;
+        true
     }
 }
 
-/// Where encoded frames go: the stream's camera channel, and its keyframe request flag,
-/// which the window (`WEBCAM_KEYFRAME`) and the transport (a dropped frame) set too.
+/// Where encoded frames go: the stream's camera channel, and its [`Feedback`], which the
+/// window (`WEBCAM_KEYFRAME`) and the socket writer (drops, bitrate, frame cap) set too.
 #[derive(Clone, Debug)]
 pub struct Uplink {
     sink: tokio::sync::mpsc::Sender<Vec<u8>>,
-    keyframe: Arc<AtomicBool>,
+    feedback: Arc<Feedback>,
 }
 
 impl Uplink {
-    pub fn new(sink: tokio::sync::mpsc::Sender<Vec<u8>>, keyframe: Arc<AtomicBool>) -> Self {
-        Self { sink, keyframe }
+    pub fn new(sink: tokio::sync::mpsc::Sender<Vec<u8>>, feedback: Arc<Feedback>) -> Self {
+        Self { sink, feedback }
+    }
+
+    pub fn feedback(&self) -> &Feedback {
+        &self.feedback
     }
 
     /// Hands a frame on; a full channel drops it and asks for a keyframe. Returns false once
@@ -160,16 +316,16 @@ impl Uplink {
         match self.sink.try_send(frame) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
-                self.keyframe.store(true, Ordering::Release);
+                self.feedback.request_keyframe();
                 true
             }
             Err(TrySendError::Closed(_)) => false,
         }
     }
 
-    /// Takes a pending keyframe request.
+    /// Takes a pending keyframe request (see [`Feedback::take_keyframe_request`]).
     pub fn take_keyframe_request(&self) -> bool {
-        self.keyframe.swap(false, Ordering::AcqRel)
+        self.feedback.take_keyframe_request()
     }
 
     fn closed(&self) -> bool {
@@ -532,7 +688,7 @@ impl<B: CamBackend> Engine<B> {
             return;
         };
         // A fresh session starts on a keyframe whatever happened before.
-        self.uplink.keyframe.store(true, Ordering::Release);
+        self.uplink.feedback.request_keyframe();
         match self.backend.open(uid, self.size, self.uplink.clone()) {
             Ok(session) => {
                 self.session = Some(Active {
@@ -734,15 +890,83 @@ mod tests {
         gate.request();
         assert!(!gate.take(start + Duration::from_millis(400)));
         assert!(gate.take(start + Duration::from_millis(500)));
-        // Requests in a burst give one keyframe per 500 ms, never more.
-        let mut keys = 0;
-        for frame in 1..=60u64 {
+        // A request on every frame (repeated drops): the gap doubles on each repeat.
+        let mut keys = Vec::new();
+        for frame in 1..=300u64 {
             gate.request();
-            if gate.take(start + Duration::from_millis(500 + frame * 33)) {
-                keys += 1;
+            let at = Duration::from_millis(500 + frame * 33);
+            if gate.take(start + at) {
+                keys.push(at.as_millis());
             }
         }
-        assert_eq!(keys, 3, "about 2 s of forced requests");
+        // 1.0 s (gap 500 ms), 2.0 s (1 s), 4.0 s (2 s, and the periodic 4 s), 8.0 s (4 s).
+        let gaps: Vec<u128> = keys.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        assert!(keys.len() <= 5, "{keys:?}");
+        assert!(gaps.windows(2).all(|pair| pair[1] >= pair[0]), "{keys:?}");
+        assert!(*gaps.last().unwrap() >= 3900, "{keys:?}");
+        // After 4 s without a forced keyframe the gap is 500 ms again.
+        let mut gate = KeyframeGate::default();
+        gate.take(start);
+        gate.request();
+        assert!(gate.take(start + Duration::from_millis(500)));
+        gate.request();
+        assert!(
+            gate.take(start + Duration::from_millis(1000)),
+            "first repeat at 500 ms"
+        );
+        gate.request();
+        assert!(!gate.take(start + Duration::from_millis(1800)), "now 1 s");
+        assert!(gate.take(start + Duration::from_millis(2000)));
+        assert!(gate.take(start + Duration::from_millis(6000)), "periodic");
+        gate.request();
+        assert!(
+            gate.take(start + Duration::from_millis(8_000)),
+            "quiet: reset"
+        );
+        gate.request();
+        assert!(gate.take(start + Duration::from_millis(8_500)));
+    }
+
+    #[test]
+    fn an_oversized_keyframe_is_dropped_and_the_bitrate_halves() {
+        let feedback = Feedback::default();
+        feedback.set_frame_cap(16_000);
+        feedback.set_bitrate(1_000_000);
+        let mut guard = FrameGuard::default();
+        assert!(guard.admit(true, 19_000, &feedback), "within 25%");
+        assert!(guard.admit(false, 3_000, &feedback));
+        assert!(!guard.admit(true, 80_000, &feedback));
+        assert_eq!(feedback.bitrate(), 500_000);
+        assert!(feedback.keyframe_requested());
+        assert!(!guard.admit(false, 2_000, &feedback), "no reference: waits");
+        assert!(guard.admit(true, 9_000, &feedback));
+        assert!(guard.admit(false, 2_000, &feedback));
+    }
+
+    #[test]
+    fn feedback_holds_requests_while_a_keyframe_is_unsent() {
+        let feedback = Feedback::default();
+        assert_eq!(feedback.bitrate(), START_BITRATE);
+        feedback.request_keyframe();
+        feedback.set_key_unsent(true);
+        assert!(!feedback.take_keyframe_request());
+        assert!(feedback.keyframe_requested(), "kept for later");
+        feedback.set_key_unsent(false);
+        assert!(feedback.take_keyframe_request());
+        assert!(!feedback.take_keyframe_request());
+        feedback.set_bitrate(10_000_000);
+        assert_eq!(feedback.bitrate(), MAX_BITRATE);
+        feedback.set_bitrate(1);
+        assert_eq!(feedback.bitrate(), MIN_BITRATE);
+    }
+
+    #[test]
+    fn capture_size_fits_640_by_480_keeping_the_aspect() {
+        assert_eq!(capture_size((1280, 720)), (640, 360));
+        assert_eq!(capture_size((1920, 1080)), (640, 360));
+        assert_eq!(capture_size((640, 480)), (640, 480));
+        assert_eq!(capture_size((320, 240)), (320, 240));
+        assert_eq!(capture_size((1080, 1920)), (270, 480));
     }
 
     #[test]
@@ -758,8 +982,8 @@ mod tests {
     #[test]
     fn a_full_channel_asks_for_a_keyframe_and_a_closed_one_reports() {
         let (sink, mut frames) = tokio::sync::mpsc::channel(1);
-        let keyframe = Arc::new(AtomicBool::new(false));
-        let uplink = Uplink::new(sink, keyframe.clone());
+        let feedback = Arc::new(Feedback::default());
+        let uplink = Uplink::new(sink, feedback.clone());
         assert!(uplink.send(vec![1]));
         assert!(!uplink.take_keyframe_request());
         assert!(uplink.send(vec![2]));
@@ -837,7 +1061,7 @@ mod tests {
         open_fails: Rc<RefCell<Option<Health>>>,
         default: Rc<RefCell<Option<String>>>,
         frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        keyframe: Arc<AtomicBool>,
+        keyframe: Arc<Feedback>,
     }
 
     fn rig(chosen: Option<&str>, encoder: bool) -> Rig {
@@ -853,7 +1077,7 @@ mod tests {
             ("iPhone".to_string(), Some("iPhone Camera".to_string())),
         ]));
         let (sink, frames) = tokio::sync::mpsc::channel(crate::capture::CAM_QUEUE);
-        let keyframe = Arc::new(AtomicBool::new(false));
+        let keyframe = Arc::new(Feedback::default());
         let backend = FakeCam {
             log: log.clone(),
             devices,
@@ -892,7 +1116,7 @@ mod tests {
         assert_eq!(rig.log.borrow().opens, [("FaceTime".into(), (1280, 720))]);
         assert!(status.live && status.problem.is_none());
         assert!(
-            rig.keyframe.load(Ordering::Acquire),
+            rig.keyframe.keyframe_requested(),
             "a new session starts on a keyframe"
         );
         // The session stopped: closed, and rebuilt at once the first time.

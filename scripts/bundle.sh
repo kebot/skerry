@@ -71,8 +71,8 @@ plutil -extract NSCameraUseContinuityCameraDeviceType raw "$APP/Contents/Info.pl
 # The floor is macOS 13 (LSMinimumSystemVersion): Rust links framework symbols strongly, so a
 # reference to one added later stops the whole app from launching there. The camera resolves
 # its macOS 14 constants at run time (ARCH-038); keep it that way.
-if nm -u "$APP/Contents/MacOS/$name" | grep -E '^_AVCaptureDeviceType(External|ContinuityCamera|DeskViewCamera|Microphone)$'; then
-  echo "error: the binary links a macOS 14+ AVFoundation symbol strongly" >&2
+if nm -u "$APP/Contents/MacOS/$name" | grep -E '^_AVCaptureDeviceType'; then
+  echo "error: the binary links an AVCaptureDeviceType constant strongly; resolve it at run time" >&2
   exit 1
 fi
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc codesign failed"

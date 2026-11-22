@@ -8,10 +8,10 @@
 //! skips the stamp does not compile.
 
 use super::Resolution;
-use crate::socket_writer::{socket_fd, Backlog, NoBacklog, SplitSocket, UnsentBacklog};
+use crate::camera::Feedback;
+use crate::socket_writer::{socket_fd, Backlog, NoBacklog, SocketBacklog, SplitSocket};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::{self, Message};
@@ -151,19 +151,20 @@ impl Wire {
         Self::with_camera(socket, role, Arc::default())
     }
 
-    /// `keyframe` is the camera's request flag, set when the writer drops a camera frame.
+    /// `feedback` is the camera's: the writer asks it for keyframes and tells it the bitrate
+    /// and frame size the uplink carries.
     pub(super) fn with_camera(
         socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
         role: StreamRole,
-        keyframe: Arc<AtomicBool>,
+        feedback: Arc<Feedback>,
     ) -> Self {
         let backlog: Box<dyn Backlog> =
-            match socket_fd(socket.get_ref()).and_then(UnsentBacklog::new) {
+            match socket_fd(socket.get_ref()).and_then(SocketBacklog::new) {
                 Some(backlog) => Box::new(backlog),
                 None => Box::new(NoBacklog),
             };
         Self {
-            socket: SplitSocket::new(socket, keyframe, backlog),
+            socket: SplitSocket::new(socket, feedback, backlog),
             role,
         }
     }
@@ -194,11 +195,22 @@ impl Wire {
         self.socket.send(Message::binary(data)).await
     }
 
-    /// Offers one camera frame (`0x06`) to the writer's camera slot, on the primary only.
+    /// Offers one camera frame (`0x06`) to the writer's camera queue, on the primary only.
     pub(super) fn send_camera(&self, frame: Vec<u8>) {
         if self.role.is_primary() {
             self.socket.send_camera(frame);
         }
+    }
+
+    /// Whether the writer takes another microphone frame now (bounded, so a stalled uplink
+    /// fills the microphone's own channel and its stall stop fires).
+    pub(super) fn mic_room(&self) -> bool {
+        self.socket.mic_room()
+    }
+
+    /// Whether the writer takes another camera frame now.
+    pub(super) fn camera_room(&self) -> bool {
+        self.socket.camera_room()
     }
 
     pub(super) async fn ping(&mut self, payload: &'static [u8]) -> Result<(), tungstenite::Error> {

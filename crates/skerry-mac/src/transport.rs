@@ -940,11 +940,11 @@ pub struct SessionOptions {
     pub camera: Option<CameraFrames>,
 }
 
-/// The camera's frame channel and its keyframe request flag, which the socket writer sets
+/// The camera's frame channel and its feedback, which the socket writer sets
 /// when it drops a frame.
 pub struct CameraFrames {
     pub frames: mpsc::Receiver<Vec<u8>>,
-    pub keyframe: Arc<std::sync::atomic::AtomicBool>,
+    pub feedback: Arc<crate::camera::Feedback>,
 }
 
 /// Why a stream ended with an error.
@@ -1186,11 +1186,11 @@ pub async fn run(
     // `ARCH-038`). The camera, like the microphone, is the primary's (`ARCH-039`).
     let mut options = options;
     options.camera = options.camera.take().filter(|_| options.role.is_primary());
-    let keyframe = options
+    let feedback = options
         .camera
         .as_ref()
-        .map_or_else(Arc::default, |camera| camera.keyframe.clone());
-    let socket = Wire::with_camera(socket, options.role, keyframe);
+        .map_or_else(Arc::default, |camera| camera.feedback.clone());
+    let socket = Wire::with_camera(socket, options.role, feedback);
     stream(
         socket, direct, frames, input, pointer, options, events, cancel,
     )
@@ -1297,6 +1297,8 @@ async fn stream(
     pad_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clipboard_in = clipboard::Receiver::default();
     let mut clipboard_transfer = 0u64;
+    let mut uplink_retry = tokio::time::interval(Duration::from_millis(20));
+    uplink_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -1450,15 +1452,18 @@ async fn stream(
                 socket.send(text).await.map_err(|_| disconnected)?;
             }
             // About 80 B every 20 ms: inline after input, before anything received
-            // (`ARCH-038`). Frames before the session is ready are dropped.
-            frame = uplink(&mut mic_frames) => {
+            // (`ARCH-038`). Frames before the session is ready are dropped. Taken only while
+            // the writer has room, so a stalled uplink fills the microphone's own channel and
+            // its 2 s stall stop fires (M-QA-2).
+            frame = uplink(&mut mic_frames), if socket.mic_room() => {
                 if let Some(frame) = uplink_message(ready, frame) {
                     socket.send_binary(frame).await.map_err(|_| disconnected)?;
                 }
             }
-            // Camera frames go to the writer's camera slot, behind every queued command and
-            // microphone frame; frames before the session is ready are dropped.
-            frame = uplink(&mut cam_frames) => {
+            // Camera frames go to the writer's camera queue, behind every queued command and
+            // microphone frame; frames before the session is ready are dropped. Bounded like
+            // the microphone's.
+            frame = uplink(&mut cam_frames), if socket.camera_room() => {
                 if let Some(frame) = camera_uplink(ready, frame) {
                     socket.send_camera(frame);
                 }
@@ -1768,6 +1773,8 @@ async fn stream(
                 }
                 .into());
             }
+            // Last: wakes the loop to look again at an uplink held back for a full writer.
+            _ = uplink_retry.tick(), if !socket.mic_room() || !socket.camera_room() => {}
         }
     }
 }
