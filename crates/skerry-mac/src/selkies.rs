@@ -2,7 +2,8 @@
 //! (Selkies `715df7c` `web/selkies-web-core/lib/file-upload.ts`, `crates/selkies/src/files/`).
 //!
 //! Every route lives on the session origin beside `api/websockets` and is authorized by the
-//! SealSkin session cookie `transport::socket_request` obtained. The server confines every path
+//! SealSkin session cookie `transport::socket_request` obtained, or by a direct server's
+//! login (`ARCH-036`). The server confines every path
 //! to its file-manager folder; paths here are relative to it, `/`-separated. No request carries
 //! an `Origin` header: Selkies treats a request without one as same-origin, which `mkdir` needs.
 
@@ -10,7 +11,7 @@ use crate::print_jobs::{
     has_pdf_header, FetchFailure, Fetched, MAX_PRINT_BYTES, PDF_HEADER_WINDOW,
 };
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
-use reqwest::header::{HeaderValue, CONTENT_TYPE, COOKIE, RANGE};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE, COOKIE, RANGE};
 use reqwest::{Method, StatusCode, Url};
 use serde::Deserialize;
 use serde_json::Value;
@@ -103,6 +104,9 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Server(status, _) if status.as_u16() == 401 => {
+                f.write_str("Selkies didn’t accept the login.")
+            }
             Error::Server(status, message) if message.is_empty() => {
                 f.write_str(match status.as_u16() {
                     403 => "The session doesn’t allow this.",
@@ -230,18 +234,36 @@ pub fn local_name(name: &str) -> Option<&str> {
 pub struct SelkiesClient {
     /// The session page, ending in `/`; the routes are `api/...` below it.
     base: Url,
-    cookie: HeaderValue,
+    /// The SealSkin session cookie, or a direct server's login (marked sensitive).
+    headers: HeaderMap,
     http: reqwest::Client,
 }
 
 impl SelkiesClient {
+    /// A SealSkin session's routes, under its cookie.
     pub fn new(base: Url, mut cookie: HeaderValue) -> Result<Self, Error> {
         cookie.set_sensitive(true);
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .build()?;
-        Ok(SelkiesClient { base, cookie, http })
+        let mut headers = HeaderMap::new();
+        headers.insert(COOKIE, cookie);
+        Ok(SelkiesClient {
+            base,
+            headers,
+            http,
+        })
+    }
+
+    /// A direct server's routes (`ARCH-036`): its own client (pinned TLS, no redirects)
+    /// and its login headers.
+    pub fn direct(base: Url, http: reqwest::Client, headers: HeaderMap) -> Self {
+        SelkiesClient {
+            base,
+            headers,
+            http,
+        }
     }
 
     fn url(&self, route: &str) -> Url {
@@ -250,9 +272,7 @@ impl SelkiesClient {
     }
 
     fn request(&self, method: Method, url: Url) -> reqwest::RequestBuilder {
-        self.http
-            .request(method, url)
-            .header(COOKIE, self.cookie.clone())
+        self.http.request(method, url).headers(self.headers.clone())
     }
 
     pub async fn browse(&self, dir: &str) -> Result<Listing, Error> {
@@ -409,6 +429,8 @@ impl SelkiesClient {
             };
             return Err(match status.as_u16() {
                 404 => FetchFailure::Gone,
+                // Only a direct server answers 401 here (SealSkin's proxy refuses with 403).
+                401 => FetchFailure::Refused("Selkies no longer accepts the login.".into()),
                 // SealSkin's forward_auth answers a stale or bad cookie with a JSON 403
                 // (`{"detail": …}`) before Selkies sees the request: the document is still
                 // in the spool. Only Selkies' own plain-text 403s are refusals.
@@ -808,6 +830,8 @@ mod tests {
         use tokio::net::{TcpListener, TcpStream};
 
         const COOKIE_VALUE: &str = "selkies_session=abc";
+        /// A direct server's Basic login (`ARCH-036`): `ubuntu`/`mypasswd`.
+        const BASIC_VALUE: &str = "Basic dWJ1bnR1Om15cGFzc3dk";
 
         #[derive(Clone, Debug)]
         struct Seen {
@@ -878,6 +902,59 @@ mod tests {
                 fake,
                 access,
                 _root: root,
+            }
+        }
+
+        /// The same fake, reached as a direct server with a Basic login.
+        async fn start_direct(password: &str) -> Server {
+            let mut server = start().await;
+            let base = server.access.base.clone();
+            let auth = crate::direct::SelkiesAuth::new("ubuntu", password, None);
+            server.access =
+                SelkiesClient::direct(base, reqwest::Client::new(), auth.http_headers());
+            server
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn direct_selkies_client_sends_its_login_on_browse_upload_download_and_print() {
+            let server = start_direct("mypasswd").await;
+            let (access, fake) = (&server.access, &server.fake);
+            let local = tempfile::tempdir().unwrap();
+            let source = local.path().join("a.txt");
+            std::fs::write(&source, b"hi").unwrap();
+            access.upload(&source, "a.txt", &Progress::default()).await.unwrap();
+            access.mkdir("Folder").await.unwrap();
+            access.browse("").await.unwrap();
+            access
+                .download("a.txt", &local.path().join("b.txt"), &Progress::default())
+                .await
+                .unwrap();
+            spool(fake, "r.pdf", PrintReply::Pdf(pdf(2_000)));
+            let (result, _local, _) = fetch_print(access, "r.pdf", STALL).await;
+            result.unwrap();
+            let seen = fake.seen.lock().unwrap();
+            assert!(seen.len() >= 5);
+            for request in seen.iter() {
+                assert_eq!(request.headers["authorization"], BASIC_VALUE, "{}", request.target);
+                assert!(!request.headers.contains_key("cookie"));
+                assert!(!request.headers.contains_key("origin"));
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_401_print_fetch_on_a_direct_server_is_a_refusal() {
+            let server = start_direct("wrong").await;
+            spool(&server.fake, "r.pdf", PrintReply::Pdf(pdf(2_000)));
+            let (result, _local, _) = fetch_print(&server.access, "r.pdf", STALL).await;
+            match result {
+                Err(crate::print_jobs::FetchFailure::Refused(why)) => {
+                    assert_eq!(why, "Selkies no longer accepts the login.")
+                }
+                other => panic!("expected a refusal, got {:?}", other.err()),
+            }
+            match server.access.browse("").await {
+                Err(error) => assert_eq!(error.to_string(), "Selkies didn’t accept the login."),
+                Ok(_) => panic!("a wrong login must not browse"),
             }
         }
 
@@ -961,7 +1038,9 @@ mod tests {
                 target: target.clone(),
                 headers: headers.clone(),
             });
-            if headers.get("cookie").map(String::as_str) != Some(COOKIE_VALUE) {
+            let cookie_ok = headers.get("cookie").map(String::as_str) == Some(COOKIE_VALUE);
+            let login_ok = headers.get("authorization").map(String::as_str) == Some(BASIC_VALUE);
+            if !cookie_ok && !login_ok {
                 return error(&mut stream, "401 Unauthorized", "no session").await;
             }
             if headers.contains_key("origin") {
