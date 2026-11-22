@@ -979,6 +979,11 @@ pub async fn run(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            // In source order: a stripe already waiting on the socket is always read before
+            // the settle timer can fire, so the settle never splits a frame that is still
+            // arriving back to back (`ARCH-034`). Input comes next, so a stripe burst delays
+            // it by at most the burst's decode.
+            biased;
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
