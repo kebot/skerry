@@ -367,13 +367,36 @@ pub enum SessionEvent {
     PointerCapture(Option<crate::view::CaptureHint>),
     /// The server asked the pad in this slot to rumble (`ARCH-032`).
     Rumble(crate::gamepad::Rumble),
+    /// An Apps window event: `apps_state`, `apps_job`, `command_error` (`ARCH-035`).
+    Apps(crate::apps::Event),
+    /// What `server_settings` allows the Apps window (`ARCH-035`).
+    AppsPolicy(crate::apps::Policy),
 }
 
-/// A `system,{"action": "rumble,…"}` frame's rumble; `None` for anything else.
-fn system_rumble(text: &str) -> Option<crate::gamepad::Rumble> {
+/// The action of a `system,{"action": "<action>"}` frame; `None` for anything else.
+fn system_action(text: &str) -> Option<String> {
     let json = text.strip_prefix("system,")?;
     let data: Value = serde_json::from_str(json).ok()?;
-    crate::gamepad::Rumble::parse(data["action"].as_str()?)
+    data["action"].as_str().map(str::to_owned)
+}
+
+/// One match for every `system,` action Skerry reads: rumble (`ARCH-032`) and the Apps
+/// window's (`ARCH-035`). Any other action is ignored.
+fn system_event(action: &str) -> Option<SessionEvent> {
+    match action.split_once(',').map_or(action, |(kind, _)| kind) {
+        "rumble" => crate::gamepad::Rumble::parse(action).map(SessionEvent::Rumble),
+        "apps_state" | "apps_job" | "command_error" => {
+            crate::apps::parse_action(action).map(SessionEvent::Apps)
+        }
+        _ => None,
+    }
+}
+
+/// A text frame that is a `system,` frame: `Some` (consumed, so it never reaches the
+/// cursor, clipboard or JSON parsers) with its event, if Skerry reads that action.
+fn system_frame(text: &str) -> Option<Option<SessionEvent>> {
+    text.starts_with("system,")
+        .then(|| system_action(text).and_then(|action| system_event(&action)))
 }
 
 #[derive(Clone, Copy)]
@@ -910,13 +933,12 @@ pub async fn run(
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
-                    if text.starts_with("system,") {
-                        // Only rumble is used; other system actions are ignored.
-                        if let Some(rumble) = system_rumble(&text) {
-                            if input_trace_enabled() {
+                    if let Some(event) = system_frame(&text) {
+                        if let Some(event) = event {
+                            if matches!(event, SessionEvent::Rumble(_)) && input_trace_enabled() {
                                 eprintln!("skerry input: {text}");
                             }
-                            let _ = events.send(SessionEvent::Rumble(rumble));
+                            let _ = events.send(event);
                         }
                         continue;
                     }
@@ -972,6 +994,7 @@ pub async fn run(
                                     let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
                                     let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
                                     let _ = events.send(SessionEvent::PrintPolicy(print_jobs::enabled(&data["settings"])));
+                                    let _ = events.send(SessionEvent::AppsPolicy(crate::apps::Policy::from_server(&data["settings"])));
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -1769,8 +1792,11 @@ mod tests {
 
     #[test]
     fn system_frame_with_rumble_becomes_an_event() {
-        let rumble =
-            system_rumble(r#"system,{"action":"rumble,1,0.800,0.200,250"}"#).expect("rumble");
+        let Some(Some(SessionEvent::Rumble(rumble))) =
+            system_frame(r#"system,{"action":"rumble,1,0.800,0.200,250"}"#)
+        else {
+            panic!("expected a rumble");
+        };
         assert_eq!(rumble.slot, 1);
         assert_eq!((rumble.strong, rumble.weak), (0.8, 0.2));
         assert_eq!(rumble.duration, Duration::from_millis(250));
@@ -1778,10 +1804,63 @@ mod tests {
 
     #[test]
     fn other_system_actions_are_ignored() {
-        assert!(system_rumble(r#"system,{"action":"reload"}"#).is_none());
-        assert!(system_rumble(r#"system,{"action":"rumble,9,1,1,10"}"#).is_none());
-        assert!(system_rumble("system,not json").is_none());
-        assert!(system_rumble(r#"{"action":"rumble,0,1,1,10"}"#).is_none());
+        let ignored = |text: &str| matches!(system_frame(text), Some(None));
+        assert!(ignored(r#"system,{"action":"reload"}"#));
+        assert!(ignored(r#"system,{"action":"rumble,9,1,1,10"}"#));
+        assert!(ignored("system,not json"));
+        assert!(system_frame(r#"{"action":"rumble,0,1,1,10"}"#).is_none());
+    }
+
+    #[test]
+    fn system_frames_yield_their_action() {
+        assert_eq!(
+            system_action(r#"system,{"action":"apps_job,{\"id\":1}"}"#).as_deref(),
+            Some(r#"apps_job,{"id":1}"#)
+        );
+        assert_eq!(system_action("system,nonsense"), None);
+        assert_eq!(system_action(r#"{"type":"x"}"#), None);
+        assert_eq!(system_action(r#"system,{"action":7}"#), None);
+    }
+
+    #[test]
+    fn apps_actions_share_the_system_match_with_rumble() {
+        let frame = |action: &str| format!("system,{}", json!({ "action": action }));
+        match system_frame(&frame(r#"apps_state,{"installed":["gimp"],"jobs":[]}"#)) {
+            Some(Some(SessionEvent::Apps(crate::apps::Event::State(state)))) => {
+                assert_eq!(state["installed"][0], "gimp")
+            }
+            _ => panic!("expected apps_state"),
+        }
+        assert!(matches!(
+            system_frame(&frame(r#"apps_job,{"id":3,"app":"vlc"}"#)),
+            Some(Some(SessionEvent::Apps(crate::apps::Event::Job(_))))
+        ));
+        match system_frame(&frame("command_error,not found, sorry")) {
+            Some(Some(SessionEvent::Apps(crate::apps::Event::CommandError(text)))) => {
+                assert_eq!(text, "not found, sorry")
+            }
+            _ => panic!("expected command_error"),
+        }
+        assert!(matches!(
+            system_frame(&frame("rumble,0,1,1,10")),
+            Some(Some(SessionEvent::Rumble(_)))
+        ));
+        // Malformed apps JSON and unknown actions are consumed, never parsed further.
+        assert!(matches!(system_frame(&frame("apps_job,{bad")), Some(None)));
+        assert!(matches!(system_frame(&frame("apps_other,{}")), Some(None)));
+    }
+
+    #[test]
+    fn a_system_frame_never_reaches_the_clipboard_parser() {
+        // A system action that looks like a clipboard frame is consumed by `system_frame`,
+        // which the stream checks first.
+        let text = format!("system,{}", json!({"action": "clipboard,aGk="}));
+        assert!(matches!(system_frame(&text), Some(None)));
+        // The clipboard parser would have taken the same text apart otherwise.
+        assert!(!matches!(
+            clipboard::Receiver::default().on_text("clipboard,aGk="),
+            clipboard::Frame::NotClipboard
+        ));
     }
 
     #[test]

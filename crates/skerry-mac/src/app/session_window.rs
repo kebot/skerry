@@ -4,11 +4,12 @@
 //! its Session Controls. The Library (`Launcher`) only opens these windows and keeps track
 //! of them through the [`OpenWindows`] global.
 
+use super::apps_window::{self, AppsOwner, AppsWindow};
 use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::gamepads::Gamepads;
 use super::{
-    dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
+    dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher, ToggleApps,
     ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSessionControls, ToggleStatsStrip,
     APP_NAME,
 };
@@ -163,6 +164,10 @@ pub(super) struct SessionWindow {
     /// The session's file routes and what the server allows (`ARCH-023`).
     file_access: Option<crate::selkies::SelkiesClient>,
     file_policy: Option<crate::selkies::Policy>,
+    /// The session's Apps window (`ARCH-035`); it stays open across reconnects.
+    pub(super) apps_window: Option<(AnyWindowHandle, Entity<AppsWindow>)>,
+    /// What this stream's `server_settings` allows Apps; `None` while disconnected.
+    pub(super) apps_policy: Option<crate::apps::Policy>,
     pub(super) dpi_override: Option<u16>,
     ui_scale: display::UiScale,
     pub(super) applied_resolution: Option<DisplayRequest>,
@@ -251,6 +256,8 @@ impl SessionWindow {
             files_window: None,
             file_access: None,
             file_policy: None,
+            apps_window: None,
+            apps_policy: None,
             dpi_override: None,
             ui_scale: display::UiScale::default(),
             applied_resolution: None,
@@ -511,7 +518,29 @@ impl SessionWindow {
                     stream.set_clipboard_policy(policy, window, cx);
                 }
             }
-            SessionEvent::Files(access) => self.file_access = Some(access),
+            SessionEvent::Files(access) => {
+                if let Some((_, apps)) = &self.apps_window {
+                    let access = Some(access.clone());
+                    apps.update(cx, |apps, cx| apps.set_access(access, cx));
+                }
+                self.file_access = Some(access);
+            }
+            SessionEvent::AppsPolicy(policy) => {
+                let changed = self.apps_policy != Some(policy);
+                self.apps_policy = Some(policy);
+                if let Some((_, apps)) = &self.apps_window {
+                    apps.update(cx, |apps, cx| apps.set_policy(policy, cx));
+                }
+                if changed {
+                    cx.notify();
+                }
+            }
+            SessionEvent::Apps(event) => {
+                // Ignored while no Apps window is open: opening one lists the whole state.
+                if let Some((_, apps)) = &self.apps_window {
+                    apps.update(cx, |apps, cx| apps.receive(event, cx));
+                }
+            }
             SessionEvent::FilePolicy(policy) => {
                 self.file_policy = Some(policy);
                 // Whichever Files window shows this session, a Library-opened one too.
@@ -1129,6 +1158,72 @@ impl SessionWindow {
         });
     }
 
+    /// Opens the session's Apps window, or brings it forward (`ARCH-035`). Only opens; it
+    /// doesn't close an open window, as Files.
+    pub(super) fn toggle_apps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((handle, _)) = &self.apps_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.apps_window = None;
+        if self.current.is_none() {
+            return;
+        }
+        let Some(policy) = self.apps_policy.filter(|policy| policy.allowed) else {
+            self.status = Some(if self.apps_policy.is_none() {
+                "Apps are available once the session has connected.".into()
+            } else {
+                "The server doesn’t allow installing apps in this session.".into()
+            });
+            cx.notify();
+            return;
+        };
+        self.release_keys(cx);
+        let source = apps_window::AppsSource {
+            title: self.remote.app_name.clone(),
+            policy,
+            selkies: self.file_access.clone(),
+            server: self.api.server().to_owned(),
+            saved_filter: self.preferences.apps_category.clone(),
+        };
+        let rt = self.rt.clone();
+        let owner_window = Window::window_handle(window);
+        let session = cx.entity();
+        cx.defer(move |cx| {
+            let _ = owner_window.update(cx, |_, window, cx| {
+                let owner = AppsOwner {
+                    window: owner_window,
+                    session: session.downgrade(),
+                };
+                let result = AppsWindow::open(source, rt, window, owner, cx);
+                session.update(cx, |session, cx| {
+                    match result {
+                        Ok(apps) => session.apps_window = Some(apps),
+                        Err(_) => session.status = Some("Couldn’t open Apps.".into()),
+                    }
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    /// Sends an `apps,` request on the current stream; the Apps window has checked it.
+    pub(super) fn send_apps(&self, request: String) {
+        if let Some(stream) = &self.current {
+            stream.send_apps(request);
+        }
+    }
+
+    fn close_apps(&mut self, cx: &mut App) {
+        if let Some((handle, _)) = self.apps_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
     fn close_files(&mut self, cx: &mut App) {
         if let Some((handle, _)) = self.files_window.take() {
             let _ = handle.update(cx, |_, window, _| window.remove_window());
@@ -1228,6 +1323,11 @@ impl SessionWindow {
         self.print_policy = None;
         self.print_settings_at = None;
         self.close_files(cx);
+        // Apps stays open across a reconnect, waiting (`ARCH-035`); teardown closes it.
+        self.apps_policy = None;
+        if let Some((_, apps)) = &self.apps_window {
+            apps.update(cx, |apps, cx| apps.disconnect(cx));
+        }
         self.applied_resolution = None;
         self.applied_dpi = None;
         self.stats = None;
@@ -1277,6 +1377,8 @@ impl SessionWindow {
     ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
         self.remove_controls(cx);
         self.end_stream(window, cx);
+        // After `end_stream`'s disconnect, so nothing is sent from a closing window.
+        self.close_apps(cx);
         let sheet =
             super::native_window(window).filter(|native| print_dialog::sheet_attached(native));
         self.print_tick = None;
@@ -1736,6 +1838,9 @@ impl Render for SessionWindow {
             }))
             .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
                 this.toggle_files(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleApps, window, cx| {
+                this.toggle_apps(window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &DisconnectSession, window, cx| this.disconnect(window, cx)),

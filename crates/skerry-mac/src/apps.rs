@@ -155,10 +155,6 @@ pub struct PolicyChange {
 }
 
 impl Link {
-    pub fn policy(&self) -> Option<Policy> {
-        self.policy
-    }
-
     pub fn connected(&self) -> bool {
         self.policy.is_some()
     }
@@ -401,10 +397,6 @@ impl Board {
             .or_else(|| self.jobs.iter().rev().find(|job| job.app == app))
     }
 
-    pub fn pending_count(&self) -> usize {
-        self.jobs.iter().filter(|job| job.pending()).count()
-    }
-
     /// The highest job id known, for telling a new job from a stale one.
     pub fn max_id(&self) -> u64 {
         self.jobs.iter().map(|job| job.id).max().unwrap_or(0)
@@ -478,12 +470,6 @@ pub fn parse_action(action: &str) -> Option<Event> {
         "command_error" => Some(Event::CommandError(rest.to_owned())),
         _ => None,
     }
-}
-
-/// Whether a `system,` action is one of the Apps window's.
-pub fn is_apps_action(action: &str) -> bool {
-    let kind = action.split_once(',').map_or(action, |(kind, _)| kind);
-    matches!(kind, "apps_state" | "apps_job" | "command_error")
 }
 
 /// The job's status line (design §7.2); `canceling` once Cancel was pressed on a pending job.
@@ -1035,7 +1021,7 @@ pub fn decode_svg(bytes: &[u8]) -> Option<IconPixels> {
         &mut pixmap.as_mut(),
     );
     let mut bgra = pixmap.take();
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         // Premultiplied RGBA to straight BGRA, as gpui's `swap_rgba_pa_to_bgra`.
         pixel.swap(0, 2);
         let alpha = pixel[3];
@@ -1064,10 +1050,6 @@ pub struct IconQueue {
 }
 
 impl IconQueue {
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     /// Asks for `icon`; `false` when it was already asked for in this generation.
     pub fn want(&mut self, icon: &str) -> bool {
         if !self.seen.insert(icon.to_owned()) {
@@ -1342,7 +1324,7 @@ mod tests {
         board.apply_job(&json!({"id": 2, "state": "canceled"}));
         assert_eq!(board.job_for_app("a").map(|j| j.id), Some(3));
         assert!(board.job_for_app("b").is_none());
-        assert_eq!(board.pending_count(), 0);
+        assert!(board.jobs.iter().all(|job| !job.pending()));
     }
 
     #[test]
@@ -1418,7 +1400,6 @@ mod tests {
         assert_eq!(parse_action("apps_job,[1]"), None);
         assert_eq!(parse_action("apps_other,{}"), None);
         assert_eq!(parse_action("apps_state"), None);
-        assert!(is_apps_action("command_error,x") && !is_apps_action("rumble,1"));
     }
 
     #[test]
@@ -1644,7 +1625,7 @@ include:
     fn the_live_catalog_parses() {
         // The real proot-apps `metadata.yml`, fetched 2026-11-22.
         let text = include_str!("../tests/fixtures/proot-apps-metadata.yml");
-        let apps = parse_catalog(&text).unwrap();
+        let apps = parse_catalog(text).unwrap();
         assert_eq!(apps.len(), 161, "168 entries, 7 disabled");
         assert_eq!(categories(&apps).len(), 11);
     }

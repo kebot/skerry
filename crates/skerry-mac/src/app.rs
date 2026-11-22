@@ -1,4 +1,5 @@
 mod account;
+mod apps_window;
 mod controls;
 mod display;
 mod files_model;
@@ -198,6 +199,7 @@ pub fn run() {
                 items: vec![
                     MenuItem::action("Session Controls", ToggleSessionControls),
                     MenuItem::action("Files", ToggleFiles),
+                    MenuItem::action("Apps", ToggleApps),
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
                     // No checkmark: menus are set once, and the strip is per window.
                     MenuItem::action("Toggle Stats Over Stream", ToggleStatsStrip),
@@ -272,6 +274,9 @@ actions!(
         CloseSessionControls,
         ToggleFullScreen,
         ToggleFiles,
+        /// Opens the session's Apps window or brings it forward; never closes it
+        /// (`ARCH-035`). No key chord: installing apps is occasional.
+        ToggleApps,
         OpenFile,
         OpenLocation,
         ToggleStatsStrip,
@@ -286,6 +291,7 @@ actions!(
 pub(crate) fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = global_bindings();
     bindings.extend(files_window::key_bindings());
+    bindings.extend(apps_window::key_bindings());
     bindings.extend(library_key_bindings());
     bindings.extend(crate::shortcuts::suppress_bindings());
     bindings
@@ -3774,6 +3780,24 @@ mod tests {
             }
         });
         keys
+    }
+
+    #[test]
+    fn apps_has_no_global_chord() {
+        // Apps is occasional: no binding outside the Apps window opens it, and every Apps
+        // window key stays in that window (`ARCH-035`), so `CHORDS` is unchanged.
+        for binding in key_bindings() {
+            let context = binding.predicate().map(|p| p.to_string());
+            if binding.action().name() == "sealskin::ToggleApps" {
+                panic!("ToggleApps is bound under {context:?}");
+            }
+            if binding.action().name().starts_with("apps_window::") {
+                assert!(
+                    matches!(context.as_deref(), Some("AppsWindow" | "AppsGrid")),
+                    "{context:?}"
+                );
+            }
+        }
     }
 
     #[test]
