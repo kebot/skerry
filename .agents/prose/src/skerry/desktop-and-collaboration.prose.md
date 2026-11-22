@@ -12,8 +12,6 @@ id: 067NC4KG01SKERRY0000000004
 <!-- compose:unresolved id=ARCH-GAP-DC-05 concept="microphone-and-webcam" question="Negotiate audio/video uplink formats, request macOS capture permissions on demand, show active capture indicators, and stop capture on disconnect." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-07 concept="session-sharing-and-rooms" question="Support Selkies view-only and player-slot roles and evaluate SealSkin collaboration rooms (room API, token handoff, control transfer)." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-08 concept="multitouch-trackpad" question="Keep raw multitouch contact forwarding deferred until gesture-to-display latency in Chrome matches native macOS pinch/pan and contact release on focus loss is proven." -->
-<!-- compose:unresolved id=ARCH-GAP-DC-11 concept="apps-catalog" question="Bring the web's Apps panel (proot-apps catalog with install/remove/update/launch and job consoles, gated by command_enabled) into Session Controls (ARCH-020)?" -->
-<!-- compose:unresolved id=ARCH-GAP-DC-13 concept="pelorus" question="Should Skerry surface the server's Pelorus text description of the desktop (/pelorus/api), as the web's Pelorus panel does (ARCH-020)?" -->
 
 ### Goal
 
@@ -62,7 +60,12 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
     - **Open Print Dialog Automatically** (per server) opens only while the window is key, and after a reconnect only the newest job under 5 minutes old.
     - The cache is cleaned on remove, on close, on quit, and after 24 h. `printing_enabled` hides it all.
   - Remote PDF print job queue (`ARCH-GAP-DC-04`), relative mouse capture and gamepad slots/rumble (`ARCH-GAP-DC-06`), and view-only / player-slot / SealSkin collaboration rooms (`ARCH-GAP-DC-07`).
-- `web-sidebar-panels` (Shortcuts settled in `ARCH-031`; Apps and Pelorus open in `ARCH-GAP-DC-11`, `ARCH-GAP-DC-13`): the web sidebar's Apps, Shortcuts, and Pelorus panels. `ARCH-020` maps every web panel to its owner.
+- `web-sidebar-panels` (Shortcuts settled in `ARCH-031`, Apps in `ARCH-035`; Pelorus excluded in `ARCH-035`): the web sidebar's Apps, Shortcuts, and Pelorus panels. `ARCH-020` maps every web panel to its owner.
+  - Apps (settled: `ARCH-035`):
+    - A per-session **Apps** window drives `apps,{op}` (install, remove, update, open, cancel) with a live job console. It is shown only when `command_enabled` is on and the server answers `list` within 5 s.
+    - The catalog comes from GitHub with no credentials, or from the session's local repository.
+    - Icons are checked and then rasterised in a sandboxed `--skerry-svg-worker` child process.
+    - Pelorus is not surfaced.
   - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
   - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
 

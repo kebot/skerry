@@ -52,7 +52,7 @@ Immaterial: build timestamps, local target cache state, and formatting-only edit
 
 Postconditions:
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` pass.
-- No embedded browser is used; Skerry talks directly to SealSkin and Selkies.
+- No embedded browser is used; Skerry talks directly to SealSkin and Selkies. The one exception is the Apps catalog fetch from the Selkies web client's GitHub raw URL, which uses a separate client with no credentials, is size-capped, and is HTTPS only (`ARCH-035`).
 - Session URLs and application keys are never written to preferences files; environment/`.env` keys are never persisted to `~/.config/skerry/config.toml`, and Skerry never reads or writes the macOS Keychain (`ARCH-011`).
 
 ### Continuity
