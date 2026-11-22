@@ -1287,31 +1287,156 @@ fn svg_tree_ok(tree: &resvg::usvg::Tree) -> bool {
     })
 }
 
+/// The parsing options for an icon's text, or `None` when its DTD could define entities: an
+/// `<!ENTITY` anywhere, or a DOCTYPE with an internal subset (`[`), is refused, since entities
+/// expand without bound before any other check runs. An external-only DOCTYPE (`<!DOCTYPE svg
+/// PUBLIC "…" "…dtd">`) is harmless: nothing external is ever resolved.
+fn svg_parsing<'a>(text: &'a str) -> Option<resvg::usvg::roxmltree::ParsingOptions<'a>> {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("<!entity") {
+        return None;
+    }
+    let doctype = match lower.find("<!doctype") {
+        Some(at) => {
+            let declaration = &lower[at..];
+            let end = declaration.find('>')?;
+            if declaration[..end].contains('[') {
+                return None;
+            }
+            true
+        }
+        None => false,
+    };
+    Some(resvg::usvg::roxmltree::ParsingOptions {
+        allow_dtd: doctype,
+        nodes_limit: SVG_MAX_NODES,
+        entity_resolver: None,
+    })
+}
+
+/// CSS declarations with every `filter` property dropped (a rule body or a `style` value).
+fn css_without_filter(declarations: &str) -> String {
+    declarations
+        .split(';')
+        .filter(|declaration| {
+            declaration
+                .split_once(':')
+                .is_none_or(|(property, _)| !property.trim().eq_ignore_ascii_case("filter"))
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// A stylesheet with every `filter` property dropped from its rule bodies.
+fn stylesheet_without_filter(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..=open]);
+        rest = &rest[open + 1..];
+        let close = rest.find('}').unwrap_or(rest.len());
+        out.push_str(&css_without_filter(&rest[..close]));
+        rest = &rest[close..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// The icon's text with every `<filter>` element, `filter=` attribute and `filter` style
+/// property removed, so resvg never runs a filter chain; `Some(None)` when there was none,
+/// `None` when the text can't be rewritten safely.
+fn without_filters(text: &str, doc: &resvg::usvg::roxmltree::Document) -> Option<Option<String>> {
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for node in doc.descendants().filter(|n| n.is_element()) {
+        match node.tag_name().name() {
+            "filter" => {
+                edits.push((node.range(), String::new()));
+                continue;
+            }
+            "style" => {
+                let css: String = node.descendants().filter_map(|n| n.text()).collect();
+                if css.to_ascii_lowercase().contains("filter") {
+                    let cleaned = stylesheet_without_filter(&css);
+                    if cleaned.contains("]]>") {
+                        return None;
+                    }
+                    edits.push((
+                        node.range(),
+                        format!("<style><![CDATA[{cleaned}]]></style>"),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        for attribute in node.attributes() {
+            if attribute.name() == "filter" {
+                edits.push((attribute.range(), String::new()));
+            } else if attribute.name() == "style"
+                && attribute.value().to_ascii_lowercase().contains("filter")
+            {
+                edits.push((
+                    attribute.range_value(),
+                    xml_escape(&css_without_filter(attribute.value())),
+                ));
+            }
+        }
+    }
+    if edits.is_empty() {
+        return Some(None);
+    }
+    // Document order; anything inside an edit already made (a filter's own content) goes.
+    edits.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (range, replacement) in edits {
+        if range.start < at {
+            continue;
+        }
+        out.push_str(text.get(at..range.start)?);
+        out.push_str(&replacement);
+        at = range.end;
+    }
+    out.push_str(text.get(at..)?);
+    Some(Some(out))
+}
+
 /// Rasterizes an SVG icon into a box [`ICON_EDGE`] pixels on the long edge, with no external
 /// resources ([`svg_options`]), after [`svg_cost_ok`], [`svg_elements_ok`] and [`svg_tree_ok`]. Gzip (SVGZ) and any
 /// DTD are refused: their expansion would escape the byte cap.
 pub fn decode_svg(bytes: &[u8]) -> Option<IconPixels> {
-    use resvg::tiny_skia::{Pixmap, Transform};
     use resvg::usvg::roxmltree;
     if bytes.len() > ICON_CAP || bytes.starts_with(&[0x1f, 0x8b]) {
         return None;
     }
     let text = std::str::from_utf8(bytes).ok()?;
-    // No DTD at all: entities expand without bound before any other check runs.
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("<!doctype") || lower.contains("<!entity") {
-        return None;
-    }
-    let parsing = roxmltree::ParsingOptions {
-        allow_dtd: false,
-        nodes_limit: SVG_MAX_NODES,
-        entity_resolver: None,
+    let stripped = {
+        let doc = roxmltree::Document::parse_with_options(text, svg_parsing(text)?).ok()?;
+        if !svg_cost_ok(&doc) {
+            return None;
+        }
+        // Filters are removed, not refused: the icon renders without its drop shadow.
+        without_filters(text, &doc)?
     };
-    let doc = roxmltree::Document::parse_with_options(text, parsing).ok()?;
-    if !svg_cost_ok(&doc) || !svg_elements_ok(&doc) || !svg_nesting_ok(&doc) {
+    render_svg(stripped.as_deref().unwrap_or(text))
+}
+
+/// Checks and renders an icon's text that has no filters left.
+fn render_svg(text: &str) -> Option<IconPixels> {
+    use resvg::tiny_skia::{Pixmap, Transform};
+    use resvg::usvg::roxmltree;
+    let doc = roxmltree::Document::parse_with_options(text, svg_parsing(text)?).ok()?;
+    let doc = &doc;
+    if !svg_cost_ok(doc) || !svg_elements_ok(doc) || !svg_nesting_ok(doc) {
         return None;
     }
-    let tree = resvg::usvg::Tree::from_xmltree(&doc, &svg_options()).ok()?;
+    let tree = resvg::usvg::Tree::from_xmltree(doc, &svg_options()).ok()?;
     if !svg_tree_ok(&tree) {
         return None;
     }
@@ -2222,10 +2347,24 @@ include:
         let started = Instant::now();
         assert!(decode_svg(svg.as_bytes()).is_none());
         assert!(started.elapsed() < Duration::from_millis(50));
-        // Any DTD, even a harmless one, is refused, and so is a bare ENTITY.
-        let doctype = r#"<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
-        assert!(decode_svg(doctype.as_bytes()).is_none());
+        // A DOCTYPE with an internal subset is refused even without entities, and so is a bare
+        // ENTITY anywhere.
+        let subset = r#"<!DOCTYPE svg [ ]><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#;
+        assert!(decode_svg(subset.as_bytes()).is_none());
         assert!(decode_svg(b"<svg><!ENTITY a 'b'></svg>").is_none());
+    }
+
+    #[test]
+    fn an_external_only_doctype_is_allowed() {
+        // flameshot.svg and filezilla.svg carry exactly this; nothing external is resolved.
+        let doctype = r#"<?xml version="1.0"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>"#;
+        let icon = decode_svg(doctype.as_bytes()).unwrap();
+        assert!(icon.bgra.chunks(4).all(|p| p[3] == 255));
+        let system = r#"<!DOCTYPE svg SYSTEM "file:///etc/passwd"><svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"/>"#;
+        assert!(
+            decode_svg(system.as_bytes()).is_some(),
+            "the external ID is never read"
+        );
     }
 
     /// The nested paint-server bombs QA timed at seconds to hours (`J-QA-2`), plus markers and
@@ -2310,9 +2449,18 @@ include:
                 )
             })
             .collect();
-        refused_fast(&format!(
+        // A filter chain is removed, fast, and the rest still draws.
+        let chain = format!(
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><filter id="f">{blurs}</filter><rect width="9" height="9" filter="url(#f)"/></svg>"#
-        ));
+        );
+        let started = Instant::now();
+        let icon = decode_svg(chain.as_bytes()).expect("drawn without its filter");
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(icon.bgra.chunks(4).all(|p| p[3] == 255));
         refused_fast(
             r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><marker id="m"><rect width="1" height="1"/></marker><path d="M0 0L9 9" marker-mid="url(#m)"/></svg>"##,
         );
@@ -2327,9 +2475,37 @@ include:
         if let Ok(dir) = std::env::var("SKERRY_SVG_CASES") {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
-                refused_fast(&std::fs::read_to_string(&path).unwrap());
+                let svg = std::fs::read_to_string(&path).unwrap();
+                if path.to_string_lossy().contains("blur") {
+                    // Filter chains: stripped, not refused, and just as fast.
+                    let started = Instant::now();
+                    assert!(decode_svg(svg.as_bytes()).is_some(), "{path:?}");
+                    assert!(started.elapsed() < Duration::from_millis(50), "{path:?}");
+                } else {
+                    refused_fast(&svg);
+                }
             }
         }
+    }
+
+    #[test]
+    fn filters_are_removed_from_attributes_styles_and_stylesheets() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><defs><filter id="s"><feGaussianBlur stdDeviation="9"/></filter></defs><style>.a{fill:#00f;filter:url(#s)}rect{filter : url(#s)}</style><rect class="a" width="8" height="4" filter="url(#s)"/><rect y="4" width="8" height="4" fill="#00f" style="filter:url(#s);opacity:1"/></svg>"##;
+        let doc = resvg::usvg::roxmltree::Document::parse(svg).unwrap();
+        let stripped = without_filters(svg, &doc).unwrap().unwrap();
+        assert!(!stripped.contains("filter"), "{stripped}");
+        let icon = decode_svg(svg.as_bytes()).unwrap();
+        assert!(
+            icon.bgra.chunks(4).all(|p| p == [255, 0, 0, 255]),
+            "solid, unblurred blue"
+        );
+        let plain = r#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"/>"#;
+        let doc = resvg::usvg::roxmltree::Document::parse(plain).unwrap();
+        assert_eq!(
+            without_filters(plain, &doc),
+            Some(None),
+            "nothing to rewrite"
+        );
     }
 
     #[test]
@@ -2351,11 +2527,7 @@ include:
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|e| e == "svg") {
                 let bytes = std::fs::read(&path).unwrap();
-                // Filters and DTDs are refused on purpose (drop shadows fall back to the
-                // initial); anything else refused is a false positive.
-                let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                let expected = text.contains("<filter") || text.contains("<!doctype");
-                if fetch_ok(&bytes) && !expected && decode_icon(&bytes, true).is_none() {
+                if fetch_ok(&bytes) && decode_icon(&bytes, true).is_none() {
                     refused.push(path.display().to_string());
                 }
             }
