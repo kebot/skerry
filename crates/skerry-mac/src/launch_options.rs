@@ -278,7 +278,7 @@ const LOCALES: &[&str] = &[
 const AUTO: &str = "auto";
 const CLEANROOM: &str = "cleanroom";
 /// A home every user has, which holds shared files and is never offered.
-const SHARED_FILES_HOME: &str = "_sealskin_shared_files";
+use crate::sealskin::SHARED_FILES_HOME;
 
 /// What the server lets this user launch with, read once per Library load.
 #[derive(Clone, Debug, Default)]

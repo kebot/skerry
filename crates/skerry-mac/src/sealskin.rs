@@ -510,16 +510,130 @@ struct HomeDirectories {
 /// Pages of a storage listing to read at most (200 names each).
 const STORAGE_LIST_MAX_PAGES: u32 = 50;
 
-#[derive(Deserialize)]
-struct StorageItem {
-    name: String,
+/// One entry of a folder in persistent storage (`GET /companion/api/files/list/<home>`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct StorageEntry {
+    pub name: String,
+    /// Home-rooted (`/Desktop/x`). Never used for a local path (`ARCH-037`).
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+    /// `st_size`: a folder reads its block size, never shown.
+    #[serde(default)]
+    pub size: u64,
+    /// Unix epoch seconds.
+    #[serde(default)]
+    pub mtime: f64,
 }
 
 #[derive(Deserialize)]
-struct StorageListing {
-    items: Vec<StorageItem>,
+struct StoragePage {
+    items: Vec<StorageEntry>,
     #[serde(default)]
     total: u64,
+}
+
+/// A folder of persistent storage, every page of it up to [`STORAGE_LIST_MAX_PAGES`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StorageListing {
+    pub entries: Vec<StorageEntry>,
+    /// More items exist past the cap.
+    pub truncated: bool,
+}
+
+/// The home every user has beside their homes: Shared Files, mounted read-write into every
+/// session with storage at `/config/Desktop/files` (`ARCH-037`). Never deleted, never
+/// offered as a launch home.
+pub const SHARED_FILES_HOME: &str = "_sealskin_shared_files";
+
+/// Persistent storage moves in 2 MiB chunks both ways, as SealSkin's web file manager does.
+pub const STORAGE_CHUNK: usize = 2 << 20;
+
+/// A folder created in storage, or one that was there already.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Created {
+    New,
+    Existed,
+}
+
+/// Why a home couldn't be created or deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeError {
+    /// 409 "already exists".
+    Exists,
+    /// The server refused the name, with its sentence.
+    Invalid(String),
+    /// 404 on delete: someone deleted it already.
+    Gone,
+    /// Shared Files or Cleanroom: never sent (`ARCH-037`).
+    Reserved,
+    Api(ApiError),
+}
+
+impl std::fmt::Display for HomeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exists => f.write_str("A home with that name already exists."),
+            Self::Invalid(detail) => f.write_str(detail),
+            Self::Gone => f.write_str("That home was already deleted."),
+            Self::Reserved => f.write_str("That home can’t be deleted."),
+            Self::Api(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// Why a storage transfer stopped.
+#[derive(Debug)]
+pub enum StorageError {
+    /// The request didn't reach the server or its answer was lost: a retry may work.
+    Network(String),
+    /// SealSkin answered and refused (classified, `ARCH-029`).
+    Api(ApiError),
+    /// The Mac side: reading or writing a local file.
+    Local(io::Error),
+    /// The answer made no sense (bad base64, an oversized chunk, a size that changed).
+    Invalid(String),
+}
+
+impl StorageError {
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Api(error) if error.is_refusal())
+    }
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(message) | Self::Invalid(message) => f.write_str(message),
+            Self::Api(error) => write!(f, "{error}"),
+            Self::Local(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<io::Error> for StorageError {
+    fn from(error: io::Error) -> Self {
+        Self::Local(error)
+    }
+}
+
+#[derive(Deserialize)]
+struct DownloadChunk {
+    chunk_data_b64: String,
+    #[serde(default)]
+    is_last_chunk: bool,
+}
+
+/// Whether a home name is one Skerry must never delete: Shared Files (every session's
+/// `Desktop/files`) and Cleanroom, in any case (`ARCH-037`).
+pub fn undeletable_home(name: &str) -> bool {
+    name == SHARED_FILES_HOME || name.eq_ignore_ascii_case("cleanroom")
+}
+
+/// A server name for one path segment (a file or folder name inside a folder).
+fn valid_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 #[derive(Deserialize)]
@@ -696,6 +810,8 @@ pub enum LaunchRoute<'a> {
     Url(&'a str),
     /// `/launch/file`, after [`SealSkinClient::upload_for_launch`].
     File(&'a Uploaded),
+    /// `/launch/file_path`: a top-level file of Shared Files, by its name (`ARCH-037`).
+    FilePath(&'a str),
 }
 
 /// A finished chunked upload, ready for `/launch/file`. The server deletes it once a launch
@@ -1074,10 +1190,57 @@ impl SealSkinClient {
         key_id_of(&self.raw_key)
     }
 
-    async fn home_directories(&self) -> Result<Vec<String>, ApiError> {
+    /// Every directory in the user's storage, Shared Files and app homes included
+    /// (`GET /companion/api/homedirs`).
+    pub async fn home_directories(&self) -> Result<Vec<String>, ApiError> {
         let homes: HomeDirectories =
             send(self.request(Method::GET, "/companion/api/homedirs")).await?;
         Ok(homes.home_dirs)
+    }
+
+    /// Creates the home `name` (`POST /companion/api/homedirs`). Unlike the launch's Auto
+    /// step, a 409 is an error here: "already exists", or pydantic's validation sentence,
+    /// which SealSkin 0.5 also answers with 409 (`ARCH-037`).
+    pub async fn create_home(&self, name: &str) -> Result<(), HomeError> {
+        if !valid_path_segment(name) || undeletable_home(name) {
+            return Err(HomeError::Invalid("Letters, numbers, - and _ only.".into()));
+        }
+        match send_with_detail::<serde_json::Value>(
+            self.request(Method::POST, "/companion/api/homedirs")
+                .json(&json!({ "home_name": name })),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(refusal) => Err(refusal.home_error()),
+        }
+    }
+
+    /// Deletes the home `name` (`DELETE /companion/api/homedirs/<name>`). The server would
+    /// delete Shared Files too, so Shared Files and Cleanroom are refused here, before any
+    /// request (`ARCH-037`). The caller checks running sessions first: the server doesn't.
+    pub async fn delete_home(&self, name: &str) -> Result<(), HomeError> {
+        if undeletable_home(name) {
+            return Err(HomeError::Reserved);
+        }
+        if !valid_path_segment(name) {
+            return Err(HomeError::Invalid("Invalid home name.".into()));
+        }
+        let path = format!("/companion/api/homedirs/{name}");
+        let response = self
+            .request(Method::DELETE, &path)
+            .send()
+            .await
+            .map_err(|_| {
+                HomeError::Api(ApiError::Message(
+                    "Couldn’t reach the SealSkin server to delete the home.".into(),
+                ))
+            })?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            StatusCode::NOT_FOUND => Err(HomeError::Gone),
+            _ => Err(HomeError::Api(classify_response(response).await)),
+        }
     }
 
     async fn create_home_directory(&self, home_name: &str) -> Result<(), ApiError> {
@@ -1157,6 +1320,30 @@ impl SealSkinClient {
                 body["open_file_on_launch"] = json!(true);
                 "/companion/api/launch/file"
             }
+            LaunchRoute::FilePath(filename) => {
+                // The server opens the basename inside Shared Files and refuses Cleanroom;
+                // neither is ever sent (`ARCH-037`).
+                if !valid_name(filename) {
+                    return Err(LaunchError::Server(
+                        "Only files at the top of Shared Files can be opened this way.".into(),
+                    ));
+                }
+                if params
+                    .home_name
+                    .as_deref()
+                    .is_none_or(|home| home.eq_ignore_ascii_case("cleanroom"))
+                {
+                    return Err(LaunchError::Server(
+                        "Choose a home: Cleanroom sessions can’t open Shared Files.".into(),
+                    ));
+                }
+                body["filename"] = json!(filename);
+                // `LaunchRequestFilePath` has no room flag.
+                if let Some(map) = body.as_object_mut() {
+                    map.remove("launch_in_room_mode");
+                }
+                "/companion/api/launch/file_path"
+            }
         };
         let mut request = self
             .request(Method::POST, path)
@@ -1185,7 +1372,6 @@ impl SealSkinClient {
         path: &Path,
         sent: &AtomicU64,
     ) -> Result<Uploaded, UploadError> {
-        use tokio::io::AsyncReadExt as _;
         let filename = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -1195,12 +1381,57 @@ impl SealSkinClient {
         let mut file = tokio::fs::File::open(path).await.map_err(unreadable)?;
         // The size of the file this handle reads, not of whatever the path names later.
         let total = file.metadata().await.map_err(unreadable)?.len();
-        let initiated: Initiated = send_with_detail(
-            self.request(Method::POST, "/companion/api/upload/initiate")
-                .json(&json!({ "filename": filename, "total_size": total })),
-        )
-        .await
-        .map_err(|refusal| refusal.upload_error(UploadStep::Initiate, &filename))?;
+        let (upload_id, total_chunks) = self
+            .upload_chunks(
+                &mut file,
+                &filename,
+                total,
+                LAUNCH_UPLOAD_CHUNK,
+                false,
+                sent,
+            )
+            .await?;
+        Ok(Uploaded {
+            upload_id,
+            total_chunks,
+            filename,
+        })
+    }
+
+    /// SealSkin's chunked upload of the open `file` (`total` bytes): `upload/initiate`, then
+    /// `upload/chunk` in `chunk`-byte pieces, one at a time, streamed from disk. A file that
+    /// changes size is refused. With `retry` (storage), `initiate` carries a fresh
+    /// `X-Idempotency-Key` and is resent once after a lost answer, and a chunk is resent
+    /// twice after a network error or a gateway's 502/503/504, never after a 4xx (resending
+    /// an index overwrites it). Returns the upload id and the number of chunks.
+    async fn upload_chunks(
+        &self,
+        file: &mut tokio::fs::File,
+        filename: &str,
+        total: u64,
+        chunk: usize,
+        retry: bool,
+        sent: &AtomicU64,
+    ) -> Result<(String, u64), UploadError> {
+        use tokio::io::AsyncReadExt as _;
+        let unreadable = |error: io::Error| format!("Couldn’t read “{filename}”: {error}");
+        let initiate_key = uuid::Uuid::new_v4().to_string();
+        let mut attempt = 0;
+        let initiated: Initiated = loop {
+            let mut request = self
+                .request(Method::POST, "/companion/api/upload/initiate")
+                .json(&json!({ "filename": filename, "total_size": total }));
+            if retry {
+                request = request.header("X-Idempotency-Key", &initiate_key);
+            }
+            match send_with_detail(request).await {
+                Ok(initiated) => break initiated,
+                Err(refusal) if retry && attempt == 0 && refusal.status.is_none() => attempt += 1,
+                Err(refusal) => {
+                    return Err(refusal.upload_error_in(UploadStep::Initiate, filename, retry))
+                }
+            }
+        };
         let upload_id = initiated.upload_id;
         if !valid_upload_id(&upload_id) {
             return Err(UploadError::Failed(
@@ -1208,11 +1439,11 @@ impl SealSkinClient {
             ));
         }
         let changed = || format!("“{filename}” changed while it was uploading.");
-        let mut buffer = vec![0u8; LAUNCH_UPLOAD_CHUNK];
+        let mut buffer = vec![0u8; chunk];
         let mut done: u64 = 0;
         let mut index: u64 = 0;
         while done < total {
-            let want = (total - done).min(LAUNCH_UPLOAD_CHUNK as u64) as usize;
+            let want = (total - done).min(chunk as u64) as usize;
             let mut filled = 0;
             while filled < want {
                 let read = file
@@ -1225,17 +1456,31 @@ impl SealSkinClient {
                 filled += read;
             }
             let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer[..filled]);
-            let _: serde_json::Value = send_with_detail(
-                self.request(Method::POST, "/companion/api/upload/chunk")
-                    .timeout(UPLOAD_CHUNK_TIMEOUT)
-                    .json(&json!({
-                        "upload_id": upload_id,
-                        "chunk_index": index,
-                        "chunk_data_b64": encoded,
-                    })),
-            )
-            .await
-            .map_err(|refusal| refusal.upload_error(UploadStep::Chunk, &filename))?;
+            let body = json!({
+                "upload_id": upload_id,
+                "chunk_index": index,
+                "chunk_data_b64": encoded,
+            });
+            drop(encoded);
+            let mut attempt = 0;
+            loop {
+                let result = send_with_detail::<serde_json::Value>(
+                    self.request(Method::POST, "/companion/api/upload/chunk")
+                        .timeout(UPLOAD_CHUNK_TIMEOUT)
+                        .json(&body),
+                )
+                .await;
+                match result {
+                    Ok(_) => break,
+                    Err(refusal) if retry && attempt < 2 && refusal.transient() => {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(refusal) => {
+                        return Err(refusal.upload_error_in(UploadStep::Chunk, filename, retry));
+                    }
+                }
+            }
             done += filled as u64;
             index += 1;
             sent.store(done, Ordering::Relaxed);
@@ -1244,11 +1489,7 @@ impl SealSkinClient {
         if file.read(&mut buffer[..1]).await.map_err(unreadable)? != 0 {
             return Err(changed().into());
         }
-        Ok(Uploaded {
-            upload_id,
-            total_chunks: index,
-            filename,
-        })
+        Ok((upload_id, index))
     }
 
     /// Hands `url` to a running session (`POST /companion/api/sessions/<id>/open_url`).
@@ -1335,27 +1576,261 @@ impl SealSkinClient {
     /// The names in one folder of a home's persistent storage, every page of it
     /// (`GET /companion/api/files/list/<home>`, `ARCH-024`).
     pub async fn storage_names(&self, home: &str, path: &str) -> Result<Vec<String>, ApiError> {
+        let listing = self.list_storage(home, path).await?;
+        // A partial list must never feed `same_folder` (`ARCH-024`).
+        if listing.truncated {
+            return Err(ApiError::Message(
+                "The folder holds too many items to compare.".into(),
+            ));
+        }
+        Ok(listing
+            .entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect())
+    }
+
+    /// One folder of a home's persistent storage, every page of it up to 10,000 items
+    /// (`GET /companion/api/files/list/<home>?path=&page=&per_page=200`). `path` is
+    /// home-rooted (`/`, `/Desktop`). Names repeated across pages (the folder changed while
+    /// it was read) are kept once.
+    pub async fn list_storage(&self, home: &str, path: &str) -> Result<StorageListing, ApiError> {
         if !valid_path_segment(home) {
             return Err(ApiError::Message("Invalid home name.".into()));
         }
         let route = format!("/companion/api/files/list/{home}");
-        let mut names = Vec::new();
+        let mut entries: Vec<StorageEntry> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut read = 0u64;
         for page in 1..=STORAGE_LIST_MAX_PAGES {
-            let listing: StorageListing = send(self.request(Method::GET, &route).query(&[
+            let listing: StoragePage = send(self.request(Method::GET, &route).query(&[
                 ("path", path),
                 ("page", &page.to_string()),
                 ("per_page", "200"),
             ]))
             .await?;
             let count = listing.items.len();
-            names.extend(listing.items.into_iter().map(|item| item.name));
-            if count == 0 || names.len() as u64 >= listing.total {
-                return Ok(names);
+            read += count as u64;
+            for item in listing.items {
+                if seen.insert(item.name.clone()) {
+                    entries.push(item);
+                }
+            }
+            if count == 0 || read >= listing.total {
+                return Ok(StorageListing {
+                    entries,
+                    truncated: false,
+                });
             }
         }
-        Err(ApiError::Message(
-            "The folder holds too many items to compare.".into(),
-        ))
+        Ok(StorageListing {
+            entries,
+            truncated: true,
+        })
+    }
+
+    /// Makes the folder `name` in `parent` (home-rooted) of `home`. A 409 is "exists" only
+    /// when a fresh listing shows a folder of that name; a file there is an error
+    /// (`ARCH-037`).
+    pub async fn create_storage_folder(
+        &self,
+        home: &str,
+        parent: &str,
+        name: &str,
+    ) -> Result<Created, ApiError> {
+        if !valid_path_segment(home) {
+            return Err(ApiError::Message("Invalid home name.".into()));
+        }
+        if !valid_name(name) {
+            return Err(ApiError::Message(
+                "A folder name can’t be empty or contain “/”.".into(),
+            ));
+        }
+        let route = format!("/companion/api/files/create_folder/{home}");
+        match send_with_detail::<serde_json::Value>(
+            self.request(Method::POST, &route)
+                .json(&json!({ "path": parent, "folder_name": name })),
+        )
+        .await
+        {
+            Ok(_) => Ok(Created::New),
+            Err(refusal) if refusal.status == Some(StatusCode::CONFLICT) => {
+                let listing = self.list_storage(home, parent).await?;
+                match listing.entries.iter().find(|entry| entry.name == name) {
+                    Some(entry) if entry.is_dir => Ok(Created::Existed),
+                    Some(_) => Err(ApiError::Message(format!(
+                        "A file named “{name}” is in the way."
+                    ))),
+                    None => Err(ApiError::Message(refusal.message())),
+                }
+            }
+            Err(refusal) => Err(refusal.api_error()),
+        }
+    }
+
+    /// Uploads the local file `local` into the folder `dir` (home-rooted) of `home` as
+    /// `filename`: `upload/initiate`, 2 MiB chunks in order, then
+    /// `files/upload_to_dir/<home>`, which never overwrites (a taken name becomes
+    /// `name-1.ext`). At most one chunk is in memory. `sent` counts bytes sent.
+    pub async fn upload_to_storage(
+        &self,
+        home: &str,
+        dir: &str,
+        local: &Path,
+        filename: &str,
+        sent: &AtomicU64,
+    ) -> Result<(), UploadError> {
+        if !valid_path_segment(home) {
+            return Err(UploadError::Failed("Invalid home name.".into()));
+        }
+        if !valid_name(filename) {
+            return Err(UploadError::Failed(format!(
+                "“{filename}” can’t be stored on the server."
+            )));
+        }
+        let unreadable = |error: io::Error| format!("Couldn’t read “{filename}”: {error}");
+        // Opened and measured before `initiate`: a file that can't be read never takes one
+        // of the server's 16 upload slots.
+        let mut file = tokio::fs::File::open(local).await.map_err(unreadable)?;
+        let total = file.metadata().await.map_err(unreadable)?.len();
+        let (upload_id, chunks) = self
+            .upload_chunks(&mut file, filename, total, STORAGE_CHUNK, true, sent)
+            .await?;
+        let route = format!("/companion/api/files/upload_to_dir/{home}");
+        let body = json!({
+            "path": dir,
+            "filename": filename,
+            "upload_id": upload_id,
+            "total_chunks": chunks,
+        });
+        let mut attempt = 0;
+        loop {
+            // Keyed by the upload: a resend after a lost answer gets the first answer back
+            // instead of "Upload session not found" (`security.py` replays keyed POSTs).
+            let result = send_with_detail::<serde_json::Value>(
+                self.request(Method::POST, &route)
+                    .timeout(UPLOAD_CHUNK_TIMEOUT)
+                    .header("X-Idempotency-Key", &upload_id)
+                    .json(&body),
+            )
+            .await;
+            match result {
+                Ok(_) => return Ok(()),
+                Err(refusal) if refusal.status.is_none() && attempt == 0 => attempt += 1,
+                Err(refusal) if refusal.status == Some(StatusCode::NOT_FOUND) && attempt > 0 => {
+                    return Err(UploadError::Failed(
+                        "The upload may have finished; refresh to check.".into(),
+                    ))
+                }
+                Err(refusal) => {
+                    return Err(match refusal.key_refusal() {
+                        Some(error) => UploadError::Refused(error),
+                        None => UploadError::Failed(format!(
+                            "The upload stopped: {}",
+                            refusal.message()
+                        )),
+                    })
+                }
+            }
+        }
+    }
+
+    /// One 2 MiB chunk of a stored file (`GET /companion/api/files/download/chunk/<home>`),
+    /// decoded, and whether it is the last.
+    pub async fn download_storage_chunk(
+        &self,
+        home: &str,
+        path: &str,
+        index: u64,
+    ) -> Result<(Vec<u8>, bool), StorageError> {
+        if !valid_path_segment(home) {
+            return Err(StorageError::Invalid("Invalid home name.".into()));
+        }
+        let route = format!("/companion/api/files/download/chunk/{home}");
+        let chunk: DownloadChunk = send_with_detail(
+            self.request(Method::GET, &route)
+                .timeout(UPLOAD_CHUNK_TIMEOUT)
+                .query(&[("path", path), ("chunk_index", &index.to_string())]),
+        )
+        .await
+        .map_err(|refusal| match refusal.status {
+            None => StorageError::Network(refusal.message()),
+            Some(status) if matches!(status.as_u16(), 502..=504) => {
+                StorageError::Network(refusal.message())
+            }
+            Some(_) => StorageError::Api(refusal.api_error()),
+        })?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(chunk.chunk_data_b64.trim())
+            .map_err(|_| StorageError::Invalid("The server sent a damaged chunk.".into()))?;
+        Ok((bytes, chunk.is_last_chunk))
+    }
+
+    /// Downloads the stored file `path` of `home` to `destination` through its
+    /// `.skerrydownload` partial. A partial left by an earlier attempt is resumed at its
+    /// last whole chunk (SealSkin has no `Range`). `expected` is the listing's size: a file
+    /// that ends at another size changed while it downloaded and fails. `progress` counts
+    /// bytes written on top of what it held.
+    pub async fn download_storage(
+        &self,
+        home: &str,
+        path: &str,
+        destination: &Path,
+        expected: Option<u64>,
+        progress: &AtomicU64,
+    ) -> Result<(), StorageError> {
+        use tokio::io::{AsyncSeekExt as _, AsyncWriteExt as _};
+        let partial = crate::selkies::partial_path(destination);
+        // The earlier attempt flushed and closed the partial, so its length is settled.
+        let have = tokio::fs::metadata(&partial)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        let chunk = STORAGE_CHUNK as u64;
+        let start = have / chunk;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&partial)
+            .await?;
+        file.set_len(start * chunk).await?;
+        file.seek(std::io::SeekFrom::Start(start * chunk)).await?;
+        let base = progress.load(Ordering::Relaxed);
+        let mut written = start * chunk;
+        progress.store(base + written, Ordering::Relaxed);
+        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let streamed: Result<(), StorageError> = async {
+            let mut index = start;
+            loop {
+                let (bytes, last) = self.download_storage_chunk(home, path, index).await?;
+                if bytes.len() > STORAGE_CHUNK || (!last && bytes.len() < STORAGE_CHUNK) {
+                    return Err(StorageError::Invalid(format!(
+                        "The server sent a chunk of “{name}” of the wrong size."
+                    )));
+                }
+                file.write_all(&bytes).await?;
+                written += bytes.len() as u64;
+                progress.store(base + written, Ordering::Relaxed);
+                if last {
+                    return Ok(());
+                }
+                index += 1;
+            }
+        }
+        .await;
+        // Settled even when the connection dropped: a retry measures the partial.
+        file.flush().await?;
+        drop(file);
+        streamed?;
+        if expected.is_some_and(|size| size != written) {
+            let _ = tokio::fs::remove_file(&partial).await;
+            return Err(StorageError::Invalid(format!(
+                "“{name}” changed while downloading; try again."
+            )));
+        }
+        tokio::fs::rename(&partial, destination).await?;
+        Ok(())
     }
 
     /// Deletes `paths` (home-relative, `/`-rooted) from a home's persistent storage and waits
@@ -1694,16 +2169,67 @@ impl Refusal {
         Some(classify(status, self.detail.as_deref())).filter(ApiError::is_refusal)
     }
 
-    fn upload_error(&self, step: UploadStep, filename: &str) -> UploadError {
+    /// Lost on the way (no answer) or a gateway's 502/503/504: a resend may work.
+    fn transient(&self) -> bool {
+        match self.status {
+            None => true,
+            Some(status) => matches!(status.as_u16(), 502..=504),
+        }
+    }
+
+    /// Through [`classify`], as `send` reports failures; a lost request reads as one.
+    fn api_error(&self) -> ApiError {
+        match self.status {
+            None => ApiError::Message(self.message()),
+            Some(status) => match classify(status, self.detail.as_deref()) {
+                ApiError::Message(_) => ApiError::Message(self.message()),
+                error => error,
+            },
+        }
+    }
+
+    /// What a refused `POST /homedirs` means. SealSkin 0.5 answers 409 for a name that
+    /// exists and also for one pydantic refused, so only "already exists" is `Exists`.
+    fn home_error(&self) -> HomeError {
+        match (self.status, self.detail.as_deref()) {
+            (Some(StatusCode::CONFLICT), Some(detail))
+                if detail.to_lowercase().contains("already exists") =>
+            {
+                HomeError::Exists
+            }
+            (Some(StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY), detail) => {
+                HomeError::Invalid(
+                    detail
+                        .map(str::trim)
+                        .filter(|detail| !detail.is_empty() && detail.len() < 200)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "The server didn’t accept that name.".into()),
+                )
+            }
+            _ => HomeError::Api(self.api_error()),
+        }
+    }
+
+    /// `storage`: an upload into persistent storage, where a 403 at `initiate` is the
+    /// server's own sentence (quota, or storage turned off), shown as is (`ARCH-037`).
+    fn upload_error_in(&self, step: UploadStep, filename: &str, storage: bool) -> UploadError {
         match self.key_refusal() {
             Some(error) => UploadError::Refused(error),
-            None => UploadError::Failed(self.upload_message(step, filename)),
+            None => UploadError::Failed(self.upload_message(step, filename, storage)),
         }
     }
 
     /// What an upload refusal means, by route and status (`ARCH-028`).
-    fn upload_message(&self, step: UploadStep, filename: &str) -> String {
+    fn upload_message(&self, step: UploadStep, filename: &str, storage: bool) -> String {
+        let detail = self
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty());
         match (step, self.status.map(|status| status.as_u16())) {
+            (UploadStep::Initiate, Some(403)) if storage && detail.is_some() => {
+                detail.unwrap_or_default().to_string()
+            }
             (UploadStep::Initiate, Some(403)) => {
                 "Your SealSkin storage is full. Free space in Files, then try again.".into()
             }
@@ -1711,7 +2237,7 @@ impl Refusal {
                 format!("“{filename}” is larger than this account may store.")
             }
             (UploadStep::Initiate, Some(429)) => {
-                "Too many uploads are waiting on the server. Try again later.".into()
+                "Too many uploads are waiting on the server. Unfinished uploads clear after 24 hours.".into()
             }
             (UploadStep::Chunk, Some(413)) => {
                 format!("“{filename}” changed while it was uploading.")
@@ -2852,7 +3378,7 @@ mod tests {
             (
                 "initiate",
                 "429 Too Many Requests",
-                "Too many uploads are waiting on the server. Try again later.",
+                "Too many uploads are waiting on the server. Unfinished uploads clear after 24 hours.",
             ),
             (
                 "chunk",
@@ -3085,5 +3611,639 @@ mod tests {
         assert!(valid_upload_id(UPLOAD_ID));
         assert!(!valid_upload_id(&UPLOAD_ID.to_uppercase()));
         assert!(!valid_upload_id("../x"));
+    }
+
+    // ---- Persistent storage (`ARCH-037`) ------------------------------------------------
+
+    fn query_value(request: &Recorded, name: &str) -> Option<String> {
+        let target = request
+            .head
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .to_string();
+        let url = Url::parse(&format!("http://x{target}")).ok()?;
+        url.query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    }
+
+    const NO_CONTENT: &str =
+        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    #[tokio::test]
+    async fn storage_list_reads_every_page_and_keeps_epoch_times() {
+        let (base, seen) = serve(|request, _| {
+            let page = query_value(request, "page").unwrap();
+            let body = if page == "1" {
+                r#"{"items":[{"name":"Docs","path":"/Docs","is_dir":true,"size":4096,"mtime":1795341845.5},{"name":"a.txt","path":"/a.txt","is_dir":false,"size":3,"mtime":1.0}],"total":3}"#
+            } else {
+                r#"{"items":[{"name":"a.txt","path":"/a.txt","is_dir":false,"size":3,"mtime":1.0},{"name":"b.txt","path":"/b.txt","is_dir":false,"size":7,"mtime":2.0}],"total":3}"#
+            };
+            reply("200 OK", body)
+        })
+        .await;
+        let listing = test_client(base).list_storage("work", "/").await.unwrap();
+        assert!(!listing.truncated);
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["Docs", "a.txt", "b.txt"],
+            "a repeated name is kept once"
+        );
+        assert!(listing.entries[0].is_dir);
+        assert_eq!(listing.entries[0].mtime, 1_795_341_845.5);
+        let requests = requests_of(&seen);
+        assert!(
+            requests[0].is("get /companion/api/files/list/work?path=%2f&page=1&per_page=200"),
+            "{}",
+            requests[0].head
+        );
+        assert!(requests[0]
+            .head
+            .contains("authorization: bearer ssk_id_secret"));
+    }
+
+    #[tokio::test]
+    async fn storage_list_stops_at_ten_thousand_items() {
+        let (base, seen) = serve(|request, _| {
+            let page: u32 = query_value(request, "page").unwrap().parse().unwrap();
+            let items: Vec<String> = (0..200)
+                .map(|n| format!(r#"{{"name":"f{page}-{n}","is_dir":false,"size":1,"mtime":0}}"#))
+                .collect();
+            reply(
+                "200 OK",
+                &format!(r#"{{"items":[{}],"total":20000}}"#, items.join(",")),
+            )
+        })
+        .await;
+        let client = test_client(base);
+        let listing = client.list_storage("work", "/").await.unwrap();
+        assert!(listing.truncated);
+        assert_eq!(listing.entries.len(), 10_000);
+        assert_eq!(requests_of(&seen).len(), 50);
+        // `ARCH-024`'s comparison never sees a partial list.
+        assert!(client.storage_names("work", "/Desktop").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn storage_names_still_compares_the_desktop() {
+        let (base, seen) = serve(|_, _| {
+            reply(
+                "200 OK",
+                r#"{"items":[{"name":"a.txt"},{"name":"Work","is_dir":true}],"total":2}"#,
+            )
+        })
+        .await;
+        let names = test_client(base)
+            .storage_names("work", "/Desktop")
+            .await
+            .unwrap();
+        assert_eq!(names, ["a.txt", "Work"]);
+        assert!(requests_of(&seen)[0]
+            .is("get /companion/api/files/list/work?path=%2fdesktop&page=1&per_page=200"));
+    }
+
+    #[tokio::test]
+    async fn create_storage_folder_body_and_existing_folder() {
+        let (base, seen) = serve(|request, _| {
+            if request.is("post /companion/api/files/create_folder/work") {
+                match request.json()["folder_name"].as_str() {
+                    Some("New") => reply("201 Created", r#"{"status":"success"}"#),
+                    _ => reply("409 Conflict", r#"{"detail":"Folder already exists."}"#),
+                }
+            } else {
+                reply(
+                    "200 OK",
+                    r#"{"items":[{"name":"Old","is_dir":true},{"name":"note","is_dir":false}],"total":2}"#,
+                )
+            }
+        })
+        .await;
+        let client = test_client(base);
+        assert_eq!(
+            client.create_storage_folder("work", "/Docs", "New").await,
+            Ok(Created::New)
+        );
+        assert_eq!(
+            requests_of(&seen)[0].json(),
+            json!({"path": "/Docs", "folder_name": "New"})
+        );
+        assert_eq!(
+            client.create_storage_folder("work", "/Docs", "Old").await,
+            Ok(Created::Existed)
+        );
+        assert_eq!(
+            client
+                .create_storage_folder("work", "/Docs", "note")
+                .await
+                .unwrap_err()
+                .to_string(),
+            "A file named “note” is in the way."
+        );
+        assert!(client
+            .create_storage_folder("work", "/", "a/b")
+            .await
+            .is_err());
+    }
+
+    fn storage_upload_server(request: &Recorded) -> String {
+        if request.is("post /companion/api/files/upload_to_dir/work") {
+            reply("200 OK", r#"{"status":"success"}"#)
+        } else {
+            upload_server(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_upload_initiates_chunks_in_order_then_places_into_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local name.bin");
+        let bytes: Vec<u8> = (0..5_000_000u32).map(|n| (n % 253) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let (base, seen) = serve(|request, _| storage_upload_server(request)).await;
+        let sent = AtomicU64::new(0);
+        test_client(base)
+            .upload_to_storage("work", "/Docs", &path, "report.bin", &sent)
+            .await
+            .unwrap();
+        assert_eq!(sent.load(Ordering::Relaxed), 5_000_000);
+        let requests = requests_of(&seen);
+        assert_eq!(
+            requests[0].json(),
+            json!({"filename": "report.bin", "total_size": 5_000_000})
+        );
+        assert!(requests[0].head.contains("x-idempotency-key: "));
+        let mut joined = Vec::new();
+        for (index, chunk) in requests[1..4].iter().enumerate() {
+            assert!(chunk.is("post /companion/api/upload/chunk"));
+            let body = chunk.json();
+            assert_eq!(body["chunk_index"], json!(index));
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(body["chunk_data_b64"].as_str().unwrap())
+                .unwrap();
+            if index < 2 {
+                assert_eq!(data.len(), STORAGE_CHUNK);
+            }
+            joined.extend(data);
+        }
+        assert_eq!(joined, bytes);
+        assert!(requests[4].is("post /companion/api/files/upload_to_dir/work"));
+        assert_eq!(
+            requests[4].json(),
+            json!({"path": "/Docs", "filename": "report.bin", "upload_id": UPLOAD_ID, "total_chunks": 3})
+        );
+        assert_eq!(requests.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn storage_finalize_carries_the_upload_id_as_idempotency_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        // Every finalize answer is lost; the one resend is keyed by the upload.
+        let (base, seen) = serve(|request, _| {
+            if request.is("post /companion/api/files/upload_to_dir/work") {
+                String::new()
+            } else {
+                storage_upload_server(request)
+            }
+        })
+        .await;
+        let error = test_client(base)
+            .upload_to_storage("work", "/", &path, "a.txt", &AtomicU64::new(0))
+            .await
+            .unwrap_err();
+        let finals: Vec<_> = requests_of(&seen)
+            .into_iter()
+            .filter(|r| r.is("post /companion/api/files/upload_to_dir/work"))
+            .collect();
+        assert_eq!(finals.len(), 2, "resent once after a lost answer");
+        for request in &finals {
+            assert!(request
+                .head
+                .contains(&format!("x-idempotency-key: {UPLOAD_ID}")));
+        }
+        assert!(
+            error.to_string().starts_with("The upload stopped"),
+            "{error}"
+        );
+        // A 404 after the resend: the first attempt may have placed the file.
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&calls);
+        let (base, _) = serve(move |request, _| {
+            if request.is("post /companion/api/files/upload_to_dir/work") {
+                if counter.fetch_add(1, Ordering::Relaxed) == 0 {
+                    String::new()
+                } else {
+                    reply("404 Not Found", r#"{"detail":"Upload session not found."}"#)
+                }
+            } else {
+                storage_upload_server(request)
+            }
+        })
+        .await;
+        let error = test_client(base)
+            .upload_to_storage("work", "/", &path, "a.txt", &AtomicU64::new(0))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "The upload may have finished; refresh to check."
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_upload_retries_a_chunk_after_a_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, vec![9u8; 3_000_000]).unwrap();
+        let resets = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&resets);
+        let (base, seen) = serve(move |request, _| {
+            if request.is("post /companion/api/upload/chunk")
+                && request.json()["chunk_index"] == json!(1)
+                && counter.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                return String::new();
+            }
+            storage_upload_server(request)
+        })
+        .await;
+        test_client(base)
+            .upload_to_storage("work", "/", &path, "a.bin", &AtomicU64::new(0))
+            .await
+            .unwrap();
+        let indexes: Vec<_> = requests_of(&seen)
+            .iter()
+            .filter(|r| r.is("post /companion/api/upload/chunk"))
+            .map(|r| r.json()["chunk_index"].as_u64().unwrap())
+            .collect();
+        assert_eq!(indexes, [0, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn storage_upload_does_not_retry_a_4xx_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let (base, seen) = serve(|request, _| {
+            if request.is("post /companion/api/upload/chunk") {
+                reply("400 Bad Request", r#"{"detail":"Bad chunk."}"#)
+            } else {
+                storage_upload_server(request)
+            }
+        })
+        .await;
+        let error = test_client(base)
+            .upload_to_storage("work", "/", &path, "a.bin", &AtomicU64::new(0))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "The upload stopped: Bad chunk.");
+        let chunks = requests_of(&seen)
+            .iter()
+            .filter(|r| r.is("post /companion/api/upload/chunk"))
+            .count();
+        assert_eq!(chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn storage_upload_shows_the_quota_and_size_sentences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.iso");
+        std::fs::write(&path, b"abc").unwrap();
+        let cases = [
+            (
+                "403 Forbidden",
+                r#"{"detail":"Storage limit reached: 50 GB."}"#,
+                "Storage limit reached: 50 GB.",
+            ),
+            (
+                "413 Payload Too Large",
+                r#"{"detail":"x"}"#,
+                "“big.iso” is larger than this account may store.",
+            ),
+            (
+                "429 Too Many Requests",
+                r#"{"detail":"x"}"#,
+                "Too many uploads are waiting on the server. Unfinished uploads clear after 24 hours.",
+            ),
+        ];
+        for (status, body, expected) in cases {
+            let (base, seen) = serve(move |request, _| {
+                if request.is("post /companion/api/upload/initiate") {
+                    reply(status, body)
+                } else {
+                    storage_upload_server(request)
+                }
+            })
+            .await;
+            let error = test_client(base)
+                .upload_to_storage("work", "/", &path, "big.iso", &AtomicU64::new(0))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected, "{status}");
+            assert_eq!(requests_of(&seen).len(), 1, "{status}");
+        }
+        // A file that can't be read never takes an upload slot.
+        let (base, seen) = serve(|request, _| storage_upload_server(request)).await;
+        let missing = dir.path().join("missing");
+        assert!(test_client(base)
+            .upload_to_storage("work", "/", &missing, "m", &AtomicU64::new(0))
+            .await
+            .is_err());
+        assert!(requests_of(&seen).is_empty());
+    }
+
+    #[tokio::test]
+    async fn storage_upload_refuses_a_file_that_changes_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.log");
+        std::fs::write(&path, vec![7u8; 2_500_000]).unwrap();
+        let grow = path.clone();
+        let (base, seen) = serve(move |request, _| {
+            if request.is("post /companion/api/upload/chunk") {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&grow)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, &[1u8; 10]).unwrap();
+            }
+            storage_upload_server(request)
+        })
+        .await;
+        let error = test_client(base)
+            .upload_to_storage("work", "/", &path, "growing.log", &AtomicU64::new(0))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "“growing.log” changed while it was uploading."
+        );
+        assert!(!requests_of(&seen)
+            .iter()
+            .any(|r| r.is("post /companion/api/files/upload_to_dir/work")));
+    }
+
+    #[tokio::test]
+    async fn launch_upload_still_sends_one_mib_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, vec![1u8; 1_500_000]).unwrap();
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let uploaded = test_client(base)
+            .upload_for_launch(&path, &AtomicU64::new(0))
+            .await
+            .unwrap();
+        assert_eq!(uploaded.total_chunks, 2);
+        assert!(!requests_of(&seen)[0].head.contains("x-idempotency-key"));
+    }
+
+    type Indexes = Arc<std::sync::Mutex<Vec<u64>>>;
+
+    /// A stored file served in 2 MiB chunks, recording each chunk index asked for.
+    fn chunk_server(
+        data: Vec<u8>,
+        indexes: Indexes,
+    ) -> impl FnMut(&Recorded, usize) -> String + Send + 'static {
+        move |request, _| {
+            let index: u64 = query_value(request, "chunk_index")
+                .unwrap()
+                .parse()
+                .unwrap();
+            indexes.lock().unwrap().push(index);
+            let start = (index as usize * STORAGE_CHUNK).min(data.len());
+            let end = (start + STORAGE_CHUNK).min(data.len());
+            let chunk = &data[start..end];
+            reply(
+                "200 OK",
+                &json!({
+                    "chunk_data_b64": base64::engine::general_purpose::STANDARD.encode(chunk),
+                    "is_last_chunk": chunk.len() < STORAGE_CHUNK,
+                })
+                .to_string(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_download_resumes_at_a_chunk_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("a.bin");
+        let data: Vec<u8> = (0..5_000_000u32).map(|n| (n % 241) as u8).collect();
+        // An earlier attempt left 2 MiB plus a torn part of the next chunk.
+        let partial = crate::selkies::partial_path(&destination);
+        let mut torn = data[..STORAGE_CHUNK + 1000].to_vec();
+        torn[STORAGE_CHUNK + 10] ^= 0xff;
+        std::fs::write(&partial, &torn).unwrap();
+        let indexes = Indexes::default();
+        let (base, seen) = serve(chunk_server(data.clone(), Arc::clone(&indexes))).await;
+        let progress = AtomicU64::new(0);
+        test_client(base)
+            .download_storage("work", "/a.bin", &destination, Some(5_000_000), &progress)
+            .await
+            .unwrap();
+        assert_eq!(*indexes.lock().unwrap(), [1, 2]);
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+        assert!(!partial.exists());
+        assert_eq!(progress.load(Ordering::Relaxed), 5_000_000);
+        let request = &requests_of(&seen)[0];
+        assert!(
+            request.is("get /companion/api/files/download/chunk/work?path=%2fa.bin&chunk_index=1"),
+            "{}",
+            request.head
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_download_ends_on_a_short_or_empty_last_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        for size in [STORAGE_CHUNK * 2, 10, 0] {
+            let destination = dir.path().join(format!("f{size}"));
+            let data = vec![3u8; size];
+            let indexes = Indexes::default();
+            let (base, _) = serve(chunk_server(data.clone(), Arc::clone(&indexes))).await;
+            test_client(base)
+                .download_storage(
+                    "work",
+                    "/f",
+                    &destination,
+                    Some(size as u64),
+                    &AtomicU64::new(0),
+                )
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(&destination).unwrap(), data, "{size}");
+            assert_eq!(
+                indexes.lock().unwrap().len(),
+                size / STORAGE_CHUNK + 1,
+                "{size}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_download_refuses_bad_base64_and_short_middle_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("a");
+        for body in [
+            r#"{"chunk_data_b64":"%%%","is_last_chunk":true}"#,
+            r#"{"chunk_data_b64":"YWJj","is_last_chunk":false}"#,
+        ] {
+            let (base, _) = serve(move |_, _| reply("200 OK", body)).await;
+            let error = test_client(base)
+                .download_storage("work", "/a", &destination, None, &AtomicU64::new(0))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, StorageError::Invalid(_)), "{error}");
+            assert!(!destination.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_download_refuses_an_oversized_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("a");
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; STORAGE_CHUNK + 1]);
+        let body = json!({"chunk_data_b64": big, "is_last_chunk": true}).to_string();
+        let (base, _) = serve(move |_, _| reply("200 OK", &body)).await;
+        let error = test_client(base)
+            .download_storage("work", "/a", &destination, None, &AtomicU64::new(0))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Invalid(_)), "{error}");
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn storage_download_checks_the_final_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("a.txt");
+        let (base, _) = serve(chunk_server(vec![1u8; 10], Indexes::default())).await;
+        let error = test_client(base)
+            .download_storage("work", "/a.txt", &destination, Some(12), &AtomicU64::new(0))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "“a.txt” changed while downloading; try again."
+        );
+        assert!(!destination.exists());
+        assert!(!crate::selkies::partial_path(&destination).exists());
+    }
+
+    #[tokio::test]
+    async fn create_home_tells_conflict_and_bad_names() {
+        let (base, seen) = serve(|request, _| match request.json()["home_name"].as_str() {
+            Some("work") => reply(
+                "409 Conflict",
+                r#"{"detail":"Home directory 'work' already exists."}"#,
+            ),
+            Some("odd") => reply(
+                "409 Conflict",
+                r#"{"detail":"1 validation error for HomeDirCreate"}"#,
+            ),
+            _ => reply("201 Created", r#"{"status":"success","home_name":"games"}"#),
+        })
+        .await;
+        let client = test_client(base);
+        assert_eq!(client.create_home("games").await, Ok(()));
+        assert_eq!(requests_of(&seen)[0].json(), json!({"home_name": "games"}));
+        assert_eq!(client.create_home("work").await, Err(HomeError::Exists));
+        assert_eq!(
+            client.create_home("odd").await,
+            Err(HomeError::Invalid(
+                "1 validation error for HomeDirCreate".into()
+            ))
+        );
+        // Refused here: never sent.
+        let before = requests_of(&seen).len();
+        assert!(client.create_home("a b").await.is_err());
+        assert!(client.create_home("_sealskin_shared_files").await.is_err());
+        assert_eq!(requests_of(&seen).len(), before);
+    }
+
+    #[tokio::test]
+    async fn delete_home_answers_204_and_404() {
+        let (base, seen) = serve(|request, _| {
+            if request.is("delete /companion/api/homedirs/work") {
+                NO_CONTENT.to_string()
+            } else {
+                NOT_FOUND.to_string()
+            }
+        })
+        .await;
+        let client = test_client(base);
+        assert_eq!(client.delete_home("work").await, Ok(()));
+        assert_eq!(client.delete_home("gone").await, Err(HomeError::Gone));
+        assert!(requests_of(&seen)[0]
+            .head
+            .contains("authorization: bearer ssk_id_secret"));
+    }
+
+    #[tokio::test]
+    async fn delete_home_refuses_shared_files_without_a_request() {
+        let (base, seen) = serve(|_, _| NO_CONTENT.to_string()).await;
+        let client = test_client(base);
+        for name in [
+            "_sealskin_shared_files",
+            "cleanroom",
+            "CleanRoom",
+            "../x",
+            "",
+        ] {
+            assert!(client.delete_home(name).await.is_err(), "{name}");
+        }
+        assert_eq!(
+            client.delete_home(SHARED_FILES_HOME).await,
+            Err(HomeError::Reserved)
+        );
+        assert!(requests_of(&seen).is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_file_path_body_has_the_filename_and_no_room_flag() {
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let client = test_client(base);
+        let params = LaunchParams {
+            launch_id: Some(LAUNCH_ID.into()),
+            home_name: Some("work".into()),
+            launch_in_room_mode: true,
+            ..LaunchParams::default()
+        };
+        client
+            .launch(
+                firefox(),
+                params,
+                LaunchRoute::FilePath("report.pdf"),
+                || {},
+            )
+            .await
+            .unwrap();
+        let request = requests_of(&seen).remove(0);
+        assert!(
+            request.is("post /companion/api/launch/file_path"),
+            "{}",
+            request.head
+        );
+        assert!(request
+            .head
+            .contains(&format!("x-idempotency-key: {LAUNCH_ID}")));
+        let body = request.json();
+        assert_eq!(body["filename"], json!("report.pdf"));
+        assert_eq!(body["home_name"], json!("work"));
+        assert!(body.get("launch_in_room_mode").is_none());
+        // A nested name or Cleanroom is never sent.
+        for (name, home) in [("a/b.pdf", "work"), ("..", "work"), ("a.pdf", "cleanroom")] {
+            let params = LaunchParams {
+                home_name: Some(home.into()),
+                ..LaunchParams::default()
+            };
+            let result = client
+                .launch(firefox(), params, LaunchRoute::FilePath(name), || {})
+                .await;
+            assert!(matches!(result, Err(LaunchError::Server(_))), "{name}");
+        }
+        assert_eq!(requests_of(&seen).len(), 1);
     }
 }
