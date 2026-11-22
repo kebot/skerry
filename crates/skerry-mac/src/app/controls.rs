@@ -2,10 +2,11 @@ use super::session_window::SessionWindow;
 use super::{
     native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, ToggleSessionControls,
 };
+use crate::audio::{OutputProblem, OutputStatus};
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
 use crate::persist::WriteQueue;
-use crate::settings::ControlsSections;
+use crate::settings::{AudioBitrate, ControlsSections};
 use crate::stats;
 use crate::video::Codec;
 use crate::{
@@ -24,8 +25,9 @@ use gpui_kit::{
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
-    self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState,
-    ScreenProps, Section, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps, CodecChoice,
+    ControlsAction, ControlsProps, ControlsUiState, ScreenProps, Section, SliderUnit, SwitchItem,
+    VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
 
@@ -49,7 +51,7 @@ pub(super) struct ControlPanel {
     scroll_saved: Option<Point<Pixels>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Command {
     Close,
     FullScreen,
@@ -71,6 +73,8 @@ enum Command {
     Chord(RemoteChord),
     Clipboard(ClipboardAction),
     Stats(bool),
+    AudioOutput(Option<String>),
+    AudioBitrate(u32),
 }
 
 impl ControlPanel {
@@ -299,6 +303,8 @@ impl ControlPanel {
                         }
                         Command::Clipboard(action) => session.change_clipboard(action, window, cx),
                         Command::Stats(open) => session.set_stats_open(open),
+                        Command::AudioOutput(uid) => session.change_audio_output(uid, cx),
+                        Command::AudioBitrate(bps) => session.change_audio_bitrate(bps, cx),
                         Command::Chord(chord) => {
                             session.close_controls(window, cx);
                             if let Some(stream) = &session.current {
@@ -452,6 +458,12 @@ impl ControlPanel {
                 }
             }
             ControlsAction::ResetVideo => Self::send(self.owner.clone(), Command::ResetVideo, cx),
+            ControlsAction::SelectAudioOutput(uid) => {
+                Self::send(self.owner.clone(), Command::AudioOutput(uid), cx)
+            }
+            ControlsAction::SetAudioBitrate(bps) => {
+                Self::send(self.owner.clone(), Command::AudioBitrate(bps), cx)
+            }
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -544,6 +556,16 @@ impl ControlPanel {
         };
 
         let video_settings = build_video_props(session);
+        let audio = AudioInputs {
+            status: session.audio_output.as_ref(),
+            chosen: session.preferences.audio.output_device.as_deref(),
+            saved_name: session.preferences.audio.output_device_name.as_deref(),
+            bitrate: session
+                .settings
+                .as_ref()
+                .and_then(|settings| settings.audio_bitrate.as_ref()),
+            unavailable: session.audio_unavailable,
+        };
 
         let stats = (!session.stats_history.is_empty()).then(|| {
             let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -560,16 +582,143 @@ impl ControlPanel {
             fullscreen: self.fullscreen,
             audio: session.audio,
             video: session.video,
-            audio_unavailable: session.audio_unavailable.map(str::to_string),
+            audio_unavailable: audio_header_line(&audio),
             input_switches,
             chords,
             clipboard,
             screen,
             video_settings,
+            audio_settings: audio_props(&audio),
             stats,
             stats_copied: self.copied.is_some(),
         }
     }
+}
+
+/// What the Audio Settings card is drawn from.
+struct AudioInputs<'a> {
+    status: Option<&'a OutputStatus>,
+    /// The saved choice (its UID); `None` is System Default.
+    chosen: Option<&'a str>,
+    saved_name: Option<&'a str>,
+    bitrate: Option<&'a AudioBitrate>,
+    /// Audio is off this session (server or decoder), as the card says it.
+    unavailable: Option<&'a str>,
+}
+
+impl AudioInputs<'_> {
+    /// The saved device when it isn't connected.
+    fn missing(&self, status: &OutputStatus) -> bool {
+        self.chosen.is_some_and(|uid| status.device(uid).is_none())
+    }
+
+    /// The status's problem, if it answers the current choice (a pick waits for the
+    /// audio thread for a moment; until then the old choice's problem is stale).
+    fn problem(&self, status: &OutputStatus) -> Option<OutputProblem> {
+        status
+            .problem
+            .filter(|_| status.chosen.as_deref() == self.chosen)
+    }
+}
+
+/// The muted line under the header buttons: only while no sound can play, since the Audio
+/// card is collapsed by default and would hide it.
+fn audio_header_line(audio: &AudioInputs) -> Option<String> {
+    if let Some(reason) = audio.unavailable {
+        return Some(reason.trim_end_matches('.').to_string());
+    }
+    let status = audio.status?;
+    match audio.problem(status) {
+        Some(OutputProblem::Failed) => Some("Audio output stopped".into()),
+        _ if status.devices.is_empty() => Some("No audio output".into()),
+        _ => None,
+    }
+}
+
+/// The Audio Settings card; `None` until the session's audio is ready (`ARCH-GAP-DC-03`).
+fn audio_props(audio: &AudioInputs) -> Option<AudioProps> {
+    if let Some(reason) = audio.unavailable {
+        return Some(AudioProps {
+            output_label: String::new(),
+            outputs: Vec::new(),
+            note: None,
+            bitrate: None,
+            unavailable: Some(reason.to_string()),
+        });
+    }
+    let status = audio.status?;
+    let default_label = status.default_device().map_or_else(
+        || "System Default".to_string(),
+        |device| format!("System Default ({})", device.name),
+    );
+    let missing = audio.missing(status);
+    let saved = audio.saved_name.unwrap_or("Saved Device");
+    let missing_label = format!("{saved} (not connected)");
+    let mut outputs = vec![AudioOutputItem {
+        uid: None,
+        label: default_label.clone(),
+        checked: audio.chosen.is_none(),
+        connected: true,
+    }];
+    outputs.extend(status.devices.iter().map(|device| AudioOutputItem {
+        uid: Some(device.uid.clone()),
+        label: device.name.clone(),
+        checked: audio.chosen == Some(device.uid.as_str()),
+        connected: true,
+    }));
+    if missing {
+        outputs.push(AudioOutputItem {
+            uid: audio.chosen.map(str::to_string),
+            label: missing_label.clone(),
+            checked: true,
+            connected: false,
+        });
+    }
+    let output_label = match audio.chosen {
+        None => default_label,
+        Some(_) if missing => missing_label,
+        Some(uid) => status
+            .device(uid)
+            .map_or_else(|| saved.to_string(), |device| device.name.clone()),
+    };
+    let subject = audio
+        .saved_name
+        .map_or_else(|| "Your saved output device".to_string(), str::to_string);
+    let playing = status.active.as_ref().map(|device| device.name.as_str());
+    let note = match (audio.problem(status), playing) {
+        (Some(OutputProblem::Failed), _) => Some("Audio output stopped. Trying again…".into()),
+        _ if missing => Some(match playing {
+            Some(active) => {
+                format!("{subject} isn’t connected. Playing through {active} until it’s back.")
+            }
+            None => format!(
+                "{subject} isn’t connected, and no other audio output is available. Audio \
+                 resumes when one is."
+            ),
+        }),
+        _ if status.devices.is_empty() => {
+            Some("No audio output is connected. Audio resumes when one is.".into())
+        }
+        (Some(OutputProblem::ChosenFailing), Some(active)) => Some(format!(
+            "{} isn’t responding. Playing through {active} while Skerry keeps trying.",
+            audio
+                .chosen
+                .and_then(|uid| status.device(uid))
+                .map_or(saved, |d| d.name.as_str())
+        )),
+        _ => None,
+    };
+    Some(AudioProps {
+        output_label,
+        outputs,
+        note,
+        bitrate: audio.bitrate.map(|bitrate| AudioBitrateProps {
+            value: bitrate.value,
+            choices: bitrate.choices.clone(),
+            locked: !bitrate.editable(),
+        }),
+        unavailable: None,
+    })
 }
 
 fn current_codec(session: &SessionWindow) -> Codec {
@@ -792,7 +941,214 @@ fn next_scroll(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::OutputDevice;
     use gpui_kit::px;
+
+    fn device(uid: &str, name: &str) -> OutputDevice {
+        OutputDevice {
+            uid: uid.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Speakers (the default) and AirPods connected, playing through `active`.
+    fn status(chosen: Option<&str>, active: Option<&str>) -> OutputStatus {
+        let devices = vec![
+            device("AirPods", "AirPods Pro"),
+            device("BuiltIn", "MacBook Pro Speakers"),
+        ];
+        OutputStatus {
+            active: active.and_then(|uid| devices.iter().find(|d| d.uid == uid).cloned()),
+            devices,
+            default_uid: Some("BuiltIn".into()),
+            chosen: chosen.map(str::to_string),
+            problem: None,
+        }
+    }
+
+    fn inputs<'a>(
+        status: Option<&'a OutputStatus>,
+        chosen: Option<&'a str>,
+        saved_name: Option<&'a str>,
+    ) -> AudioInputs<'a> {
+        AudioInputs {
+            status,
+            chosen,
+            saved_name,
+            bitrate: None,
+            unavailable: None,
+        }
+    }
+
+    #[test]
+    fn audio_props_label_system_default_with_active_device() {
+        let status = status(None, Some("BuiltIn"));
+        let props = audio_props(&inputs(Some(&status), None, None)).unwrap();
+        assert_eq!(props.output_label, "System Default (MacBook Pro Speakers)");
+        let labels: Vec<_> = props
+            .outputs
+            .iter()
+            .map(|o| (o.label.as_str(), o.checked, o.connected))
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                ("System Default (MacBook Pro Speakers)", true, true),
+                ("AirPods Pro", false, true),
+                ("MacBook Pro Speakers", false, true),
+            ]
+        );
+        assert_eq!(props.note, None);
+        // A chosen device shows its name only, even when it is also the default.
+        let chosen = status_with_chosen("BuiltIn");
+        let props = audio_props(&inputs(Some(&chosen), Some("BuiltIn"), None)).unwrap();
+        assert_eq!(props.output_label, "MacBook Pro Speakers");
+        assert!(props.outputs[2].checked && !props.outputs[0].checked);
+    }
+
+    fn status_with_chosen(uid: &str) -> OutputStatus {
+        status(Some(uid), Some(uid))
+    }
+
+    #[test]
+    fn audio_props_mark_missing_saved_device_and_note_fallback() {
+        let mut status = status(Some("USB"), Some("BuiltIn"));
+        status.problem = Some(OutputProblem::ChosenMissing);
+        let props = audio_props(&inputs(Some(&status), Some("USB"), Some("USB DAC"))).unwrap();
+        assert_eq!(props.output_label, "USB DAC (not connected)");
+        let last = props.outputs.last().unwrap();
+        assert_eq!(
+            (last.label.as_str(), last.checked, last.connected),
+            ("USB DAC (not connected)", true, false)
+        );
+        assert!(!props.outputs[0].checked);
+        assert_eq!(
+            props.note.as_deref(),
+            Some("USB DAC isn’t connected. Playing through MacBook Pro Speakers until it’s back.")
+        );
+        // A name never seen.
+        let props = audio_props(&inputs(Some(&status), Some("USB"), None)).unwrap();
+        assert_eq!(props.output_label, "Saved Device (not connected)");
+        assert!(props
+            .note
+            .unwrap()
+            .starts_with("Your saved output device isn’t connected."));
+    }
+
+    #[test]
+    fn audio_props_missing_device_with_no_other_output() {
+        let status = OutputStatus {
+            chosen: Some("USB".into()),
+            problem: Some(OutputProblem::ChosenMissing),
+            ..OutputStatus::default()
+        };
+        let audio = inputs(Some(&status), Some("USB"), Some("USB DAC"));
+        let props = audio_props(&audio).unwrap();
+        assert_eq!(
+            props.note.as_deref(),
+            Some(
+                "USB DAC isn’t connected, and no other audio output is available. Audio \
+                 resumes when one is."
+            )
+        );
+        assert_eq!(props.outputs.len(), 2);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("No audio output")
+        );
+    }
+
+    #[test]
+    fn audio_props_hide_bitrate_when_server_does_not_expose_it() {
+        let status = status(None, Some("BuiltIn"));
+        let props = audio_props(&inputs(Some(&status), None, None)).unwrap();
+        assert_eq!(props.bitrate, None);
+        let bitrate = AudioBitrate {
+            value: 96_000,
+            choices: vec![96_000],
+            locked: false,
+        };
+        let mut audio = inputs(Some(&status), None, None);
+        audio.bitrate = Some(&bitrate);
+        assert_eq!(
+            audio_props(&audio).unwrap().bitrate,
+            Some(AudioBitrateProps {
+                value: 96_000,
+                choices: vec![96_000],
+                locked: true
+            })
+        );
+    }
+
+    #[test]
+    fn audio_props_show_only_reason_when_audio_disabled_by_server() {
+        let mut audio = inputs(None, None, None);
+        audio.unavailable = Some("Audio turned off by the server");
+        let props = audio_props(&audio).unwrap();
+        assert_eq!(
+            props.unavailable.as_deref(),
+            Some("Audio turned off by the server")
+        );
+        assert!(props.outputs.is_empty() && props.bitrate.is_none());
+        audio.unavailable = Some("Audio couldn’t start on this Mac.");
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("Audio couldn’t start on this Mac")
+        );
+        // Before the session is ready the card waits.
+        assert_eq!(audio_props(&inputs(None, None, None)), None);
+    }
+
+    #[test]
+    fn audio_props_header_line_only_when_no_sound_can_play() {
+        let playing = status(None, Some("BuiltIn"));
+        assert_eq!(audio_header_line(&inputs(Some(&playing), None, None)), None);
+        let mut missing = status(Some("USB"), Some("BuiltIn"));
+        missing.problem = Some(OutputProblem::ChosenMissing);
+        assert_eq!(
+            audio_header_line(&inputs(Some(&missing), Some("USB"), None)),
+            None,
+            "sound still plays"
+        );
+        let none = OutputStatus {
+            problem: Some(OutputProblem::NoDevice),
+            ..OutputStatus::default()
+        };
+        let audio = inputs(Some(&none), None, None);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("No audio output")
+        );
+        assert_eq!(
+            audio_props(&audio).unwrap().note.as_deref(),
+            Some("No audio output is connected. Audio resumes when one is.")
+        );
+        let mut failed = status(None, None);
+        failed.problem = Some(OutputProblem::Failed);
+        let audio = inputs(Some(&failed), None, None);
+        assert_eq!(
+            audio_header_line(&audio).as_deref(),
+            Some("Audio output stopped")
+        );
+        assert_eq!(
+            audio_props(&audio).unwrap().note.as_deref(),
+            Some("Audio output stopped. Trying again…")
+        );
+    }
+
+    #[test]
+    fn a_fresh_pick_ignores_the_previous_choices_problem() {
+        // Picked System Default; the thread still reports the failing AirPods choice.
+        let mut stale = status(Some("AirPods"), Some("BuiltIn"));
+        stale.problem = Some(OutputProblem::ChosenFailing);
+        let props = audio_props(&inputs(Some(&stale), None, None)).unwrap();
+        assert_eq!(props.note, None);
+        let props = audio_props(&inputs(Some(&stale), Some("AirPods"), None)).unwrap();
+        assert_eq!(
+            props.note.as_deref(),
+            Some("AirPods Pro isn’t responding. Playing through MacBook Pro Speakers while Skerry keeps trying.")
+        );
+    }
 
     fn at(y: f32) -> Point<Pixels> {
         point(px(0.), px(y))
