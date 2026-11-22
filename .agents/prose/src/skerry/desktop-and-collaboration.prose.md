@@ -9,7 +9,6 @@ id: 067NC4KG01SKERRY0000000004
 <!-- compose:status=partially-settled provenance=compose-managed -->
 <!-- compose:unresolved id=ARCH-GAP-DC-14 concept="session-file-mount" question="Future scope: mount the session's files in Finder through a File Provider extension, a local WebDAV server, or a local NFS server. Not started; revisit after the Files window ships." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-15 concept="remote-rename-move" question="Delete is settled through SealSkin home storage (ARCH-024). Neither Selkies 715df7c nor SealSkin has a rename or move file route, and Cleanroom or direct Selkies sessions have no delete at all; revisit when a server offers them." -->
-<!-- compose:unresolved id=ARCH-GAP-DC-05 concept="webcam" question="Microphone settled (ARCH-038). Camera uplink (VideoToolbox H.264 0x06, AVFoundation capture) is being built as M2." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-16 concept="mic-echo-cancellation" question="Deferred: echo cancellation needs VoiceProcessingIO to own playback, which conflicts with ARCH-030." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-07 concept="session-sharing-and-rooms" question="Support Selkies view-only and player-slot roles and evaluate SealSkin collaboration rooms (room API, token handoff, control transfer)." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-08 concept="multitouch-trackpad" question="Keep raw multitouch contact forwarding deferred until gesture-to-display latency in Chrome matches native macOS pinch/pan and contact release on focus loss is proven." -->
@@ -47,14 +46,18 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
   - Out of the session: dragging rows to Finder writes `NSFilePromiseProvider` items, and Skerry downloads each into the folder Finder names; ⌘C downloads the selection to a staging folder first, then puts the real file URLs on the pasteboard. A folder is downloaded file by file into a matching folder, not as the server's zip.
   - **Delete** (⌘⌫, confirmed in a native alert) goes through `SealSkinClient` to the session's home storage (`/Desktop/<path>`), offered only for a SealSkin session with a home whose `Desktop` lists the same names as the Selkies root (`ARCH-024`).
   - Upload and download controls follow `server_settings.file_transfers`; the server also refuses view-only credentials (Skerry connects as the primary client, so it does not model a viewer role).
-- `audio-devices-and-media-uplinks` (output settled in `ARCH-030`; mic/webcam open in `ARCH-GAP-DC-05`):
+- `audio-devices-and-media-uplinks` (output settled in `ARCH-030`; mic and camera in `ARCH-038`):
   - Audio output (settled: `ARCH-030`): each session has its own `skerry-audio` thread. Output follows the macOS default, or a chosen **Output Device** saved per server by UID that falls back while missing or failing. The stream opens at 48 kHz f32 with Core Audio converting. Skerry rebuilds after errors, stalls, or sleep/wake, with backoff and a probe that leaves the fallback playing. **Audio Bitrate** sends `SETTINGS {audio_bitrate, picked}` and is hidden or locked as the server says.
   - Microphone (settled: `ARCH-038`):
     - Opus encoded by AudioToolbox and sent as `0x02` frames.
     - Starts on `on_start`, demand, a server lock, or the switch, only after macOS grants access; nothing touches the device before then.
     - Stops on every stream end, including a 10 s silent network.
     - A **Microphone & Camera** card and an in-window badge show it.
-  - Unresolved frontier (`ARCH-GAP-DC-05`): the camera uplink (M2). Echo cancellation is deferred (`ARCH-GAP-DC-16`).
+  - Camera (settled: `ARCH-038`):
+    - AVFoundation capture is encoded by VideoToolbox H.264 and sent as `0x06` frames on the primary only.
+    - The rate adapts to the uplink so input stays responsive, and keyframes come on request (capped).
+    - It follows the same start rules, permission gate, and stop on every stream end as the mic.
+  - Echo cancellation is deferred (`ARCH-GAP-DC-16`).
 - `printing-gaming-and-sharing` (unresolved: `ARCH-GAP-DC-04`, `ARCH-GAP-DC-06`, `ARCH-GAP-DC-07`):
   - Gaming (settled: `ARCH-032`):
     - **Capture Pointer** (⌃⌥⇧Z, the Input card, the View menu) locks and hides the Mac cursor, sends relative `m2` motion with `p,1`, and releases on the chord, blur, child windows, full screen, and disconnect. The transport always sends `p,0` on close.

@@ -108,6 +108,12 @@ subject: skerry
   - Late events from a dropped stream are ignored, and a primary error puts Display 2 in Waiting.
   - When its owner closes Display 2, keys are released.
   - A direct-server target works.
+- Task M2 tests pass (`ARCH-038`):
+  - The real VideoToolbox session encodes NV12 to Annex B with an IDR, and teardown with frames in flight is clean.
+  - Keyframe requests are capped and backed off.
+  - `kd` p95 ≤ 150 ms at 1 Mbps with 60–120 KB keyframes, with and without 150 ms RTT, and 10 Mbps with 150 ms RTT reaches ≥ 1 Mbps.
+  - Bounded queues let the stall stop fire.
+  - Camera and mic frames never go on Display 2, and Killed stops the camera.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
