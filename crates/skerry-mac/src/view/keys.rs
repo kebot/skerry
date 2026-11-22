@@ -40,10 +40,18 @@ pub struct KeyLedger {
 
 impl KeyLedger {
     /// A key went down. A macOS auto-repeat sends `kd` again on purpose: Skerry's 1 s `kh`
-    /// heartbeat alone would let the server's repeat loop pause.
+    /// heartbeat alone would let the server's repeat loop pause. A repeat that now maps to a
+    /// different keysym (a held `a` repeating as `A` once Shift goes down) releases the
+    /// first keysym, or it would stay down on the server.
     pub fn press(&mut self, code: String, keysym: u32) -> Vec<String> {
-        self.keys.insert(code, keysym);
-        vec![format!("kd,{keysym}")]
+        let mut commands = Vec::new();
+        if let Some(previous) = self.keys.insert(code, keysym) {
+            if previous != keysym {
+                commands.push(format!("ku,{previous}"));
+            }
+        }
+        commands.push(format!("kd,{keysym}"));
+        commands
     }
 
     /// A key came up; only a key this ledger holds is released.
@@ -127,6 +135,20 @@ mod tests {
         assert_eq!(ledger.press("a".into(), 0x61), ["kd,97"]);
         assert_eq!(ledger.release("a"), ["ku,97"]);
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_held_letter_that_shift_turns_into_another_keysym_releases_the_first() {
+        let mut ledger = KeyLedger::default();
+        assert_eq!(ledger.press("a".into(), 0x61), ["kd,97"]);
+        assert_eq!(ledger.press("a".into(), 0x61), ["kd,97"]);
+        ledger.set_mods(Mods {
+            shift: true,
+            ..Mods::default()
+        });
+        assert_eq!(ledger.press("a".into(), 0x41), ["ku,97", "kd,65"]);
+        assert_eq!(ledger.release("a"), ["ku,65"]);
+        assert_eq!(ledger.release_all(), ["ku,65505"]);
     }
 
     #[test]
