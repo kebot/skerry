@@ -658,13 +658,20 @@ impl SessionWindow {
                 }
             }
             SessionEvent::CapturePolicy(policy) => {
-                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                use crate::capture::{Auths, Subject};
+                let auth = Auths {
+                    mic: crate::permissions::authorization(Subject::Microphone),
+                    cam: crate::permissions::authorization(Subject::Camera),
+                };
                 let effects = self.capture.on_policy(policy, auth);
                 self.apply_capture(effects, cx);
                 self.ensure_input_ticker(cx);
             }
             SessionEvent::Capture(reply) => {
-                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                let auth = reply.subject().map_or(
+                    crate::capture::Auth::Denied,
+                    crate::permissions::authorization,
+                );
                 let effects = self.capture.state.on_reply(reply, auth);
                 self.apply_capture(effects, cx);
             }
@@ -2136,7 +2143,7 @@ impl Render for SessionWindow {
             })
             // Top left below the traffic lights while the microphone is open, no hitbox
             // (`ARCH-038`).
-            .when_some(self.capture.badge(), |root, mic| {
+            .when_some(self.capture.badge(), |root, (mic, _cam)| {
                 root.child(session::capture_badge(mic, print_top))
             })
             // Bottom-centre with no hitbox, above a bottom banner when one shows (`ARCH-032`).

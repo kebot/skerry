@@ -142,6 +142,7 @@ impl<M: MicHandle> MediaCapture<M> {
                     }
                 }
                 Effect::Stop(Subject::Microphone) => self.drop_microphone(),
+                Effect::Start(Subject::Camera) | Effect::Stop(Subject::Camera) => {}
                 Effect::AskPermission(ticket) => asks.push(ticket),
             }
         }
@@ -198,12 +199,19 @@ impl<M: MicHandle> MediaCapture<M> {
     }
 
     /// The badge shows while the device is open.
-    pub(super) fn badge(&self) -> Option<bool> {
-        capture::badge(self.mic_status.as_ref().is_some_and(|status| status.live))
+    pub(super) fn badge(&self) -> Option<(bool, bool)> {
+        capture::badge(
+            self.mic_status.as_ref().is_some_and(|status| status.live),
+            false,
+        )
     }
 
     /// A primary `server_settings`.
-    pub(super) fn on_policy(&mut self, policy: CapturePolicy, auth: capture::Auth) -> Vec<Effect> {
+    pub(super) fn on_policy(
+        &mut self,
+        policy: CapturePolicy,
+        auth: impl Into<capture::Auths>,
+    ) -> Vec<Effect> {
         self.state.on_policy(policy, auth)
     }
 
@@ -347,6 +355,7 @@ mod tests {
                 on_start,
                 ..DevicePolicy::default()
             },
+            ..CapturePolicy::default()
         }
     }
 
@@ -380,7 +389,7 @@ mod tests {
     fn error_event_stops_capture() {
         let (mut capture, log, _frames, _events) = capturing();
         capture.on_status(1, live());
-        assert_eq!(capture.badge(), Some(true));
+        assert_eq!(capture.badge(), Some((true, false)));
         capture.on_stream_event(&SessionEvent::Video(true));
         assert_eq!(log.borrow().dropped, 0);
         capture.on_stream_event(&SessionEvent::Error("closed".into()));
@@ -526,7 +535,7 @@ mod tests {
         capture.on_status(1, live());
         assert_eq!(capture.badge(), None);
         capture.on_status(2, live());
-        assert_eq!(capture.badge(), Some(true));
+        assert_eq!(capture.badge(), Some((true, false)));
     }
 
     #[test]
@@ -558,7 +567,7 @@ mod tests {
         let (mut capture, _log, _frames, _events) = capturing();
         // The thread reports live as soon as the device is open, before any packet.
         capture.on_status(1, live());
-        assert_eq!(capture.badge(), Some(true));
+        assert_eq!(capture.badge(), Some((true, false)));
         capture.on_status(1, MicStatus::default());
         assert_eq!(capture.badge(), None);
     }

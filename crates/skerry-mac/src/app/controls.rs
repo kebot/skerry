@@ -1682,6 +1682,7 @@ mod tests {
                 locked,
                 ..Default::default()
             },
+            ..CapturePolicy::default()
         }
     }
 
