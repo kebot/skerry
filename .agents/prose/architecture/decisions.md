@@ -302,6 +302,29 @@
 - **Affected Contracts:** `index.prose.md`, `desktop-and-collaboration.prose.md`, `launcher-and-sessions.prose.md`, `implement-feature.prose.md`, `skerry.test.prose.md`. Earlier decisions keep their original `api.rs` / `Api` names as history.
 - **Design review 2026-11-22 (subagent, preview screenshots in Light and Dark):** first pass applied — one-line transfer rows in a collapsible "Transfers (n)" panel above the status bar (capped at about four rows); selection in the accent colour with white text, grey when the window is not key; Trash (not ⌫) at the toolbar's end and a folder-plus New Folder icon (both embedded through `skerry_ui::assets::SkerryAssets`, since gpui-kit's default bundle lacks them); header columns built like the rows so labels sit over values; the extension kept visible when a name truncates; Finder dates (`Today at 10:04`, `2 Nov 2026 at 08:05`) and `--` for folder sizes; error notices tinted with an icon and kept, information notices fading after 4 s or on navigation; Delete progress as a status-bar spinner; Try Again on a listing error; a loading spinner; drops onto a folder row upload into that folder; "Uploaded as “a 2.txt”" when keep-both renames; Delete alert copy ("This item will be deleted immediately from the persistent storage “X”. You can’t undo this action.") with Cancel as the cancel button; one name, **Files** (View menu, Session Controls button, window title `<app> — Files`, root crumb **Desktop**); blue folder icons; a primary Create button; plainer error wording. Second pass applied: a right-click menu on the list (Open, Quick Look, Download, Download To…, Copy, New Folder, Upload…, Paste, Delete…; a right-click on an unselected row selects it, on empty space clears the selection) and **File** (New Folder, Upload…, Download, Download To…, Open, Quick Look, Delete…, Close Window), **Edit** (Copy, Paste, Select All), and **Go** (Back, Forward, Enclosing Folder) menus bound to the window's actions, disabled where no Files window has focus. To check live: that the Edit menu's ⌘C/⌘V key equivalents never take those keys from a session window (GPUI handles the key window's keys before the menu). Left for later (low): type-to-select, Home/End/Page keys, a unified title bar, collapsing breadcrumbs, resizable columns.
 
+## ARCH-025: Frontier Build Plan of 2026-11-22 (PM Triage)
+
+- **Status:** settled 2026-11-22 (planning decision; each task settles its own `ARCH-*` when it ships).
+- **Asked by the person:** "check the rest of missing feature, build them, decide for me", with every task run as PLAN → design → review → build → QA → code review in subagents and the main agent acting only as PM.
+- **Process:** work lands on the integration branch `frontier-2026-11-22`; each task is built on its own branch in a worktree and merged into the integration branch only after its code review passes. Product questions inside a task are decided by the PM and recorded in that task's `ARCH-*` entry.
+- **Build order (tasks, each one `ARCH-*` when settled):**
+  - **A. Polish and hardening:** `ARCH-GAP-LS-10`, `ARCH-GAP-LS-11`, `ARCH-GAP-VS-05`, `ARCH-GAP-DC-09`.
+  - **B. Library organization and quick launch:** `ARCH-GAP-LS-04` (favorites, hidden, recents, session reuse) and `ARCH-GAP-LS-01` (startup progress, one-click remembered launch).
+  - **C. Open links and files, Send File:** `ARCH-GAP-LS-03`, `ARCH-GAP-LS-02`.
+  - **D. Account and key recovery:** `ARCH-GAP-LS-06`.
+  - **E. Audio devices and quality:** `ARCH-GAP-DC-03`.
+  - **F. Stats overlay and Shortcuts panel:** `ARCH-GAP-VS-06`, `ARCH-GAP-DC-12`.
+  - **G. Gaming controls:** `ARCH-GAP-DC-06`.
+  - **H. Remote printing:** `ARCH-GAP-DC-04` (only if the pinned Selkies sends print jobs; otherwise recorded as blocked by the server).
+  - **I. JPEG CPU cost:** `ARCH-GAP-VS-04`.
+  - **J. Pelorus and Apps catalog:** `ARCH-GAP-DC-13`, `ARCH-GAP-DC-11`.
+  - **K. Direct Selkies sessions:** `ARCH-GAP-LS-13`.
+  - **L. Persistent storage and shares:** `ARCH-GAP-LS-05`.
+  - **M. Microphone and webcam:** `ARCH-GAP-DC-05`.
+  - **N. Second display:** `ARCH-GAP-VS-01`.
+- **Deferred by the PM (not built in this plan):** `ARCH-GAP-VS-02` WebRTC (a second transport stack, needs a prototype before it can be designed); `ARCH-GAP-VS-03` VP8/VP9 software decode, 10-bit, and 4:4:4 (VideoToolbox has no hardware path; the hardware codecs already cover the need); `ARCH-GAP-DC-07` rooms and viewer roles (SealSkin 0.5.0 room messages carry only the sender alias, so control handoff can't be built cleanly); `ARCH-GAP-DC-08` raw multitouch (kept deferred on its own condition); `ARCH-GAP-DC-14` Finder mount (needs a signed File Provider extension); `ARCH-GAP-DC-15` rename and move (blocked: no server route); `ARCH-GAP-LS-07` cluster placement and per-session origins (no test cluster to verify against); `ARCH-GAP-LS-09` native per-app Dock presence (needs code-signing and a helper-process design of its own).
+- **Rationale:** the order puts small, low-risk, client-only work first, then the launcher features people use every day, then in-session media and input. Tasks that need a second protocol stack, signing infrastructure, or a server we can't test against are deferred, so that what ships can be verified.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
