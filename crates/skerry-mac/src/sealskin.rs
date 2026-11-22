@@ -97,7 +97,8 @@ impl std::fmt::Display for ApiError {
             Self::Account(AccountBlock::Other(detail)) | Self::Forbidden(detail)
                 if !detail.trim().is_empty() =>
             {
-                return write!(f, "SealSkin refused this account: {}", detail.trim());
+                // Quota and permission refusals: the server's own sentence says it best.
+                return f.write_str(detail.trim());
             }
             Self::Account(AccountBlock::Other(_)) | Self::Forbidden(_) => {
                 "This account doesn’t have permission for that action."
@@ -429,16 +430,16 @@ pub struct UserSettings {
     /// Sessions at once, across nodes.
     #[serde(default = "unlimited", deserialize_with = "whole_number")]
     pub session_limit: i64,
-    #[serde(default = "unlimited_f")]
+    #[serde(default = "unlimited_f", deserialize_with = "lenient_number")]
     pub session_cpus: f64,
     #[serde(default = "unlimited", deserialize_with = "whole_number")]
     pub session_memory_mb: i64,
-    #[serde(default = "unlimited_f")]
+    #[serde(default = "unlimited_f", deserialize_with = "lenient_number")]
     pub session_hours: f64,
-    #[serde(default = "unlimited_f")]
+    #[serde(default = "unlimited_f", deserialize_with = "lenient_number")]
     pub session_idle_minutes: f64,
     /// Hours after the last web sign-in before a key sleeps; negative: never.
-    #[serde(default = "unlimited_f")]
+    #[serde(default = "unlimited_f", deserialize_with = "lenient_number")]
     pub application_key_dormant_hours: f64,
     /// A key sleeps when the web sign-in ends.
     #[serde(default)]
@@ -472,10 +473,17 @@ fn unlimited_f() -> f64 {
     -1.
 }
 
+/// A limit that isn't a number (null, a string) reads unlimited rather than failing the
+/// whole status, which would also lose its structural `held`.
+fn lenient_number<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+    Ok(serde_json::Value::deserialize(deserializer)?
+        .as_f64()
+        .unwrap_or(-1.))
+}
+
 /// An integer limit, accepting any JSON number (pydantic may write `40.0`).
 fn whole_number<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
-    let number = f64::deserialize(deserializer)?;
-    Ok(number.round() as i64)
+    Ok(lenient_number(deserializer)?.round() as i64)
 }
 
 /// Hours of session time per period, and how many are used (`quota.py`).
@@ -1544,10 +1552,7 @@ mod tests {
             ApiError::Forbidden("Your account is paused.".into())
         );
         assert!(!reworded.is_refusal());
-        assert_eq!(
-            reworded.to_string(),
-            "SealSkin refused this account: Your account is paused."
-        );
+        assert_eq!(reworded.to_string(), "Your account is paused.");
         // Display never carries the key.
         for error in [
             ApiError::Key(KeyRefusal::Dormant),
@@ -1727,6 +1732,16 @@ mod tests {
         assert_eq!(status.settings.application_key_dormant_hours, 24.);
         assert_eq!(status.allowance.as_ref().unwrap().used, 12.5);
         assert_eq!(status.storage_used, Some(1 << 30));
+        // A limit that isn't a number doesn't lose the status (or its `held`).
+        let odd: ServerStatus = serde_json::from_value(json!({
+            "held": true, "username": "new",
+            "settings": {"session_limit": null, "session_hours": "8", "storage_limit": 5.0}
+        }))
+        .unwrap();
+        assert!(odd.held);
+        assert_eq!(odd.settings.session_limit, -1);
+        assert_eq!(odd.settings.session_hours, -1.);
+        assert_eq!(odd.settings.storage_limit, 5);
         let minimal: ServerStatus = serde_json::from_value(json!({"username": "x"})).unwrap();
         assert_eq!(minimal.settings.session_limit, -1);
         assert_eq!(minimal.settings.application_key_dormant_hours, -1.);

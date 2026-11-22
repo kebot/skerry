@@ -7,7 +7,7 @@
 
 use super::{Launcher, LoadKind};
 use crate::sealskin::{
-    AccountBlock, ApiError, KeyRefusal, KeySource, SealSkinClient, ServerStatus,
+    AccountBlock, ApiError, Credential, KeyRefusal, KeySource, SealSkinClient, ServerStatus,
 };
 use gpui_kit::component::Theme;
 use gpui_kit::{div, prelude::*, Context, Div, KeyDownEvent, Window};
@@ -50,13 +50,71 @@ impl Recovery {
     }
 }
 
-/// The account menu's storage measure, once per Library load.
+/// The account menu's storage measure, once per Library load; only a failed one is retried.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Measure {
     #[default]
     NotAsked,
     Measuring,
+    /// The server answered (`None`: it reported no usage).
     Done(Option<u64>),
+    /// The request failed; the next opening of the menu measures again.
+    Failed,
+}
+
+impl Measure {
+    pub fn wants_measure(self) -> bool {
+        matches!(self, Self::NotAsked | Self::Failed)
+    }
+}
+
+/// The wake poll's bookkeeping: which wake is current, whether its check is out, and
+/// whether a check succeeded while a load was running.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct WakeState {
+    /// Bumped whenever a poll starts or stops, so a stale check is ignored.
+    pub generation: u64,
+    in_flight: bool,
+    /// A check said the key works while a load was busy; the load's Dormant answer (sent
+    /// before the wake landed) then reloads once instead of showing the panel again.
+    pub confirmed: bool,
+}
+
+impl WakeState {
+    /// A poll starts (or stops): a check still out belongs to the old one, so nothing is
+    /// in flight for the new one.
+    pub fn restart(&mut self) -> u64 {
+        self.generation += 1;
+        self.in_flight = false;
+        self.confirmed = false;
+        self.generation
+    }
+
+    /// Whether a check may start now; marks it in flight if so.
+    pub fn begin_check(&mut self, busy: bool) -> bool {
+        if busy || self.in_flight {
+            return false;
+        }
+        self.in_flight = true;
+        true
+    }
+
+    /// A check of wake `generation` answered; whether it is still the current wake.
+    pub fn finish_check(&mut self, generation: u64) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        self.in_flight = false;
+        true
+    }
+}
+
+/// The key to save once a kept client connects: the pasted credential, if it is the one the
+/// client uses (a key pasted, then refused, then waking or retried is saved when it works).
+pub(super) fn kept_save(pending: Option<&Credential>, api: &SealSkinClient) -> Option<Credential> {
+    pending
+        .filter(|credential| credential.raw() == api.raw_key())
+        .cloned()
 }
 
 /// What a refusal leads to.
@@ -330,6 +388,7 @@ impl Launcher {
             // A dead key is never resent by an empty Connect.
             self.retry_api = None;
             self.startup_credential = None;
+            self.pending_save = None;
         }
         self.recovery = plan.panel.map(|kind| {
             let (waking_since, timed_out) = previous
@@ -347,7 +406,35 @@ impl Launcher {
         if self.recovery.is_none() {
             self.wake_poll = None;
         }
+        // A wake check said the key works while this load was out: the load's Dormant
+        // answer predates the wake, so reload once.
+        if std::mem::take(&mut self.wake.confirmed) && dormant {
+            if let Some(api) = self.recovery.as_ref().map(|recovery| recovery.api.clone()) {
+                let save = kept_save(self.pending_save.as_ref(), &api);
+                self.load(api, save, LoadKind::Connect, cx);
+            }
+        }
         cx.notify();
+    }
+
+    /// A Library load was refused. A pasted key that is kept (to wake or retry) is kept
+    /// with its credential, so it is saved once it connects.
+    pub(super) fn refused_load(
+        &mut self,
+        api: SealSkinClient,
+        save: Option<Credential>,
+        error: ApiError,
+        cx: &mut Context<Self>,
+    ) {
+        let raw = api.raw_key().to_string();
+        self.on_refusal(api, error, cx);
+        let kept = self
+            .retry_api
+            .as_ref()
+            .is_some_and(|kept| kept.raw_key() == raw);
+        if let Some(save) = save.filter(|_| kept) {
+            self.pending_save = Some(save);
+        }
     }
 
     /// Opens `<origin>/?wake=1` in the browser (never with the key) and checks the key every
@@ -376,15 +463,14 @@ impl Launcher {
 
     pub(super) fn stop_wake_poll(&mut self) {
         self.wake_poll = None;
-        self.wake_generation += 1;
+        self.wake.restart();
         if let Some(recovery) = self.recovery.as_mut() {
             recovery.waking_since = None;
         }
     }
 
     fn start_wake_poll(&mut self, cx: &mut Context<Self>) {
-        self.wake_generation += 1;
-        let generation = self.wake_generation;
+        let generation = self.wake.restart();
         let started = Instant::now();
         let window = self.window;
         self.wake_poll = Some(cx.spawn(async move |this, cx| {
@@ -446,8 +532,8 @@ impl Launcher {
         else {
             return Tick::Stop;
         };
-        if !poll_should_continue(started, Instant::now(), generation, self.wake_generation) {
-            if generation == self.wake_generation {
+        if !poll_should_continue(started, Instant::now(), generation, self.wake.generation) {
+            if generation == self.wake.generation {
                 recovery.waking_since = None;
                 recovery.timed_out = true;
                 self.wake_poll = None;
@@ -455,10 +541,9 @@ impl Launcher {
             }
             return Tick::Stop;
         }
-        if self.busy.is_some() || self.wake_check_in_flight {
+        if !self.wake.begin_check(self.busy.is_some()) {
             return Tick::Skip;
         }
-        self.wake_check_in_flight = true;
         Tick::Check((recovery.api.clone(), self.rt.clone()))
     }
 
@@ -470,17 +555,19 @@ impl Launcher {
         result: Result<(), ApiError>,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.wake_check_in_flight = false;
-        if generation != self.wake_generation || self.recovery.is_none() {
+        if !self.wake.finish_check(generation) || self.recovery.is_none() {
             return false;
         }
         match result {
             Ok(()) => {
                 self.stop_wake_poll();
-                // The poll's own load: it never waits behind a load already running, which
-                // ends with the same answer.
                 if self.busy.is_none() {
-                    self.load(api, None, LoadKind::Connect, cx);
+                    let save = kept_save(self.pending_save.as_ref(), &api);
+                    self.load(api, save, LoadKind::Connect, cx);
+                } else {
+                    // A load is running: if it answers Dormant (sent before the wake),
+                    // `on_refusal` reloads once instead of showing the panel again.
+                    self.wake.confirmed = true;
                 }
                 false
             }
@@ -500,14 +587,13 @@ impl Launcher {
         let pending = self.recovery.as_ref().is_some_and(|recovery| {
             recovery.kind == RecoveryKind::Dormant && recovery.waking_since.is_some()
         });
-        if !pending || self.busy.is_some() || self.wake_check_in_flight {
+        if !pending || !self.wake.begin_check(self.busy.is_some()) {
             return;
         }
         let Some(api) = self.recovery.as_ref().map(|recovery| recovery.api.clone()) else {
             return;
         };
-        let generation = self.wake_generation;
-        self.wake_check_in_flight = true;
+        let generation = self.wake.generation;
         let window = self.window;
         let client = api.clone();
         let pending = self.rt.spawn(async move { client.key_works().await });
@@ -528,7 +614,8 @@ impl Launcher {
     /// Try Again on a recovery panel: one load with the kept key.
     pub(super) fn try_again(&mut self, cx: &mut Context<Self>) {
         if let Some(api) = self.recovery.as_ref().map(|recovery| recovery.api.clone()) {
-            self.load(api, None, LoadKind::Connect, cx);
+            let save = kept_save(self.pending_save.as_ref(), &api);
+            self.load(api, save, LoadKind::Connect, cx);
         }
     }
 
@@ -573,12 +660,7 @@ impl Launcher {
                 && !library.status.is_admin
                 && !library.status.username.is_empty()
         });
-        if !wanted
-            || matches!(
-                self.account_storage,
-                Measure::Measuring | Measure::Done(Some(_))
-            )
-        {
+        if !wanted || !self.account_storage.wants_measure() {
             return;
         }
         let Some(api) = self.api.clone() else {
@@ -607,7 +689,7 @@ impl Launcher {
                             }
                         }
                         Err(error) if error.is_refusal() => this.on_refusal(api, error, cx),
-                        Err(_) => this.account_storage = Measure::Done(None),
+                        Err(_) => this.account_storage = Measure::Failed,
                     }
                     cx.notify();
                 })
@@ -796,6 +878,52 @@ mod tests {
             submit_decision(true, None, false, false),
             Submit::Hint(_)
         ));
+    }
+
+    #[test]
+    fn a_check_dropped_with_its_poll_never_blocks_the_next_poll() {
+        let mut wake = WakeState::default();
+        let first = wake.restart();
+        assert!(wake.begin_check(false));
+        // A second check (activation, the next tick) waits for the one out.
+        assert!(!wake.begin_check(false));
+        // The poll is dropped while its check is out (Use a Different Key, a new wake).
+        wake.restart();
+        let second = wake.restart();
+        assert!(wake.begin_check(false), "the new poll's first tick checks");
+        // The old check's answer, if it ever comes, is stale and changes nothing.
+        assert!(!wake.finish_check(first));
+        assert!(!wake.begin_check(false));
+        assert!(wake.finish_check(second));
+        assert!(!wake.begin_check(true), "never while a load runs");
+        assert!(wake.begin_check(false));
+        wake.confirmed = true;
+        wake.restart();
+        assert!(!wake.confirmed);
+    }
+
+    #[test]
+    fn a_pasted_key_that_connects_later_is_saved() {
+        let typed = Credential::parse("ssk_new_secret@seal.example").unwrap();
+        let api = SealSkinClient::new(&typed).unwrap();
+        // Refused (dormant, held, disabled) and kept: the wake poll, Try Again or an empty
+        // Connect reloads with the credential, so the load saves it.
+        let save = kept_save(Some(&typed), &api).expect("saved once it connects");
+        assert_eq!(save.raw(), typed.raw());
+        // Never another key's credential.
+        let other = Credential::parse("ssk_old_secret@seal.example").unwrap();
+        let other_api = SealSkinClient::new(&other).unwrap();
+        assert!(kept_save(Some(&typed), &other_api).is_none());
+        assert!(kept_save(None, &api).is_none());
+    }
+
+    #[test]
+    fn only_a_failed_storage_measure_is_retried() {
+        assert!(Measure::NotAsked.wants_measure());
+        assert!(Measure::Failed.wants_measure());
+        assert!(!Measure::Measuring.wants_measure());
+        assert!(!Measure::Done(None).wants_measure());
+        assert!(!Measure::Done(Some(1)).wants_measure());
     }
 
     #[test]

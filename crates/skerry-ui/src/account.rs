@@ -259,9 +259,13 @@ pub fn dormancy_text(hours: f64, follow_sign_in: bool) -> Option<String> {
     let duration = if hours.fract() == 0. {
         let whole = hours as i64;
         format!("{whole} hour{}", if whole == 1 { "" } else { "s" })
-    } else {
+    } else if hours * 60. < 1. {
+        "less than a minute".into()
+    } else if hours < 2. {
         let minutes = (hours * 60.).round() as i64;
         format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
+    } else {
+        format!("{} hours", number(hours))
     };
     Some(format!("Sleeps {duration} after your last web sign-in."))
 }
@@ -785,6 +789,18 @@ mod tests {
         );
         // 0 is a rule too: the key sleeps right after each wake.
         assert!(dormancy_text(0., false).is_some());
+        assert_eq!(
+            dormancy_text(0.005, false).as_deref(),
+            Some("Sleeps less than a minute after your last web sign-in.")
+        );
+        assert_eq!(
+            dormancy_text(0.02, false).as_deref(),
+            Some("Sleeps 1 minute after your last web sign-in.")
+        );
+        assert_eq!(
+            dormancy_text(36.5, false).as_deref(),
+            Some("Sleeps 36.5 hours after your last web sign-in.")
+        );
         assert_eq!(dormancy_text(-1., false), None);
     }
 

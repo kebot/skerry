@@ -71,7 +71,8 @@ impl KeyProblem {
             ProblemKind::KeysDisabled => "Application keys are turned off",
             ProblemKind::ClientNotAllowed => "Skerry isn’t allowed to use keys",
             ProblemKind::OtherKey(_) => "The server didn’t accept this key",
-            ProblemKind::Inactive | ProblemKind::OtherAccount(_) => "This account is turned off",
+            ProblemKind::Inactive => "This account is turned off",
+            ProblemKind::OtherAccount(_) => "SealSkin refused the request",
         }
     }
 
@@ -85,9 +86,9 @@ impl KeyProblem {
             ProblemKind::OtherKey(_) => "SealSkin refused the key without saying why.".into(),
             ProblemKind::Inactive => "Ask your SealSkin administrator to turn it back on, then choose Connect to try again.".into(),
             ProblemKind::OtherAccount(detail) if !detail.trim().is_empty() => {
-                format!("SealSkin refused this account: {}", detail.trim())
+                detail.trim().into()
             }
-            ProblemKind::OtherAccount(_) => "SealSkin refused this account without saying why.".into(),
+            ProblemKind::OtherAccount(_) => "SealSkin didn’t say why.".into(),
         }
     }
 

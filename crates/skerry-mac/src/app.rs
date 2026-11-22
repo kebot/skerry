@@ -320,9 +320,10 @@ struct Launcher {
     account_storage: account::Measure,
     /// The wake poll after Sign In on the Web; dropping it (or the Launcher) stops it.
     wake_poll: Option<Task<()>>,
-    /// Bumped whenever a wake poll starts or stops, so a stale check is ignored.
-    wake_generation: u64,
-    wake_check_in_flight: bool,
+    wake: account::WakeState,
+    /// A pasted key that was refused but kept (dormant, held, a policy refusal): saved
+    /// once its kept client connects.
+    pending_save: Option<Credential>,
 }
 
 impl Launcher {
@@ -386,8 +387,8 @@ impl Launcher {
             account_open: false,
             account_storage: account::Measure::NotAsked,
             wake_poll: None,
-            wake_generation: 0,
-            wake_check_in_flight: false,
+            wake: account::WakeState::default(),
+            pending_save: None,
         };
         // Back from the browser: check a pending wake at once.
         cx.observe_window_activation(window, |this, window, cx| {
@@ -461,8 +462,11 @@ impl Launcher {
             }
             account::Submit::RetryKept => {
                 self.clear_recovery();
-                if let Some(api) = self.retry_api.take() {
-                    self.load(api, None, LoadKind::Connect, cx);
+                // Kept until a load succeeds or a refusal replaces it, so a network failure
+                // leaves the retry target in place.
+                if let Some(api) = self.retry_api.clone() {
+                    let save = account::kept_save(self.pending_save.as_ref(), &api);
+                    self.load(api, save, LoadKind::Connect, cx);
                 }
             }
             account::Submit::RetrySaved => {
@@ -569,6 +573,7 @@ impl Launcher {
                         this.retry_api = None;
                         this.clear_recovery();
                         this.account_storage = account::Measure::NotAsked;
+                        this.pending_save = None;
                         // Launch options remembered per app live with the other preferences.
                         // Through the queue's copy, which includes writes not yet on disk.
                         this.preferences = cx.global::<WriteQueue>().read(api.server());
@@ -588,12 +593,18 @@ impl Launcher {
                         this.status = Some(error);
                     }
                     // SealSkin refused the key or the account (`ARCH-029`).
-                    Err(LibraryError::Key(refusal)) => {
-                        this.on_refusal(api.clone(), crate::sealskin::ApiError::Key(refusal), cx)
-                    }
-                    Err(LibraryError::Account(block)) => {
-                        this.on_refusal(api.clone(), crate::sealskin::ApiError::Account(block), cx)
-                    }
+                    Err(LibraryError::Key(refusal)) => this.refused_load(
+                        api.clone(),
+                        save,
+                        crate::sealskin::ApiError::Key(refusal),
+                        cx,
+                    ),
+                    Err(LibraryError::Account(block)) => this.refused_load(
+                        api.clone(),
+                        save,
+                        crate::sealskin::ApiError::Account(block),
+                        cx,
+                    ),
                     Err(LibraryError::Failed(error)) if saved_startup_key && this.api.is_none() => {
                         this.status = Some(format!(
                             "{error} Choose Connect to try the saved key again, or paste a new one."
@@ -726,6 +737,7 @@ impl Launcher {
         self.retry_api = None;
         self.leave_server();
         self.clear_recovery();
+        self.pending_save = None;
         cx.notify();
     }
 
