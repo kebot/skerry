@@ -36,6 +36,10 @@ subject: skerry
   - The raw-TCP tests: logo and icon fetches carry no `Authorization`, and only `/companion/api/` requests do.
   - The write queue is the only writer (a test fails if another module calls the file writers), runs jobs in order, and backs up an unreadable preferences file.
   - Unknown preference keys survive a rewrite.
+- Task E tests pass (`ARCH-030`):
+  - `audio::tests::*` use the fake `Backend`: following the default, chosen-missing fallback and return, the stall heartbeat (no false stall while muted), backoff and strikes, the probe keeping the fallback playing, and one failed listing keeping a healthy stream.
+  - The `AudioBitrate` parsing accepts strings or numbers, and the `SETTINGS` audio_bitrate message is the exact text.
+  - A preferences file without audio settings loads.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

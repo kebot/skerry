@@ -361,6 +361,38 @@
 - **Known, not fixed:** quitting still ends streams abruptly (1006), so the server holds keys for its grace period. The in-memory preferences stay ahead of disk after a failed write.
 - **Affected Rust:** `persist.rs` (new), `view/keys.rs` (new), `sealskin.rs`, `settings.rs`, `app.rs`, `view.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{library.rs,controls.rs,components.rs}`, `examples/preview.rs`.
 
+## ARCH-030: Audio Output Follows the Mac, with a Device Picker, Recovery, and Audio Bitrate (Task E)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-03`.
+- **Process:** plan → design → review (12 required changes) → build → QA (3 minor, 1 trivial, all fixed) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-e-audio`.
+- **Decision:**
+  - Each session has its own `skerry-audio` thread behind a `Backend` seam. Every cpal/Core Audio call runs on that thread, never on GPUI or Tokio. This is the one exception to "all I/O on Tokio". `Drop` sends a shutdown message and never joins.
+  - **Following the default:** cpal 0.17's error callback does nothing for the default device, so a 1 s poll of the default device's UID rebuilds the stream when it changes.
+  - **Output Device** dropdown in a new **Audio Settings** card (between Video Settings and Stats, collapsed by default):
+    - It lists "System Default (<active name>)" and then the connected devices by name. The choice is saved per server by raw UID.
+    - A saved device that is missing appears greyed and checked as "<name> (not connected)". Sound plays through the default until the device returns.
+    - A chosen device that fails falls back with the note "X isn't responding. Playing through Y while Skerry keeps trying."
+  - The stream always opens at 48 kHz f32 and Core Audio (AUHAL) converts. cpal never sets the device rate. Mono devices get an L+R downmix. There is no in-tree resampler.
+  - **Recovery:** rebuild on a stream error, on a stall (render callbacks stop for 2 s, counted only while a stream exists, so mute and pause don't count), on a default change, or when the chosen device returns.
+    - At most one rebuild per second, with 2–30 s exponential backoff.
+    - Strikes clear only after 5 s of steady callbacks.
+    - A retry of the chosen device opens a silent probe stream beside the playing fallback, and swaps only once the probe renders.
+    - A single failed device listing keeps the last list.
+    - The first recovery shows nothing; "Audio output stopped" appears only when nothing can play.
+  - The 125 ms drop-oldest queue is kept across rebuilds.
+  - **Audio Bitrate:** Selkies publishes `audio_bitrate` as an enum (bps strings in `allowed`, and a live value that can be a number). Skerry sends `SETTINGS,{"audio_bitrate":N,"picked":["audio_bitrate"]}`, as the Selkies web client does.
+    - The dropdown reads "128 kbps".
+    - It is hidden when the server doesn't send the setting, and shown disabled when locked or when only one value is allowed.
+    - The choice is saved per server and re-sent when the session is ready, if it is still allowed.
+  - Preferences (`AudioPreferences`, `ControlsSections.audio`) use struct-level `#[serde(default)]` and are written only through `persist.rs` (`ARCH-026`).
+- **Evidence:** Selkies 715df7c `settings/table.rs`, `ws/server.rs:2294`, `selkies-ws-core.ts:6204`, and the dashboard's `utils.ts:184` visibility rule. cpal 0.17.3 `device.rs:916` (no error callback for the default device) and l.751 (sample rate is set only for input). Prior art: Parsec and Windows App on the Mac follow the macOS default with no picker, so the picker exists for parity with the Selkies web client.
+- **QA (live, real Core Audio over the real transport against a fake WebSocket server):**
+  - Audio started on 44.1 kHz speakers, and the bitrate pick went out as the exact `SETTINGS` text.
+  - With a temporary aggregate device, the stream followed default changes in about 0.2 s. A chosen device that was also the default stayed put when the default moved, and a missing chosen device fell back and came back.
+  - 15 open/close cycles leaked no threads.
+- **Not verified:** real plug/unplug, sleep/wake, and mono hardware (all simulated); nothing on screen, because the screen was locked. "Sound Settings…" in the menu was deferred as scope creep.
+- **Affected Rust:** `audio.rs`, `settings.rs`, `transport.rs`, `app/controls.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{controls.rs,components.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -383,7 +415,7 @@
 | `ARCH-GAP-DC-02` | `desktop-and-collaboration` | `file-transfers` | settled (`ARCH-023`, `ARCH-024`) | Per-session Files window over Selkies' HTTP file routes: browse, New Folder, upload/download with progress and Cancel, Finder copy/paste and drag-and-drop both ways. |
 | `ARCH-GAP-DC-14` | `desktop-and-collaboration` | `session-file-mount` | future scope | Mount session files in Finder via a File Provider extension, a local WebDAV server, or a local NFS server. |
 | `ARCH-GAP-DC-15` | `desktop-and-collaboration` | `remote-rename-move` | blocked (server) | Delete settled via SealSkin storage (`ARCH-024`); no server offers rename or move, and Cleanroom/direct-Selkies sessions cannot delete. |
-| `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | unresolved (todo) | Output device selection, sample-rate conversion, sleep/wake recovery, and server-allowed audio bitrate controls. |
+| `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
 | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | unresolved (todo) | Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference. |
 | `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
