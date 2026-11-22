@@ -347,9 +347,11 @@ impl Haptics {
             return Ok(());
         };
         unsafe {
-            // Starting a running engine is a no-op; one macOS stopped starts again.
+            // Starting a running engine is a no-op; one macOS stopped starts again. A start
+            // that races the asynchronous stop from `stop()` fails once, so it is retried.
             engine
                 .startAndReturnError()
+                .or_else(|_| engine.startAndReturnError())
                 .map_err(|error| error.localizedDescription().to_string())?;
             let parameters = NSArray::from_retained_slice(&[
                 CHHapticEventParameter::initWithParameterID_value(

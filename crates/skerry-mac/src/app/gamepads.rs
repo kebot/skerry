@@ -6,7 +6,7 @@
 
 use super::session_window::{OpenWindows, SessionWindow};
 use crate::gamepad::native::{Controllers, PadEvent};
-use crate::gamepad::{Pad, PadState, Rumble, SlotTable, SLOTS};
+use crate::gamepad::{Pad, PadState, Rumble, SlotTable};
 use gpui_kit::{AnyWindowHandle, App, BorrowAppContext as _, Global, WeakEntity};
 
 type SessionHandle = (AnyWindowHandle, WeakEntity<SessionWindow>);
@@ -18,9 +18,35 @@ pub(crate) struct Gamepads {
     pads: Vec<Pad>,
     /// The key session window, if any: only it sends pads.
     active: Option<SessionHandle>,
-    /// The window that last drove each slot while key. Only it may send that slot's
-    /// `js,d` (`ARCH-032`).
-    drivers: [Option<AnyWindowHandle>; SLOTS],
+    /// The window that last drove each slot of each server while key. Only it may send
+    /// that slot's `js,d` (`ARCH-032`).
+    drivers: Drivers<AnyWindowHandle>,
+}
+
+/// The window driving each `(server, slot)`. Slot tables are per Selkies server, so slot 0
+/// on one server and slot 0 on another are different Players.
+#[derive(Debug)]
+pub(super) struct Drivers<W>(std::collections::HashMap<(String, u8), W>);
+
+impl<W> Default for Drivers<W> {
+    fn default() -> Self {
+        Self(std::collections::HashMap::new())
+    }
+}
+
+impl<W: Copy + PartialEq> Drivers<W> {
+    fn drive(&mut self, window: W, server: &str, slots: &[u8]) {
+        for &slot in slots {
+            self.0.insert((server.to_string(), slot), window);
+        }
+    }
+
+    /// Whether `window` still drives `slot` on `server` (no other window has since).
+    fn drives(&self, window: W, server: &str, slot: u8) -> bool {
+        self.0
+            .get(&(server.to_string(), slot))
+            .is_none_or(|driver| *driver == window)
+    }
 }
 
 impl Global for Gamepads {}
@@ -33,7 +59,7 @@ pub(super) fn init(cx: &mut App) {
         slots: SlotTable::default(),
         pads: Vec::new(),
         active: None,
-        drivers: [None; SLOTS],
+        drivers: Drivers::default(),
     });
     cx.spawn(async move |cx| {
         while let Some(first) = incoming.recv().await {
@@ -130,21 +156,14 @@ fn hand_over<T>(
 }
 
 impl Gamepads {
-    /// The key window drives the slots it announced.
-    pub(super) fn drive(&mut self, window: AnyWindowHandle, slots: &[u8]) {
-        for &slot in slots {
-            if let Some(driver) = self.drivers.get_mut(usize::from(slot)) {
-                *driver = Some(window);
-            }
-        }
+    /// The key window drives the slots it announced on its server.
+    pub(super) fn drive(&mut self, window: AnyWindowHandle, server: &str, slots: &[u8]) {
+        self.drivers.drive(window, server, slots);
     }
 
-    /// Whether `window` still drives `slot` (no other window has since).
-    pub(super) fn drives(&self, window: AnyWindowHandle, slot: u8) -> bool {
-        self.drivers
-            .get(usize::from(slot))
-            .and_then(|driver| *driver)
-            .is_none_or(|driver| driver == window)
+    /// Whether `window` still drives `slot` on `server`.
+    pub(super) fn drives(&self, window: AnyWindowHandle, server: &str, slot: u8) -> bool {
+        self.drivers.drives(window, server, slot)
     }
 
     fn apply(&mut self, event: PadEvent) {
@@ -238,7 +257,7 @@ impl Gamepads {
             slots: SlotTable::default(),
             pads: Vec::new(),
             active: None,
-            drivers: [None; SLOTS],
+            drivers: Drivers::default(),
         }
     }
 }
@@ -252,6 +271,44 @@ fn slots_of(gamepads: &Gamepads) -> Vec<(crate::gamepad::PadId, Option<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drivers_are_per_server_and_slot() {
+        use crate::gamepad::{Gate, Link, Pad};
+        let pad = |id| Pad {
+            id,
+            name: "Pad".into(),
+            slot: Some(0),
+            state: PadState::REST,
+            rumble: false,
+        };
+        let key = Gate {
+            ready_and_enabled: true,
+            input_on: true,
+            key: true,
+        };
+        // Window 1 on server A and window 2 on server B both drive slot 0.
+        let mut drivers = Drivers::default();
+        let (mut a, mut b) = (Link::default(), Link::default());
+        a.sync(&[pad(7)], key);
+        drivers.drive(1u8, "a.example", &a.announced_slots());
+        b.sync(&[pad(7)], key);
+        drivers.drive(2u8, "b.example", &b.announced_slots());
+        // Closing window 1 sends js,d to its own server: nothing yielded.
+        assert!(a
+            .yield_to(&|slot| drivers.drives(1, "a.example", slot))
+            .is_empty());
+        assert_eq!(a.close(), ["js,d,0"]);
+        // Window 2's slot stays its own.
+        assert!(b
+            .yield_to(&|slot| drivers.drives(2, "b.example", slot))
+            .is_empty());
+        assert_eq!(b.announced_slots(), [0]);
+        // On the same server, a newer driver takes the slot over.
+        drivers.drive(3u8, "a.example", &[0]);
+        assert!(!drivers.drives(1, "a.example", 0));
+        assert!(drivers.drives(2, "b.example", 0));
+    }
 
     #[test]
     fn set_active_reports_the_window_that_lost_key() {

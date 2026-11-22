@@ -775,6 +775,8 @@ impl Desktop {
     fn release_input(&mut self) {
         // Child windows, full screen, settings changes and the stream's end all pass here.
         self.release_capture(capture::Release::Closed);
+        // Whatever took the keyboard, the next ⌃⌥⇧Z is a fresh press.
+        self.chord = capture::ChordGuard::default();
         let commands = self.keys.release_all();
         self.commands(commands);
         self.marked.clear();

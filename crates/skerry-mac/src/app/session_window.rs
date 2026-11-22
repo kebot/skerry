@@ -856,17 +856,19 @@ impl SessionWindow {
         }
         if gate.key && cx.has_global::<Gamepads>() {
             let (window, slots) = (self.window, self.gamepad_link.announced_slots());
-            cx.update_global::<Gamepads, _>(|gamepads, _| gamepads.drive(window, &slots));
+            let server = self.api.server().to_string();
+            cx.update_global::<Gamepads, _>(|gamepads, _| gamepads.drive(window, &server, &slots));
         }
     }
 
     /// Forgets the announced slots another window drives now (`ARCH-032`).
     fn yield_gamepad_slots(&mut self, cx: &App) -> Vec<u8> {
         let window = self.window;
+        let server = self.api.server().to_string();
         match cx.try_global::<Gamepads>() {
             Some(gamepads) => self
                 .gamepad_link
-                .yield_to(&|slot| gamepads.drives(window, slot)),
+                .yield_to(&|slot| gamepads.drives(window, &server, slot)),
             None => Vec::new(),
         }
     }
