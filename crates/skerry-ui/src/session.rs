@@ -99,8 +99,11 @@ pub fn controls_trigger(
         )
 }
 
-/// Placeholder overlay shown before the first remote video frame arrives.
-pub fn waiting_overlay() -> Div {
+/// Placeholder overlay shown before the first remote video frame arrives: "Connecting to
+/// Firefox…", or "Waiting for Firefox to start…" during Keep Waiting. An empty label keeps
+/// the generic text.
+pub fn waiting_overlay(label: impl Into<SharedString>) -> Div {
+    let label = label.into();
     div()
         .absolute()
         .inset_0()
@@ -108,7 +111,67 @@ pub fn waiting_overlay() -> Div {
         .items_center()
         .justify_center()
         .text_color(rgb(0xb6bdcc))
-        .child("Waiting for the remote display…")
+        .child(if label.is_empty() {
+            SharedString::from("Waiting for the remote display…")
+        } else {
+            label
+        })
+}
+
+/// The banner when a session hasn't answered within the start-up grace (`ARCH-027`):
+/// Keep Waiting (5 more minutes), Retry (a fresh 45 s), or Disconnect.
+pub fn startup_banner(
+    theme: &Theme,
+    message: impl Into<SharedString>,
+    on_keep_waiting: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_retry: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_disconnect: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    div()
+        .id("session-startup-banner")
+        .absolute()
+        .bottom_3()
+        .left_3()
+        .right_3()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover)
+        .text_color(theme.foreground)
+        .occlude()
+        .h_flex()
+        .items_center()
+        .gap_3()
+        .child(
+            Icon::new(IconName::Info)
+                .with_size(px(16.))
+                .text_color(theme.muted_foreground),
+        )
+        .child(div().flex_1().min_w_0().text_sm().child(message.into()))
+        .child(
+            Button::new("session-startup-keep-waiting")
+                .primary()
+                .small()
+                .label("Keep Waiting")
+                .tooltip("Keep trying for 5 more minutes")
+                .on_click(on_keep_waiting),
+        )
+        .child(
+            Button::new("session-startup-retry")
+                .outline()
+                .small()
+                .label("Retry")
+                .tooltip("Try connecting again now")
+                .on_click(on_retry),
+        )
+        .child(
+            Button::new("session-startup-disconnect")
+                .ghost()
+                .small()
+                .label("Disconnect")
+                .on_click(on_disconnect),
+        )
 }
 
 /// Confirmation dialog shown before stopping a running remote session.

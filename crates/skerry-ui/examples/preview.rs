@@ -74,6 +74,8 @@ enum Story {
     ControlsDropdownOpen,
     ControlsRestoredSections,
     SessionOverlays,
+    SessionStartupStalled,
+    SessionKeepWaiting,
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
@@ -112,6 +114,8 @@ impl Story {
         Story::ControlsDropdownOpen,
         Story::ControlsRestoredSections,
         Story::SessionOverlays,
+        Story::SessionStartupStalled,
+        Story::SessionKeepWaiting,
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
@@ -147,7 +151,9 @@ impl Story {
             | Story::ControlsServerLocked
             | Story::ControlsDropdownOpen
             | Story::ControlsRestoredSections => "Session Controls",
-            Story::SessionOverlays => "Session Overlays",
+            Story::SessionOverlays | Story::SessionStartupStalled | Story::SessionKeepWaiting => {
+                "Session Overlays"
+            }
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
         }
     }
@@ -185,6 +191,8 @@ impl Story {
             Story::ControlsDropdownOpen => "Dropdown Open",
             Story::ControlsRestoredSections => "Restored Sections",
             Story::SessionOverlays => "Waiting + IME + Banner",
+            Story::SessionStartupStalled => "Still Starting",
+            Story::SessionKeepWaiting => "Waiting to Start",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
@@ -224,6 +232,8 @@ impl Story {
             Story::ControlsDropdownOpen => "story-controls-dropdown-open",
             Story::ControlsRestoredSections => "story-controls-restored-sections",
             Story::SessionOverlays => "story-session-overlays",
+            Story::SessionStartupStalled => "story-session-startup-stalled",
+            Story::SessionKeepWaiting => "story-session-keep-waiting",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
@@ -1983,7 +1993,7 @@ impl PreviewApp {
                     .size_full()
                     .relative()
                     .bg(rgb(0x111318))
-                    .child(session::waiting_overlay())
+                    .child(session::waiting_overlay(""))
                     .child(session::ime_preedit(point(px(120.), px(96.)), "にほんご"))
                     .child(session::controls_trigger(
                         point(px(20.), px(20.)),
@@ -1999,6 +2009,35 @@ impl PreviewApp {
                         "Reconnecting to Selkies stream (attempt 2)…",
                     ))
             }
+            Story::SessionStartupStalled => {
+                let (keep, retry, disconnect) = (entity.clone(), entity.clone(), entity);
+                div()
+                    .size_full()
+                    .relative()
+                    .bg(rgb(0x111318))
+                    .child(session::startup_banner(
+                        theme,
+                        "Firefox hasn’t answered yet. It may still be starting.",
+                        move |_, _, cx| {
+                            keep.update(cx, |this, cx| {
+                                this.record_event("Session: Keep Waiting", cx)
+                            });
+                        },
+                        move |_, _, cx| {
+                            retry.update(cx, |this, cx| this.record_event("Session: Retry", cx));
+                        },
+                        move |_, _, cx| {
+                            disconnect.update(cx, |this, cx| {
+                                this.record_event("Session: Disconnect", cx)
+                            });
+                        },
+                    ))
+            }
+            Story::SessionKeepWaiting => div()
+                .size_full()
+                .relative()
+                .bg(rgb(0x111318))
+                .child(session::waiting_overlay("Waiting for Firefox to start…")),
         }
     }
 

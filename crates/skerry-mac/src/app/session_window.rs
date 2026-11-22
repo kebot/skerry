@@ -15,7 +15,10 @@ use crate::persist::WriteQueue;
 use crate::sealskin::{RemoteSession, SealSkinClient};
 use crate::settings::{Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings};
 use crate::stats;
-use crate::transport::{DisplayRequest, SessionEvent, SessionOptions, StreamInfo, StreamSample};
+use crate::transport::{
+    DisplayRequest, SessionEvent, SessionOptions, StreamInfo, StreamSample, KEEP_WAITING_GRACE,
+    SOCKET_STARTUP_GRACE,
+};
 use crate::video::Codec;
 use crate::view::NativeSession;
 use gpui_kit::component::ActiveTheme as _;
@@ -116,6 +119,11 @@ pub(super) struct SessionWindow {
     pub(super) pending_settings: VideoSettings,
     settings_task: Option<Task<()>>,
     status: Option<String>,
+    /// The session hasn't answered within the start-up grace: the banner offers Keep
+    /// Waiting and Retry. `true` once a Keep Waiting period has run out too (`ARCH-027`).
+    startup_stalled: Option<bool>,
+    /// The current stream retries start-up errors for 5 minutes (Keep Waiting).
+    keep_waiting: bool,
     /// Last seen full-screen state; a change releases held keys (`ARCH-GAP-DC-09`).
     fullscreen: bool,
 }
@@ -166,6 +174,8 @@ impl SessionWindow {
             pending_settings: VideoSettings::new(),
             settings_task: None,
             status: None,
+            startup_stalled: None,
+            keep_waiting: false,
             fullscreen: window.is_fullscreen(),
         };
         let owner = cx.weak_entity();
@@ -218,6 +228,16 @@ impl SessionWindow {
                     muted: self.muted,
                     codec: self.preferences.codec,
                     stats: self.stats_open,
+                    startup_grace: if self.keep_waiting {
+                        KEEP_WAITING_GRACE
+                    } else {
+                        SOCKET_STARTUP_GRACE
+                    },
+                    waiting: if self.keep_waiting {
+                        format!("Waiting for {} to start…", self.remote.app_name)
+                    } else {
+                        format!("Connecting to {}…", self.remote.app_name)
+                    },
                     display: self
                         .display_mode
                         .request(window.viewport_size(), window.scale_factor()),
@@ -314,6 +334,13 @@ impl SessionWindow {
                     stream.receive_clipboard(incoming, cx);
                 }
             }
+            SessionEvent::StartupTimeout => {
+                self.resize_allowed = false;
+                self.settings = None;
+                self.audio = None;
+                self.video = None;
+                self.startup_stalled = Some(self.keep_waiting);
+            }
             SessionEvent::Error(error) => {
                 self.resize_allowed = false;
                 self.settings = None;
@@ -322,6 +349,15 @@ impl SessionWindow {
                 self.status = Some(error);
             }
         }
+    }
+
+    /// After the start-up banner: Keep Waiting retries for 5 more minutes behind "Waiting
+    /// for {App} to start…"; Retry starts a fresh 45 s window.
+    fn retry_startup(&mut self, keep_waiting: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.startup_stalled = None;
+        self.keep_waiting = keep_waiting;
+        self.reconnect(window, cx);
+        cx.notify();
     }
 
     pub(super) fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -738,11 +774,30 @@ impl Render for SessionWindow {
                     status,
                     cx.listener(|this, _, window, cx| {
                         this.status = None;
+                        this.keep_waiting = false;
                         this.reconnect(window, cx);
                         cx.notify();
                     }),
                     cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
                 ))
             })
+            .when_some(
+                self.startup_stalled.filter(|_| self.status.is_none()),
+                |root, after_waiting| {
+                    let app = &self.remote.app_name;
+                    let message = if after_waiting {
+                        format!("{app} still hasn’t answered after 5 more minutes.")
+                    } else {
+                        format!("{app} hasn’t answered yet. It may still be starting.")
+                    };
+                    root.child(session::startup_banner(
+                        &theme,
+                        message,
+                        cx.listener(|this, _, window, cx| this.retry_startup(true, window, cx)),
+                        cx.listener(|this, _, window, cx| this.retry_startup(false, window, cx)),
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
     }
 }

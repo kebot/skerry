@@ -14,8 +14,8 @@ use gpui_kit::{
     canvas, div, point, prelude::*, px, size, AnyView, App, Bounds, ContentMask, Context, Corners,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, HitboxBehavior,
     KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent, Task,
-    UTF16Selection, Window,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollEvent,
+    SharedString, Task, UTF16Selection, Window,
 };
 use reqwest::Url;
 use skerry_ui::session;
@@ -59,7 +59,12 @@ impl NativeSession {
         let (frame_tx, frames) = watch::channel(Frame::default());
         let (input, commands) = mpsc::unbounded_channel();
         let (pointer, motion) = watch::channel(None);
-        let view = cx.new(|cx| Desktop::new(input.clone(), pointer, frames, window, cx));
+        let waiting = SharedString::from(options.waiting.clone());
+        let view = cx.new(|cx| {
+            let mut desktop = Desktop::new(input.clone(), pointer, frames, window, cx);
+            desktop.waiting = waiting;
+            desktop
+        });
         let pinch = crate::app::native_window(window).and_then(|native| {
             let desktop = view.read(cx);
             pinch::Monitor::install(native, desktop.pinch_target.clone(), input.clone())
@@ -68,12 +73,18 @@ impl NativeSession {
         window.focus(&focus, cx);
         let (cancel, cancelled) = watch::channel(false);
         let task = runtime.spawn(async move {
-            if let Err(message) = transport::run(
+            match transport::run(
                 address, frame_tx, commands, motion, options, &events, cancelled,
             )
             .await
             {
-                let _ = events.send(SessionEvent::Error(message.into()));
+                Ok(()) => {}
+                Err(transport::RunError::StartupTimeout) => {
+                    let _ = events.send(SessionEvent::StartupTimeout);
+                }
+                Err(error) => {
+                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                }
             }
         });
         Self {
@@ -263,6 +274,8 @@ const CLOSE_WATCHDOG: Duration = Duration::from_secs(1);
 
 struct Desktop {
     focus: FocusHandle,
+    /// The overlay's text until the first frame: "Connecting to Firefox…".
+    waiting: SharedString,
     scale_locally: bool,
     frame: Frame,
     painted: Rc<RefCell<Option<Arc<RenderImage>>>>,
@@ -374,6 +387,7 @@ impl Desktop {
         .detach();
         Self {
             focus,
+            waiting: SharedString::default(),
             scale_locally: true,
             frame: Frame::default(),
             painted: Rc::default(),
@@ -965,7 +979,9 @@ impl Render for Desktop {
                     |_, window, cx| window.dispatch_action(Box::new(ToggleSessionControls), cx),
                 ))
             })
-            .when(empty, |view| view.child(session::waiting_overlay()))
+            .when(empty, |view| {
+                view.child(session::waiting_overlay(self.waiting.clone()))
+            })
     }
 }
 
