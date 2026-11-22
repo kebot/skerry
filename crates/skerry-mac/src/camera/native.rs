@@ -48,7 +48,7 @@ use objc2_video_toolbox::{
     kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel,
     kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder,
     kVTVideoEncoderSpecification_EnableLowLatencyRateControl, VTCompressionSession,
-    VTCompressionSessionPrepareToEncodeFrames, VTEncodeInfoFlags, VTSessionSetProperty,
+    VTEncodeInfoFlags, VTSessionSetProperty,
 };
 use std::ffi::{c_void, CStr};
 use std::ptr::{null, null_mut, NonNull};
@@ -281,7 +281,7 @@ impl Encoder {
                 )
         };
         // SAFETY: a valid session.
-        let prepared = unsafe { VTCompressionSessionPrepareToEncodeFrames(&session) } == 0;
+        let prepared = unsafe { session.prepare_to_encode_frames() } == 0;
         // SAFETY: framework constants.
         let force_key = unsafe {
             CFDictionary::<CFString, CFBoolean>::from_slices(
@@ -589,13 +589,10 @@ pub(super) struct Session {
     failed: Arc<AtomicBool>,
 }
 
+type Format = Retained<objc2_av_foundation::AVCaptureDeviceFormat>;
+
 /// `(width, height, max fps)` of each format, and the formats themselves.
-fn formats(
-    device: &AVCaptureDevice,
-) -> (
-    Vec<(u32, u32, f64)>,
-    Vec<Retained<objc2_av_foundation::AVCaptureDeviceFormat>>,
-) {
+fn formats(device: &AVCaptureDevice) -> (Vec<(u32, u32, f64)>, Vec<Format>) {
     // SAFETY: plain property reads.
     let all = unsafe { device.formats() }.to_vec();
     let sizes = all
@@ -837,9 +834,9 @@ mod tests {
         let resolved = |name| framework_string(name).unwrap().to_string();
         // SAFETY: immutable framework constants, present on the Mac running the tests.
         unsafe {
-            use objc2_av_foundation::{
-                AVCaptureDeviceTypeBuiltInWideAngleCamera, AVCaptureDeviceTypeExternalUnknown,
-            };
+            use objc2_av_foundation::AVCaptureDeviceTypeBuiltInWideAngleCamera;
+            #[allow(deprecated)]
+            use objc2_av_foundation::AVCaptureDeviceTypeExternalUnknown;
             assert_eq!(
                 resolved(WIDE_ANGLE),
                 AVCaptureDeviceTypeBuiltInWideAngleCamera.to_string()

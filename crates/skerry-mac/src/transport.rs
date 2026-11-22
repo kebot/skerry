@@ -4,9 +4,10 @@ use crate::clipboard;
 use crate::print_jobs;
 use crate::selkies;
 use crate::settings::{Key, ScreenChange, ScreenPolicy, Settings};
+use crate::socket_writer::{socket_fd, Backlog, NoBacklog, SplitSocket, UnsentBacklog};
 use crate::video::{self, Codec, Decoder};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use gpui_kit::RenderImage;
 use image::{ImageFormat, ImageReader};
 use reqwest::Url;
@@ -613,7 +614,8 @@ pub enum SessionEvent {
     Rumble(crate::gamepad::Rumble),
     /// The capture part of a primary `server_settings` (`ARCH-038`).
     CapturePolicy(capture::CapturePolicy),
-    /// `MICROPHONE_DISABLED` or `CAPTURE_DEMAND` (`ARCH-038`).
+    /// `MICROPHONE_DISABLED`, `WEBCAM_DISABLED`, `WEBCAM_KEYFRAME` or `CAPTURE_DEMAND`
+    /// (`ARCH-038`).
     Capture(capture::Reply),
     /// A status from the window's `skerry-mic` thread, tagged with that thread's id so a
     /// late one from a thread already stopped is ignored. Raised by the window, not the
@@ -622,6 +624,10 @@ pub enum SessionEvent {
     /// The card's input list, from plain CoreAudio properties, tagged with its stream.
     /// Raised by the window.
     MicInputs(u64, crate::input_devices::InputList),
+    /// A status from the window's `skerry-camera` thread, tagged like `MicStatus`.
+    CamStatus(u64, crate::camera::CamStatus),
+    /// The card's camera list (only once macOS granted the camera), tagged with its stream.
+    CamInputs(u64, crate::input_devices::InputList),
     /// An Apps window event: `apps_state`, `apps_job`, `command_error` (`ARCH-035`).
     Apps(crate::apps::Event),
     /// What `server_settings` allows the Apps window (`ARCH-035`).
@@ -903,6 +909,15 @@ pub struct SessionOptions {
     /// `0x02` microphone frames from the window's `skerry-mic` thread (`ARCH-038`). Dropping
     /// it when the stream ends stops that thread's capture.
     pub mic: Option<mpsc::Receiver<Vec<u8>>>,
+    /// `0x06` camera frames from the window's `skerry-camera` thread (`ARCH-038`).
+    pub camera: Option<CameraFrames>,
+}
+
+/// The camera's frame channel and its keyframe request flag, which the socket writer sets
+/// when it drops a frame.
+pub struct CameraFrames {
+    pub frames: mpsc::Receiver<Vec<u8>>,
+    pub keyframe: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Why a stream ended with an error.
@@ -1089,6 +1104,10 @@ pub async fn run(
     };
     let (template, access, connector) = requested?;
     let mut mic_frames = options.mic;
+    let (mut cam_frames, cam_keyframe) = match options.camera {
+        Some(camera) => (Some(camera.frames), camera.keyframe),
+        None => (None, Arc::default()),
+    };
     if let Some(access) = access {
         let _ = events.send(SessionEvent::Files(access));
     }
@@ -1096,7 +1115,7 @@ pub async fn run(
     // A just-launched session answers 404/5xx or refuses connections until Selkies is up, so
     // keep retrying transient failures for a while instead of failing the first attempt.
     let give_up = Instant::now() + options.startup_grace;
-    let mut socket = loop {
+    let socket = loop {
         let mut request = template
             .uri()
             .clone()
@@ -1146,6 +1165,13 @@ pub async fn run(
             Retry::Fail => return Err("Couldn’t connect to the Selkies WebSocket.".into()),
         }
     };
+    // Writes go through a writer task, so a camera keyframe never holds this loop; camera
+    // frames wait while the kernel holds unsent bytes (`socket_writer`, `ARCH-038`).
+    let backlog: Box<dyn Backlog> = match socket_fd(socket.get_ref()).and_then(UnsentBacklog::new) {
+        Some(backlog) => Box::new(backlog),
+        None => Box::new(NoBacklog),
+    };
+    let mut socket = SplitSocket::new(socket, cam_keyframe, backlog);
     let mut codec = if options.codec.supported() {
         options.codec
     } else {
@@ -1363,6 +1389,13 @@ pub async fn run(
             frame = uplink(&mut mic_frames) => {
                 if let Some(message) = uplink_message(ready, frame) {
                     socket.send(message).await.map_err(|_| disconnected)?;
+                }
+            }
+            // Camera frames go to the writer's camera slot, behind every queued command and
+            // microphone frame; frames before the session is ready are dropped.
+            frame = uplink(&mut cam_frames) => {
+                if ready {
+                    socket.send_camera(frame);
                 }
             }
             incoming = inbound(&mut socket, &mut last_inbound) => match incoming {
@@ -1929,6 +1962,7 @@ mod tests {
             audio_output: None,
             audio_bitrate: None,
             mic: None,
+            camera: None,
         }
     }
 

@@ -120,13 +120,9 @@ pub struct KeyframeGate {
 }
 
 impl KeyframeGate {
-    /// The server asked (`WEBCAM_KEYFRAME`).
+    /// The server asked (`WEBCAM_KEYFRAME`), or a frame was dropped (the next ones can't
+    /// decode until a keyframe). Both arrive through the uplink's keyframe flag.
     pub fn request(&mut self) {
-        self.force = true;
-    }
-
-    /// A frame was dropped: the next ones can't decode until a keyframe.
-    pub fn dropped(&mut self) {
         self.force = true;
     }
 
@@ -723,7 +719,7 @@ mod tests {
         gate.request();
         assert!(gate.take(start + Duration::from_secs(1)));
         assert!(!gate.take(start + Duration::from_millis(1033)));
-        gate.dropped();
+        gate.request();
         assert!(gate.take(start + Duration::from_secs(2)));
     }
 
@@ -735,7 +731,7 @@ mod tests {
         // A request right after a keyframe waits for 500 ms, then still applies.
         gate.request();
         assert!(!gate.take(start + Duration::from_millis(100)));
-        gate.dropped();
+        gate.request();
         assert!(!gate.take(start + Duration::from_millis(400)));
         assert!(gate.take(start + Duration::from_millis(500)));
         // Requests in a burst give one keyframe per 500 ms, never more.
@@ -795,9 +791,11 @@ mod tests {
         }
     }
 
+    type Listed = Rc<RefCell<Vec<(String, Option<String>)>>>;
+
     struct FakeCam {
         log: Rc<RefCell<Log>>,
-        devices: Rc<RefCell<Vec<(String, Option<String>)>>>,
+        devices: Listed,
         default: Rc<RefCell<Option<String>>>,
         running: Rc<RefCell<Health>>,
         open_fails: Rc<RefCell<Option<Health>>>,

@@ -144,6 +144,9 @@ enum Story {
     CaptureDenied,
     CaptureServerOff,
     CaptureMissingDevice,
+    CaptureBothLive,
+    CaptureCameraInUse,
+    CaptureCameraHidden,
     SessionCaptureBadge,
     SessionCaptureBadgeNarrow,
     SessionOverlays,
@@ -281,6 +284,9 @@ impl Story {
         Story::CaptureDenied,
         Story::CaptureServerOff,
         Story::CaptureMissingDevice,
+        Story::CaptureBothLive,
+        Story::CaptureCameraInUse,
+        Story::CaptureCameraHidden,
         Story::SessionCaptureBadge,
         Story::SessionCaptureBadgeNarrow,
         Story::SessionOverlays,
@@ -418,6 +424,9 @@ impl Story {
             | Story::CaptureDenied
             | Story::CaptureServerOff
             | Story::CaptureMissingDevice
+            | Story::CaptureBothLive
+            | Story::CaptureCameraInUse
+            | Story::CaptureCameraHidden
             | Story::SessionCaptureBadge
             | Story::SessionCaptureBadgeNarrow => "Session Capture",
             Story::SessionOverlays
@@ -550,6 +559,9 @@ impl Story {
             Story::CaptureDenied => "Permission Denied",
             Story::CaptureServerOff => "Turned Off by Server",
             Story::CaptureMissingDevice => "Saved Microphone Missing",
+            Story::CaptureBothLive => "Microphone and Camera Sending",
+            Story::CaptureCameraInUse => "Camera in Use",
+            Story::CaptureCameraHidden => "Camera Hidden by Server",
             Story::SessionCaptureBadge => "Badge over the Picture",
             Story::SessionCaptureBadgeNarrow => "Badge · Narrow Window",
             Story::SessionOverlays => "Waiting + IME + Banner",
@@ -689,6 +701,9 @@ impl Story {
             Story::CaptureDenied => "story-capture-denied",
             Story::CaptureServerOff => "story-capture-server-off",
             Story::CaptureMissingDevice => "story-capture-problems",
+            Story::CaptureBothLive => "story-capture-both-sending",
+            Story::CaptureCameraInUse => "story-capture-camera-in-use",
+            Story::CaptureCameraHidden => "story-capture-mic-only",
             Story::SessionCaptureBadge => "story-session-capture-badge",
             Story::SessionCaptureBadgeNarrow => "story-session-capture-badge-narrow",
             Story::SessionOverlays => "story-session-overlays",
@@ -828,6 +843,9 @@ impl Story {
                 | Story::CaptureDenied
                 | Story::CaptureServerOff
                 | Story::CaptureMissingDevice
+                | Story::CaptureBothLive
+                | Story::CaptureCameraInUse
+                | Story::CaptureCameraHidden
         )
     }
 
@@ -2924,6 +2942,37 @@ impl PreviewApp {
                     capture.mic.note = None;
                 }
             }
+            ControlsAction::SetCamera(on) => {
+                if let Some(camera) = self
+                    .controls_props
+                    .media_capture
+                    .as_mut()
+                    .and_then(|capture| capture.camera.as_mut())
+                {
+                    if !camera.locked {
+                        camera.on = on;
+                        camera.live = on;
+                        camera.denied = false;
+                        camera.detail = on.then(|| "Sending to the session".into());
+                    }
+                }
+            }
+            ControlsAction::SelectCamera(uid) => {
+                if let Some(camera) = self
+                    .controls_props
+                    .media_capture
+                    .as_mut()
+                    .and_then(|capture| capture.camera.as_mut())
+                {
+                    for item in &mut camera.devices {
+                        item.checked = item.uid == uid;
+                    }
+                    if let Some(item) = camera.devices.iter().find(|item| item.checked) {
+                        camera.device_label = item.label.clone();
+                    }
+                    camera.note = None;
+                }
+            }
             ControlsAction::OpenPrivacySettings(_) => {}
             ControlsAction::Reconnect
             | ControlsAction::OpenFiles
@@ -3362,9 +3411,86 @@ impl PreviewApp {
                     ..off
                 }
             }
+            Story::CaptureBothLive => CaptureDeviceProps {
+                on: true,
+                live: true,
+                detail: Some("Sending to the session".into()),
+                level: Some(3),
+                ..off
+            },
             _ => off,
         };
-        MediaCaptureProps { mic }
+        let cameras = |chosen: Option<&str>| {
+            vec![
+                item(
+                    None,
+                    "System Default (FaceTime HD Camera)",
+                    chosen.is_none(),
+                    true,
+                ),
+                item(
+                    Some("facetime"),
+                    "FaceTime HD Camera",
+                    chosen == Some("facetime"),
+                    true,
+                ),
+                item(
+                    Some("iphone"),
+                    "iPhone Camera",
+                    chosen == Some("iphone"),
+                    true,
+                ),
+            ]
+        };
+        let camera_off = CaptureDeviceProps {
+            on: false,
+            locked: false,
+            picker_locked: false,
+            live: false,
+            detail: None,
+            denied: false,
+            device_label: "System Default (FaceTime HD Camera)".into(),
+            devices: cameras(None),
+            note: None,
+            level: None,
+        };
+        let camera = match story {
+            Story::CaptureCameraHidden => None,
+            Story::CaptureBothLive => Some(CaptureDeviceProps {
+                on: true,
+                live: true,
+                detail: Some("Sending to the session".into()),
+                device_label: "iPhone Camera".into(),
+                devices: cameras(Some("iphone")),
+                ..camera_off
+            }),
+            Story::CaptureCameraInUse => Some(CaptureDeviceProps {
+                on: true,
+                detail: Some(
+                    "The camera is in use by another app or stopped. Trying again…".into(),
+                ),
+                ..camera_off
+            }),
+            Story::CaptureAsking => Some(CaptureDeviceProps {
+                on: true,
+                detail: Some("Waiting for permission…".into()),
+                ..camera_off
+            }),
+            Story::CaptureServerOff => Some(CaptureDeviceProps {
+                locked: true,
+                picker_locked: true,
+                detail: Some("Turned off by the server".into()),
+                device_label: "System Default".into(),
+                devices: vec![item(None, "System Default", true, true)],
+                ..camera_off
+            }),
+            Story::CaptureMissingDevice => Some(CaptureDeviceProps {
+                detail: Some("Starts when an app in the session uses the camera".into()),
+                ..camera_off
+            }),
+            _ => Some(camera_off),
+        };
+        MediaCaptureProps { mic, camera }
     }
 
     /// The Audio Settings card each Session Audio story shows, as `skerry-mac` builds it.
@@ -4238,7 +4364,10 @@ impl PreviewApp {
             | Story::CaptureAsking
             | Story::CaptureDenied
             | Story::CaptureServerOff
-            | Story::CaptureMissingDevice => {
+            | Story::CaptureMissingDevice
+            | Story::CaptureBothLive
+            | Story::CaptureCameraInUse
+            | Story::CaptureCameraHidden => {
                 let handler = Rc::new(
                     move |action: ControlsAction, window: &mut Window, cx: &mut App| {
                         entity.update(cx, |this, cx| {
@@ -4516,8 +4645,8 @@ impl PreviewApp {
                 Self::strip_stage(frame.child(Self::capture_hint_overlay(hint, 1280., banner)))
             }
             Story::SessionCaptureBadge => {
-                // Microphone badge at the left, the strip on one line (top 52), the ⋯ trigger
-                // and one print notice at the right.
+                // Microphone and camera badge at the left, the strip on one line (top 52), the
+                // ⋯ trigger and one print notice at the right.
                 let strip = Self::fixture_strip(false);
                 let top = session::print_notices_top(Some(stats::strip_bottom(&strip, px(1280.))));
                 let notices = Self::fixture_print_notices();
@@ -4528,7 +4657,7 @@ impl PreviewApp {
                             px(32.),
                             |_, _, _| {},
                         ))
-                        .child(session::capture_badge(true, top))
+                        .child(session::capture_badge(true, true, top))
                         .child(session::print_notices(
                             theme,
                             &notices[..1],
@@ -4545,7 +4674,7 @@ impl PreviewApp {
                 let top = session::print_notices_top(Some(stats::strip_bottom(&strip, px(400.))));
                 Self::strip_stage(
                     Self::session_frame(400., 600., &strip)
-                        .child(session::capture_badge(true, top)),
+                        .child(session::capture_badge(false, true, top)),
                 )
             }
             Story::SessionCaptureHintNarrow => {

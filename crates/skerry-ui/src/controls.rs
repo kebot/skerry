@@ -207,14 +207,19 @@ pub enum ControlsAction {
     SetMicrophone(bool),
     /// Capture from this input device (its Core Audio UID); `None` follows the Mac.
     SelectInputDevice(Option<String>),
+    /// The **Camera** switch (`ARCH-038`).
+    SetCamera(bool),
+    /// Capture from this camera (its `AVCaptureDevice.uniqueID`); `None` follows the Mac.
+    SelectCamera(Option<String>),
     /// **Open Privacy Settings** after macOS refused a device.
     OpenPrivacySettings(CaptureSubject),
 }
 
-/// A capture device the Microphone & Camera card shows (`ARCH-038`). The camera joins in M2.
+/// A capture device the Microphone & Camera card shows (`ARCH-038`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureSubject {
     Microphone,
+    Camera,
 }
 
 /// One entry of a capture device menu: E's Output Device entry shape.
@@ -244,15 +249,23 @@ pub struct CaptureDeviceProps {
     pub level: Option<u8>,
 }
 
-/// The Microphone & Camera card; M1 has the microphone group only.
+/// The Microphone & Camera card.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaCaptureProps {
     pub mic: CaptureDeviceProps,
+    /// `None` when the server hides the camera (`ui_sidebar_show_webcam` false).
+    pub camera: Option<CaptureDeviceProps>,
 }
 
-/// The card header's status: "Microphone on" while the microphone is open.
+/// The card header's status while a device is open: which dots, and the text.
 pub fn media_capture_header(props: &MediaCaptureProps) -> Option<&'static str> {
-    props.mic.live.then_some("Microphone on")
+    let camera = props.camera.as_ref().is_some_and(|camera| camera.live);
+    match (props.mic.live, camera) {
+        (true, true) => Some("Microphone and camera on"),
+        (true, false) => Some("Microphone on"),
+        (false, true) => Some("Camera on"),
+        (false, false) => None,
+    }
 }
 
 /// Whether a pad in a slot reaches the session (`ARCH-032`).
@@ -740,7 +753,8 @@ pub fn render(
                         theme,
                         "Microphone & Camera",
                         state.capture_open,
-                        media_capture_header(capture).map(|text| header_status(theme, text)),
+                        media_capture_header(capture)
+                            .map(|text| header_status(theme, capture, text)),
                         || render_media_capture(theme, capture, &on_action, menus),
                         toggle(Section::Capture),
                     ))
@@ -1273,6 +1287,8 @@ fn render_audio(
 
 /// macOS's own microphone indicator colour.
 const MIC_DOT: u32 = 0xFF9F0A;
+/// macOS's own camera indicator colour.
+const CAM_DOT: u32 = 0x30D158;
 
 /// An 8 px dot in `color`.
 fn dot(color: u32) -> Div {
@@ -1283,13 +1299,20 @@ fn dot(color: u32) -> Div {
         .bg(gpui_kit::rgb(color))
 }
 
-/// The header's status: the microphone's dot, then the text.
-fn header_status(theme: &Theme, text: &'static str) -> AnyElement {
+/// The header's status: the open devices' dots, then the text.
+fn header_status(theme: &Theme, capture: &MediaCaptureProps, text: &'static str) -> AnyElement {
+    let camera = capture.camera.as_ref().is_some_and(|camera| camera.live);
     div()
         .h_flex()
         .items_center()
         .gap(px(6.))
-        .child(dot(MIC_DOT))
+        .child(
+            div()
+                .h_flex()
+                .gap(px(4.))
+                .when(capture.mic.live, |dots| dots.child(dot(MIC_DOT)))
+                .when(camera, |dots| dots.child(dot(CAM_DOT))),
+        )
         .child(
             div()
                 .text_size(px(12.))
@@ -1315,8 +1338,8 @@ fn level_meter(theme: &Theme, level: u8) -> Div {
     }))
 }
 
-/// The Microphone & Camera card (`ARCH-038`): the microphone's switch, picker and meter, then
-/// the menu-bar footnote. The camera's group (M2) slots in before the footnote.
+/// The Microphone & Camera card (`ARCH-038`): the microphone's switch, picker and meter, the
+/// camera's switch and picker (unless the server hides it), then the menu-bar footnote.
 fn render_media_capture(
     theme: &Theme,
     capture: &MediaCaptureProps,
@@ -1333,12 +1356,26 @@ fn render_media_capture(
             on_action,
             menus,
         ))
+        .when_some(capture.camera.as_ref(), |card, camera| {
+            card.child(div().h(px(1.)).w_full().bg(theme.border))
+                .child(capture_device(
+                    theme,
+                    camera,
+                    CaptureSubject::Camera,
+                    on_action,
+                    menus,
+                ))
+        })
         .child(div().h(px(1.)).w_full().bg(theme.border))
         .child(
             div()
                 .text_size(px(12.))
                 .text_color(theme.muted_foreground)
-                .child("macOS also shows its own indicator in the menu bar while the microphone is in use."),
+                .child(if capture.camera.is_some() {
+                    "macOS also shows its own indicator in the menu bar while the microphone or camera is in use."
+                } else {
+                    "macOS also shows its own indicator in the menu bar while the microphone is in use."
+                }),
         )
 }
 
@@ -1350,12 +1387,30 @@ fn capture_device(
     on_action: &ControlsHandler,
     menus: &MenuContext,
 ) -> Div {
-    let (label, picker_label, id, toggle): (_, _, _, fn(bool) -> ControlsAction) = match subject {
+    type Pick = fn(Option<String>) -> ControlsAction;
+    let (label, picker_label, id, color, toggle, pick): (
+        _,
+        _,
+        _,
+        _,
+        fn(bool) -> ControlsAction,
+        Pick,
+    ) = match subject {
         CaptureSubject::Microphone => (
             "Microphone",
             "Input Device",
             "capture-mic-device",
+            MIC_DOT,
             ControlsAction::SetMicrophone,
+            ControlsAction::SelectInputDevice,
+        ),
+        CaptureSubject::Camera => (
+            "Camera",
+            "Camera Device",
+            "capture-cam-device",
+            CAM_DOT,
+            ControlsAction::SetCamera,
+            ControlsAction::SelectCamera,
         ),
     };
     let detail_color = if device.denied {
@@ -1380,7 +1435,7 @@ fn capture_device(
                         .h_flex()
                         .items_center()
                         .gap(px(6.))
-                        .when(device.live, |row| row.child(dot(MIC_DOT)))
+                        .when(device.live, |row| row.child(dot(color)))
                         .child(div().font_weight(FontWeight::SEMIBOLD).child(label)),
                 )
                 .when_some(device.detail.clone(), |column, detail| {
@@ -1427,7 +1482,7 @@ fn capture_device(
         label: item.label.clone(),
         checked: item.checked,
         disabled: !item.connected,
-        action: ControlsAction::SelectInputDevice(item.uid.clone()),
+        action: pick(item.uid.clone()),
     };
     let mut items: Vec<MenuItem> = default.into_iter().map(entry).collect();
     if !devices.is_empty() {
@@ -2542,10 +2597,22 @@ mod tests {
             note: None,
             level: None,
         };
-        let mut props = MediaCaptureProps { mic: device };
+        let mut props = MediaCaptureProps {
+            mic: device.clone(),
+            camera: Some(device),
+        };
         assert_eq!(media_capture_header(&props), None);
         props.mic.live = true;
         assert_eq!(media_capture_header(&props), Some("Microphone on"));
+        props.camera.as_mut().unwrap().live = true;
+        assert_eq!(
+            media_capture_header(&props),
+            Some("Microphone and camera on")
+        );
+        props.mic.live = false;
+        assert_eq!(media_capture_header(&props), Some("Camera on"));
+        props.camera = None;
+        assert_eq!(media_capture_header(&props), None);
     }
 
     #[test]
