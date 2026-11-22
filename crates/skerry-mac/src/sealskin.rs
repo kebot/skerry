@@ -2015,7 +2015,11 @@ mod tests {
             .unwrap();
         assert_eq!(session.session_id, "s1");
         let request = requests_of(&seen).remove(0);
-        assert!(request.is("post /companion/api/launch/url"), "{}", request.head);
+        assert!(
+            request.is("post /companion/api/launch/url"),
+            "{}",
+            request.head
+        );
         assert!(request
             .head
             .contains(&format!("x-idempotency-key: {LAUNCH_ID}")));
@@ -2147,7 +2151,10 @@ mod tests {
         let grow = path.clone();
         let (base, seen) = serve(move |request, _| {
             if request.is("post /companion/api/upload/chunk") {
-                let mut file = std::fs::OpenOptions::new().append(true).open(&grow).unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&grow)
+                    .unwrap();
                 std::io::Write::write_all(&mut file, &[1u8; 10]).unwrap();
             }
             upload_server(request)
@@ -2311,7 +2318,10 @@ mod tests {
             .upload_for_launch(&path, &AtomicU64::new(0))
             .await
             .unwrap();
-        for route in [LaunchRoute::File(&uploaded), LaunchRoute::Url("https://a.com")] {
+        for route in [
+            LaunchRoute::File(&uploaded),
+            LaunchRoute::Url("https://a.com"),
+        ] {
             api.launch(firefox(), LaunchParams::default(), route, || {})
                 .await
                 .unwrap();

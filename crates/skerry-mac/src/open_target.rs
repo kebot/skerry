@@ -75,7 +75,10 @@ pub enum Typed {
 pub enum Incoming {
     Target(OpenTarget),
     /// A `skerry:` link whose address SealSkin wouldn't take: shown so the user sees why.
-    Rejected { label: String, reason: RejectReason },
+    Rejected {
+        label: String,
+        reason: RejectReason,
+    },
     /// A folder from Finder or the Dock (`launch/file` takes one file).
     Folder(PathBuf),
     /// A `skerry:` link with no address to open.
@@ -110,7 +113,10 @@ pub fn validate_url(url: &str) -> Result<(), RejectReason> {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
         let host = authority.rsplit('@').next().unwrap_or_default();
         let host = if host.starts_with('[') {
-            host.split(']').next().unwrap_or_default().trim_start_matches('[')
+            host.split(']')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches('[')
         } else {
             host.split(':').next().unwrap_or_default()
         };
@@ -161,7 +167,10 @@ fn bare_host(text: &str) -> bool {
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() < 2
         || labels.iter().any(|label| {
-            label.is_empty() || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            label.is_empty()
+                || !label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
     {
         return false;
@@ -616,11 +625,17 @@ mod tests {
     #[test]
     fn typed_links_follow_the_web_omnibar() {
         let cases: &[(&str, Option<&str>)] = &[
-            ("https://example.com/a?b=c", Some("https://example.com/a?b=c")),
+            (
+                "https://example.com/a?b=c",
+                Some("https://example.com/a?b=c"),
+            ),
             ("example.com", Some("https://example.com")),
             ("wiki.lan:8080/page", Some("https://wiki.lan:8080/page")),
             ("192.168.1.10/admin", Some("https://192.168.1.10/admin")),
-            ("ftp://files.example.org/pub", Some("ftp://files.example.org/pub")),
+            (
+                "ftp://files.example.org/pub",
+                Some("ftp://files.example.org/pub"),
+            ),
             (
                 "magnet:?xt=urn:btih:abc&dn=x",
                 Some("magnet:?xt=urn:btih:abc&dn=x"),
@@ -677,8 +692,8 @@ mod tests {
 
     #[test]
     fn validate_url_matches_server_pattern() {
-        let server = regex::Regex::new(r"^(?:(?:https?|ftp)://|magnet:\?)[^\s\x00-\x1f\x7f]+$")
-            .unwrap();
+        let server =
+            regex::Regex::new(r"^(?:(?:https?|ftp)://|magnet:\?)[^\s\x00-\x1f\x7f]+$").unwrap();
         let inputs = [
             "https://example.com/a?b=c",
             "  HTTP://Example.com  ",
@@ -832,8 +847,14 @@ mod tests {
         assert_eq!(normalize_extension("pdf"), "pdf");
         assert_eq!(extension_of(Path::new("a.tar.GZ")).as_deref(), Some("gz"));
         assert_eq!(extension_of(Path::new("Makefile")), None);
-        assert_eq!(extension_of(Path::new(".bashrc")).as_deref(), Some("bashrc"));
-        assert_eq!(extension_of(Path::new("/x/y/report.Pdf")).as_deref(), Some("pdf"));
+        assert_eq!(
+            extension_of(Path::new(".bashrc")).as_deref(),
+            Some("bashrc")
+        );
+        assert_eq!(
+            extension_of(Path::new("/x/y/report.Pdf")).as_deref(),
+            Some("pdf")
+        );
         assert!(app_opens_extension(&[".html".into(), "PDF".into()], "pdf"));
     }
 
