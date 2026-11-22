@@ -474,6 +474,7 @@ impl LaunchContext {
         let chosen = |value: &str| (!value.is_empty()).then(|| value.to_string());
         let vpn = chosen(&selection.vpn);
         LaunchParams {
+            launch_id: None,
             home_name: Some(home_name),
             create_home,
             language: Some(selection.language.clone()),

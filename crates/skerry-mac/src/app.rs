@@ -1032,9 +1032,11 @@ impl Launcher {
         let app_id = app.id.clone();
         self.status = None;
         self.busy = Some(format!("Launching {}…", app.name));
-        let pending = self
-            .rt
-            .spawn(async move { api.launch_with_options(app, params).await });
+        let pending = self.rt.spawn(async move {
+            api.launch_with_options(app, params, || {})
+                .await
+                .map_err(|error| error.message().to_string())
+        });
         // Resolve the Launcher window by handle: gpui-pre's `update_in` uses the entity's
         // *current* window, which is Session Controls whenever that panel last rendered the
         // Launcher (ARCH-015).
