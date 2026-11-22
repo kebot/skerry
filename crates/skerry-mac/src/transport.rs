@@ -527,6 +527,22 @@ fn finger_scroll_capability(text: &str) -> Option<bool> {
     Some(data["finger_scroll"].as_bool().unwrap_or(false))
 }
 
+/// Runs `work` unless the stream is cancelled first (`None`). A dropped sender counts as
+/// cancelled: the session that owned it is gone.
+async fn unless_cancelled<T>(
+    cancel: &mut watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => None,
+        out = work => Some(out),
+    }
+}
+
+/// Runs one Selkies stream. `cancel` turns true when the session drops this stream: until
+/// the main loop reads `Input::Close`, the transport checks it so a stream dropped while
+/// still connecting never opens its socket or sends SETTINGS (`ARCH-GAP-DC-09`).
 pub async fn run(
     url: Url,
     frames: watch::Sender<Frame>,
@@ -534,8 +550,12 @@ pub async fn run(
     pointer: watch::Receiver<Option<Pointer>>,
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<(), &'static str> {
-    let (template, access) = socket_request(url).await?;
+    let Some(requested) = unless_cancelled(&mut cancel, socket_request(url)).await else {
+        return Ok(());
+    };
+    let (template, access) = requested?;
     if let Some(access) = access {
         let _ = events.send(SessionEvent::Files(access));
     }
@@ -553,13 +573,17 @@ pub async fn run(
         let attempt = tokio::time::timeout(
             Duration::from_secs(10),
             tokio_tungstenite::connect_async_with_config(request, Some(config), false),
-        )
-        .await
-        .map_err(|_| "The Selkies WebSocket did not respond.")?;
-        match attempt {
+        );
+        let Some(attempt) = unless_cancelled(&mut cancel, attempt).await else {
+            return Ok(());
+        };
+        match attempt.map_err(|_| "The Selkies WebSocket did not respond.")? {
             Ok((socket, _)) => break socket,
             Err(error) if transient_socket_error(&error) && Instant::now() < give_up => {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let wait = tokio::time::sleep(Duration::from_millis(1500));
+                if unless_cancelled(&mut cancel, wait).await.is_none() {
+                    return Ok(());
+                }
             }
             Err(_) => return Err("Couldn’t connect to the Selkies WebSocket."),
         }
@@ -586,6 +610,12 @@ pub async fn run(
     settings["displayId"] = json!("primary");
     settings["audioRedundancy"] = json!(false);
     let disconnected = "The Selkies stream disconnected. Choose Reconnect to resume.";
+    if *cancel.borrow() {
+        // Dropped while the handshake finished: leave without sending the stale SETTINGS.
+        trace_input_event("close frame (cancelled before SETTINGS)");
+        let _ = socket.close(None).await;
+        return Ok(());
+    }
     socket
         .send(format!("SETTINGS,{settings}").into())
         .await
@@ -1149,6 +1179,85 @@ async fn socket_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_options() -> SessionOptions {
+        SessionOptions {
+            preferences: Vec::new(),
+            dark: false,
+            muted: true,
+            codec: Codec::Jpeg,
+            display: None,
+            stats: false,
+        }
+    }
+
+    /// Runs a stream against `listener` with `cancel`, and returns how it ended and every
+    /// connection the listener saw (each one's first bytes) within `wait`.
+    async fn run_against(
+        listener: tokio::net::TcpListener,
+        cancel: watch::Receiver<bool>,
+        wait: Duration,
+    ) -> (Result<(), &'static str>, Vec<String>) {
+        use tokio::io::AsyncReadExt as _;
+        let address = listener.local_addr().unwrap();
+        let url = Url::parse(&format!("http://{address}/s/?access_token=t")).unwrap();
+        let seen = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            // Accept everything, answer nothing: the HTTP step hangs as on a slow server.
+            let mut held = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+            {
+                let mut buf = [0u8; 256];
+                let read = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(0);
+                seen.push(String::from_utf8_lossy(&buf[..read]).to_string());
+                held.push(stream);
+            }
+            seen
+        });
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let ended = tokio::time::timeout(
+            wait,
+            run(url, frames, input, pointer, test_options(), &events, cancel),
+        )
+        .await
+        .expect("a cancelled stream ends at once");
+        (ended, seen.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_stream_cancelled_before_it_starts_never_connects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cancel_tx, cancel) = watch::channel(true);
+        let (ended, seen) = run_against(listener, cancel, Duration::from_millis(200)).await;
+        drop(cancel_tx);
+        assert_eq!(ended, Ok(()));
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_while_connecting_stops_without_settings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cancel_tx, cancel) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // What `NativeSession::drop` does: set the flag, then drop the sender.
+            let _ = cancel_tx.send(true);
+        });
+        let (ended, seen) = run_against(listener, cancel, Duration::from_secs(2)).await;
+        assert_eq!(ended, Ok(()));
+        // Only the hung HTTP request ever reached the server: no WebSocket, no SETTINGS.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("GET /s/?access_token=t"), "{seen:?}");
+        assert!(!seen.iter().any(|request| request.contains("SETTINGS")));
+    }
 
     #[test]
     fn closing_releases_every_held_key_then_closes() {

@@ -41,6 +41,8 @@ pub struct NativeSession {
     view: Entity<Desktop>,
     input: mpsc::UnboundedSender<Input>,
     task: tokio::task::JoinHandle<()>,
+    /// Set on drop, so a transport still connecting stops before it talks to the server.
+    cancel: watch::Sender<bool>,
     runtime: Handle,
     _pinch: Option<pinch::Monitor>,
 }
@@ -64,9 +66,12 @@ impl NativeSession {
         });
         let focus = view.read(cx).focus.clone();
         window.focus(&focus, cx);
+        let (cancel, cancelled) = watch::channel(false);
         let task = runtime.spawn(async move {
-            if let Err(message) =
-                transport::run(address, frame_tx, commands, motion, options, &events).await
+            if let Err(message) = transport::run(
+                address, frame_tx, commands, motion, options, &events, cancelled,
+            )
+            .await
             {
                 let _ = events.send(SessionEvent::Error(message.into()));
             }
@@ -75,6 +80,7 @@ impl NativeSession {
             view,
             input,
             task,
+            cancel,
             runtime: runtime.clone(),
             _pinch: pinch,
         }
@@ -239,6 +245,7 @@ impl Drop for NativeSession {
     /// here would drop them, and the server would hold those keys through its reconnect
     /// grace. A watchdog aborts a transport that hasn't finished within a second.
     fn drop(&mut self) {
+        let _ = self.cancel.send(true);
         let _ = self.input.send(Input::Close);
         let abort = self.task.abort_handle();
         self.runtime.spawn(async move {
