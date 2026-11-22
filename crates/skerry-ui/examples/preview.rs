@@ -10,11 +10,12 @@ use gpui_kit::{
     KeyBinding, RenderImage, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use skerry_ui::{
+    components::{self, Toast, ToastKind},
     connect::{self, ConnectProps},
     controls::{
         self, ChordItem, ClipboardProps, CodecChoice, ControlsAction, ControlsProps,
-        ControlsUiState, ScreenProps, Section, SliderUnit, SwitchItem, VideoProps,
-        VideoSettingControl, VideoSettingRow,
+        ControlsUiState, ScreenProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl,
+        VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, SortColumn,
@@ -25,7 +26,8 @@ use skerry_ui::{
         LaunchOptions, LaunchSelect,
     },
     library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
-    session, stats,
+    session::{self, KeySourceLabel},
+    stats,
 };
 use std::rc::Rc;
 use std::sync::Arc;
@@ -45,9 +47,18 @@ enum Story {
     LibraryLaunchDialogMinimal,
     LibraryEmpty,
     LibraryBusy,
+    LibrarySignOut,
+    LibrarySignOutEnv,
+    LibrarySignOutDotEnv,
+    LibrarySignOutUnsaved,
+    LibraryToast,
+    LibraryLaunchDialogCopied,
+    LibraryLongServer,
     ControlsHardware,
     ControlsJpeg,
     ControlsServerLocked,
+    ControlsDropdownOpen,
+    ControlsRestoredSections,
     SessionOverlays,
     FilesBrowsing,
     FilesEmpty,
@@ -64,9 +75,18 @@ impl Story {
         Story::LibraryLaunchDialogMinimal,
         Story::LibraryEmpty,
         Story::LibraryBusy,
+        Story::LibrarySignOut,
+        Story::LibrarySignOutEnv,
+        Story::LibrarySignOutDotEnv,
+        Story::LibrarySignOutUnsaved,
+        Story::LibraryToast,
+        Story::LibraryLaunchDialogCopied,
+        Story::LibraryLongServer,
         Story::ControlsHardware,
         Story::ControlsJpeg,
         Story::ControlsServerLocked,
+        Story::ControlsDropdownOpen,
+        Story::ControlsRestoredSections,
         Story::SessionOverlays,
         Story::FilesBrowsing,
         Story::FilesEmpty,
@@ -80,10 +100,19 @@ impl Story {
             | Story::LibraryLaunchDialog
             | Story::LibraryLaunchDialogMinimal
             | Story::LibraryEmpty
-            | Story::LibraryBusy => "Library",
-            Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked => {
-                "Session Controls"
-            }
+            | Story::LibraryBusy
+            | Story::LibrarySignOut
+            | Story::LibrarySignOutEnv
+            | Story::LibrarySignOutDotEnv
+            | Story::LibrarySignOutUnsaved
+            | Story::LibraryToast
+            | Story::LibraryLaunchDialogCopied
+            | Story::LibraryLongServer => "Library",
+            Story::ControlsHardware
+            | Story::ControlsJpeg
+            | Story::ControlsServerLocked
+            | Story::ControlsDropdownOpen
+            | Story::ControlsRestoredSections => "Session Controls",
             Story::SessionOverlays => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
         }
@@ -99,9 +128,18 @@ impl Story {
             Story::LibraryLaunchDialogMinimal => "Launch Dialog · Minimal",
             Story::LibraryEmpty => "Empty",
             Story::LibraryBusy => "Busy + Status",
+            Story::LibrarySignOut => "Sign Out · Saved key",
+            Story::LibrarySignOutEnv => "Sign Out · Environment key",
+            Story::LibrarySignOutDotEnv => "Sign Out · .env key",
+            Story::LibrarySignOutUnsaved => "Sign Out · Not saved",
+            Story::LibraryToast => "Toast · Library refreshed",
+            Story::LibraryLaunchDialogCopied => "Launch Dialog · Copied",
+            Story::LibraryLongServer => "Long server name",
             Story::ControlsHardware => "Hardware H.265",
             Story::ControlsJpeg => "JPEG + Paint-Over",
             Story::ControlsServerLocked => "Server Locked",
+            Story::ControlsDropdownOpen => "Dropdown Open",
+            Story::ControlsRestoredSections => "Restored Sections",
             Story::SessionOverlays => "Waiting + IME + Banner",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
@@ -119,16 +157,81 @@ impl Story {
             Story::LibraryLaunchDialogMinimal => "story-library-launch-dialog-minimal",
             Story::LibraryEmpty => "story-library-empty",
             Story::LibraryBusy => "story-library-busy",
+            Story::LibrarySignOut => "story-library-sign-out",
+            Story::LibrarySignOutEnv => "story-library-sign-out-env",
+            Story::LibrarySignOutDotEnv => "story-library-sign-out-dotenv",
+            Story::LibrarySignOutUnsaved => "story-library-sign-out-unsaved",
+            Story::LibraryToast => "story-library-toast",
+            Story::LibraryLaunchDialogCopied => "story-library-launch-dialog-copied",
+            Story::LibraryLongServer => "story-library-long-server",
             Story::ControlsHardware => "story-controls-hardware",
             Story::ControlsJpeg => "story-controls-jpeg",
             Story::ControlsServerLocked => "story-controls-locked",
+            Story::ControlsDropdownOpen => "story-controls-dropdown-open",
+            Story::ControlsRestoredSections => "story-controls-restored-sections",
             Story::SessionOverlays => "story-session-overlays",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
         }
     }
+
+    /// Stories that show the Launch Dialog over the Library.
+    fn has_launch_dialog(self) -> bool {
+        matches!(
+            self,
+            Story::LibraryLaunchDialog
+                | Story::LibraryLaunchDialogMinimal
+                | Story::LibraryLaunchDialogCopied
+        )
+    }
+
+    /// Stories drawn with the Session Controls panel.
+    fn is_controls(self) -> bool {
+        matches!(
+            self,
+            Story::ControlsHardware
+                | Story::ControlsJpeg
+                | Story::ControlsServerLocked
+                | Story::ControlsDropdownOpen
+                | Story::ControlsRestoredSections
+        )
+    }
+
+    /// The Sign Out confirmation a story shows, if any.
+    fn sign_out(self) -> Option<KeySourceLabel> {
+        match self {
+            Story::LibrarySignOut => Some(KeySourceLabel::SavedFile),
+            Story::LibrarySignOutEnv => Some(KeySourceLabel::Environment),
+            Story::LibrarySignOutDotEnv => Some(KeySourceLabel::DotEnv),
+            Story::LibrarySignOutUnsaved => Some(KeySourceLabel::ThisRunOnly),
+            _ => None,
+        }
+    }
+
+    /// The Session Controls state a story opens with.
+    fn controls_ui(self) -> ControlsUiState {
+        let base = ControlsUiState {
+            video_open: true,
+            stats_open: true,
+            ..ControlsUiState::default()
+        };
+        match self {
+            // Input and Video open, Screen closed: what a server remembered.
+            Story::ControlsRestoredSections => {
+                ControlsUiState::default().with_sections([true, false, false, true, false])
+            }
+            Story::ControlsDropdownOpen => ControlsUiState {
+                open_menu: Some("preset-picker"),
+                ..ControlsUiState::default()
+            },
+            _ => base,
+        }
+    }
 }
+
+/// The canvas width presets: `None` fills the stage.
+const CANVAS_WIDTHS: [Option<f32>; 5] = [None, Some(700.), Some(1200.), Some(1800.), Some(2540.)];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Appearance {
@@ -177,6 +280,8 @@ struct PreviewApp {
     files_props: FilesProps,
     folder_name: Entity<InputState>,
     files_scroll: gpui_kit::UniformListScrollHandle,
+    /// A fixed story canvas width, to check wide layouts on a small screen.
+    canvas_width: Option<f32>,
 }
 
 impl PreviewApp {
@@ -254,41 +359,51 @@ impl PreviewApp {
             .ok()
             .and_then(|id| Story::ALL.iter().copied().find(|story| story.id() == id))
             .unwrap_or(Story::LibraryLaunchDialog);
-        let initial_dialog = Self::fixture_launch_dialog(
+        let mut initial_dialog = Self::fixture_launch_dialog(
             "zen",
             "Zen",
             Some(Arc::clone(&assets.icon_zen)),
             story == Story::LibraryLaunchDialogMinimal,
         );
+        initial_dialog.link_copied = story == Story::LibraryLaunchDialogCopied;
         let initial_selects = Self::bind_launch_selects(&initial_dialog, window, cx);
-        let initial_dialog = matches!(
-            story,
-            Story::LibraryLaunchDialog | Story::LibraryLaunchDialogMinimal
-        )
-        .then_some((initial_dialog, initial_selects));
+        let initial_dialog = story
+            .has_launch_dialog()
+            .then_some((initial_dialog, initial_selects));
+        // `SKERRY_PREVIEW_APPEARANCE=light|dark` and `SKERRY_PREVIEW_CANVAS_W=<pt>` set the
+        // appearance and canvas width at launch (for screenshots).
+        let appearance = match std::env::var("SKERRY_PREVIEW_APPEARANCE").as_deref() {
+            Ok("light") => Appearance::Light,
+            Ok("dark") => Appearance::Dark,
+            _ => Appearance::System,
+        };
+        match appearance {
+            Appearance::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+            Appearance::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+            Appearance::System => {}
+        }
+        let canvas_width = std::env::var("SKERRY_PREVIEW_CANVAS_W")
+            .ok()
+            .and_then(|width| width.parse::<f32>().ok())
+            .filter(|width| *width > 0.)
+            .or((story == Story::LibraryLongServer).then_some(700.));
         Self {
             story,
-            appearance: Appearance::System,
+            appearance,
             last_event: None,
             assets,
             key_input,
             search_input,
             selected_filter: "All".into(),
             launch_dialog: initial_dialog,
-            controls_ui: ControlsUiState {
-                input_open: false,
-                clipboard_open: false,
-                screen_open: true,
-                video_open: true,
-                stats_open: true,
-                size_error: false,
-            },
+            controls_ui: story.controls_ui(),
             controls_props: Self::fixture_controls(story),
             width,
             height,
             files_props: Self::fixture_files(story),
             folder_name: cx.new(|cx| InputState::new(window, cx).default_value("untitled folder")),
             files_scroll: gpui_kit::UniformListScrollHandle::new(),
+            canvas_width,
         }
     }
 
@@ -434,34 +549,25 @@ impl PreviewApp {
         self.story = story;
         self.files_props = Self::fixture_files(story);
         self.last_event = None;
-        if matches!(
-            story,
-            Story::LibraryLaunchDialog | Story::LibraryLaunchDialogMinimal
-        ) {
-            let dialog = Self::fixture_launch_dialog(
+        if story.has_launch_dialog() {
+            let mut dialog = Self::fixture_launch_dialog(
                 "zen",
                 "Zen",
                 Some(Arc::clone(&self.assets.icon_zen)),
                 story == Story::LibraryLaunchDialogMinimal,
             );
+            dialog.link_copied = story == Story::LibraryLaunchDialogCopied;
             let selects = Self::bind_launch_selects(&dialog, window, cx);
             self.launch_dialog = Some((dialog, selects));
-        } else if story == Story::LibraryPopulated {
+        } else if story.group() == "Library" {
             self.launch_dialog = None;
         }
-        if matches!(
-            story,
-            Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked
-        ) {
+        if story == Story::LibraryLongServer {
+            self.canvas_width = Some(700.);
+        }
+        if story.is_controls() {
             self.controls_props = Self::fixture_controls(story);
-            self.controls_ui = ControlsUiState {
-                input_open: false,
-                clipboard_open: false,
-                screen_open: true,
-                video_open: true,
-                stats_open: true,
-                size_error: false,
-            };
+            self.controls_ui = story.controls_ui();
             self.width.update(cx, |s, cx| s.set_value("", window, cx));
             self.height.update(cx, |s, cx| s.set_value("", window, cx));
         }
@@ -687,15 +793,9 @@ impl PreviewApp {
     ) {
         self.last_event = Some(format!("Controls: {action:?}"));
         match action {
-            ControlsAction::ToggleSection(section) => match section {
-                Section::Input => self.controls_ui.input_open = !self.controls_ui.input_open,
-                Section::Clipboard => {
-                    self.controls_ui.clipboard_open = !self.controls_ui.clipboard_open
-                }
-                Section::Screen => self.controls_ui.screen_open = !self.controls_ui.screen_open,
-                Section::Video => self.controls_ui.video_open = !self.controls_ui.video_open,
-                Section::Stats => self.controls_ui.stats_open = !self.controls_ui.stats_open,
-            },
+            ControlsAction::ToggleSection(section) => {
+                self.controls_ui.toggle(section);
+            }
             ControlsAction::SetAudio(enabled) => self.controls_props.audio = Some(enabled),
             ControlsAction::SetPlayback(enabled) => self.controls_props.video = Some(enabled),
             ControlsAction::ToggleFullScreen => {
@@ -1316,10 +1416,35 @@ impl PreviewApp {
             }
             Story::LibraryPopulated
             | Story::LibraryLaunchDialog
-            | Story::LibraryLaunchDialogMinimal => {
+            | Story::LibraryLaunchDialogMinimal
+            | Story::LibrarySignOut
+            | Story::LibrarySignOutEnv
+            | Story::LibrarySignOutDotEnv
+            | Story::LibrarySignOutUnsaved
+            | Story::LibraryToast
+            | Story::LibraryLaunchDialogCopied
+            | Story::LibraryLongServer => {
+                let server = if self.story == Story::LibraryLongServer {
+                    "analytics-gpu-cluster-07.eu-central.sealskin.example.internal"
+                } else {
+                    "sealskin.example.internal"
+                };
+                // The toasts and modals are static here: the 3 s timer never runs.
+                let toast = match self.story {
+                    Story::LibraryToast => Some("Library refreshed"),
+                    Story::LibraryLaunchDialogCopied => Some("Link copied"),
+                    _ => None,
+                }
+                .map(|message| Toast {
+                    id: 1,
+                    message: message.into(),
+                    kind: ToastKind::Success,
+                    leaving: false,
+                });
+                let sign_out = self.story.sign_out();
                 let props = LibraryProps {
                     app_name: "SealSkin Native".into(),
-                    server: "sealskin.example.internal".into(),
+                    server: server.into(),
                     apps: vec![
                         AppItem {
                             id: "lightcraft".into(),
@@ -1406,6 +1531,18 @@ impl PreviewApp {
                             theme, dialog, selects, on_action,
                         ))
                     })
+                    .when_some(sign_out, |view, source| {
+                        view.child(session::sign_out_confirm_modal(
+                            theme,
+                            server,
+                            source,
+                            |_, _, _| {},
+                            |_, _, _| {},
+                        ))
+                    })
+                    .when_some(toast, |view, toast| {
+                        view.child(components::toast_layer(theme, &toast))
+                    })
             }
             Story::LibraryEmpty => {
                 let props = LibraryProps {
@@ -1440,7 +1577,11 @@ impl PreviewApp {
                 };
                 library::render(theme, &props, &self.search_input, self.library_handlers(cx))
             }
-            Story::ControlsHardware | Story::ControlsJpeg | Story::ControlsServerLocked => {
+            Story::ControlsHardware
+            | Story::ControlsJpeg
+            | Story::ControlsServerLocked
+            | Story::ControlsDropdownOpen
+            | Story::ControlsRestoredSections => {
                 let handler = Rc::new(
                     move |action: ControlsAction, window: &mut Window, cx: &mut App| {
                         entity.update(cx, |this, cx| {
@@ -1580,7 +1721,7 @@ impl PreviewApp {
             }),
             on_sign_out: Box::new(move |_, _, cx| {
                 on_sign_out_entity.update(cx, |this, cx| {
-                    this.record_event("Library: Disconnect Server", cx);
+                    this.record_event("Library: Sign Out…", cx);
                 });
             }),
             on_launch: Rc::new(move |id, window, cx| {
@@ -1693,6 +1834,23 @@ impl Render for PreviewApp {
             button
         };
 
+        let canvas_widths = CANVAS_WIDTHS.map(|width| {
+            let label: SharedString = width.map_or("Fit".into(), |w| format!("{w:.0}").into());
+            let mut button = Button::new(SharedString::from(format!("canvas-{label}")))
+                .xsmall()
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.canvas_width = width;
+                    cx.notify();
+                }));
+            if self.canvas_width == width {
+                button = button.primary();
+            } else {
+                button = button.outline();
+            }
+            button
+        });
+
         let toolbar = div()
             .h_flex()
             .items_center()
@@ -1738,10 +1896,23 @@ impl Render for PreviewApp {
                     .items_center()
                     .gap_1()
                     .flex_none()
+                    .children(canvas_widths)
+                    .child(div().w(px(8.)))
                     .child(theme_button("theme-system", "System", Appearance::System))
                     .child(theme_button("theme-light", "Light", Appearance::Light))
                     .child(theme_button("theme-dark", "Dark", Appearance::Dark)),
             );
+        let story = self.render_story(&theme, window, cx);
+        // A fixed width scrolls sideways inside the stage.
+        let canvas = match self.canvas_width {
+            Some(width) => div()
+                .id("preview-canvas")
+                .size_full()
+                .overflow_x_scroll()
+                .child(div().w(px(width)).h_full().flex_none().child(story))
+                .into_any_element(),
+            None => story.size_full().into_any_element(),
+        };
 
         let stage = div()
             .flex_1()
@@ -1749,12 +1920,7 @@ impl Render for PreviewApp {
             .h_full()
             .v_flex()
             .child(toolbar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_story(&theme, window, cx)),
-            );
+            .child(div().flex_1().min_h_0().child(canvas));
 
         div()
             .size_full()
