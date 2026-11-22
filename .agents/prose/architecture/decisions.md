@@ -239,7 +239,7 @@
 | **Stats** | "Show over the stream" switch; status rows, graphs, tiles, meters, copy (`StatsSection`) | Rows, graphs, tiles, meters, copy (`ARCH-019`) | Strip and floating gauges: `ARCH-GAP-VS-06` |
 | **Clipboard** | The server clipboard's text, editable (sent on blur, `clipboardUpdateFromUI`); image upload when binary clipboard is on (`enable_binary_clipboard`); masked-secret copy button | Clipboard section: Send to Session, Receive from Session, Seamless; Send Mac Clipboard / Copy Session Clipboard when Seamless is off; `NSPasteboard` sync on focus (`ARCH-017`). No editable text box: the Mac's own pasteboard is the clipboard | Settled: `ARCH-017` (`ARCH-GAP-DC-01`) |
 | **Files** | Opens the file manager: browse the session's directories, upload and download (shown when the server allows either transfer) | A native **Files** window per session (⌘⇧F, Session Controls → Files): browse, transfers, Finder copy/paste and drag both ways, Delete via SealSkin storage (`ARCH-023`, `ARCH-024`) | Settled (`ARCH-GAP-DC-02`); mount `ARCH-GAP-DC-14`, rename/move `ARCH-GAP-DC-15` |
-| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` |
+| **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
 | **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` |
@@ -540,6 +540,42 @@
   - Not verified (screen locked): the strip's look, clicking through it, full screen, and AppKit's ⌃⌘F item live.
 - **Affected Rust:** `shortcuts.rs` (new), `view/keys.rs`, `view.rs`, `stats.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{stats.rs,controls.rs,session.rs}`, `examples/preview.rs`.
 
+## ARCH-033: Remote Printing Through the macOS Print Dialog (Task H)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-04`.
+- **Process:** plan → design → review (12 required changes) → build → QA (1 medium) → code review (3 medium; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-h-printing`.
+- **Server facts (Selkies 715df7c):**
+  - The server sends text JSON `{"type":"print_document","name","size_bytes"}` to the primary controller, and sends it again after `server_settings`.
+  - `GET /api/print/{name}` deletes the file on a 200 before the body is sent (`transfer.rs:297`), so the fetch is one-shot.
+  - Gated by `printing_enabled` (default on). SealSkin's `harden_container` turns it off.
+- **Decision:**
+  - **Fetch:** each job downloads immediately on Tokio through `SelkiesClient::print_document`.
+    - The local file is created before the GET.
+    - Never `Range`.
+    - 30 s timeouts on the headers and on each chunk.
+    - A 1 GiB cap, checked before the request, on Content-Length, and while streaming. An over-cap announcement shows **Too large** and is never fetched.
+    - A `%PDF-` check as the bytes arrive.
+    - Failures before a 200, including a SealSkin cookie 403, say "Reconnect to receive", because the document is still on the server.
+    - No fetch starts once the window has closed.
+  - **Print…:** the PDFKit print operation runs as a sheet on the session window, from a `cx.spawn` task with no `cx.update` around the AppKit call. It takes the `NSWindow` and checks again before opening that the window is visible, has no sheet, and is key. A damaged or locked PDF shows **Unreadable**, with Open as the main button. `objc2-pdf-kit` 0.3.2 was added; it is the only new crate.
+  - **Notices:** stacked at top right, 340 pt wide, below the ⋯ button or below `ARCH-031`'s strip (`stats::strip_bottom`), with at most three shown. A Ready notice (Print… / Open / Save…) hides after 15 s. A name that failed and is announced again replaces the earlier failed job.
+  - **Printing card:** placed after Clipboard and shown only while `printing_enabled` is on. It holds **Open Print Dialog Automatically** (default on, like the web client's `print_auto`, saved per server through `persist.rs`) and the session's jobs, with Print…, Open, Save… and Remove per row.
+  - **Auto-open:** only when the session window or its sheet is key; otherwise the job waits for the window to become active (up to 5 min) and the notice says so.
+    - PM decision: documents already waiting at connect (announced within 3 s of `server_settings`, aged by `Last-Modified`) each get a notice. Only the newest auto-opens, and only if it is less than 5 minutes old, so a reconnect never brings up a burst of print dialogs.
+  - **Cache** (`~/Library/Caches/SealSkin Native/Print/`):
+    - Remove and window close delete unopened files. A job under an open sheet survives.
+    - Cmd-Q cleans every window's jobs synchronously in `on_app_quit`.
+    - A startup sweep removes anything older than 24 h.
+    - Closing with a sheet up ends the sheet and then removes the window, in one task.
+- **Prior art:** Parallels RAS and Windows App on the Mac open the native print dialog without an extra step.
+- **QA (live, real server):**
+  - `lp` printed through Selkies came back as a PDF. A second fetch got 404.
+  - A file over 1 GiB was listed as Too large and never fetched.
+  - A reconnect with 6 waiting documents auto-opened only the newest fresh one.
+  - The cleanup sweeps work in the real binary, and PDFKit rejects damaged, locked and no-print PDFs.
+  - Not verified (screen locked): the notices, the card, and the print sheet on screen.
+- **Affected Rust:** `print_jobs.rs` (new), `print_dialog.rs` (new), `selkies.rs`, `transport.rs`, `settings.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{session.rs,controls.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -563,7 +599,7 @@
 | `ARCH-GAP-DC-14` | `desktop-and-collaboration` | `session-file-mount` | future scope | Mount session files in Finder via a File Provider extension, a local WebDAV server, or a local NFS server. |
 | `ARCH-GAP-DC-15` | `desktop-and-collaboration` | `remote-rename-move` | blocked (server) | Delete settled via SealSkin storage (`ARCH-024`); no server offers rename or move, and Cleanroom/direct-Selkies sessions cannot delete. |
 | `ARCH-GAP-DC-03` | `desktop-and-collaboration` | `audio-devices-and-quality` | settled (`ARCH-030`) | Follows the macOS default, Output Device picker by UID, Core Audio conversion at 48 kHz, recovery with backoff, Audio Bitrate. |
-| `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | unresolved (todo) | Receive remote PDF print jobs with macOS Save and Print actions and optional auto-open preference. |
+| `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
 | `ARCH-GAP-DC-05` | `desktop-and-collaboration` | `microphone-and-webcam` | unresolved (todo) | Audio/video capture uplinks with macOS permission requests on demand, capture indicators, and disconnect teardown. |
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | unresolved (todo) | Relative pointer capture with escape shortcut, physical gamepad forwarding with slot/rumble support, and custom chords. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |

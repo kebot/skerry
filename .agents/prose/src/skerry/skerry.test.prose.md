@@ -61,6 +61,11 @@ subject: skerry
   - Every chord that acts in a session is listed, forwarding matches suppression, and suppression comes last. All three run against the shipped `key_bindings()`.
   - A forwarded chord taps its key while Control stays latched, and a letter released under ⌘ is released when ⌘ lifts.
   - `StatsInterest` subscribes while Stats or the strip wants it.
+- Task H tests pass (`ARCH-033`):
+  - `print_jobs::tests::*`: one GET with no Range, the 1 GiB cap checked three times, the `%PDF-` check, and a cut-off stream marked Broken.
+  - Failures before a 200 and SealSkin's 403 read as reconnect.
+  - A re-announce replaces a failed job, and the connect burst auto-opens only the newest fresh job.
+  - A closed window fetches nothing, and cleanup keeps any file under a sheet.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
