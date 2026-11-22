@@ -393,6 +393,78 @@
 - **Not verified:** real plug/unplug, sleep/wake, and mono hardware (all simulated); nothing on screen, because the screen was locked. "Sound Settings…" in the menu was deferred as scope creep.
 - **Affected Rust:** `audio.rs`, `settings.rs`, `transport.rs`, `app/controls.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{controls.rs,components.rs}`, `examples/preview.rs`.
 
+## ARCH-027: Favorites, Hidden Apps, Recents, Session Reuse, Launch Progress, and One-Click Launch (Task B)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-04` and `ARCH-GAP-LS-01`, and lifts the `ARCH-013` hold on Favorite and Hide.
+- **Process:** plan → design → review (11 required changes) → build → QA (4 low, fixed) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-b-library`, merged after Task E.
+- **Organization (`LS-04`):**
+  - SealSkin 0.5 has no per-user favorites, hidden or recents API: its web launcher keeps all three in browser storage (`home.js:113-116, 214-220`). Skerry saves them per server in a `library` key of the preferences JSON, through `persist.rs`.
+    - One bad entry drops only that entry.
+    - Lists are capped at 512 ids (Recent at 8) on load and on write.
+    - Unknown app ids are kept, never pruned.
+  - **Library order:** Running sessions, a Favorites row, a Recent row, then Applications. The rows show only on All with an empty search, as compact 120×112 pt tiles.
+  - **Recent:** at most 8, newest first, recorded only after a successful launch. It leaves out favorites and hidden apps.
+  - **Hidden apps:** they leave All, the categories and both rows, but still match a search. A **Hidden (n)** chip, last in the row, lists them. The chip is a filter enum, so it can't collide with a category named "Hidden", and it resets once nothing is hidden.
+  - Favorite and Hide are offered both in the Launch Dialog (toggle buttons; the dialog stays open) and in a tile right-click menu. The menu items are "Launch with Last Options", "Launch Options…", "Add to/Remove from Favorites" and "Hide from/Show in Library"; a bare "Hide" would read as ⌘H.
+  - **Session reuse** follows the web launcher (`open.js:240-249`): the oldest running session with the same app, the same resolved storage and the same Collaborative flag.
+    - When one matches, the Launch Dialog shows **Open Running Session** as the primary button and **Launch New** as secondary, and updates as Storage or Collaborative change.
+    - Sessions created locally carry their real `created_at`.
+- **Launch progress (`LS-01`):**
+  - Every launch sends a UUID `launch_id`, which is also the `X-Idempotency-Key`. The companion lane runs a POST at most once and caches its result for 600 s (`security.py:245-330`).
+  - Skerry polls `GET /companion/api/launch/progress/<id>` (`progress.py`). The launch timeout is 960 s, since Kubernetes image pulls can take up to 900 s.
+  - **Stages shown:** Requesting, Pulling image (Docker only), Starting (which covers `client`), and Connecting. They never move backwards.
+  - A launching card shows first under Running sessions, with a checklist and the server's sentence; the app's tile shows the stage. There is no Cancel, because SealSkin has no cancel route.
+  - Launches no longer lock the Library; one launch runs per app at a time.
+  - **Follower rules (no second container):**
+    - Progress decides, and a POST success always wins.
+    - A launch is called lost only after its POST has ended.
+    - A same-id Retry is offered only after the request was lost; a fresh-id Retry only once nothing is outstanding.
+    - Results that arrive after Ready are ignored.
+    - A 401 from progress waits for the outstanding POST.
+    - A gateway 502 or 504 counts as a lost request.
+  - **Recovery:** 180 s with no stage change before the session exists shows Keep Waiting / Retry. A failure shows "Couldn't launch {App}" with Retry and Dismiss.
+  - **In the session window:** when the 45 s connection retry runs out, a banner offers Keep Waiting (5 more minutes), Retry and Disconnect. A single timed-out socket attempt counts as transient. A new stream clears the banner. Only Keep Waiting keeps the longer grace period.
+  - A Refresh that was requested before a launch became ready keeps that launch's session.
+  - Closing the Library window drops the launches it was following. The server finishes them, and the session appears under Running sessions next time.
+- **One-click launch:** tiles with remembered options show a hover ▶ ("Launch with Last Options"), and Option-click does the same. It always starts a new session and rechecks the remembered options as the dialog does. A plain click still opens the dialog.
+- **QA (live, `sealskin.kebot.me`, Kubernetes):**
+  - Two POSTs with the same `launch_id` returned the same `session_id`, and the list grew by one. A third resend after ready came back cached in 31 ms.
+  - Progress went 404 → starting → waiting → ready in 4.5 s, with no image stage on Kubernetes.
+  - A copy of the Task A-era preferences file kept every key.
+  - Not verified: anything on screen (screen locked), the 180 s stall prompt, a gateway 504 mid-launch, and closing the Library mid-launch.
+- **Known:** a progress run that the server pruned after 900 s can still offer a fresh Retry.
+- **Affected Rust:** `launch_progress.rs` (new), `sealskin.rs`, `settings.rs`, `launch_options.rs`, `transport.rs`, `app.rs`, `app/session_window.rs`, `view.rs`, `crates/skerry-ui/src/{library.rs,launch_dialog.rs,session.rs,components.rs}`, `examples/preview.rs`.
+
+## ARCH-029: Account Menu and Key Recovery (Task D)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-06`.
+- **Process:** plan → design → review (10 required changes) → build → QA (2 medium, fixed) → code review (1 high, 1 medium, fixed; 2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-d-account`.
+- **What SealSkin 0.5.0 gives a key:**
+  - `POST /companion/api/admin/status` (`routers/admin.py:116`) is open to every user. It returns name, admin flag, groups, rights (storage, GPU, VPN), limits (sessions, session length, idle, CPUs, memory, storage), the hours allowance, `held`, and storage used (with `?storage=1`).
+  - Key refusals are `401` with `detail` = `unknown` / `expired` / `dormant` / `disabled` / `client` (`security.py:489-513`).
+  - A key's own expiry, name and last use are not available to the key (`/api/keys` answers web sign-ins only), so they are left out.
+  - Only the built-in `admin` user never goes dormant.
+- **Account menu:**
+  - The Library header's right edge holds an account button (user icon, name, caret). It takes the place of Task A's header Sign Out (macOS convention and SealSkin's own profile card).
+  - Its 300 pt popover shows: name with an Admin tag, server, groups; Storage/GPU/VPN chips; and limit rows in the web profile's order with 4 pt meters (warning at 80 %, danger at 100 %, with a caption). Storage uses binary GB, as `quota.py` does, and is measured only when the menu opens; only a failed measure is retried. The key's source and its sleep time come next.
+  - The footer has **Open SealSkin in Browser** and **Sign Out…** (in red), which closes the popover and then opens Task A's confirmation (`ARCH-026`).
+  - Admins see "Administrators have every capability and no limits." The key id appears only in a tooltip.
+- **Recovery:**
+  - **Dormant:** a panel with **Sign In on the Web** (opens `<origin>/?wake=1`, never with the key in the URL), Try Again, and Use a Different Key. Skerry checks again every 5 s for up to 3 minutes and when the window becomes active. The poll is a GPUI task the Launcher owns, cancelled on every exit; `WakeState` clears its in-flight mark whenever a poll starts or stops.
+  - **Revoked or expired:** back to Connect with a red alert. The field is relabelled "New Application Key", empty and focused. The saved key stays in `config.toml` until a replacement connects. An empty Connect says "Paste a new application key." and sends nothing.
+  - **Disabled, client not allowed, or inactive:** a yellow alert, and an empty field retries the current key. Use a Different Key keeps the current key as the retry target, and a network failure on retry doesn't lose it.
+  - **Held:** read from `held: true` before any text match. It shows a panel with Open SealSkin in Browser and Try Again.
+  - Any unrecognised 403 shows the server's own sentence under "SealSkin refused the request" and allows a retry. Quota or permission 403s show the server's sentence alone.
+  - A key from the environment or `.env` gets a note: a pasted key is saved, but the environment key wins at the next launch.
+  - A pasted key that is refused at first and connects later (wake poll, Try Again, empty Connect) is kept as a pending credential and saved on that success. Environment and `.env` keys are never saved.
+  - Refusals on Refresh, Launch (including home creation and Task B's progress 401) and Stop all reach this flow. Session windows keep streaming; their Files window's Storage pane shows the refusal; a new key reaches a session window only after it is reopened.
+- **Evidence:** SealSkin 0.5.0 `routers/admin.py`, `security.py:489-513`, `api.md:42`, `shell/host.js:253`, `ui/app.js:122-165`. Prior art: gh and Tailscale re-authenticate in the browser and keep the old credential until the new one works.
+- **QA:**
+  - Live and read-only: the real `admin/status` for the admin user gives the expected menu.
+  - A fake HTTPS server with the real binary: every refusal code mapped to the right recovery state with one Library round, `config.toml` stayed byte-identical, and the key went only to the control-plane host.
+  - Not verified: anything on screen (screen locked) and the wake flow in a real browser.
+- **Affected Rust:** `app/account.rs` (new), `crates/skerry-ui/src/account.rs` (new), `sealskin.rs`, `app.rs`, `launch_progress.rs`, `app/files_window.rs`, `crates/skerry-ui/src/{library.rs,connect.rs,assets.rs}`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -402,12 +474,12 @@
 | `ARCH-GAP-VS-01` | `video-and-screen` | `second-display` | unresolved (backlog) | Open a second remote display in its own GPUI window following server display placement while primary session owns audio. |
 | `ARCH-GAP-VS-02` | `video-and-screen` | `webrtc-transport` | unresolved (backlog) | Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, and data-channel input vs. direct WebSocket. |
 | `ARCH-GAP-VS-03` | `video-and-screen` | `extended-codecs-and-tuning` | unresolved (backlog) | Evaluate VP8/VP9 decode paths, 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder options. |
-| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | partially settled (`ARCH-013`, `ARCH-016`) | Settled: storage (Auto/Cleanroom/named homes), GPU, VPN, language, timezone, Wayland, collaborative, remembered options, Copy link options. Open: startup progress stages and one-click remembered launch. |
+| `ARCH-GAP-LS-01` | `launcher-and-sessions` | `launch-options-and-progress` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Launch options, plus staged progress via `launch_id`, idempotent retries, timeout recovery, and one-click remembered launch. |
 | `ARCH-GAP-LS-02` | `launcher-and-sessions` | `session-management` | partially settled (`ARCH-013`) | Settled: thumbnails and confirmed Stop. Open: Send File. |
 | `ARCH-GAP-LS-03` | `launcher-and-sessions` | `open-links-and-files` | unresolved (todo) | Open pasted URLs in the omnibar and local files via native macOS mechanisms (File → Open… `⌘O`, window drag-and-drop, and `.app` bundle `CFBundleDocumentTypes` / `on_open_urls` Finder "Open With" — no "Upload a file" omnibar button) via SealSkin 0.5.0 `POST /api/launch/url`, `/api/launch/file`, `/api/launch/file_path`, and `POST /api/sessions/<id>/open_url`; only `http`, `https`, `ftp`, or space-free `magnet` addresses are sent. |
-| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | partially settled (`ARCH-013`, `ARCH-016`) | Settled: search (apps + sessions), app icons, category filters, per-app launch preferences. Open: recents, favorites, hidden apps, and matching running-session reuse. |
+| `ARCH-GAP-LS-04` | `launcher-and-sessions` | `launcher-library` | settled (`ARCH-013`, `ARCH-016`, `ARCH-027`) | Search, icons, categories, favorites, hidden apps, recents (saved per server), and reuse of a matching running session. |
 | `ARCH-GAP-LS-05` | `launcher-and-sessions` | `persistent-storage` | unresolved (todo) | SealSkin storage API integration for homes, shared files, direct remote file opening, and public share links. |
-| `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | unresolved (todo) | Show signed-in account, capabilities, and limits; dormant-key browser wake flow and expired/revoked key replacement. |
+| `ARCH-GAP-LS-06` | `launcher-and-sessions` | `account-and-key-recovery` | settled (`ARCH-029`) | Account menu with limits and meters, plus dormant / revoked / expired / disabled / held key recovery that keeps the old key until a new one connects. |
 | `ARCH-GAP-LS-07` | `launcher-and-sessions` | `cluster-and-session-origins` | unresolved (todo) | Automatic/pool/node placement and validated token handoff to isolated per-session origins without leaking control-plane keys. |
 | `ARCH-GAP-LS-08` | `launcher-and-sessions` | `multi-window-sessions` | settled (`ARCH-022`) | Always-separate-windows model (`ARCH-010`): Launcher stays in its own window; every launched/resumed session opens in its own native macOS window, supporting multiple concurrent sessions of the same app. |
 | `ARCH-GAP-LS-09` | `launcher-and-sessions` | `native-mac-app-presence` | unresolved (backlog) | Per-app native macOS presence (Dock icon, `Cmd+Tab`, optionally Spotlight); mechanism (`.app` shims vs. helper processes vs. both) and existing-session relaunch behavior deferred to future compose decision. |

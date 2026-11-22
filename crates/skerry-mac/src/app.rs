@@ -1,3 +1,4 @@
+mod account;
 mod controls;
 mod display;
 mod files_model;
@@ -7,11 +8,11 @@ mod session_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchMemory, LaunchSelection};
 use crate::launch_progress::{self, Flight, FlightRoute, Outcome, RowState};
-use crate::open_target::{self, Incoming, OpenTarget, OpeningState, RowRef, Subject, Typed};
+use crate::open_target::{self, Incoming, OpenTarget, OpeningState, RowRef, Subject};
 use crate::persist::{self, WriteQueue};
 use crate::sealskin::{
     Credential, KeySource, LaunchError, LaunchParams, LaunchRoute, Library, LibraryError,
-    OpenUrlError, RemoteApp, RemoteSession, SealSkinClient, Uploaded,
+    OpenUrlError, RemoteApp, RemoteSession, SealSkinClient, UploadError, Uploaded,
 };
 use crate::settings::Preferences;
 use crate::transport::{DisplayRequest, Resolution};
@@ -33,7 +34,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use session_window::{OpenSession, OpenWindows, SessionWindow};
 use skerry_ui::{
     components::{self, Toast, ToastKind, TOAST_DURATION, TOAST_EXIT},
-    connect::{self, ConnectProps},
+    connect,
     files::Notice,
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
@@ -112,9 +113,16 @@ pub fn run() {
         let library_handle = handle.clone();
         cx.on_action(move |_: &ShowLibrary, cx| show_library(&library_handle, cx));
         let open_handle = handle.clone();
-        cx.on_action(move |_: &OpenFile, cx| choose_files(&open_handle, cx));
+        cx.on_action(move |_: &OpenFile, cx| {
+            if library_may_act(cx) {
+                choose_files(&open_handle, cx);
+            }
+        });
         let location_handle = handle.clone();
         cx.on_action(move |_: &OpenLocation, cx| {
+            if !library_may_act(cx) {
+                return;
+            }
             show_library(&location_handle, cx);
             with_launcher(cx, |launcher, window, cx| {
                 launcher.focus_omnibar(window, cx)
@@ -296,6 +304,23 @@ fn deliver_opens(items: Vec<Incoming>, rt: &Handle, cx: &mut App) {
     with_launcher(cx, move |launcher, _, cx| launcher.receive(items, cx));
 }
 
+/// Open… and Open Location… act only from the Library (or with no window key): from a
+/// session or Files window, a menu key equivalent that slipped through does nothing
+/// (`ARCH-028`).
+fn library_may_act(cx: &App) -> bool {
+    let library = cx
+        .try_global::<OpenWindows>()
+        .and_then(|windows| windows.library.as_ref().map(|(window, _)| *window));
+    key_window_is_library(cx.active_window(), library)
+}
+
+fn key_window_is_library<W: PartialEq>(active: Option<W>, library: Option<W>) -> bool {
+    match active {
+        None => true,
+        Some(active) => library == Some(active),
+    }
+}
+
 /// File → Open…: the Library comes forward, then the open panel (files only, several).
 fn choose_files(rt: &Handle, cx: &mut App) {
     show_library(rt, cx);
@@ -431,6 +456,9 @@ struct Launcher {
     opening_note: Option<(u64, Notice)>,
     /// The running row whose `open_url` is pending.
     open_pending: Option<String>,
+    /// The pending `open_url` request; dropping it (Cancel, Escape, sign-out) aborts it, so
+    /// the remote app never opens a link the user took back.
+    open_job: Option<AbortOnDrop>,
     /// Set by the Launch Dialog when it was opened from the chooser.
     dialog_opening: Option<DialogOpening>,
     /// File launches still uploading, by launch id. Dropping one aborts its upload.
@@ -443,6 +471,26 @@ struct Launcher {
     pending_opens: Vec<Incoming>,
     /// Set after a typed link was acted on; the next render clears the omnibar.
     clear_search_input: bool,
+    /// A dormant key's or held account's panel on the Connect screen (`ARCH-029`).
+    recovery: Option<account::Recovery>,
+    /// A refused key's alert on the Connect card.
+    key_problem: Option<skerry_ui::connect::KeyProblem>,
+    /// The server the alert or panel is about.
+    refused_server: Option<String>,
+    /// Under the key field after an empty Connect that can't retry.
+    key_hint: Option<String>,
+    /// "Use a Different Key" was chosen: the field asks for a new key.
+    different_key: bool,
+    /// The next render focuses the key field (needs a Window).
+    focus_key_input: bool,
+    account_open: bool,
+    account_storage: account::Measure,
+    /// The wake poll after Sign In on the Web; dropping it (or the Launcher) stops it.
+    wake_poll: Option<Task<()>>,
+    wake: account::WakeState,
+    /// A pasted key that was refused but kept (dormant, held, a policy refusal): saved
+    /// once its kept client connects.
+    pending_save: Option<Credential>,
 }
 
 impl Launcher {
@@ -509,13 +557,32 @@ impl Launcher {
             opening_apps_expanded: false,
             opening_note: None,
             open_pending: None,
+            open_job: None,
             dialog_opening: None,
             uploads: HashMap::new(),
             uploaded: HashMap::new(),
             files_pending: HashSet::new(),
             pending_opens: Vec::new(),
             clear_search_input: false,
+            recovery: None,
+            key_problem: None,
+            refused_server: None,
+            key_hint: None,
+            different_key: false,
+            focus_key_input: false,
+            account_open: false,
+            account_storage: account::Measure::NotAsked,
+            wake_poll: None,
+            wake: account::WakeState::default(),
+            pending_save: None,
         };
+        // Back from the browser: check a pending wake at once.
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.wake_check_on_activation(cx);
+            }
+        })
+        .detach();
         // Closing the Library leaves session windows streaming; Window → Library or the
         // Dock icon opens it again (ARCH-022).
         window.on_window_should_close(cx, |window, cx| {
@@ -565,24 +632,47 @@ impl Launcher {
         }
         let text = self.key_input.read(cx).value().to_string();
         let trimmed = text.trim();
-        if trimmed.is_empty() {
-            if let Some(api) = self.retry_api.take() {
-                self.load(api, None, LoadKind::Connect, cx);
-            } else if let Some(saved) = self.startup_credential.clone() {
-                self.connect(saved, false, cx);
-            } else {
-                self.status = Some("Enter a SealSkin application key first.".to_string());
+        let decision = account::submit_decision(
+            trimmed.is_empty(),
+            self.key_problem.as_ref(),
+            self.retry_api.is_some(),
+            self.startup_credential.is_some(),
+        );
+        match decision {
+            account::Submit::Hint(hint) => {
+                if self.key_problem.is_some() || self.different_key {
+                    self.key_hint = Some(hint.into());
+                } else {
+                    self.status = Some(hint.into());
+                }
             }
-            cx.notify();
-            return;
-        }
-        match Credential::parse(trimmed) {
-            Ok(credential) => {
-                // The field is cleared once the key is accepted (see `load`), so a failed
-                // connect leaves it in place to fix or retry.
-                self.connect(credential, true, cx);
+            account::Submit::RetryKept => {
+                self.clear_recovery();
+                // Kept until a load succeeds or a refusal replaces it, so a network failure
+                // leaves the retry target in place.
+                if let Some(api) = self.retry_api.clone() {
+                    let save = account::kept_save(self.pending_save.as_ref(), &api);
+                    self.load(api, save, LoadKind::Connect, cx);
+                }
             }
-            Err(error) => self.status = Some(error),
+            account::Submit::RetrySaved => {
+                self.clear_recovery();
+                if let Some(saved) = self.startup_credential.clone() {
+                    self.connect(saved, false, cx);
+                }
+            }
+            account::Submit::Parse => match Credential::parse(trimmed) {
+                Ok(credential) => {
+                    // A new key: the old refusal's alert and any wake poll are done.
+                    self.clear_recovery();
+                    // The field is cleared once the key is accepted (see `load`), so a
+                    // failed connect leaves it in place to fix or retry.
+                    self.connect(credential, true, cx);
+                }
+                // Under the field while an alert shows, where the red line is hidden.
+                Err(error) if self.key_problem.is_some() => self.key_hint = Some(error),
+                Err(error) => self.status = Some(error),
+            },
         }
         cx.notify();
     }
@@ -667,6 +757,9 @@ impl Launcher {
                         }
                         this.startup_credential = None;
                         this.retry_api = None;
+                        this.clear_recovery();
+                        this.account_storage = account::Measure::NotAsked;
+                        this.pending_save = None;
                         // Launch options remembered per app live with the other preferences.
                         // Through the queue's copy, which includes writes not yet on disk.
                         this.preferences = cx.global::<WriteQueue>().read(api.server());
@@ -685,8 +778,22 @@ impl Launcher {
                         this.retry_api = Some(api.clone());
                         this.leave_server();
                         close_library_files(cx, |_| true);
+                        this.clear_recovery();
                         this.status = Some(error);
                     }
+                    // SealSkin refused the key or the account (`ARCH-029`).
+                    Err(LibraryError::Key(refusal)) => this.refused_load(
+                        api.clone(),
+                        save,
+                        crate::sealskin::ApiError::Key(refusal),
+                        cx,
+                    ),
+                    Err(LibraryError::Account(block)) => this.refused_load(
+                        api.clone(),
+                        save,
+                        crate::sealskin::ApiError::Account(block),
+                        cx,
+                    ),
                     Err(LibraryError::Failed(error)) if saved_startup_key && this.api.is_none() => {
                         this.status = Some(format!(
                             "{error} Choose Connect to try the saved key again, or paste a new one."
@@ -820,6 +927,8 @@ impl Launcher {
         self.leave_server();
         // Files windows the Library opened go too; session windows keep streaming.
         close_library_files(cx, |_| true);
+        self.clear_recovery();
+        self.pending_save = None;
         cx.notify();
     }
 
@@ -990,6 +1099,9 @@ impl Launcher {
         self.server_generation += 1;
         self.signed_in = None;
         self.pending_sign_out = None;
+        self.account_open = false;
+        self.account_storage = account::Measure::NotAsked;
+        self.wake_poll = None;
         self.age_tick = None;
         self.toast = None;
         self.toast_task = None;
@@ -1010,7 +1122,7 @@ impl Launcher {
         self.uploaded.clear();
         self.opening.cancel_all();
         self.opening_note = None;
-        self.open_pending = None;
+        self.cancel_open_pending();
         self.dialog_opening = None;
         self.files_pending.clear();
     }
@@ -1041,6 +1153,9 @@ impl Launcher {
     }
 
     fn open_launch_dialog(&mut self, app: RemoteApp, window: &mut Window, cx: &mut Context<Self>) {
+        // A new dialog never inherits an old Launch & Open target (`ARCH-028`); the chooser
+        // sets one again after this, when it opened the dialog.
+        self.close_launch_dialog();
         let context = self.launch_context();
         let memory = self
             .preferences
@@ -1207,7 +1322,7 @@ impl Launcher {
                 // Close the dialog first, in this same update; `open_session` defers the
                 // window open (ARCH-006, ARCH-022).
                 let running = self.running_match();
-                self.launch_dialog = None;
+                self.close_launch_dialog();
                 if let Some(session) = running {
                     self.open_session(session, window, cx);
                 }
@@ -1365,10 +1480,14 @@ impl Launcher {
         let total = std::fs::metadata(&path).map_or(0, |meta| meta.len());
         let sent = Arc::new(AtomicU64::new(0));
         let job_sent = Arc::clone(&sent);
+        let refused_api = api.clone();
         let pending = self
             .rt
             .spawn(async move { api.upload_for_launch(&path, &job_sent).await });
         self.uploaded.remove(&launch_id);
+        if let Some(flight) = self.flight_mut(&launch_id) {
+            flight.begin_upload();
+        }
         self.uploads.insert(
             launch_id.clone(),
             UploadJob {
@@ -1392,18 +1511,24 @@ impl Launcher {
                     {
                         return;
                     }
+                    // A refused key or account ends the Library, not just this launch.
+                    if let Err(UploadError::Refused(error)) = result {
+                        this.forget_flight(&launch_id);
+                        this.on_refusal(refused_api, error, cx);
+                        return;
+                    }
                     let Some(flight) = this.flight_mut(&launch_id) else {
                         return;
                     };
                     match result {
                         Ok(uploaded) => {
                             // The stall timer starts with the request, not the upload.
-                            flight.keep_waiting(Instant::now());
+                            flight.upload_done(Instant::now());
                             this.uploaded.insert(launch_id.clone(), uploaded);
                             this.post_flight(&launch_id, cx);
                             this.poll_flight(launch_id.clone(), cx);
                         }
-                        Err(message) => flight.fail_before_request(message),
+                        Err(error) => flight.fail_before_request(error.to_string()),
                     }
                     this.flight_changed(&launch_id, window, cx);
                 })
@@ -1454,6 +1579,7 @@ impl Launcher {
         let route = flight.route.clone();
         let uploaded = self.uploaded.get(launch_id).cloned();
         let (sent, on_sent) = tokio::sync::oneshot::channel();
+        let refused_api = api.clone();
         let pending = self.rt.spawn(async move {
             let on_send = move || {
                 let _ = sent.send(());
@@ -1496,6 +1622,11 @@ impl Launcher {
             let _ = window.update(cx, |_, window, cx| {
                 this.update(cx, |this, cx| {
                     if !gate.admits(this.server_generation) {
+                        return;
+                    }
+                    // A refused key or account ends the Library, not just this launch.
+                    if let Err(LaunchError::Refused(error)) = result {
+                        this.on_refusal(refused_api, error, cx);
                         return;
                     }
                     if let Some(flight) = this.flight_mut(&launch_id) {
@@ -1607,13 +1738,16 @@ impl Launcher {
                     cx,
                 );
             }
-        } else if self
+        } else if let Some(refusal) = self
             .flights
             .iter()
-            .any(|flight| flight.launch_id == launch_id && flight.signed_out && !flight.in_flight())
+            .find(|flight| flight.launch_id == launch_id && !flight.in_flight())
+            .and_then(|flight| flight.signed_out.clone())
         {
-            // Reported as a Refresh reports a refused key.
-            self.status = Some(launch_progress::KEY_REFUSED.into());
+            // Progress said 401: handled as a Refresh handles a refused key (`ARCH-029`).
+            if let Some(api) = self.api.clone() {
+                self.on_refusal(api, crate::sealskin::ApiError::Key(refusal), cx);
+            }
         }
         cx.notify();
     }
@@ -1758,14 +1892,17 @@ impl Launcher {
         self.status = None;
         self.busy = Some(format!("Stopping {}…", session.app_name));
         let session_id = session.session_id.clone();
+        let client = api.clone();
         let pending = self
             .rt
-            .spawn(async move { api.stop_session(&session_id).await });
+            .spawn(async move { client.stop_session(&session_id).await });
         let gate = LoadGate(self.server_generation);
         cx.spawn(async move |this, cx| {
-            let result = pending
-                .await
-                .unwrap_or_else(|_| Err("Stopping the session was interrupted.".into()));
+            let result = pending.await.unwrap_or_else(|_| {
+                Err(crate::sealskin::ApiError::Message(
+                    "Stopping the session was interrupted.".into(),
+                ))
+            });
             let _ = this.update(cx, |this, cx| {
                 if !gate.admits(this.server_generation) {
                     return;
@@ -1784,7 +1921,8 @@ impl Launcher {
                         let stopped = session.session_id.clone();
                         close_library_files(cx, move |id| id == stopped);
                     }
-                    Err(error) => this.status = Some(error),
+                    Err(error) if error.is_refusal() => this.on_refusal(api, error, cx),
+                    Err(error) => this.status = Some(error.to_string()),
                 }
                 cx.notify();
             });
@@ -1839,13 +1977,7 @@ impl Launcher {
 
     /// The omnibar's text changed: a typed link shows the chooser, other text searches.
     fn typed_changed(&mut self, text: &str) {
-        match open_target::classify_typed(text) {
-            Typed::Link(url) => self.opening.set_typed(Some(Subject::Link(url))),
-            Typed::Rejected { label, reason } => self
-                .opening
-                .set_typed(Some(Subject::Rejected { label, reason })),
-            Typed::Search => self.opening.clear_typed(),
-        }
+        self.opening.set_typed_text(text);
     }
 
     /// Return in the omnibar: the chooser's first row, only for a link typed there.
@@ -2064,15 +2196,18 @@ impl Launcher {
                 self.opening.set_locked(true);
                 self.open_pending = Some(session.session_id.clone());
                 let id = session.session_id.clone();
+                let refused_api = api.clone();
                 let pending = self
                     .rt
                     .spawn(async move { api.open_url_in_session(&id, &url).await });
+                self.open_job = Some(AbortOnDrop(pending.abort_handle()));
                 let launcher_window = self.window;
                 let gate = LoadGate(self.server_generation);
                 cx.spawn(async move |this, cx| {
-                    let result = pending
-                        .await
-                        .unwrap_or_else(|_| Err(OpenUrlError::Failed("interrupted".into())));
+                    // Aborted: cancelled meanwhile, nothing to do.
+                    let Ok(result) = pending.await else {
+                        return;
+                    };
                     let _ = launcher_window.update(cx, |_, window, cx| {
                         this.update(cx, |this, cx| {
                             // Cancelled meanwhile (✕, Escape, sign-out): the answer is ignored.
@@ -2081,9 +2216,14 @@ impl Launcher {
                             {
                                 return;
                             }
-                            this.open_pending = None;
+                            this.cancel_open_pending();
                             let app = session.app_name.clone();
                             match result {
+                                // A refused key or account ends the Library (`ARCH-029`).
+                                Err(OpenUrlError::Key(error)) => {
+                                    this.opening.set_locked(false);
+                                    this.on_refusal(refused_api, error, cx);
+                                }
                                 Ok(()) => {
                                     this.opening_acted();
                                     this.show_toast(format!("Opened in {app}"), cx);
@@ -2095,6 +2235,7 @@ impl Launcher {
                                         OpenUrlError::NotTaken => format!("{app} couldn’t take the link. Choose another session or launch a new one."),
                                         OpenUrlError::Refused => "The server refused this link.".into(),
                                         OpenUrlError::Failed(reason) => format!("Couldn’t reach {app}: {reason}"),
+                                        OpenUrlError::Key(error) => error.to_string(),
                                     };
                                     this.set_opening_note(text, true);
                                 }
@@ -2178,6 +2319,12 @@ impl Launcher {
         // While the dialog is up, nothing from outside replaces the context.
         self.opening.set_locked(true);
         cx.notify();
+    }
+
+    /// Drops a pending `open_url`: its answer is ignored and its request aborted.
+    fn cancel_open_pending(&mut self) {
+        self.open_pending = None;
+        self.open_job = None;
     }
 
     /// Closes the Launch Dialog; one opened from the chooser gives the context back.
@@ -2277,6 +2424,10 @@ impl Launcher {
                         return;
                     }
                     this.files_pending.remove(&session.session_id);
+                    // Stopped meanwhile: no window for a session that's gone.
+                    if this.find_session(&session.session_id).is_none() {
+                        return;
+                    }
                     let Ok(selkies) = result else {
                         this.status = Some(failed);
                         cx.notify();
@@ -2350,7 +2501,7 @@ impl Launcher {
                     this.clear_search_input = true;
                 }
                 this.opening.cancel_all();
-                this.open_pending = None;
+                this.cancel_open_pending();
                 cx.notify();
             });
         });
@@ -2523,20 +2674,16 @@ impl Render for Launcher {
             self.search_input
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
+        if std::mem::take(&mut self.focus_key_input) {
+            self.key_input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.focus(window, cx);
+            });
+        }
         let theme = cx.theme().clone();
         self.ensure_age_tick(window.is_visible(), cx);
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
-            let props = ConnectProps {
-                status: self.status.clone(),
-                busy: self.busy.clone(),
-                pending_open: pending_open_banner(&self.pending_opens),
-            };
-            return connect::render(
-                &theme,
-                &props,
-                &self.key_input,
-                cx.listener(|this, _, window, cx| this.submit_key(window, cx)),
-            );
+            return self.render_connect(&theme, window, cx);
         };
 
         let server = api.server().to_string();
@@ -2599,6 +2746,8 @@ impl Render for Launcher {
                 && self.pending_stop.is_none()
                 && self.pending_sign_out.is_none(),
             drop_preview: None,
+            account: self.account_menu(),
+            account_open: self.account_open,
         };
 
         // Handlers capture only the entity and look the app or flight up by id (ARCH-026).
@@ -2612,6 +2761,7 @@ impl Render for Launcher {
         let launcher_for_filter = cx.entity().clone();
         let launcher_for_dialog = cx.entity().clone();
         let open = self.open_handlers(cx);
+        let launcher_for_account = cx.entity().clone();
 
         div()
             .size_full()
@@ -2632,8 +2782,10 @@ impl Render for Launcher {
                     cx.stop_propagation();
                     cx.notify();
                 } else if this.opening.current().is_some_and(|current| !current.typed) {
-                    // A context from outside: Escape cancels it, as ✕ does.
+                    // A context from outside: Escape cancels it, as ✕ does, pending
+                    // `open_url` included.
                     this.opening.cancel_all();
+                    this.cancel_open_pending();
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -2645,9 +2797,18 @@ impl Render for Launcher {
                 LibraryHandlers {
                     on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(true, cx))),
                     on_sign_out: Box::new(cx.listener(|this, _, window, cx| {
+                        this.account_open = false;
                         this.pending_sign_out = Some(this.sign_out_label());
                         // Focus the Launcher so Escape reaches the confirmation.
                         window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    })),
+                    on_account_open: Rc::new(move |open, _, cx| {
+                        launcher_for_account.update(cx, |this, cx| this.set_account_open(open, cx));
+                    }),
+                    on_open_web: Box::new(cx.listener(|this, _, _, cx| {
+                        this.account_open = false;
+                        this.open_web(cx);
                         cx.notify();
                     })),
                     on_launch: Rc::new(move |app_id, window, cx| {
@@ -3564,5 +3725,29 @@ mod tests {
             pending_open_banner(&[file, link]).as_deref(),
             Some("Connect to a server to open 2 items.")
         );
+    }
+
+    #[test]
+    fn a_long_upload_shows_no_stall_notice() {
+        let start = Instant::now();
+        let mut flight = test_flight("office").with_route(FlightRoute::File("/tmp/big.iso".into()));
+        flight.begin_upload();
+        let item = launching_item(
+            &flight,
+            None,
+            Some((500_000_000, 1_000_000_000)),
+            start + Duration::from_secs(200),
+        );
+        assert!(item.notice.is_none(), "{:?}", item.notice);
+        assert!(item.upload.is_some());
+    }
+
+    #[test]
+    fn open_actions_act_only_from_the_library() {
+        // 1 is the Library, 2 a session or Files window.
+        assert!(key_window_is_library(Some(1), Some(1)));
+        assert!(!key_window_is_library(Some(2), Some(1)));
+        assert!(!key_window_is_library(Some(2), None));
+        assert!(key_window_is_library(None::<u8>, None));
     }
 }

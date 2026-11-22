@@ -10,8 +10,12 @@ use gpui_kit::{
     KeyBinding, RenderImage, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use skerry_ui::{
+    account::{self, AccessChip, AccountProps, Limits, StorageMeasure, StorageUse},
     components::{self, Toast, ToastKind},
-    connect::{self, ConnectProps},
+    connect::{
+        self, ConnectHandler, ConnectHandlers, ConnectProps, EnvNote, KeyProblem, ProblemKind,
+        RecoveryKind, RecoveryProps,
+    },
     controls::{
         self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps,
         CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, SliderUnit,
@@ -47,6 +51,15 @@ enum Story {
     ConnectDefault,
     ConnectBusy,
     ConnectError,
+    ConnectDormant,
+    ConnectDormantWaiting,
+    ConnectDormantTimedOut,
+    ConnectHeld,
+    ConnectKeyRevoked,
+    ConnectKeyExpiredEnv,
+    ConnectKeyDisabled,
+    ConnectKeyClient,
+    ConnectDifferentKey,
     LibraryPopulated,
     LibraryLaunchDialog,
     LibraryLaunchDialogMinimal,
@@ -83,6 +96,11 @@ enum Story {
     LibraryLaunchFailed,
     LibraryLaunchDialogRunning,
     LibraryLaunchDialogHidden,
+    LibraryAccountUser,
+    LibraryAccountMeasuring,
+    LibraryAccountLimits,
+    LibraryAccountAdmin,
+    LibraryAccountFallback,
     ControlsHardware,
     ControlsJpeg,
     ControlsServerLocked,
@@ -109,6 +127,15 @@ impl Story {
         Story::ConnectDefault,
         Story::ConnectBusy,
         Story::ConnectError,
+        Story::ConnectDormant,
+        Story::ConnectDormantWaiting,
+        Story::ConnectDormantTimedOut,
+        Story::ConnectHeld,
+        Story::ConnectKeyRevoked,
+        Story::ConnectKeyExpiredEnv,
+        Story::ConnectKeyDisabled,
+        Story::ConnectKeyClient,
+        Story::ConnectDifferentKey,
         Story::LibraryPopulated,
         Story::LibraryLaunchDialog,
         Story::LibraryLaunchDialogMinimal,
@@ -145,6 +172,11 @@ impl Story {
         Story::LibraryLaunchFailed,
         Story::LibraryLaunchDialogRunning,
         Story::LibraryLaunchDialogHidden,
+        Story::LibraryAccountUser,
+        Story::LibraryAccountMeasuring,
+        Story::LibraryAccountLimits,
+        Story::LibraryAccountAdmin,
+        Story::LibraryAccountFallback,
         Story::ControlsHardware,
         Story::ControlsJpeg,
         Story::ControlsServerLocked,
@@ -168,7 +200,18 @@ impl Story {
 
     fn group(self) -> &'static str {
         match self {
-            Story::ConnectDefault | Story::ConnectBusy | Story::ConnectError => "Connect",
+            Story::ConnectDefault
+            | Story::ConnectBusy
+            | Story::ConnectError
+            | Story::ConnectDormant
+            | Story::ConnectDormantWaiting
+            | Story::ConnectDormantTimedOut
+            | Story::ConnectHeld
+            | Story::ConnectKeyRevoked
+            | Story::ConnectKeyExpiredEnv
+            | Story::ConnectKeyDisabled
+            | Story::ConnectKeyClient
+            | Story::ConnectDifferentKey => "Connect",
             Story::LibraryPopulated
             | Story::LibraryLaunchDialog
             | Story::LibraryLaunchDialogMinimal
@@ -204,7 +247,12 @@ impl Story {
             | Story::LibraryLaunchStalled
             | Story::LibraryLaunchFailed
             | Story::LibraryLaunchDialogRunning
-            | Story::LibraryLaunchDialogHidden => "Library",
+            | Story::LibraryLaunchDialogHidden
+            | Story::LibraryAccountUser
+            | Story::LibraryAccountMeasuring
+            | Story::LibraryAccountLimits
+            | Story::LibraryAccountAdmin
+            | Story::LibraryAccountFallback => "Library",
             Story::ControlsHardware
             | Story::ControlsJpeg
             | Story::ControlsServerLocked
@@ -230,6 +278,15 @@ impl Story {
             Story::ConnectDefault => "Default",
             Story::ConnectBusy => "Connecting",
             Story::ConnectError => "Error",
+            Story::ConnectDormant => "Dormant Key",
+            Story::ConnectDormantWaiting => "Dormant · Waiting",
+            Story::ConnectDormantTimedOut => "Dormant · Still Asleep",
+            Story::ConnectHeld => "Waiting for Admin",
+            Story::ConnectKeyRevoked => "Key Revoked",
+            Story::ConnectKeyExpiredEnv => "Key Expired + Env Note",
+            Story::ConnectKeyDisabled => "Keys Turned Off",
+            Story::ConnectKeyClient => "App Not Allowed",
+            Story::ConnectDifferentKey => "Use a Different Key",
             Story::LibraryPopulated => "Populated",
             Story::LibraryLaunchDialog => "Launch Dialog",
             Story::LibraryLaunchDialogMinimal => "Launch Dialog · Minimal",
@@ -266,6 +323,11 @@ impl Story {
             Story::LibraryLaunchFailed => "Launch Failed",
             Story::LibraryLaunchDialogRunning => "Launch Dialog · Running",
             Story::LibraryLaunchDialogHidden => "Launch Dialog · Hidden",
+            Story::LibraryAccountUser => "Account Menu · User",
+            Story::LibraryAccountMeasuring => "Account Menu · Measuring",
+            Story::LibraryAccountLimits => "Account Menu · Near Limits",
+            Story::LibraryAccountAdmin => "Account Menu · Admin",
+            Story::LibraryAccountFallback => "Account Menu · Unavailable",
             Story::ControlsHardware => "Hardware H.265",
             Story::ControlsJpeg => "JPEG + Paint-Over",
             Story::ControlsServerLocked => "Server Locked",
@@ -293,6 +355,15 @@ impl Story {
             Story::ConnectDefault => "story-connect-default",
             Story::ConnectBusy => "story-connect-busy",
             Story::ConnectError => "story-connect-error",
+            Story::ConnectDormant => "story-connect-dormant",
+            Story::ConnectDormantWaiting => "story-connect-dormant-waiting",
+            Story::ConnectDormantTimedOut => "story-connect-dormant-timed-out",
+            Story::ConnectHeld => "story-connect-held",
+            Story::ConnectKeyRevoked => "story-connect-key-revoked",
+            Story::ConnectKeyExpiredEnv => "story-connect-key-expired-env",
+            Story::ConnectKeyDisabled => "story-connect-key-disabled",
+            Story::ConnectKeyClient => "story-connect-key-client",
+            Story::ConnectDifferentKey => "story-connect-different-key",
             Story::LibraryPopulated => "story-library-populated",
             Story::LibraryLaunchDialog => "story-library-launch-dialog",
             Story::LibraryLaunchDialogMinimal => "story-library-launch-dialog-minimal",
@@ -329,6 +400,11 @@ impl Story {
             Story::LibraryLaunchFailed => "story-library-launch-failed",
             Story::LibraryLaunchDialogRunning => "story-library-launch-dialog-running",
             Story::LibraryLaunchDialogHidden => "story-library-launch-dialog-hidden",
+            Story::LibraryAccountUser => "story-library-account-user",
+            Story::LibraryAccountMeasuring => "story-library-account-measuring",
+            Story::LibraryAccountLimits => "story-library-account-limits",
+            Story::LibraryAccountAdmin => "story-library-account-admin",
+            Story::LibraryAccountFallback => "story-library-account-fallback",
             Story::ControlsHardware => "story-controls-hardware",
             Story::ControlsJpeg => "story-controls-jpeg",
             Story::ControlsServerLocked => "story-controls-locked",
@@ -413,6 +489,68 @@ impl Story {
     /// Session Audio stories: Session Controls with only Audio Settings open.
     fn is_audio(self) -> bool {
         self.group() == "Session Audio"
+    }
+
+    /// Stories that open with the account menu open.
+    fn account_open(self) -> bool {
+        matches!(
+            self,
+            Story::LibraryAccountUser
+                | Story::LibraryAccountMeasuring
+                | Story::LibraryAccountLimits
+                | Story::LibraryAccountAdmin
+                | Story::LibraryAccountFallback
+        )
+    }
+
+    /// What a Connect story shows.
+    fn connect_props(self) -> ConnectProps {
+        let server = Some("sealskin.example.internal".to_string());
+        let recovery = |kind, waiting, timed_out| ConnectProps {
+            server: server.clone(),
+            recovery: Some(RecoveryProps {
+                kind,
+                waiting,
+                timed_out,
+            }),
+            ..ConnectProps::default()
+        };
+        let problem = |kind, env_note, hint: Option<&str>| ConnectProps {
+            server: server.clone(),
+            problem: Some(KeyProblem { kind, env_note }),
+            hint: hint.map(Into::into),
+            ..ConnectProps::default()
+        };
+        match self {
+            Story::ConnectBusy => ConnectProps {
+                busy: Some("Connecting to sealskin.example.internal…".into()),
+                pending_open: Some("Connect to a server to open “report.pdf”.".into()),
+                ..ConnectProps::default()
+            },
+            Story::ConnectError => ConnectProps {
+                status: Some(
+                    "Invalid application key format. Expected ssk_<id>_<secret>@<host>.".into(),
+                ),
+                ..ConnectProps::default()
+            },
+            Story::ConnectDormant => recovery(RecoveryKind::Dormant, false, false),
+            Story::ConnectDormantWaiting => recovery(RecoveryKind::Dormant, true, false),
+            Story::ConnectDormantTimedOut => recovery(RecoveryKind::Dormant, false, true),
+            Story::ConnectHeld => recovery(RecoveryKind::Held, false, false),
+            Story::ConnectKeyRevoked => problem(ProblemKind::Revoked, None, None),
+            Story::ConnectKeyExpiredEnv => problem(
+                ProblemKind::Expired,
+                Some(EnvNote::Environment),
+                Some(connect::PASTE_NEW_KEY),
+            ),
+            Story::ConnectKeyDisabled => problem(ProblemKind::KeysDisabled, None, None),
+            Story::ConnectKeyClient => problem(ProblemKind::ClientNotAllowed, None, None),
+            Story::ConnectDifferentKey => ConnectProps {
+                different_key: true,
+                ..ConnectProps::default()
+            },
+            _ => ConnectProps::default(),
+        }
     }
 
     /// The Sign Out confirmation a story shows, if any.
@@ -500,6 +638,8 @@ struct PreviewApp {
     files_props: FilesProps,
     folder_name: Entity<InputState>,
     files_scroll: gpui_kit::UniformListScrollHandle,
+    /// The account menu is open (controlled, as in the Launcher).
+    account_open: bool,
     /// A fixed story canvas width, to check wide layouts on a small screen.
     canvas_width: Option<f32>,
 }
@@ -618,6 +758,7 @@ impl PreviewApp {
             folder_name: cx.new(|cx| InputState::new(window, cx).default_value("untitled folder")),
             files_scroll: gpui_kit::UniformListScrollHandle::new(),
             canvas_width,
+            account_open: story.account_open(),
         }
     }
 
@@ -761,6 +902,7 @@ impl PreviewApp {
 
     fn select_story(&mut self, story: Story, window: &mut Window, cx: &mut Context<Self>) {
         self.story = story;
+        self.account_open = story.account_open();
         self.files_props = Self::fixture_files(story);
         self.last_event = story.note().map(Into::into);
         if let Some(dialog) = Self::story_dialog(story, &self.assets) {
@@ -1186,6 +1328,8 @@ impl PreviewApp {
                 "Open one file at a time. To copy a folder, use Files on a running session.".into()
             }),
             busy: None,
+            account: Self::fixture_account(self.story, server),
+            account_open: self.account_open,
             omnibar: match story {
                 Story::LibraryOpenLink
                 | Story::LibraryOpenLinkPending
@@ -1354,6 +1498,84 @@ impl PreviewApp {
                 ..base
             }),
             _ => None,
+        }
+    }
+
+    /// The account menu each Library story shows.
+    fn fixture_account(story: Story, server: &str) -> AccountProps {
+        const GIB: f64 = 1024. * 1024. * 1024.;
+        let chip = |label: &'static str, allowed| AccessChip {
+            label: label.into(),
+            allowed,
+        };
+        let limits = |storage, allowance, session_limit| Limits {
+            running: if session_limit < 0 { 2 } else { 1 },
+            session_limit,
+            session_cpus: if session_limit < 0 { -1. } else { 4. },
+            session_memory_mb: if session_limit < 0 { -1 } else { 8192 },
+            session_hours: if session_limit < 0 { -1. } else { 8. },
+            session_idle_minutes: if session_limit < 0 { -1. } else { 30. },
+            storage: Some(StorageUse {
+                limit_gb: 50,
+                used: storage,
+            }),
+            allowance: Some(allowance),
+        };
+        let user = AccountProps {
+            user: "kebot".into(),
+            server: server.into(),
+            admin: false,
+            groups: vec!["users".into(), "designers".into()],
+            access: vec![
+                chip("Persistent storage", true),
+                chip("GPU", true),
+                chip("VPN", false),
+            ],
+            limits: account::limit_rows(&limits(
+                StorageMeasure::Bytes((12.4 * GIB) as u64),
+                (12.5, 40., "month".into()),
+                2,
+            )),
+            key_source: Some(KeySourceLabel::SavedFile),
+            key_id: "3f9a1c21".into(),
+            dormancy: account::dormancy_text(24., false),
+        };
+        match story {
+            Story::LibraryAccountMeasuring => AccountProps {
+                limits: account::limit_rows(&limits(
+                    StorageMeasure::Measuring,
+                    (12.5, 40., "month".into()),
+                    2,
+                )),
+                ..user
+            },
+            Story::LibraryAccountLimits => AccountProps {
+                groups: Vec::new(),
+                limits: account::limit_rows(&limits(
+                    StorageMeasure::Bytes((43.1 * GIB) as u64),
+                    (40., 40., "week".into()),
+                    -1,
+                )),
+                key_source: Some(KeySourceLabel::Environment),
+                dormancy: account::dormancy_text(24., true),
+                ..user
+            },
+            Story::LibraryAccountAdmin => AccountProps {
+                user: "admin".into(),
+                admin: true,
+                groups: Vec::new(),
+                limits: Vec::new(),
+                dormancy: None,
+                ..user
+            },
+            Story::LibraryAccountFallback => AccountProps {
+                user: String::new(),
+                server: server.into(),
+                key_source: Some(KeySourceLabel::SavedFile),
+                key_id: "3f9a1c21".into(),
+                ..AccountProps::default()
+            },
+            _ => user,
         }
     }
 
@@ -2327,39 +2549,37 @@ impl PreviewApp {
     ) -> gpui_kit::Div {
         let entity = cx.entity().clone();
         match self.story {
-            Story::ConnectDefault => {
-                let props = ConnectProps::default();
-                let entity = entity.clone();
-                connect::render(theme, &props, &self.key_input, move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
+            Story::ConnectDefault
+            | Story::ConnectBusy
+            | Story::ConnectError
+            | Story::ConnectDormant
+            | Story::ConnectDormantWaiting
+            | Story::ConnectDormantTimedOut
+            | Story::ConnectHeld
+            | Story::ConnectKeyRevoked
+            | Story::ConnectKeyExpiredEnv
+            | Story::ConnectKeyDisabled
+            | Story::ConnectKeyClient
+            | Story::ConnectDifferentKey => {
+                let props = self.story.connect_props();
+                let connect_entity = entity.clone();
+                let mut handlers = ConnectHandlers::new(move |_, _, cx| {
+                    connect_entity.update(cx, |this, cx| {
                         let len = this.key_input.read(cx).value().trim().len();
                         this.record_event(format!("Connect: Submit ({len} chars)"), cx);
                     });
-                })
-            }
-            Story::ConnectBusy => {
-                let props = ConnectProps {
-                    busy: Some("Connecting to sealskin.example.internal…".into()),
-                    status: None,
-                    pending_open: Some("Connect to a server to open “report.pdf”.".into()),
+                });
+                let event = |label: &'static str| -> Option<ConnectHandler> {
+                    let entity = entity.clone();
+                    Some(Rc::new(move |_, _, cx| {
+                        entity.update(cx, |this, cx| this.record_event(label, cx));
+                    }))
                 };
-                connect::render(theme, &props, &self.key_input, |_, _, _| {})
-            }
-            Story::ConnectError => {
-                let props = ConnectProps {
-                    status: Some(
-                        "Invalid application key format. Expected ssk_<id>_<secret>@<host>.".into(),
-                    ),
-                    busy: None,
-                    pending_open: None,
-                };
-                let entity = entity.clone();
-                connect::render(theme, &props, &self.key_input, move |_, _, cx| {
-                    entity.update(cx, |this, cx| {
-                        let len = this.key_input.read(cx).value().trim().len();
-                        this.record_event(format!("Connect: Retry ({len} chars)"), cx);
-                    });
-                })
+                handlers.on_sign_in_web = event("Recovery: Sign In on the Web");
+                handlers.on_try_again = event("Recovery: Try Again");
+                handlers.on_other_key = event("Recovery: Use a Different Key");
+                handlers.on_open_web = event("Recovery: Open SealSkin in Browser");
+                connect::render(theme, &props, &self.key_input, handlers)
             }
             Story::LibraryPopulated
             | Story::LibraryLaunchDialog
@@ -2394,7 +2614,12 @@ impl PreviewApp {
             | Story::LibraryUploading
             | Story::LibraryUploadFailed
             | Story::LaunchDialogOpenFile
-            | Story::LaunchDialogOpenLink => {
+            | Story::LaunchDialogOpenLink
+            | Story::LibraryAccountUser
+            | Story::LibraryAccountMeasuring
+            | Story::LibraryAccountLimits
+            | Story::LibraryAccountAdmin
+            | Story::LibraryAccountFallback => {
                 let server = if self.story == Story::LibraryLongServer {
                     "analytics-gpu-cluster-07.eu-central.sealskin.example.internal"
                 } else {
@@ -2650,6 +2875,8 @@ impl PreviewApp {
     fn library_handlers(&self, cx: &mut Context<Self>) -> LibraryHandlers {
         let on_refresh_entity = cx.entity().clone();
         let on_sign_out_entity = cx.entity().clone();
+        let on_account_entity = cx.entity().clone();
+        let on_web_entity = cx.entity().clone();
         let on_launch_entity = cx.entity().clone();
         let on_resume_entity = cx.entity().clone();
         let on_stop_entity = cx.entity().clone();
@@ -2686,7 +2913,25 @@ impl PreviewApp {
             }),
             on_sign_out: Box::new(move |_, _, cx| {
                 on_sign_out_entity.update(cx, |this, cx| {
-                    this.record_event("Library: Sign Out…", cx);
+                    this.record_event("Account: Sign Out…", cx);
+                });
+            }),
+            on_account_open: Rc::new(move |open, _, cx| {
+                on_account_entity.update(cx, |this, cx| {
+                    this.account_open = open;
+                    this.record_event(
+                        if open {
+                            "Account: Open"
+                        } else {
+                            "Account: Close"
+                        },
+                        cx,
+                    );
+                });
+            }),
+            on_open_web: Box::new(move |_, _, cx| {
+                on_web_entity.update(cx, |this, cx| {
+                    this.record_event("Account: Open SealSkin in Browser", cx);
                 });
             }),
             on_launch: Rc::new(move |id, window, cx| {

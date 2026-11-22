@@ -113,9 +113,36 @@ pub fn sends_key_down(modifiers: Modifiers, command_as_control: bool) -> bool {
     !modifiers.platform || command_as_control
 }
 
+/// ⌘O and ⌘L are the Library's (File → Open…, Open Location…). In a session window the
+/// desktop claims them, so the menu's key equivalents never pull the user out to the Library
+/// (`ARCH-028`). With Command as Control they go to the remote app as Control+O / Control+L;
+/// otherwise they are swallowed, since Skerry never sends Super.
+pub fn claims_library_shortcut(modifiers: Modifiers, key: &str) -> bool {
+    modifiers.platform
+        && !modifiers.control
+        && !modifiers.alt
+        && !modifiers.shift
+        && matches!(key, "o" | "l")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_desktop_claims_cmd_o_and_cmd_l() {
+        assert!(claims_library_shortcut(mac(false, false, false, true), "o"));
+        assert!(claims_library_shortcut(mac(false, false, false, true), "l"));
+        assert!(!claims_library_shortcut(
+            mac(false, false, false, false),
+            "o"
+        ));
+        assert!(!claims_library_shortcut(mac(true, false, false, true), "o"));
+        assert!(!claims_library_shortcut(
+            mac(false, false, false, true),
+            "w"
+        ));
+    }
 
     const SUPER_AND_META: [u32; 4] = [0xffe7, 0xffe8, 0xffeb, 0xffec];
 

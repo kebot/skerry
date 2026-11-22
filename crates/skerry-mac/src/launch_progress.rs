@@ -10,8 +10,8 @@
 
 use crate::launch_options::LaunchSelection;
 use crate::sealskin::{
-    session_from_progress, LaunchError, LaunchParams, LaunchProgress, ProgressAnswer, RemoteApp,
-    RemoteSession,
+    session_from_progress, KeyRefusal, LaunchError, LaunchParams, LaunchProgress, ProgressAnswer,
+    RemoteApp, RemoteSession,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -206,10 +206,12 @@ pub struct Flight {
     prompt_after: Instant,
     poll_errors: u32,
     /// Progress answered 401. Like `failed`, it ends the flight only once no request is
-    /// outstanding; the Library then reports the refused key as a Refresh would.
-    pub signed_out: bool,
+    /// outstanding; the Library then handles the refused key as a Refresh would (`ARCH-029`).
+    pub signed_out: Option<KeyRefusal>,
     pub outcome: Outcome,
     pub route: FlightRoute,
+    /// The file of a `/launch/file` flight is going up: no request yet, so no stall prompt.
+    uploading: bool,
 }
 
 impl Flight {
@@ -239,9 +241,10 @@ impl Flight {
             progress_failed: None,
             prompt_after: now,
             poll_errors: 0,
-            signed_out: false,
+            signed_out: None,
             outcome: Outcome::Running,
             route: FlightRoute::Simple,
+            uploading: false,
         };
         flight.reset(now, now_unix);
         flight
@@ -262,8 +265,9 @@ impl Flight {
         self.progress_failed = None;
         self.prompt_after = now + STALL;
         self.poll_errors = 0;
-        self.signed_out = false;
+        self.signed_out = None;
         self.outcome = Outcome::Running;
+        self.uploading = false;
     }
 
     pub fn with_route(mut self, route: FlightRoute) -> Self {
@@ -271,8 +275,20 @@ impl Flight {
         self
     }
 
+    /// The file of a `/launch/file` flight starts going up.
+    pub fn begin_upload(&mut self) {
+        self.uploading = true;
+    }
+
+    /// The upload finished: the stall timer starts now, with the request.
+    pub fn upload_done(&mut self, now: Instant) {
+        self.uploading = false;
+        self.prompt_after = now + STALL;
+    }
+
     /// The work before the launch request (a file upload) failed: no request was sent.
     pub fn fail_before_request(&mut self, message: String) {
+        self.uploading = false;
         if self.in_flight() && !self.posting {
             self.outcome = Outcome::Failed(Some(message));
         }
@@ -351,9 +367,9 @@ impl Flight {
                     _ => {}
                 }
             }
-            ProgressAnswer::SignedOut => {
+            ProgressAnswer::SignedOut(refusal) => {
                 // The outstanding request may still succeed; wait for it (as for `failed`).
-                self.signed_out = true;
+                self.signed_out = Some(refusal.clone());
                 self.progress_failed = Some(Some(KEY_REFUSED.into()));
                 self.settle();
             }
@@ -437,7 +453,10 @@ impl Flight {
     /// The stall prompt shows: running, not yet connecting, and no stage change for
     /// [`STALL`] (or since the last Keep Waiting).
     pub fn stalled(&self, now: Instant) -> bool {
-        self.is_running() && self.stage() < UserStage::Connecting && now >= self.prompt_after
+        self.is_running()
+            && !self.uploading
+            && self.stage() < UserStage::Connecting
+            && now >= self.prompt_after
     }
 
     pub fn keep_waiting(&mut self, now: Instant) {
@@ -843,19 +862,19 @@ mod tests {
         let t = Instant::now();
         let mut f = flight(t);
         f.begin_attempt();
-        f.observe(&ProgressAnswer::SignedOut, t + secs(5));
-        assert!(f.is_running() && f.signed_out);
+        f.observe(&ProgressAnswer::SignedOut(KeyRefusal::Dormant), t + secs(5));
+        assert!(f.is_running() && f.signed_out.is_some());
         f.posted(Ok(session("new", "firefox", T0)), t + secs(6));
         assert!(matches!(f.outcome, Outcome::Ready(_)));
 
         let mut refused = flight(t);
         refused.begin_attempt();
-        refused.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        refused.observe(&ProgressAnswer::SignedOut(KeyRefusal::Dormant), t + secs(5));
         refused.posted(Err(LaunchError::Server(KEY_REFUSED.into())), t + secs(6));
         assert_eq!(refused.failure_body(), Some(KEY_REFUSED));
         // With no request outstanding, a 401 ends the flight at once.
         let mut idle = flight(t);
-        idle.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        idle.observe(&ProgressAnswer::SignedOut(KeyRefusal::Dormant), t + secs(5));
         assert!(matches!(idle.outcome, Outcome::Failed(_)));
     }
 
@@ -923,5 +942,27 @@ mod tests {
         assert!(matches!(&f.outcome, Outcome::Ready(s) if s.session_id == "new"));
         f.observe(&known("failed"), t + secs(8));
         assert!(matches!(&f.outcome, Outcome::Ready(s) if s.session_id == "new"));
+    }
+
+    #[test]
+    fn no_stall_prompt_while_the_file_uploads() {
+        let start = Instant::now();
+        let mut flight = Flight::new(
+            app(),
+            LaunchParams::default(),
+            None,
+            HashSet::new(),
+            start,
+            0.0,
+        )
+        .with_route(FlightRoute::File("/tmp/big.iso".into()));
+        flight.begin_upload();
+        // Four minutes of upload: past STALL, still no prompt.
+        assert!(!flight.stalled(start + Duration::from_secs(240)));
+        // The request goes out after the upload: the stall timer starts then.
+        let sent = start + Duration::from_secs(240);
+        flight.upload_done(sent);
+        assert!(!flight.stalled(sent + Duration::from_secs(60)));
+        assert!(flight.stalled(sent + STALL));
     }
 }

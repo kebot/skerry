@@ -788,6 +788,16 @@ impl SessionWindow {
         let session = cx.entity();
         let session_id = self.remote.session_id.clone();
         cx.defer(move |cx| {
+            // The Library may have opened this session's Files window since the check above.
+            let open = cx.default_global::<OpenWindows>().files_window(&session_id);
+            if let Some((handle, _)) = open {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+                {
+                    return;
+                }
+            }
             let _ = owner_window.update(cx, |_, window, cx| {
                 let source = files_window::FilesSource {
                     title,

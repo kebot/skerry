@@ -944,6 +944,10 @@ impl Render for Desktop {
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
                 let stroke = &event.keystroke;
                 if !keys::sends_key_down(stroke.modifiers, desktop.settings.command_as_control) {
+                    // ⌘O / ⌘L: claimed, so the File menu's key equivalents don't fire.
+                    if keys::claims_library_shortcut(stroke.modifiers, &stroke.key) {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 let shortcut = stroke.modifiers.control || stroke.modifiers.platform;

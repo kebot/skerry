@@ -241,6 +241,9 @@ pub struct LibraryProps {
     /// Takes Finder drops (not while busy).
     pub accepts_drops: bool,
     pub drop_preview: Option<DropPreview>,
+    /// The header's account menu (`ARCH-029`), and whether it is open.
+    pub account: crate::account::AccountProps,
+    pub account_open: bool,
 }
 
 /// The widest the Library's content column grows; wider windows centre it.
@@ -250,8 +253,12 @@ pub const RECENT_ROW_MAX: usize = 8;
 
 pub struct LibraryHandlers {
     pub on_refresh: ClickHandler,
-    /// Asks to sign out; the caller shows the confirmation.
+    /// Asks to sign out; the caller shows the confirmation. The account menu calls it.
     pub on_sign_out: ClickHandler,
+    /// The account menu opened (`true`) or closed.
+    pub on_account_open: crate::account::OpenHandler,
+    /// Opens the server's web app in the browser.
+    pub on_open_web: ClickHandler,
     /// Opens the Launch Dialog for an app.
     pub on_launch: ItemHandler,
     /// Launches an app with its remembered options at once.
@@ -450,6 +457,8 @@ pub fn render(
     let LibraryHandlers {
         on_refresh,
         on_sign_out,
+        on_account_open,
+        on_open_web,
         on_launch,
         on_quick_launch,
         on_toggle_favorite,
@@ -525,16 +534,17 @@ pub fn render(
                         .disabled(!enabled)
                         .on_click(move |event, window, cx| on_refresh(event, window, cx)),
                 )
-                .child(
-                    Button::new("sign-out")
-                        .ghost()
-                        .xsmall()
-                        .icon(gpui_kit::assets::IconName::LogOut)
-                        .label("Sign Out…")
-                        .tooltip("Sign out of this server")
-                        .disabled(!enabled)
-                        .on_click(move |event, window, cx| on_sign_out(event, window, cx)),
-                ),
+                // Sign Out lives in the account menu, at the trailing edge (`ARCH-029`).
+                .child(crate::account::render_menu(
+                    &props.account,
+                    props.account_open,
+                    enabled,
+                    crate::account::AccountHandlers {
+                        on_open_change: on_account_open,
+                        on_open_web: Rc::from(on_open_web),
+                        on_sign_out: Rc::from(on_sign_out),
+                    },
+                )),
         );
 
     let omnibar = div()

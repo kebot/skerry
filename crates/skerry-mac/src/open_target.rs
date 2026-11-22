@@ -44,6 +44,9 @@ pub enum RejectReason {
     Scheme,
     /// Over [`MAX_URL_CHARS`].
     TooLong,
+    /// An allowed scheme with spaces or control characters (a magnet whose `dn` wasn't
+    /// encoded, say).
+    Spaces,
     /// A `skerry:` link whose address can't be told apart (an unencoded `&`, two `url`s).
     Ambiguous,
 }
@@ -52,6 +55,7 @@ impl RejectReason {
     pub fn note(self) -> &'static str {
         match self {
             Self::Scheme => "Skerry opens web (http, https), ftp and magnet links.",
+            Self::Spaces => "This link contains spaces, which SealSkin doesn’t accept.",
             Self::TooLong => {
                 "This link is longer than 8,192 characters, which SealSkin doesn’t accept."
             }
@@ -102,8 +106,11 @@ pub fn validate_url(url: &str) -> Result<(), RejectReason> {
         return Err(RejectReason::Scheme);
     };
     let rest = &url[prefix.len()..];
-    if rest.is_empty() || rest.chars().any(forbidden_char) {
+    if rest.is_empty() {
         return Err(RejectReason::Scheme);
+    }
+    if rest.chars().any(forbidden_char) {
+        return Err(RejectReason::Spaces);
     }
     if url.chars().count() > MAX_URL_CHARS {
         return Err(RejectReason::TooLong);
@@ -200,6 +207,27 @@ pub fn parse_typed_url(text: &str) -> Option<String> {
     validate_url(&candidate).ok().map(|()| candidate)
 }
 
+/// Top-level domains common enough that a bare `host.tld` typed in the omnibar is surely an
+/// address. Anything else ("notes.txt", "report.pdf", "wiki.lan", an IP) still shows the
+/// chooser but needs a click, so Return never opens a file name searched for (`ARCH-028`).
+const RETURN_TLDS: [&str; 32] = [
+    "com", "net", "org", "edu", "gov", "mil", "int", "io", "co", "dev", "app", "ai", "me", "info",
+    "biz", "us", "uk", "de", "fr", "eu", "ca", "au", "jp", "cn", "in", "nl", "ch", "se", "no",
+    "es", "it", "br",
+];
+
+/// Whether Return may act on typed text: an explicit scheme, or a bare host ending in a
+/// well-known TLD.
+pub fn return_may_open(text: &str) -> bool {
+    let text = text.trim();
+    if text.contains("://") || text.to_ascii_lowercase().starts_with("magnet:?") {
+        return true;
+    }
+    let host = text.split(['/', ':', '?', '#']).next().unwrap_or_default();
+    host.rsplit_once('.')
+        .is_some_and(|(_, tld)| RETURN_TLDS.contains(&tld.to_ascii_lowercase().as_str()))
+}
+
 /// What the omnibar's text is: a link, clearly a link that can't be opened, or a search.
 /// Text with whitespace is never a rejected link ("javascript tutorial" searches).
 pub fn classify_typed(text: &str) -> Typed {
@@ -221,7 +249,7 @@ pub fn classify_typed(text: &str) -> Typed {
         return Typed::Search;
     }
     let reason = match validate_url(&lowered) {
-        Err(RejectReason::TooLong) => RejectReason::TooLong,
+        Err(reason @ (RejectReason::TooLong | RejectReason::Spaces)) => reason,
         _ => RejectReason::Scheme,
     };
     Typed::Rejected {
@@ -459,6 +487,9 @@ pub struct Opening {
     pub subject: Subject,
     /// It came from the omnibar's own text; only then may Return act.
     pub typed: bool,
+    /// Return may act: the typed text had a scheme or ends in a well-known TLD
+    /// ([`return_may_open`]). A guess like "notes.txt" shows the chooser but needs a click.
+    pub enter_ok: bool,
 }
 
 /// What Return in the omnibar does.
@@ -528,6 +559,7 @@ impl OpeningState {
             self.current = Some(Opening {
                 subject,
                 typed: false,
+                enter_ok: false,
             });
             self.bump();
             return 0;
@@ -542,13 +574,30 @@ impl OpeningState {
 
     /// The omnibar's text changed. A typed link shows, or a typed context goes away; it
     /// never replaces a context from outside, and nothing changes while locked.
+    #[cfg(test)]
     pub fn set_typed(&mut self, subject: Option<Subject>) {
+        self.set_typed_opening(subject, true);
+    }
+
+    /// The omnibar's text changed: classify it, and allow Return only when the text is
+    /// clearly an address (`return_may_open`).
+    pub fn set_typed_text(&mut self, text: &str) {
+        let subject = match classify_typed(text) {
+            Typed::Link(url) => Some(Subject::Link(url)),
+            Typed::Rejected { label, reason } => Some(Subject::Rejected { label, reason }),
+            Typed::Search => None,
+        };
+        self.set_typed_opening(subject, return_may_open(text));
+    }
+
+    fn set_typed_opening(&mut self, subject: Option<Subject>, enter_ok: bool) {
         if self.locked || self.current.as_ref().is_some_and(|current| !current.typed) {
             return;
         }
         let next = subject.map(|subject| Opening {
             subject,
             typed: true,
+            enter_ok,
         });
         if next == self.current {
             return;
@@ -558,6 +607,7 @@ impl OpeningState {
         self.bump();
     }
 
+    #[cfg(test)]
     pub fn clear_typed(&mut self) {
         self.set_typed(None);
     }
@@ -570,6 +620,7 @@ impl OpeningState {
         self.current = self.queue.pop_front().map(|subject| Opening {
             subject,
             typed: false,
+            enter_ok: false,
         });
         if self.current.is_none() {
             self.taken = 0;
@@ -604,7 +655,11 @@ impl OpeningState {
         first_app: Option<&str>,
     ) -> Option<RowRef> {
         let current = self.current.as_ref()?;
-        if !current.typed || self.locked || !matches!(current.subject, Subject::Link(_)) {
+        if !current.typed
+            || !current.enter_ok
+            || self.locked
+            || !matches!(current.subject, Subject::Link(_))
+        {
             return None;
         }
         first_session
@@ -1054,5 +1109,50 @@ mod tests {
         state.cancel_all();
         state.push_external(file("a.pdf"));
         assert_eq!(state.enter_action(Some("s1"), Some("zen")), None);
+    }
+
+    #[test]
+    fn return_acts_only_on_clear_addresses() {
+        for text in [
+            "https://notes.txt",
+            "example.com/a",
+            "wiki.Example.ORG",
+            "magnet:?xt=1",
+        ] {
+            assert!(return_may_open(text), "{text}");
+        }
+        for text in [
+            "notes.txt",
+            "report.pdf",
+            "wiki.lan/page",
+            "1.2.3.4",
+            "localhost",
+        ] {
+            assert!(!return_may_open(text), "{text}");
+        }
+        let mut state = OpeningState::default();
+        state.set_typed_text("notes.txt");
+        assert!(matches!(state.current().unwrap().subject, Subject::Link(_)));
+        assert_eq!(state.enter_action(Some("s1"), Some("zen")), None);
+        state.set_typed_text("example.com");
+        assert_eq!(
+            state.enter_action(Some("s1"), Some("zen")),
+            Some(RowRef::Session("s1".into()))
+        );
+    }
+
+    #[test]
+    fn a_magnet_with_spaces_says_so() {
+        assert!(matches!(
+            from_open_url("skerry://open?url=magnet%3A%3Fxt%3Durn%3Abtih%3Aabc%26dn%3DMy%20File"),
+            Incoming::Rejected {
+                reason: RejectReason::Spaces,
+                ..
+            }
+        ));
+        assert_eq!(
+            RejectReason::Spaces.note(),
+            "This link contains spaces, which SealSkin doesn’t accept."
+        );
     }
 }
