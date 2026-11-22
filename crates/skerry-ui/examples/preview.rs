@@ -155,6 +155,16 @@ enum Story {
     PrintNoticeStack,
     PrintNoticeWithStrip,
     PrintNoticeNarrow,
+    ConnectSelkiesRecent,
+    ConnectSelkiesToken,
+    ConnectSelkiesBadLogin,
+    ConnectSelkiesWebRtc,
+    ConnectSelkiesUnreachable,
+    ConnectCertificate,
+    ConnectCertificateChanged,
+    SelkiesHomeOpen,
+    SelkiesHomeMenu,
+    SelkiesHomeForget,
 }
 
 impl Story {
@@ -265,6 +275,16 @@ impl Story {
         Story::PrintNoticeStack,
         Story::PrintNoticeWithStrip,
         Story::PrintNoticeNarrow,
+        Story::ConnectSelkiesRecent,
+        Story::ConnectSelkiesToken,
+        Story::ConnectSelkiesBadLogin,
+        Story::ConnectSelkiesWebRtc,
+        Story::ConnectSelkiesUnreachable,
+        Story::ConnectCertificate,
+        Story::ConnectCertificateChanged,
+        Story::SelkiesHomeOpen,
+        Story::SelkiesHomeMenu,
+        Story::SelkiesHomeForget,
     ];
 
     fn group(self) -> &'static str {
@@ -373,6 +393,16 @@ impl Story {
             | Story::PrintNoticeStack
             | Story::PrintNoticeWithStrip
             | Story::PrintNoticeNarrow => "Session Printing",
+            Story::ConnectSelkiesRecent
+            | Story::ConnectSelkiesToken
+            | Story::ConnectSelkiesBadLogin
+            | Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => "Connect",
+            Story::SelkiesHomeOpen | Story::SelkiesHomeMenu | Story::SelkiesHomeForget => {
+                "Selkies Library"
+            }
         }
     }
 
@@ -484,6 +514,16 @@ impl Story {
             Story::PrintNoticeStack => "Stack + More",
             Story::PrintNoticeWithStrip => "Below the Stats Strip",
             Story::PrintNoticeNarrow => "Narrow Window",
+            Story::ConnectSelkiesRecent => "Selkies · Recent Servers",
+            Story::ConnectSelkiesToken => "Selkies · Token Link",
+            Story::ConnectSelkiesBadLogin => "Selkies · Wrong Password",
+            Story::ConnectSelkiesWebRtc => "Selkies · WebRTC Server",
+            Story::ConnectSelkiesUnreachable => "Selkies · Unreachable",
+            Story::ConnectCertificate => "Selkies · Trust Certificate",
+            Story::ConnectCertificateChanged => "Selkies · Certificate Changed",
+            Story::SelkiesHomeOpen => "Open Here",
+            Story::SelkiesHomeMenu => "Server Menu",
+            Story::SelkiesHomeForget => "Forget Server",
         }
     }
 
@@ -595,6 +635,16 @@ impl Story {
             Story::PrintNoticeStack => "story-print-notice-stack",
             Story::PrintNoticeWithStrip => "story-print-notice-strip",
             Story::PrintNoticeNarrow => "story-print-notice-narrow",
+            Story::ConnectSelkiesRecent => "story-connect-selkies-recent",
+            Story::ConnectSelkiesToken => "story-connect-selkies-token",
+            Story::ConnectSelkiesBadLogin => "story-connect-selkies-bad-login",
+            Story::ConnectSelkiesWebRtc => "story-connect-selkies-webrtc",
+            Story::ConnectSelkiesUnreachable => "story-connect-selkies-unreachable",
+            Story::ConnectCertificate => "story-connect-certificate",
+            Story::ConnectCertificateChanged => "story-connect-certificate-changed",
+            Story::SelkiesHomeOpen => "story-selkies-home-open",
+            Story::SelkiesHomeMenu => "story-selkies-home-menu",
+            Story::SelkiesHomeForget => "story-selkies-home-forget",
         }
     }
 
@@ -846,6 +896,7 @@ struct PreviewApp {
     height: Entity<InputState>,
     files_props: FilesProps,
     folder_name: Entity<InputState>,
+    selkies_inputs: skerry_ui::selkies::SelkiesInputs,
     files_scroll: gpui_kit::UniformListScrollHandle,
     /// The account menu is open (controlled, as in the Launcher).
     account_open: bool,
@@ -965,10 +1016,254 @@ impl PreviewApp {
             height,
             files_props: Self::fixture_files(story),
             folder_name: cx.new(|cx| InputState::new(window, cx).default_value("untitled folder")),
+            selkies_inputs: Self::fixture_selkies_inputs(story, window, cx),
             files_scroll: gpui_kit::UniformListScrollHandle::new(),
             canvas_width,
             account_open: story.account_open(),
         }
+    }
+
+    fn fixture_selkies_inputs(
+        story: Story,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> skerry_ui::selkies::SelkiesInputs {
+        let inputs = skerry_ui::selkies::new_selkies_inputs(window, cx);
+        let (address, user, password) = match story {
+            Story::ConnectSelkiesToken => ("https://gpu.example.com/kasm/", "", ""),
+            Story::ConnectSelkiesBadLogin => {
+                ("https://desktop.lab:8443/", "ubuntu", "wrong-password")
+            }
+            Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => {
+                ("https://desktop.lab:8443/", "ubuntu", "mypasswd")
+            }
+            _ => ("", "", ""),
+        };
+        for (input, value) in [
+            (&inputs.address, address),
+            (&inputs.username, user),
+            (&inputs.password, password),
+        ] {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        inputs
+    }
+
+    fn selkies_connect_props(story: Story) -> skerry_ui::selkies::SelkiesConnectProps {
+        use skerry_ui::selkies::{
+            AlertTone, CertificateProps, RecentServerRow, SelkiesConnectProps, SelkiesField,
+            SelkiesProblem,
+        };
+        let fingerprint = |seed: u8| {
+            (0..32u8)
+                .map(|i| format!("{:02X}", i.wrapping_mul(37).wrapping_add(seed)))
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        let base = SelkiesConnectProps {
+            remember: true,
+            ..SelkiesConnectProps::default()
+        };
+        match story {
+            Story::ConnectSelkiesRecent => SelkiesConnectProps {
+                recent: vec![
+                    RecentServerRow {
+                        url: "https://desktop.lab:8443/".into(),
+                        label: "desktop.lab:8443".into(),
+                        login: "ubuntu@".into(),
+                        pinned: true,
+                        loopback: false,
+                    },
+                    RecentServerRow {
+                        url: "https://gpu.example.com/kasm/".into(),
+                        label: "gpu.example.com/kasm/".into(),
+                        login: "Session token".into(),
+                        pinned: false,
+                        loopback: false,
+                    },
+                    RecentServerRow {
+                        url: "http://localhost:8080/".into(),
+                        label: "localhost:8080".into(),
+                        login: "No login".into(),
+                        pinned: false,
+                        loopback: true,
+                    },
+                ],
+                ..base
+            },
+            Story::ConnectSelkiesToken => SelkiesConnectProps {
+                token_chip: true,
+                remember: false,
+                ..base
+            },
+            Story::ConnectSelkiesBadLogin => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Field {
+                    field: SelkiesField::Login,
+                    text: "The username or password is incorrect.".into(),
+                }),
+                ..base
+            },
+            Story::ConnectSelkiesWebRtc => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Alert {
+                    tone: AlertTone::Warning,
+                    title: "This server streams over WebRTC".into(),
+                    body: "Skerry needs the WebSockets mode: ask its operator to run Selkies with --mode=websockets. Dual mode is on, but the server is in WebRTC mode right now; Skerry won’t switch it, because that would change the stream for everyone watching.".into(),
+                    server: Some("desktop.lab:8443".into()),
+                    switch_to_sealskin: false,
+                }),
+                ..base
+            },
+            Story::ConnectSelkiesUnreachable => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Alert {
+                    tone: AlertTone::Danger,
+                    title: "Couldn’t reach desktop.lab:8443".into(),
+                    body: "Nothing is listening at that address and port. Check the address, and that the server is running.".into(),
+                    server: Some("desktop.lab:8443".into()),
+                    switch_to_sealskin: false,
+                }),
+                ..base
+            },
+            Story::ConnectCertificate => SelkiesConnectProps {
+                certificate: Some(CertificateProps {
+                    host: "desktop.lab".into(),
+                    host_port: "desktop.lab:8443".into(),
+                    fingerprint: fingerprint(0x3F),
+                    previous: None,
+                }),
+                ..base
+            },
+            Story::ConnectCertificateChanged => SelkiesConnectProps {
+                certificate: Some(CertificateProps {
+                    host: "desktop.lab".into(),
+                    host_port: "desktop.lab:8443".into(),
+                    fingerprint: fingerprint(0x3F),
+                    previous: Some(fingerprint(0x91)),
+                }),
+                ..base
+            },
+            _ => base,
+        }
+    }
+
+    fn render_selkies_connect(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use skerry_ui::selkies::{ConnectTab, SelkiesConnectHandlers};
+        let entity = cx.entity().clone();
+        let click = |label: &'static str| -> skerry_ui::selkies::Click {
+            let entity = entity.clone();
+            Rc::new(move |_, _, cx| entity.update(cx, |this, cx| this.record_event(label, cx)))
+        };
+        let url = |label: &'static str| -> skerry_ui::selkies::UrlHandler {
+            let entity = entity.clone();
+            Rc::new(move |url, _, cx| {
+                entity.update(cx, |this, cx| {
+                    this.record_event(format!("{label} {url}"), cx)
+                })
+            })
+        };
+        let e = entity.clone();
+        let handlers = SelkiesConnectHandlers {
+            on_tab: Rc::new(move |tab, _, cx| {
+                e.update(cx, |this, cx| {
+                    this.record_event(format!("Tab: {tab:?}"), cx)
+                })
+            }),
+            on_connect: click("Selkies: Connect"),
+            on_recent: url("Recent:"),
+            on_recent_remove: url("Remove recent:"),
+            on_remember: {
+                let e = entity.clone();
+                Rc::new(move |on, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.record_event(format!("Remember: {on}"), cx)
+                    })
+                })
+            },
+            on_drop_token: click("Drop token"),
+            on_trust: click("Trust certificate"),
+            on_cert_cancel: click("Cancel certificate"),
+            on_switch_sealskin: click("Switch to SealSkin"),
+        };
+        let selkies = Self::selkies_connect_props(self.story);
+        connect::render_with_tabs(
+            theme,
+            &ConnectProps::default(),
+            &self.key_input,
+            ConnectHandlers::new(|_, _, _| {}),
+            connect::ConnectTabs {
+                tab: ConnectTab::Selkies,
+                selkies: &selkies,
+                inputs: &self.selkies_inputs,
+                handlers,
+            },
+        )
+    }
+
+    fn render_selkies_home(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use skerry_ui::selkies::{SecurityBadge, SelkiesHomeHandlers, SelkiesHomeProps};
+        let entity = cx.entity().clone();
+        let click = |label: &'static str| -> skerry_ui::selkies::Click {
+            let entity = entity.clone();
+            Rc::new(move |_, _, cx| entity.update(cx, |this, cx| this.record_event(label, cx)))
+        };
+        let open = self.story == Story::SelkiesHomeOpen;
+        let props = SelkiesHomeProps {
+            app_name: "SealSkin Native".into(),
+            display_name: "desktop.lab:8443".into(),
+            base_url: "https://desktop.lab:8443/".into(),
+            login_label: "ubuntu@".into(),
+            security: Some(SecurityBadge::Pinned),
+            fingerprint: Some(
+                (0..32u8)
+                    .map(|i| format!("{:02X}", i.wrapping_mul(37)))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+            open_here: open,
+            others: usize::from(open),
+            thumbnail: open.then(|| self.assets.thumb_zen.clone()),
+            accepts_drop: true,
+            menu_open: self.story == Story::SelkiesHomeMenu,
+            ..SelkiesHomeProps::default()
+        };
+        let e = entity.clone();
+        let handlers = SelkiesHomeHandlers {
+            on_open: click("Desktop: Open"),
+            on_files: click("Desktop: Files"),
+            on_refresh: click("Refresh"),
+            on_menu_open: Rc::new(move |open, _, cx| {
+                e.update(cx, |this, cx| {
+                    this.record_event(format!("Menu open: {open}"), cx)
+                })
+            }),
+            on_open_web: click("Open in Browser"),
+            on_disconnect: click("Disconnect"),
+            on_forget: click("Forget This Server…"),
+            on_drop: {
+                let e = entity.clone();
+                Rc::new(move |paths, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.record_event(format!("Drop {} items", paths.len()), cx)
+                    })
+                })
+            },
+            on_copy_pending: click("Copy to Desktop"),
+            on_cancel_pending: click("Cancel copy"),
+        };
+        div()
+            .size_full()
+            .relative()
+            .child(skerry_ui::selkies::render_home(theme, &props, handlers))
+            .when(self.story == Story::SelkiesHomeForget, |view| {
+                view.child(session::forget_server_confirm_modal(
+                    theme,
+                    "desktop.lab:8443",
+                    |_, _, _| {},
+                    |_, _, _| {},
+                ))
+            })
     }
 
     fn fixture_files(story: Story) -> FilesProps {
@@ -3691,6 +3986,16 @@ impl PreviewApp {
                     Some(&strip),
                     entity,
                 ))
+            }
+            Story::ConnectSelkiesRecent
+            | Story::ConnectSelkiesToken
+            | Story::ConnectSelkiesBadLogin
+            | Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => self.render_selkies_connect(theme, cx),
+            Story::SelkiesHomeOpen | Story::SelkiesHomeMenu | Story::SelkiesHomeForget => {
+                self.render_selkies_home(theme, cx)
             }
             Story::PrintNoticeNarrow => {
                 let strip = Self::fixture_strip(false);
