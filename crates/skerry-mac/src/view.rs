@@ -178,6 +178,15 @@ impl NativeSession {
         let _ = self.input.send(Input::Audio(enabled));
     }
 
+    /// Plays through this output device's Core Audio UID; `None` follows the Mac's default.
+    pub fn set_audio_output(&self, uid: Option<String>) {
+        let _ = self.input.send(Input::AudioOutput(uid));
+    }
+
+    pub fn set_audio_bitrate(&self, bps: u32) {
+        let _ = self.input.send(Input::AudioBitrate(bps));
+    }
+
     pub fn set_clipboard_policy(&self, policy: Policy, window: &mut Window, cx: &mut App) {
         self.view.update(cx, |desktop, _| {
             desktop.clipboard.policy = Some(policy);

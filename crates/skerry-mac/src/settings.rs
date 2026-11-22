@@ -88,6 +88,8 @@ pub struct Control {
 pub struct Settings {
     controls: BTreeMap<Key, Control>,
     pub codecs: Vec<Codec>,
+    /// The server's audio bitrate choices; `None` when it doesn't expose them.
+    pub audio_bitrate: Option<AudioBitrate>,
 }
 
 impl Default for Settings {
@@ -98,6 +100,7 @@ impl Default for Settings {
                 .into_iter()
                 .filter(|codec| codec.supported())
                 .collect(),
+            audio_bitrate: None,
         }
     }
 }
@@ -137,6 +140,7 @@ impl Settings {
                 self.controls.remove(&key);
             }
         }
+        self.audio_bitrate = AudioBitrate::from_server(&payload[AudioBitrate::WIRE]);
     }
 
     pub fn live(&mut self, payload: &Value) {
@@ -144,6 +148,9 @@ impl Settings {
             if let Some(value) = key.read(&payload[key.wire()]) {
                 control.current = value.clamp(control.min, control.max);
             }
+        }
+        if let Some(bitrate) = &mut self.audio_bitrate {
+            bitrate.live(&payload[AudioBitrate::WIRE]);
         }
     }
 
@@ -156,6 +163,71 @@ impl Settings {
             .filter(|control| !control.locked && control.min != control.max)
             .map(|control| value.clamp(control.min, control.max))
     }
+}
+
+/// The server's `audio_bitrate` enum (bps), as the web sidebar's Audio Bitrate reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioBitrate {
+    pub value: u32,
+    /// Ascending, without repeats, always holding `value`.
+    pub choices: Vec<u32>,
+    /// The server locked it.
+    pub locked: bool,
+}
+
+impl AudioBitrate {
+    pub const WIRE: &'static str = "audio_bitrate";
+
+    /// `None` when the entry is absent or has no readable value. `allowed` arrives as
+    /// strings in `server_settings`; numbers are read too.
+    pub fn from_server(entry: &Value) -> Option<Self> {
+        let value = bps(&entry["value"])?;
+        let mut bitrate = Self {
+            value,
+            choices: entry["allowed"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(bps)
+                .collect(),
+            locked: entry["locked"] == true,
+        };
+        bitrate.insert(value);
+        Some(bitrate)
+    }
+
+    /// Follows a live value (a number in `display_settings`, a string elsewhere). A value
+    /// outside the list joins it, as Selkies does, rather than being clamped.
+    pub fn live(&mut self, value: &Value) {
+        if let Some(value) = bps(value) {
+            self.value = value;
+            self.insert(value);
+        }
+    }
+
+    /// Whether the person can change it: not locked, and more than one choice.
+    pub fn editable(&self) -> bool {
+        !self.locked && self.choices.len() > 1
+    }
+
+    /// `bps` if it may be requested now: a listed value other than the current one.
+    pub fn request(&self, bps: u32) -> Option<u32> {
+        (self.editable() && bps != self.value && self.choices.contains(&bps)).then_some(bps)
+    }
+
+    fn insert(&mut self, value: u32) {
+        self.choices.push(value);
+        self.choices.sort_unstable();
+        self.choices.dedup();
+    }
+}
+
+fn bps(value: &Value) -> Option<u32> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+        .and_then(|bps| u32::try_from(bps).ok())
+        .filter(|bps| *bps > 0)
 }
 
 pub fn encoder_allowed(encoder: &Value, name: &str) -> bool {
@@ -277,6 +349,7 @@ pub struct ControlsSections {
     pub clipboard: bool,
     pub screen: bool,
     pub video: bool,
+    pub audio: bool,
     pub stats: bool,
 }
 
@@ -287,6 +360,7 @@ impl Default for ControlsSections {
             clipboard: false,
             screen: true,
             video: false,
+            audio: false,
             stats: false,
         }
     }
@@ -297,25 +371,49 @@ impl ControlsSections {
         *self == Self::default()
     }
 
-    /// In Session Controls order: Input, Clipboard, Screen, Video, Stats.
-    pub fn to_array(self) -> [bool; 5] {
+    /// In Session Controls order: Input, Clipboard, Screen, Video, Audio, Stats.
+    pub fn to_array(self) -> [bool; 6] {
         [
             self.input,
             self.clipboard,
             self.screen,
             self.video,
+            self.audio,
             self.stats,
         ]
     }
 
-    pub fn from_array([input, clipboard, screen, video, stats]: [bool; 5]) -> Self {
+    pub fn from_array([input, clipboard, screen, video, audio, stats]: [bool; 6]) -> Self {
         Self {
             input,
             clipboard,
             screen,
             video,
+            audio,
             stats,
         }
+    }
+}
+
+/// The audio choices saved for a server.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioPreferences {
+    /// The chosen output device's raw Core Audio UID (`kAudioDevicePropertyDeviceUID`, not
+    /// cpal's `coreaudio:` form); `None` follows the Mac's default output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+    /// The chosen device's last-seen name, to label it while it isn't connected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device_name: Option<String>,
+    /// The audio bitrate (bps) last picked, re-requested when a session starts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+}
+
+impl AudioPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -333,6 +431,8 @@ pub struct Preferences {
     /// Which Session Controls sections were open last on this server.
     #[serde(default, skip_serializing_if = "ControlsSections::is_default")]
     pub controls: ControlsSections,
+    #[serde(default, skip_serializing_if = "AudioPreferences::is_default")]
+    pub audio: AudioPreferences,
     #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
@@ -432,6 +532,7 @@ fn read_file(path: &Path) -> Loaded {
             "clipboard" => field(value, &mut prefs.clipboard),
             "launch" => field(value, &mut prefs.launch),
             "controls" => field(value, &mut prefs.controls),
+            "audio" => field(value, &mut prefs.audio),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
                     .map(|number| {
@@ -482,13 +583,13 @@ mod tests {
     #[test]
     fn controls_sections_round_trip_beside_video_settings() {
         let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
-        prefs.controls = ControlsSections::from_array([true, false, false, true, false]);
+        prefs.controls = ControlsSections::from_array([true, false, false, true, true, false]);
         let saved = serde_json::to_value(&prefs).unwrap();
         let restored: Preferences = serde_json::from_value(saved).unwrap();
         // `controls` is read as the struct, not swallowed by the flattened video map.
         assert_eq!(
             restored.controls.to_array(),
-            [true, false, false, true, false]
+            [true, false, false, true, true, false]
         );
         assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
         assert_eq!(restored.video.len(), 1);
@@ -675,5 +776,158 @@ mod tests {
         assert!(settings.codecs.contains(&Codec::Jpeg));
         settings.announce(&json!({"encoder": {"value": "h264enc", "allowed": ["h264enc"]}}));
         assert!(!settings.codecs.contains(&Codec::Jpeg));
+    }
+    /// The `audio_bitrate` entry Selkies 715df7c sends in `server_settings`.
+    fn selkies_audio_bitrate() -> Value {
+        json!({
+            "value": "128000",
+            "overridden": false,
+            "allowed": ["32000", "48000", "64000", "96000", "128000", "192000", "256000",
+                        "320000", "384000", "510000"]
+        })
+    }
+
+    #[test]
+    fn audio_bitrate_parses_server_allowed_strings() {
+        let bitrate = AudioBitrate::from_server(&selkies_audio_bitrate()).unwrap();
+        assert_eq!(bitrate.value, 128_000);
+        assert_eq!(
+            bitrate.choices,
+            [
+                32_000, 48_000, 64_000, 96_000, 128_000, 192_000, 256_000, 320_000, 384_000,
+                510_000
+            ]
+        );
+        assert!(bitrate.editable());
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": selkies_audio_bitrate()}));
+        assert_eq!(settings.audio_bitrate, Some(bitrate));
+    }
+
+    #[test]
+    fn audio_bitrate_hidden_only_when_absent() {
+        assert_eq!(AudioBitrate::from_server(&Value::Null), None);
+        assert_eq!(AudioBitrate::from_server(&json!({"value": "fast"})), None);
+        let mut settings = Settings::default();
+        settings.announce(&json!({}));
+        assert_eq!(settings.audio_bitrate, None);
+    }
+
+    #[test]
+    fn audio_bitrate_disabled_when_locked_or_single() {
+        let mut locked = selkies_audio_bitrate();
+        locked["locked"] = json!(true);
+        let locked = AudioBitrate::from_server(&locked).unwrap();
+        assert!(!locked.editable());
+        assert_eq!(locked.request(96_000), None);
+        let single =
+            AudioBitrate::from_server(&json!({"value": "96000", "allowed": ["96000"]})).unwrap();
+        assert_eq!((single.value, single.editable()), (96_000, false));
+        let bare = AudioBitrate::from_server(&json!({"value": 64000})).unwrap();
+        assert_eq!(bare.choices, [64_000]);
+        assert!(!bare.editable());
+    }
+
+    #[test]
+    fn audio_bitrate_request_accepts_only_listed_values() {
+        let bitrate = AudioBitrate::from_server(&selkies_audio_bitrate()).unwrap();
+        assert_eq!(bitrate.request(96_000), Some(96_000));
+        assert_eq!(bitrate.request(128_000), None, "already the value");
+        assert_eq!(bitrate.request(100_000), None, "not offered");
+    }
+
+    #[test]
+    fn audio_bitrate_follows_live_updates() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": selkies_audio_bitrate()}));
+        settings.live(&json!({"audio_bitrate": "320000"}));
+        assert_eq!(settings.audio_bitrate.as_ref().unwrap().value, 320_000);
+        settings.live(&json!({"framerate": 30}));
+        assert_eq!(settings.audio_bitrate.as_ref().unwrap().value, 320_000);
+    }
+
+    #[test]
+    fn audio_bitrate_live_accepts_numeric_display_settings() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"audio_bitrate": selkies_audio_bitrate()}));
+        settings.live(&json!({"audio_bitrate": 64000}));
+        assert_eq!(settings.audio_bitrate.unwrap().value, 64_000);
+    }
+
+    #[test]
+    fn audio_bitrate_off_list_value_is_shown_not_clamped() {
+        let mut bitrate = AudioBitrate::from_server(&selkies_audio_bitrate()).unwrap();
+        bitrate.live(&json!(100_000));
+        assert_eq!(bitrate.value, 100_000);
+        assert_eq!(&bitrate.choices[3..6], [96_000, 100_000, 128_000]);
+        let operator =
+            AudioBitrate::from_server(&json!({"value": "24000", "allowed": ["32000", "64000"]}))
+                .unwrap();
+        assert_eq!(operator.choices, [24_000, 32_000, 64_000]);
+    }
+
+    #[test]
+    fn audio_preferences_round_trip_and_old_files_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // A file from before audio preferences: loads with the defaults, video untouched.
+        std::fs::write(&path, r#"{"jpeg": 45, "controls": {"video": true}}"#).unwrap();
+        let old = load_at(&path);
+        assert!(old.audio.is_default());
+        assert_eq!(old.video.get(&Key::Jpeg), Some(&45));
+        update_at(&path, |p| {
+            p.audio.output_device = Some("AppleUSBAudioEngine:1234".into());
+            p.audio.output_device_name = Some("USB DAC".into());
+            p.audio.bitrate = Some(96_000);
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(
+            saved.audio.output_device.as_deref(),
+            Some("AppleUSBAudioEngine:1234")
+        );
+        assert_eq!(saved.audio.output_device_name.as_deref(), Some("USB DAC"));
+        assert_eq!(saved.audio.bitrate, Some(96_000));
+        assert_eq!(saved.video.get(&Key::Jpeg), Some(&45));
+        assert!(saved.controls.video);
+        // Defaults are left out of the file.
+        assert!(!serde_json::to_value(Preferences::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("audio"));
+    }
+
+    #[test]
+    fn controls_sections_without_audio_still_load() {
+        // Written by a build whose Session Controls had no Audio card.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"controls": {"input": true, "clipboard": false, "screen": false, "video": true, "stats": true}}"#,
+        )
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(
+            saved.controls.to_array(),
+            [true, false, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn audio_preferences_round_trip_beside_video_and_controls() {
+        let mut prefs: Preferences = serde_json::from_value(json!({"bitrate": 8000})).unwrap();
+        prefs.audio.bitrate = Some(320_000);
+        prefs.controls.audio = true;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        // Audio is its own struct: its `bitrate` never lands in the flattened video map.
+        assert_eq!(saved["audio"], json!({"bitrate": 320000}));
+        assert_eq!(saved["bitrate"], json!(8000));
+        let restored: Preferences = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored.audio.bitrate, Some(320_000));
+        assert!(restored.controls.audio);
+        assert_eq!(restored.video.get(&Key::Bitrate), Some(&8000));
+        assert_eq!(restored.video.len(), 1);
     }
 }
