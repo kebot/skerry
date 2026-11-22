@@ -1,6 +1,8 @@
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
+mod apps;
+#[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
 mod clipboard;
