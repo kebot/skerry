@@ -1,12 +1,14 @@
 use super::session_window::SessionWindow;
 use super::{
     native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, ToggleSessionControls,
+    ToggleStatsStrip,
 };
 use crate::audio::{OutputProblem, OutputStatus};
 use crate::clipboard::{ClipboardAction, Effective};
 use crate::input::{InputFeature, RemoteChord};
 use crate::persist::WriteQueue;
 use crate::settings::{AudioBitrate, ControlsSections};
+use crate::shortcuts;
 use crate::stats;
 use crate::video::Codec;
 use crate::{
@@ -26,8 +28,8 @@ use gpui_kit::{
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
     self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps, CodecChoice,
-    ControlsAction, ControlsProps, ControlsUiState, ScreenProps, Section, SliderUnit, SwitchItem,
-    VideoProps, VideoSettingControl, VideoSettingRow,
+    ControlsAction, ControlsProps, ControlsUiState, ScreenProps, Section, ShortcutRow,
+    ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
 
@@ -75,6 +77,8 @@ enum Command {
     Stats(bool),
     AudioOutput(Option<String>),
     AudioBitrate(u32),
+    StatsStrip(bool),
+    MacShortcuts(bool),
 }
 
 impl ControlPanel {
@@ -305,6 +309,8 @@ impl ControlPanel {
                         Command::Stats(open) => session.set_stats_open(open),
                         Command::AudioOutput(uid) => session.change_audio_output(uid, cx),
                         Command::AudioBitrate(bps) => session.change_audio_bitrate(bps, cx),
+                        Command::StatsStrip(on) => session.set_stats_strip(on, cx),
+                        Command::MacShortcuts(active) => session.change_mac_shortcuts(active, cx),
                         Command::Chord(chord) => {
                             session.close_controls(window, cx);
                             if let Some(stream) = &session.current {
@@ -464,6 +470,12 @@ impl ControlPanel {
             ControlsAction::SetAudioBitrate(bps) => {
                 Self::send(self.owner.clone(), Command::AudioBitrate(bps), cx)
             }
+            ControlsAction::SetStatsStrip(on) => {
+                Self::send(self.owner.clone(), Command::StatsStrip(on), cx)
+            }
+            ControlsAction::SetMacShortcuts(active) => {
+                Self::send(self.owner.clone(), Command::MacShortcuts(active), cx)
+            }
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -591,7 +603,32 @@ impl ControlPanel {
             audio_settings: audio_props(&audio),
             stats,
             stats_copied: self.copied.is_some(),
+            stats_strip: session.preferences.stats_strip,
+            shortcuts: shortcuts_props(session.mac_shortcuts(), session.shortcuts_locked()),
         }
+    }
+}
+
+/// The Shortcuts card, from `shortcuts::CHORDS` (`ARCH-031`).
+fn shortcuts_props(mac_active: bool, locked: bool) -> ShortcutsProps {
+    let rows = shortcuts::CHORDS
+        .iter()
+        .map(|chord| {
+            let (modifiers, key) = shortcuts::glyphs(chord.keystroke);
+            ShortcutRow {
+                label: chord.label.into(),
+                modifiers,
+                key,
+                remote: (!chord.always_local)
+                    .then(|| format!("Sent as {}", shortcuts::remote_label(chord.keystroke))),
+                always_local: chord.always_local,
+            }
+        })
+        .collect();
+    ShortcutsProps {
+        mac_active,
+        locked,
+        rows,
     }
 }
 
@@ -855,6 +892,7 @@ impl Render for ControlPanel {
         let close_owner = owner.clone();
         let toggle_owner = owner.clone();
         let fullscreen_owner = owner.clone();
+        let strip_owner = owner.clone();
         let scroll = owner.session.read(cx).controls_scroll.clone();
         let root = div()
             .id("session-controls")
@@ -875,6 +913,11 @@ impl Render for ControlPanel {
             })
             .on_action(move |_: &ToggleFullScreen, _, cx| {
                 Self::send(fullscreen_owner.clone(), Command::FullScreen, cx)
+            })
+            .on_action(move |_: &ToggleStatsStrip, _, cx| {
+                // View → Toggle Stats Over Stream while the panel is key.
+                let on = !strip_owner.session.read(cx).preferences.stats_strip;
+                Self::send(strip_owner.clone(), Command::StatsStrip(on), cx)
             });
 
         let session = owner.session.read(cx);

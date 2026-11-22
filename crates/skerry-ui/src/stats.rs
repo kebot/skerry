@@ -6,12 +6,13 @@
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     tooltip::Tooltip,
-    IconName, Sizable as _, StyledExt as _, Theme,
+    Icon, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
-    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, Div, FontWeight, Hsla,
-    PathBuilder, Pixels, SharedString, Window,
+    canvas, div, point, prelude::*, px, rgb, rgba, AnyElement, App, Bounds, Div, FontFeatures,
+    FontWeight, Hsla, PathBuilder, Pixels, SharedString, Window,
 };
+use std::sync::Arc;
 
 /// A graph's height, as the web sidebar's `.stream-graph-plot`.
 const GRAPH_HEIGHT: f32 = 44.;
@@ -77,6 +78,216 @@ pub struct StatsProps {
     pub graphs: Vec<Graph>,
     pub tiles: Vec<Tile>,
     pub meters: Vec<Meter>,
+}
+
+/// One figure of the strip over the stream: "60 fps" over "FPS".
+#[derive(Clone, Debug, PartialEq)]
+pub struct StripFigure {
+    pub value: String,
+    pub caption: String,
+    pub warn: bool,
+}
+
+/// The strip over the stream (`ARCH-031`, the web's `StreamStrip`): the four status marks,
+/// then the figures. Worded by the caller.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StripProps {
+    pub marks: Vec<Status>,
+    pub figures: Vec<StripFigure>,
+}
+
+/// The strip's distance from the window's top edge.
+pub const STRIP_TOP: f32 = 8.;
+/// The traffic-light corner and the controls trigger's corner, which the strip keeps clear
+/// of where the window is wide enough.
+const STRIP_CORNER: f32 = 96.;
+const STRIP_PAD_X: f32 = 10.;
+const STRIP_PAD_Y: f32 = 4.;
+const STRIP_GAP_X: f32 = 12.;
+const STRIP_GAP_Y: f32 = 4.;
+/// A figure's height: a 15 pt value line over a 12 pt caption line.
+const STRIP_LINE_H: f32 = 27.;
+const STRIP_MARK: f32 = 12.;
+const STRIP_MARK_GAP: f32 = 2.;
+/// Fixed colours for the dark ground, whatever the theme.
+const STRIP_GOOD: u32 = 0x3fb950;
+const STRIP_WARN: u32 = 0xf5a524;
+const STRIP_NEUTRAL: u32 = 0x9aa4b2;
+
+/// The pill's widest extent in a viewport `viewport_width` wide: clear of both 96 pt
+/// corners where it fits (432 pt and up), else the web's 16 pt margin.
+pub fn strip_max_width(viewport_width: Pixels) -> Pixels {
+    let width = f32::from(viewport_width);
+    px(if width >= 2. * STRIP_CORNER + 240. {
+        width - 2. * STRIP_CORNER
+    } else {
+        (width - 16.).max(0.)
+    })
+}
+
+/// The width a figure takes at most, estimated generously from its text (SF Pro, 13 pt
+/// semibold tabular value, 10 pt caption), never under its fixed minimum.
+fn strip_figure_width(index: usize, figure: &StripFigure) -> f32 {
+    let value = figure.value.chars().count() as f32 * 8.2 + if figure.warn { 13. } else { 0. };
+    let caption = figure.caption.chars().count() as f32 * 6.2;
+    strip_figure_min(index).max(value).max(caption)
+}
+
+/// Video rate (the second figure) is wider, so "7.8 / 8 Mbps" changing never re-centres.
+fn strip_figure_min(index: usize) -> f32 {
+    if index == 1 {
+        84.
+    } else {
+        44.
+    }
+}
+
+/// How many lines the strip wraps to in a viewport `viewport_width` wide. An estimate that
+/// errs high, for whatever stacks below the strip (`strip_bottom`).
+pub fn strip_lines(props: &StripProps, viewport_width: Pixels) -> usize {
+    let room = f32::from(strip_max_width(viewport_width)) - 2. * STRIP_PAD_X;
+    let marks = (!props.marks.is_empty()).then(|| {
+        let count = props.marks.len() as f32;
+        count * STRIP_MARK + (count - 1.) * STRIP_MARK_GAP
+    });
+    let units = marks.into_iter().chain(
+        props
+            .figures
+            .iter()
+            .enumerate()
+            .map(|(index, figure)| strip_figure_width(index, figure)),
+    );
+    let mut lines = 0;
+    let mut used = 0.;
+    for width in units {
+        if lines == 0 || used + STRIP_GAP_X + width > room {
+            lines += 1;
+            used = width;
+        } else {
+            used += STRIP_GAP_X + width;
+        }
+    }
+    lines
+}
+
+/// Where the strip's pill ends, from the window's top edge, plus the 8 pt gap below it: the
+/// top for a notice stacked under the strip. `STRIP_TOP` when there is nothing to show.
+pub fn strip_bottom(props: &StripProps, viewport_width: Pixels) -> Pixels {
+    let lines = strip_lines(props, viewport_width) as f32;
+    if lines == 0. {
+        return px(STRIP_TOP);
+    }
+    px(
+        STRIP_TOP
+            + 2. * STRIP_PAD_Y
+            + lines * STRIP_LINE_H
+            + (lines - 1.) * STRIP_GAP_Y
+            + STRIP_TOP,
+    )
+}
+
+fn strip_mark(status: Status) -> AnyElement {
+    let icon = |name: IconName, color: u32| {
+        Icon::new(name)
+            .with_size(px(STRIP_MARK))
+            .text_color(rgb(color))
+            .into_any_element()
+    };
+    let mark = match status {
+        Status::Good => icon(IconName::CircleCheck, STRIP_GOOD),
+        Status::Warn => icon(IconName::TriangleAlert, STRIP_WARN),
+        Status::Neutral => div()
+            .size(px(5.))
+            .rounded_full()
+            .bg(rgb(STRIP_NEUTRAL))
+            .into_any_element(),
+    };
+    div()
+        .size(px(STRIP_MARK))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(mark)
+        .into_any_element()
+}
+
+fn strip_figure(index: usize, figure: &StripFigure) -> AnyElement {
+    let value = div()
+        .h_flex()
+        .items_center()
+        .gap(px(3.))
+        .text_size(px(13.))
+        .line_height(px(15.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .whitespace_nowrap()
+        .when(figure.warn, |value| {
+            value.text_color(rgb(STRIP_WARN)).child(
+                Icon::new(IconName::TriangleAlert)
+                    .with_size(px(10.))
+                    .text_color(rgb(STRIP_WARN)),
+            )
+        })
+        .child(figure.value.clone());
+    div()
+        .v_flex()
+        .items_start()
+        .flex_none()
+        .min_w(px(strip_figure_min(index)))
+        .child(value)
+        .child(
+            div()
+                .text_size(px(10.))
+                .line_height(px(12.))
+                .text_color(rgba(0xffffffbf))
+                .whitespace_nowrap()
+                .child(figure.caption.clone()),
+        )
+        .into_any_element()
+}
+
+/// The strip over the stream, centred 8 pt below the window's top. It takes no pointer
+/// input (no id, listener, cursor, or hover), so clicks reach the desktop under it.
+pub fn strip(props: &StripProps, viewport_width: Pixels) -> Div {
+    let pill = div()
+        .max_w(strip_max_width(viewport_width))
+        .h_flex()
+        .flex_wrap()
+        .justify_center()
+        .items_center()
+        .gap_x(px(STRIP_GAP_X))
+        .gap_y(px(STRIP_GAP_Y))
+        .px(px(STRIP_PAD_X))
+        .py(px(STRIP_PAD_Y))
+        .rounded(px(6.))
+        .bg(rgba(0x0000008c))
+        .text_color(rgb(0xffffff))
+        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+        .when(!props.marks.is_empty(), |pill| {
+            pill.child(
+                div()
+                    .h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(STRIP_MARK_GAP))
+                    .children(props.marks.iter().map(|status| strip_mark(*status))),
+            )
+        })
+        .children(
+            props
+                .figures
+                .iter()
+                .enumerate()
+                .map(|(index, figure)| strip_figure(index, figure)),
+        );
+    div()
+        .absolute()
+        .top(px(STRIP_TOP))
+        .left_0()
+        .right_0()
+        .flex()
+        .justify_center()
+        .child(pill)
 }
 
 /// The section's body. `copied` shows the copy button's check for a moment
@@ -499,5 +710,47 @@ fn render_meter(theme: &Theme, meter: &Meter) -> Div {
                 .text_color(theme.muted_foreground)
                 .child(meter.text.clone()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props() -> StripProps {
+        let figure = |value: &str, caption: &str| StripFigure {
+            value: value.into(),
+            caption: caption.into(),
+            warn: false,
+        };
+        StripProps {
+            marks: vec![Status::Good, Status::Good, Status::Neutral, Status::Warn],
+            figures: vec![
+                figure("60 fps", "FPS"),
+                figure("7.8 / 8 Mbps", "Video rate"),
+                figure("12 ms", "Capture to sent"),
+                figure("24 ms", "Latency"),
+            ],
+        }
+    }
+
+    #[test]
+    fn the_strip_keeps_clear_of_the_corners_where_it_fits() {
+        assert_eq!(strip_max_width(px(1280.)), px(1088.));
+        assert_eq!(strip_max_width(px(640.)), px(448.));
+        assert_eq!(strip_max_width(px(432.)), px(240.));
+        assert_eq!(strip_max_width(px(431.)), px(415.));
+    }
+
+    #[test]
+    fn the_strip_wraps_to_two_lines_only_when_narrow() {
+        let props = props();
+        assert_eq!(strip_lines(&props, px(1280.)), 1);
+        assert_eq!(strip_lines(&props, px(640.)), 1);
+        assert_eq!(strip_lines(&props, px(480.)), 2);
+        assert_eq!(strip_bottom(&props, px(1280.)), px(8. + 35. + 8.));
+        assert_eq!(strip_bottom(&props, px(480.)), px(8. + 66. + 8.));
+        assert_eq!(strip_lines(&StripProps::default(), px(1280.)), 0);
+        assert_eq!(strip_bottom(&StripProps::default(), px(1280.)), px(8.));
     }
 }
