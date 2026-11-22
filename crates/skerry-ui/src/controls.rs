@@ -1,14 +1,17 @@
+use crate::components::elevated_shadow;
 use gpui_kit::component::{
     button::Button,
     collapsible::Collapsible,
     input::{Input, InputState},
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{PopupMenu, PopupMenuItem},
+    popover::Popover,
     slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
     ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
-    div, prelude::*, px, AnyElement, App, ClickEvent, Div, Entity, FontWeight, SharedString, Window,
+    div, prelude::*, px, Anchor, AnyElement, App, ClickEvent, DismissEvent, Div, Entity,
+    FocusHandle, Focusable as _, FontWeight, SharedString, Window,
 };
 use std::rc::Rc;
 
@@ -23,6 +26,17 @@ pub enum Section {
     Stats,
 }
 
+impl Section {
+    /// Every section, top to bottom; the order of `ControlsUiState::sections`.
+    pub const ALL: [Self; 5] = [
+        Self::Input,
+        Self::Clipboard,
+        Self::Screen,
+        Self::Video,
+        Self::Stats,
+    ];
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlsUiState {
     pub input_open: bool,
@@ -31,6 +45,11 @@ pub struct ControlsUiState {
     pub video_open: bool,
     pub stats_open: bool,
     pub size_error: bool,
+    /// Focus returned to once a dropdown menu closes: the panel's, so Escape and cmd-w
+    /// still close the panel after a pick.
+    pub return_focus: Option<FocusHandle>,
+    /// A dropdown (by id) shown open on its first render, for the preview workbench.
+    pub open_menu: Option<&'static str>,
 }
 
 impl Default for ControlsUiState {
@@ -42,8 +61,56 @@ impl Default for ControlsUiState {
             video_open: false,
             stats_open: false,
             size_error: false,
+            return_focus: None,
+            open_menu: None,
         }
     }
+}
+
+impl ControlsUiState {
+    pub fn is_open(&self, section: Section) -> bool {
+        match section {
+            Section::Input => self.input_open,
+            Section::Clipboard => self.clipboard_open,
+            Section::Screen => self.screen_open,
+            Section::Video => self.video_open,
+            Section::Stats => self.stats_open,
+        }
+    }
+
+    /// Opens or closes `section`; returns whether it is now open.
+    pub fn toggle(&mut self, section: Section) -> bool {
+        let open = match section {
+            Section::Input => &mut self.input_open,
+            Section::Clipboard => &mut self.clipboard_open,
+            Section::Screen => &mut self.screen_open,
+            Section::Video => &mut self.video_open,
+            Section::Stats => &mut self.stats_open,
+        };
+        *open = !*open;
+        *open
+    }
+
+    /// Which sections are open, in `Section::ALL` order.
+    pub fn sections(&self) -> [bool; 5] {
+        Section::ALL.map(|section| self.is_open(section))
+    }
+
+    /// This state with the sections opened as `open` says, in `Section::ALL` order.
+    pub fn with_sections(mut self, open: [bool; 5]) -> Self {
+        for (section, open) in Section::ALL.into_iter().zip(open) {
+            if self.is_open(section) != open {
+                self.toggle(section);
+            }
+        }
+        self
+    }
+}
+
+/// What the Session Controls dropdowns need besides their items.
+struct MenuContext {
+    return_focus: Option<FocusHandle>,
+    open: Option<&'static str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,6 +285,10 @@ pub fn render(
     cx: &mut App,
 ) -> Div {
     let theme = &cx.theme().clone();
+    let menus = &MenuContext {
+        return_focus: state.return_focus.clone(),
+        open: state.open_menu,
+    };
     let actions = div()
         .h_flex()
         .flex_wrap()
@@ -316,14 +387,33 @@ pub fn render(
                     theme,
                     "Screen Settings",
                     state.screen_open,
-                    || render_screen(theme, &props.screen, state, width, height, &on_action),
+                    || {
+                        render_screen(
+                            theme,
+                            &props.screen,
+                            state,
+                            width,
+                            height,
+                            &on_action,
+                            menus,
+                        )
+                    },
                     toggle(Section::Screen),
                 ))
                 .child(section(
                     theme,
                     "Video Settings",
                     state.video_open,
-                    || render_video(theme, props.video_settings.as_ref(), &on_action, window, cx),
+                    || {
+                        render_video(
+                            theme,
+                            props.video_settings.as_ref(),
+                            &on_action,
+                            menus,
+                            window,
+                            cx,
+                        )
+                    },
                     toggle(Section::Video),
                 ))
                 .child(section(
@@ -450,6 +540,7 @@ fn render_screen(
     width: &Entity<InputState>,
     height: &Entity<InputState>,
     on_action: &ControlsHandler,
+    menus: &MenuContext,
 ) -> Div {
     let mut panel = div().v_flex().gap(px(STACK_GAP));
     if screen.resize_allowed {
@@ -501,6 +592,7 @@ fn render_screen(
                 items,
                 screen.dpi_choices.len() <= 1,
                 on_action,
+                menus,
             ),
         ));
     }
@@ -526,6 +618,7 @@ fn render_screen(
                     presets,
                     false,
                     on_action,
+                    menus,
                 ),
             ))
             .child(
@@ -577,6 +670,7 @@ fn render_video(
     theme: &Theme,
     video: Option<&VideoProps>,
     on_action: &ControlsHandler,
+    menus: &MenuContext,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
@@ -611,6 +705,7 @@ fn render_video(
                 codecs,
                 video.codecs.len() <= 1,
                 on_action,
+                menus,
             ),
         ))
         .when_some(video.preferred_notice.clone(), |panel, notice| {
@@ -659,6 +754,7 @@ fn render_video(
                         items,
                         *locked || options.len() <= 1,
                         on_action,
+                        menus,
                     ),
                 )
                 .into_any_element()
@@ -783,27 +879,125 @@ fn dropdown(
     items: Vec<(String, bool, ControlsAction)>,
     disabled: bool,
     on_action: &ControlsHandler,
+    menus: &MenuContext,
 ) -> AnyElement {
-    let on_action = Rc::clone(on_action);
-    let items = Rc::new(items);
-    Button::new(id.into())
+    let id = id.into();
+    let trigger = Button::new(id.clone())
         .outline()
         .w_full()
         .h(px(CONTROL_H))
         .rounded(px(CONTROL_RADIUS))
         .label(current)
         .dropdown_caret(true)
-        .disabled(disabled)
-        .dropdown_menu(move |menu, _, _| {
-            items.iter().fold(menu, |menu, (label, checked, action)| {
-                let on_action = Rc::clone(&on_action);
-                let action = action.clone();
-                menu.item(
-                    PopupMenuItem::new(label.clone())
-                        .checked(*checked)
-                        .on_click(move |_, window, cx| on_action(action.clone(), window, cx)),
-                )
+        .disabled(disabled);
+    menu_dropdown(id, trigger, Rc::new(items), Rc::clone(on_action), menus)
+}
+
+/// The menu a dropdown opens, kept across renders so its highlighted row survives.
+#[derive(Default)]
+struct MenuState {
+    menu: Option<Entity<PopupMenu>>,
+    /// The labels and checks the menu was built with.
+    built_for: Vec<(String, bool)>,
+}
+
+/// Whether a menu built for `built_for` still shows `items`. A menu can close without a
+/// `DismissEvent` (the popover's own Escape or trigger click), so the cache is checked
+/// against the current items instead of trusting the dismissal to clear it.
+fn menu_is_current(built_for: &[(String, bool)], items: &[(String, bool, ControlsAction)]) -> bool {
+    built_for.len() == items.len()
+        && built_for
+            .iter()
+            .zip(items)
+            .all(|((label, checked), (item, item_checked, _))| {
+                label == item && checked == item_checked
             })
+}
+
+/// gpui-kit's `dropdown_menu`, rebuilt so the popup gets `elevated_shadow` (gpui-kit's own
+/// shadow vanishes in Dark). It follows gpui-kit's wiring: one cached `PopupMenu`, one
+/// dismiss subscription holding only Weak handles (a strong one would leak the menu), and
+/// no overlay close. gpui-kit's trigger-focus hook is private, so focus goes back to
+/// `menus.return_focus` instead.
+///
+/// A click on the trigger while the menu is open closes it and doesn't reopen it: the menu's
+/// mouse-down-out runs in the capture phase and dismisses the popover first, and the
+/// popover's trigger handler toggles only when the open state is still the one it rendered
+/// with (gpui-base `Popover`).
+fn menu_dropdown(
+    id: SharedString,
+    trigger: Button,
+    items: Rc<Vec<(String, bool, ControlsAction)>>,
+    on_action: ControlsHandler,
+    menus: &MenuContext,
+) -> AnyElement {
+    let return_focus = menus.return_focus.clone();
+    let open = menus.open == Some(id.as_ref());
+    let state_key = SharedString::from(format!("menu-state:{id}"));
+    Popover::new(SharedString::from(format!("menu:{id}")))
+        .appearance(false)
+        .overlay_closable(false)
+        .anchor(Anchor::TopLeft)
+        .default_open(open)
+        .trigger(trigger)
+        .content(move |_, window, cx| {
+            let menu_state =
+                window.use_keyed_state(state_key.clone(), cx, |_, _| MenuState::default());
+            // The wrapper takes the menu's own radius, so the shadow's corners match.
+            let radius = cx.theme().radius;
+            let shadow = elevated_shadow(cx.theme());
+            let cached = menu_state
+                .read(cx)
+                .menu
+                .clone()
+                .filter(|_| menu_is_current(&menu_state.read(cx).built_for, &items));
+            let menu = match cached {
+                Some(menu) => menu,
+                None => {
+                    let menu_items = Rc::clone(&items);
+                    let on_action = Rc::clone(&on_action);
+                    let menu = PopupMenu::build(window, cx, move |menu, _, _| {
+                        menu_items
+                            .iter()
+                            .fold(menu, |menu, (label, checked, action)| {
+                                let on_action = Rc::clone(&on_action);
+                                let action = action.clone();
+                                menu.item(
+                                    PopupMenuItem::new(label.clone())
+                                        .checked(*checked)
+                                        .on_click(move |_, window, cx| {
+                                            on_action(action.clone(), window, cx)
+                                        }),
+                                )
+                            })
+                    });
+                    let built_for = items
+                        .iter()
+                        .map(|(label, checked, _)| (label.clone(), *checked))
+                        .collect();
+                    menu_state.update(cx, |state, _| {
+                        state.menu = Some(menu.clone());
+                        state.built_for = built_for;
+                    });
+                    menu.focus_handle(cx).focus(window, cx);
+                    let popover_state = cx.entity().downgrade();
+                    let weak_state = menu_state.downgrade();
+                    let return_focus = return_focus.clone();
+                    window
+                        .subscribe(&menu, cx, move |_, _: &DismissEvent, window, cx| {
+                            if let Some(popover_state) = popover_state.upgrade() {
+                                popover_state.update(cx, |state, cx| state.dismiss(window, cx));
+                            }
+                            let _ = weak_state.update(cx, |state, _| state.menu = None);
+                            if let Some(focus) = &return_focus {
+                                window.focus(focus, cx);
+                            }
+                        })
+                        .detach();
+                    menu
+                }
+            };
+            div().rounded(radius).shadow(shadow).child(menu)
         })
         .into_any_element()
 }
@@ -973,4 +1167,50 @@ fn switch_row(
                 .on_click(move |_, window, cx| on_action(action.clone(), window, cx)),
         )
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_menu_is_rebuilt_when_its_items_change() {
+        let item = |label: &str, checked| (label.to_string(), checked, ControlsAction::SetFitMode);
+        let built = vec![
+            ("1280 × 720".to_string(), true),
+            ("1920 × 1080".to_string(), false),
+        ];
+        let same = [item("1280 × 720", true), item("1920 × 1080", false)];
+        let moved_check = [item("1280 × 720", false), item("1920 × 1080", true)];
+        assert!(menu_is_current(&built, &same));
+        assert!(!menu_is_current(&built, &moved_check));
+        assert!(!menu_is_current(&built, &same[..1]));
+        assert!(!menu_is_current(&[], &same));
+    }
+
+    #[test]
+    fn toggle_flips_only_that_section() {
+        let mut state = ControlsUiState::default();
+        let before = state.sections();
+        assert!(state.toggle(Section::Video));
+        let after = state.sections();
+        for (index, section) in Section::ALL.into_iter().enumerate() {
+            assert_eq!(after[index] != before[index], section == Section::Video);
+        }
+        assert!(!state.toggle(Section::Video));
+        assert_eq!(state.sections(), before);
+    }
+
+    #[test]
+    fn sections_round_trip_in_section_order() {
+        // Input and Video open, Screen closed.
+        let open = [true, false, false, true, false];
+        let state = ControlsUiState::default().with_sections(open);
+        assert_eq!(state.sections(), open);
+        assert!(state.input_open && state.video_open && !state.screen_open);
+        assert_eq!(
+            ControlsUiState::default().sections(),
+            [false, false, true, false, false]
+        );
+    }
 }

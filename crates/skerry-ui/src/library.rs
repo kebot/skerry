@@ -2,6 +2,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     scroll::ScrollableElement as _,
+    tooltip::Tooltip,
     Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
@@ -39,17 +40,22 @@ pub struct SessionItem {
 pub struct LibraryProps {
     pub app_name: String,
     pub server: String,
-    pub apps: Vec<AppItem>,
-    pub sessions: Vec<SessionItem>,
+    /// Built once per Library change and shared, never rebuilt per frame.
+    pub apps: Rc<[AppItem]>,
+    pub sessions: Rc<[SessionItem]>,
     pub search_query: String,
     pub selected_filter: String,
     pub status: Option<String>,
     pub busy: Option<String>,
 }
 
+/// The widest the Library's content column grows; wider windows centre it.
+pub const LIBRARY_MAX_WIDTH: f32 = 1200.0;
+
 pub struct LibraryHandlers {
     pub on_refresh: ClickHandler,
-    pub on_forget: ClickHandler,
+    /// Asks to sign out; the caller shows the confirmation.
+    pub on_sign_out: ClickHandler,
     pub on_launch: ItemHandler,
     pub on_resume: ItemHandler,
     pub on_stop: Option<ItemHandler>,
@@ -70,7 +76,7 @@ pub fn render(
     let enabled = props.busy.is_none();
     let LibraryHandlers {
         on_refresh,
-        on_forget,
+        on_sign_out,
         on_launch,
         on_resume,
         on_stop,
@@ -84,7 +90,7 @@ pub fn render(
     };
 
     let mut categories = BTreeSet::new();
-    for app in &props.apps {
+    for app in props.apps.iter() {
         for cat in &app.categories {
             if !cat.is_empty() {
                 categories.insert(cat.clone());
@@ -125,6 +131,7 @@ pub fn render(
         })
         .collect();
 
+    let server = props.server.clone();
     let header = div()
         .h_flex()
         .items_center()
@@ -132,18 +139,23 @@ pub fn render(
         .gap_3()
         .child(
             div()
+                .flex_1()
                 .h_flex()
                 .items_center()
                 .gap_2()
                 .min_w_0()
                 .child(
                     div()
+                        .flex_none()
                         .text_sm()
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(props.app_name.clone()),
                 )
                 .child(
                     div()
+                        .id("server-chip")
+                        .min_w_0()
+                        .overflow_hidden()
                         .h_flex()
                         .items_center()
                         .gap_1p5()
@@ -155,12 +167,14 @@ pub fn render(
                         .border_color(theme.border)
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(IconName::Globe)
-                        .child(props.server.clone()),
+                        .child(div().flex_none().child(IconName::Globe))
+                        .child(div().min_w_0().truncate().child(props.server.clone()))
+                        .tooltip(move |window, cx| Tooltip::new(server.clone()).build(window, cx)),
                 ),
         )
         .child(
             div()
+                .flex_none()
                 .h_flex()
                 .items_center()
                 .gap_2()
@@ -174,13 +188,14 @@ pub fn render(
                         .on_click(move |event, window, cx| on_refresh(event, window, cx)),
                 )
                 .child(
-                    Button::new("forget")
+                    Button::new("sign-out")
                         .ghost()
                         .xsmall()
-                        .label("Disconnect Server")
-                        .tooltip("Disconnect and forget the saved application key")
+                        .icon(gpui_kit::assets::IconName::LogOut)
+                        .label("Sign Out…")
+                        .tooltip("Sign out of this server")
                         .disabled(!enabled)
-                        .on_click(move |event, window, cx| on_forget(event, window, cx)),
+                        .on_click(move |event, window, cx| on_sign_out(event, window, cx)),
                 ),
         );
 
@@ -322,44 +337,48 @@ pub fn render(
                 .size_full()
                 .overflow_y_scrollbar()
                 .child(
-                    div()
-                        .w_full()
-                        .px_7()
-                        .py_5()
-                        .v_flex()
-                        .gap_6()
-                        .child(header)
-                        .child(omnibar)
-                        .when_some(props.busy.clone(), |body, busy| {
-                            body.child(
-                                div()
-                                    .px_3p5()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(theme.secondary)
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(busy),
-                            )
-                        })
-                        .when_some(props.status.clone(), |body, status| {
-                            body.child(
-                                div()
-                                    .px_3p5()
-                                    .py_2()
-                                    .rounded_lg()
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(theme.popover)
-                                    .text_sm()
-                                    .text_color(theme.danger)
-                                    .child(status),
-                            )
-                        })
-                        .child(sessions_section)
-                        .child(apps_section),
+                    div().w_full().px_7().py_5().child(
+                        // One centred column, capped on content width; the scrollbar stays at
+                        // the window edge.
+                        div()
+                            .w_full()
+                            .max_w(px(LIBRARY_MAX_WIDTH))
+                            .mx_auto()
+                            .v_flex()
+                            .gap_6()
+                            .child(header)
+                            .child(omnibar)
+                            .when_some(props.busy.clone(), |body, busy| {
+                                body.child(
+                                    div()
+                                        .px_3p5()
+                                        .py_2()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.secondary)
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .child(busy),
+                                )
+                            })
+                            .when_some(props.status.clone(), |body, status| {
+                                body.child(
+                                    div()
+                                        .px_3p5()
+                                        .py_2()
+                                        .rounded_lg()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.popover)
+                                        .text_sm()
+                                        .text_color(theme.danger)
+                                        .child(status),
+                                )
+                            })
+                            .child(sessions_section)
+                            .child(apps_section),
+                    ),
                 ),
         )
 }

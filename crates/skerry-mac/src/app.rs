@@ -6,10 +6,12 @@ mod promise;
 mod session_window;
 
 use crate::launch_options::{self, LaunchContext, LaunchSelection};
+use crate::persist::{self, WriteQueue};
 use crate::sealskin::{
-    Credential, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession, SealSkinClient,
+    Credential, KeySource, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession,
+    SealSkinClient,
 };
-use crate::settings::{self, Preferences};
+use crate::settings::Preferences;
 use crate::transport::{DisplayRequest, Resolution};
 use gpui_kit::component::{
     input::{InputEvent, InputState},
@@ -17,28 +19,30 @@ use gpui_kit::component::{
     ActiveTheme as _, Theme,
 };
 use gpui_kit::{
-    actions, div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity,
-    FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage, Size,
-    TitlebarOptions, Window, WindowAppearance, WindowBounds, WindowOptions,
+    actions, div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, ClipboardItem,
+    Context, Entity, FocusHandle, KeyBinding, KeyDownEvent, Menu, MenuItem, Pixels, RenderImage,
+    SharedString, Size, Task, TitlebarOptions, Window, WindowAppearance, WindowBounds,
+    WindowOptions,
 };
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask, NSWindowTitleVisibility};
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSUserDefaults};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use session_window::{OpenSession, OpenWindows, SessionWindow};
 use skerry_ui::{
+    components::{self, Toast, ToastKind, TOAST_DURATION, TOAST_EXIT},
     connect::{self, ConnectProps},
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
         LaunchOptions, LaunchSelect,
     },
     library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
-    session,
+    session::{self, KeySourceLabel},
 };
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
@@ -65,6 +69,16 @@ pub fn run() {
     application.run(move |cx: &mut App| {
         gpui_kit::init(cx);
         cx.set_global(OpenWindows::default());
+        // Every preference and key write goes through this one queue (`persist`).
+        cx.set_global(persist::start(&handle));
+        // GPUI gives quit futures 200 ms; wait for queued writes (at most 1 s) before
+        // returning one.
+        cx.on_app_quit(|cx| {
+            cx.global::<WriteQueue>()
+                .flush_blocking(Duration::from_secs(1));
+            async {}
+        })
+        .detach();
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-0", ShowLibrary, None),
@@ -233,6 +247,8 @@ impl DisplayMode {
 }
 
 struct Launcher {
+    /// The Library window, for async updates (`ARCH-015`).
+    window: AnyWindowHandle,
     rt: Handle,
     api: Option<SealSkinClient>,
     library: Option<Library>,
@@ -246,9 +262,24 @@ struct Launcher {
     /// Every session locale with the Mac's name for it; built on the first Launch Dialog.
     language_options: Option<Vec<LaunchOption>>,
     pending_stop: Option<RemoteSession>,
+    /// The Sign Out confirmation is showing, with what it says about the key.
+    pending_sign_out: Option<KeySourceLabel>,
+    /// Where the signed-in key came from, which decides what Sign Out removes.
+    signed_in: Option<SignedInKey>,
+    /// Bumped whenever the Launcher leaves a server, so a load, launch or stop still in
+    /// flight from before never brings the old server back.
+    server_generation: u64,
+    toast: Option<Toast>,
+    toast_task: Option<Task<()>>,
+    toast_id: u64,
+    /// Refreshes "Started … ago" every 30 s while the Library shows sessions.
+    age_tick: Option<Task<()>>,
     /// Images replaced or removed since the last render; their GPU textures are freed with
-    /// `window.drop_image` on the next render (GPUI never frees them on drop).
+    /// `window.drop_image` on the next render (GPUI never frees them on drop). Only
+    /// `retire` adds to it, and it also drops `items`, which may still hold the image.
     retired_images: Vec<Arc<RenderImage>>,
+    /// The Library's cards and tiles, built once per change instead of every frame.
+    items: ItemCache,
     /// Bumped on every Library load and on Disconnect Server, so icon/thumbnail downloads
     /// started for an older Library never write into a newer one.
     media_generation: u64,
@@ -284,6 +315,7 @@ impl Launcher {
         })
         .detach();
         let mut launcher = Self {
+            window: Window::window_handle(window),
             rt,
             api: None,
             library: None,
@@ -296,7 +328,15 @@ impl Launcher {
             launch_dialog: None,
             language_options: None,
             pending_stop: None,
+            pending_sign_out: None,
+            signed_in: None,
+            server_generation: 0,
+            toast: None,
+            toast_task: None,
+            toast_id: 0,
+            age_tick: None,
             retired_images: Vec::new(),
+            items: ItemCache::default(),
             media_generation: 0,
             startup_credential: None,
             retry_api: None,
@@ -319,6 +359,18 @@ impl Launcher {
             }
             true
         });
+        // Back on screen: fresh "Started … ago" labels, and the render restarts the age tick.
+        let this = cx.weak_entity();
+        window
+            .observe_window_visibility(move |visibility, _, cx| {
+                if visibility.is_visible() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.items.invalidate();
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
         Theme::sync_system_appearance(Some(window), cx);
         cx.observe_window_appearance(window, |_, window, cx| {
             Theme::sync_system_appearance(Some(window), cx);
@@ -344,7 +396,7 @@ impl Launcher {
         let trimmed = text.trim();
         if trimmed.is_empty() {
             if let Some(api) = self.retry_api.take() {
-                self.load(api, None, true, cx);
+                self.load(api, None, LoadKind::Connect, cx);
             } else if let Some(saved) = self.startup_credential.clone() {
                 self.connect(saved, false, cx);
             } else {
@@ -366,14 +418,20 @@ impl Launcher {
 
     fn connect(&mut self, credential: Credential, save: bool, cx: &mut Context<Self>) {
         match SealSkinClient::new(&credential) {
-            Ok(api) => self.load(api, save.then_some(credential), true, cx),
+            Ok(api) => self.load(api, save.then_some(credential), LoadKind::Connect, cx),
             Err(error) => self.status = Some(error),
         }
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    /// Reloads the Library; `manual` (the Refresh button) confirms success with a toast.
+    fn refresh(&mut self, manual: bool, cx: &mut Context<Self>) {
         if let Some(api) = self.api.clone() {
-            self.load(api, None, false, cx);
+            let kind = if manual {
+                LoadKind::ManualRefresh
+            } else {
+                LoadKind::Refresh
+            };
+            self.load(api, None, kind, cx);
         }
     }
 
@@ -381,12 +439,14 @@ impl Launcher {
         &mut self,
         api: SealSkinClient,
         save: Option<Credential>,
-        connecting: bool,
+        kind: LoadKind,
         cx: &mut Context<Self>,
     ) {
         if self.busy.is_some() {
             return;
         }
+        let connecting = kind == LoadKind::Connect;
+        let gate = LoadGate(self.server_generation);
         self.busy = Some(
             if connecting {
                 "Connecting…"
@@ -406,6 +466,10 @@ impl Launcher {
                 ))
             });
             let _ = this.update(cx, |this, cx| {
+                if !gate.admits(this.server_generation) {
+                    // Signed out meanwhile: this result belongs to a server left behind.
+                    return;
+                }
                 this.busy = None;
                 match result {
                     Ok(library) => {
@@ -414,13 +478,23 @@ impl Launcher {
                         if save.is_some() {
                             this.clear_key_input = true;
                         }
+                        if connecting {
+                            this.signed_in =
+                                Some(SignedInKey::of(api.key_source(), save.is_some()));
+                        }
+                        if kind == LoadKind::ManualRefresh {
+                            this.show_toast("Library refreshed", cx);
+                        }
                         this.startup_credential = None;
                         this.retry_api = None;
                         // Launch options remembered per app live with the other preferences.
-                        this.preferences = settings::load(api.server());
+                        // Through the queue's copy, which includes writes not yet on disk.
+                        this.preferences = cx.global::<WriteQueue>().read(api.server());
                         this.api = Some(api.clone());
-                        this.library = Some(library);
-                        this.status = save.and_then(|credential| credential.save().err());
+                        this.set_library(Some(library));
+                        if let Some(credential) = save {
+                            this.save_key(&credential, cx);
+                        }
                         this.fetch_library_media(api, apps, sessions, cx);
                     }
                     Err(LibraryError::Refused(error)) => {
@@ -464,7 +538,7 @@ impl Launcher {
             .collect();
         for id in gone {
             if let Some(image) = self.session_thumbnails.remove(&id) {
-                self.retired_images.push(image);
+                self.retire(image);
             }
         }
         let missing_apps: Vec<RemoteApp> = apps
@@ -483,12 +557,13 @@ impl Launcher {
                 if let Ok(Some(image)) = pending.await {
                     let _ = this.update(cx, |this, cx| {
                         if this.media_generation != generation {
-                            this.retired_images.push(image);
+                            this.retire(image);
                             return;
                         }
                         if let Some(old) = this.app_icons.insert(app_id, image) {
-                            this.retired_images.push(old);
+                            this.retire(old);
                         }
+                        this.items.invalidate();
                         cx.notify();
                     });
                 }
@@ -507,13 +582,14 @@ impl Launcher {
                 if let Ok(Some(image)) = pending.await {
                     let _ = this.update(cx, |this, cx| {
                         if this.media_generation != generation {
-                            this.retired_images.push(image);
+                            this.retire(image);
                             return;
                         }
                         if let Some(old) = this.session_thumbnails.insert(session.session_id, image)
                         {
-                            this.retired_images.push(old);
+                            this.retire(old);
                         }
+                        this.items.invalidate();
                         cx.notify();
                     });
                 }
@@ -522,25 +598,240 @@ impl Launcher {
         }
     }
 
-    fn forget(&mut self, cx: &mut Context<Self>) {
-        self.status = Credential::forget().err();
+    /// What the Sign Out confirmation says about the key: saved whenever config.toml holds
+    /// it (whichever way it got there, a retry included), unless it comes from the
+    /// environment or `.env`.
+    fn sign_out_label(&self) -> KeySourceLabel {
+        SignedInKey::label(self.signed_in, || {
+            self.api
+                .as_ref()
+                .is_some_and(|api| crate::sealskin::saved_key_is(api.raw_key()))
+        })
+    }
+
+    /// Signs out after the confirmation: back to Connect, removing the key from config.toml
+    /// whenever it is saved there. Open session windows keep streaming (`ARCH-022`).
+    fn sign_out(&mut self, cx: &mut Context<Self>) {
+        self.pending_sign_out = None;
+        self.status = None;
+        // An in-flight load, launch or stop is ignored once the generation is bumped below
+        // (see `LoadGate`); a launched session shows in the Library at the next sign-in.
+        self.busy = None;
+        let from_environment = matches!(
+            self.signed_in,
+            Some(SignedInKey::Environment | SignedInKey::DotEnv)
+        );
+        if let Some(api) = self.api.as_ref().filter(|_| !from_environment) {
+            // Removes the key only if config.toml holds this one. Queued after any pending
+            // save of it, so the removal wins.
+            let done = cx.global::<WriteQueue>().forget_key(api.raw_key());
+            self.on_written(
+                done,
+                |this, error| this.status = Some(format!("Signed out. {error}")),
+                cx,
+            );
+        }
+        // An environment or .env key is never written, but don't reconnect with it silently.
         self.startup_credential = None;
         self.retry_api = None;
         self.leave_server();
         cx.notify();
     }
 
+    /// Queues `credential` to be saved; a failure shows in the status banner and leaves the
+    /// key marked as not saved.
+    fn save_key(&mut self, credential: &Credential, cx: &mut Context<Self>) {
+        let done = cx.global::<WriteQueue>().save_key(credential);
+        let gate = LoadGate(self.server_generation);
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            let result = done
+                .await
+                .unwrap_or_else(|_| Err("Skerry couldn’t finish saving the key.".into()));
+            let _ = window.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    if !gate.admits(this.server_generation) {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => this.signed_in = Some(SignedInKey::Saved),
+                        Err(error) => {
+                            this.signed_in = Some(SignedInKey::Unsaved);
+                            this.status = Some(error);
+                        }
+                    }
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Shows `message` as a toast for 3 s, replacing any toast showing. The same message
+    /// again just restarts the timer.
+    fn show_toast(&mut self, message: &'static str, cx: &mut Context<Self>) {
+        let id = match &self.toast {
+            Some(toast) if toast.message == message && !toast.leaving => toast.id,
+            _ => {
+                self.toast_id += 1;
+                self.toast_id
+            }
+        };
+        self.toast = Some(Toast {
+            id,
+            message: SharedString::from(message),
+            kind: ToastKind::Success,
+            leaving: false,
+        });
+        let window = self.window;
+        // Replacing the task drops the previous toast's timer.
+        self.toast_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TOAST_DURATION).await;
+            let still_shown = window
+                .update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| match &mut this.toast {
+                        Some(toast) if toast.id == id => {
+                            toast.leaving = true;
+                            cx.notify();
+                            true
+                        }
+                        _ => false,
+                    })
+                })
+                .is_ok_and(|shown| shown.unwrap_or(false));
+            if !still_shown {
+                return;
+            }
+            cx.background_executor().timer(TOAST_EXIT).await;
+            let _ = window.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    if this.toast.as_ref().is_some_and(|toast| toast.id == id) {
+                        this.toast = None;
+                        cx.notify();
+                    }
+                })
+            });
+        }));
+        cx.notify();
+    }
+
+    /// Starts the 30 s "Started … ago" refresh while the Library is on screen and shows
+    /// sessions. It stops itself once there are none or the window is hidden (minimized,
+    /// covered, asleep), and on sign-out; closing the window drops it. A render restarts it.
+    fn ensure_age_tick(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.age_tick.is_some() || !visible || !self.has_sessions() {
+            return;
+        }
+        let window = self.window;
+        self.age_tick = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(AGE_TICK).await;
+            let keep = window
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        if this.has_sessions() && window.is_visible() {
+                            this.items.invalidate();
+                            cx.notify();
+                            true
+                        } else {
+                            this.age_tick = None;
+                            false
+                        }
+                    })
+                })
+                .is_ok_and(|keep| keep.unwrap_or(false));
+            if !keep {
+                break;
+            }
+        }));
+    }
+
+    fn has_sessions(&self) -> bool {
+        self.library
+            .as_ref()
+            .is_some_and(|library| !library.sessions.is_empty())
+    }
+
+    /// Runs `failed` with the error once a queued write fails, through the Library window.
+    fn on_written<E: ToString + 'static>(
+        &self,
+        done: tokio::sync::oneshot::Receiver<Result<(), E>>,
+        failed: impl FnOnce(&mut Self, String) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            let error = match done.await {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "Skerry couldn’t finish saving its settings.".to_string(),
+            };
+            let _ = window.update(cx, |_, _, cx| {
+                this.update(cx, |this, cx| {
+                    failed(this, error);
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Frees `image`'s texture on the next render. The item cache may hold it, so it is
+    /// dropped in the same update (`ARCH-014`).
+    fn retire(&mut self, image: Arc<RenderImage>) {
+        self.retired_images.push(image);
+        self.items.invalidate();
+    }
+
+    /// Replaces the Library; the cards and tiles rebuild on the next render.
+    fn set_library(&mut self, library: Option<Library>) {
+        self.library = library;
+        self.items.invalidate();
+    }
+
+    /// Changes the loaded Library in place; the cards and tiles rebuild on the next render.
+    fn edit_library(&mut self, edit: impl FnOnce(&mut Library)) {
+        if let Some(library) = &mut self.library {
+            edit(library);
+            self.items.invalidate();
+        }
+    }
+
     /// Returns to the Connect screen, dropping the Library and its textures.
     fn leave_server(&mut self) {
         self.api = None;
-        self.library = None;
+        self.set_library(None);
         self.media_generation += 1;
-        self.retired_images
-            .extend(self.app_icons.drain().map(|(_, image)| image));
-        self.retired_images
-            .extend(self.session_thumbnails.drain().map(|(_, image)| image));
+        self.server_generation += 1;
+        self.signed_in = None;
+        self.pending_sign_out = None;
+        self.age_tick = None;
+        self.toast = None;
+        self.toast_task = None;
+        let images: Vec<_> = self
+            .app_icons
+            .drain()
+            .chain(self.session_thumbnails.drain())
+            .map(|(_, image)| image)
+            .collect();
+        for image in images {
+            self.retire(image);
+        }
         self.launch_dialog = None;
         self.pending_stop = None;
+    }
+
+    fn find_app(&self, app_id: &str) -> Option<RemoteApp> {
+        let library = self.library.as_ref()?;
+        library.apps.iter().find(|app| app.id == app_id).cloned()
+    }
+
+    fn find_session(&self, session_id: &str) -> Option<RemoteSession> {
+        let library = self.library.as_ref()?;
+        library
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .cloned()
     }
 
     /// What this server lets the user launch with, from the loaded Library.
@@ -705,7 +996,9 @@ impl Launcher {
                     let query = context.link_query(app, &selection_of(dialog), &default_language);
                     if let Some(link) = api.app_deep_link(&app.id, &query) {
                         cx.write_to_clipboard(ClipboardItem::new_string(link));
+                        // The button's own "Copied" stays too (ARCH-013).
                         dialog.link_copied = true;
+                        self.show_toast("Link copied", cx);
                     }
                 }
             }
@@ -746,25 +1039,29 @@ impl Launcher {
         // *current* window, which is Session Controls whenever that panel last rendered the
         // Launcher (ARCH-015).
         let launcher_window = Window::window_handle(window);
+        let gate = LoadGate(self.server_generation);
         cx.spawn(async move |this, cx| {
             let result = pending
                 .await
                 .unwrap_or_else(|_| Err("The launch was interrupted.".into()));
             let _ = launcher_window.update(cx, |_, window, cx| {
                 this.update(cx, |this, cx| {
+                    if !gate.admits(this.server_generation) {
+                        return;
+                    }
                     this.busy = None;
                     match result {
                         Ok(session) => {
-                            if let Some(library) = &mut this.library {
+                            this.edit_library(|library| {
                                 library.sessions.insert(0, session.clone());
                                 if session.home.starts_with("auto-")
                                     && !library.homes.contains(&session.home)
                                 {
                                     library.homes.push(session.home.clone());
                                 }
-                            }
+                            });
                             if let Some(selection) = &remember {
-                                this.remember_launch(&app_id, selection);
+                                this.remember_launch(&app_id, selection, cx);
                             }
                             this.open_session(session, window, cx);
                         }
@@ -779,7 +1076,12 @@ impl Launcher {
     }
 
     /// Keeps `selection` as the options `app_id` opens with next time (saved per server).
-    fn remember_launch(&mut self, app_id: &str, selection: &LaunchSelection) {
+    fn remember_launch(
+        &mut self,
+        app_id: &str,
+        selection: &LaunchSelection,
+        cx: &mut Context<Self>,
+    ) {
         let Some(api) = &self.api else {
             return;
         };
@@ -788,14 +1090,18 @@ impl Launcher {
             .launch
             .insert(app_id.to_string(), memory.clone());
         let app_id = app_id.to_string();
-        // Re-read first so a session window's saved codec or input changes survive (ARCH-022).
-        if settings::update(api.server(), |p| {
-            p.launch.insert(app_id, memory);
-        })
-        .is_err()
-        {
-            self.status = Some("Couldn’t save this app’s launch options.".into());
-        }
+        // The queue re-reads first, so a session window's saved codec or input changes
+        // survive (ARCH-022).
+        let done = cx
+            .global::<WriteQueue>()
+            .preferences(api.server(), move |p| {
+                p.launch.insert(app_id.clone(), memory.clone());
+            });
+        self.on_written(
+            done,
+            |this, _| this.status = Some("Couldn’t save this app’s launch options.".into()),
+            cx,
+        );
     }
 
     fn stop_session(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
@@ -809,21 +1115,25 @@ impl Launcher {
         let pending = self
             .rt
             .spawn(async move { api.stop_session(&session_id).await });
+        let gate = LoadGate(self.server_generation);
         cx.spawn(async move |this, cx| {
             let result = pending
                 .await
                 .unwrap_or_else(|_| Err("Stopping the session was interrupted.".into()));
             let _ = this.update(cx, |this, cx| {
+                if !gate.admits(this.server_generation) {
+                    return;
+                }
                 this.busy = None;
                 match result {
                     Ok(()) => {
-                        if let Some(library) = &mut this.library {
+                        this.edit_library(|library| {
                             library
                                 .sessions
                                 .retain(|s| s.session_id != session.session_id);
-                        }
+                        });
                         if let Some(image) = this.session_thumbnails.remove(&session.session_id) {
-                            this.retired_images.push(image);
+                            this.retire(image);
                         }
                     }
                     Err(error) => this.status = Some(error),
@@ -958,6 +1268,7 @@ impl Render for Launcher {
                 .update(cx, |state, cx| state.set_value("", window, cx));
         }
         let theme = cx.theme().clone();
+        self.ensure_age_tick(window.is_visible(), cx);
         let (Some(api), Some(library)) = (&self.api, &self.library) else {
             let props = ConnectProps {
                 status: self.status.clone(),
@@ -971,52 +1282,28 @@ impl Render for Launcher {
             );
         };
 
+        let server = api.server().to_string();
+        // Built after the retired textures were dropped above and before any element uses
+        // them, so no cached item hands a freed texture to `img` (`ARCH-014`).
+        let (apps, sessions) = self.items.get(|| {
+            build_items(
+                library,
+                &self.app_icons,
+                &self.session_thumbnails,
+                unix_now(),
+            )
+        });
         let props = LibraryProps {
             app_name: APP_NAME.to_string(),
-            server: api.server().to_string(),
-            apps: library
-                .apps
-                .iter()
-                .map(|app| AppItem {
-                    id: app.id.clone(),
-                    name: app.name.clone(),
-                    categories: if app.kind.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![app.kind.clone()]
-                    },
-                    recent: false,
-                    icon: self.app_icons.get(&app.id).cloned(),
-                })
-                .collect(),
-            sessions: library
-                .sessions
-                .iter()
-                .map(|session| SessionItem {
-                    id: session.session_id.clone(),
-                    app_name: session.app_name.clone(),
-                    started_label: format_started_ago(session.created_at),
-                    gpu: session.gpu,
-                    // No home means a cleanroom session; label it so every card shows its
-                    // storage and the cards line up.
-                    storage_label: Some(if session.home.is_empty() {
-                        "Cleanroom".to_string()
-                    } else {
-                        session.home.clone()
-                    }),
-                    thumbnail: self.session_thumbnails.get(&session.session_id).cloned(),
-                    app_icon: self.app_icons.get(&session.app_id).cloned(),
-                })
-                .collect(),
+            server: server.clone(),
+            apps,
+            sessions,
             search_query: self.search_input.read(cx).value().to_string(),
             selected_filter: self.selected_filter.clone(),
             status: self.status.clone(),
             busy: self.busy.clone(),
         };
 
-        let apps_by_id = library.apps.clone();
-        let sessions_by_id = library.sessions.clone();
-        let sessions_for_stop = library.sessions.clone();
         let launcher_for_launch = cx.entity().clone();
         let launcher_for_resume = cx.entity().clone();
         let launcher_for_stop = cx.entity().clone();
@@ -1029,10 +1316,13 @@ impl Render for Launcher {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key == "escape"
-                    && (this.launch_dialog.is_some() || this.pending_stop.is_some())
+                    && (this.launch_dialog.is_some()
+                        || this.pending_stop.is_some()
+                        || this.pending_sign_out.is_some())
                 {
                     this.launch_dialog = None;
                     this.pending_stop = None;
+                    this.pending_sign_out = None;
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1042,36 +1332,35 @@ impl Render for Launcher {
                 &props,
                 &self.search_input,
                 LibraryHandlers {
-                    on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(cx))),
-                    on_forget: Box::new(cx.listener(|this, _, _, cx| this.forget(cx))),
+                    on_refresh: Box::new(cx.listener(|this, _, _, cx| this.refresh(true, cx))),
+                    on_sign_out: Box::new(cx.listener(|this, _, window, cx| {
+                        this.pending_sign_out = Some(this.sign_out_label());
+                        // Focus the Launcher so Escape reaches the confirmation.
+                        window.focus(&this.focus_handle, cx);
+                        cx.notify();
+                    })),
                     on_launch: Rc::new(move |app_id, window, cx| {
-                        if let Some(app) = apps_by_id.iter().find(|a| a.id == app_id).cloned() {
-                            launcher_for_launch
-                                .update(cx, |this, cx| this.open_launch_dialog(app, window, cx));
-                        }
+                        launcher_for_launch.update(cx, |this, cx| {
+                            if let Some(app) = this.find_app(&app_id) {
+                                this.open_launch_dialog(app, window, cx);
+                            }
+                        });
                     }),
                     on_resume: Rc::new(move |session_id, window, cx| {
-                        if let Some(session) = sessions_by_id
-                            .iter()
-                            .find(|s| s.session_id == session_id)
-                            .cloned()
-                        {
-                            launcher_for_resume
-                                .update(cx, |this, cx| this.open_session(session, window, cx));
-                        }
+                        launcher_for_resume.update(cx, |this, cx| {
+                            if let Some(session) = this.find_session(&session_id) {
+                                this.open_session(session, window, cx);
+                            }
+                        });
                     }),
                     on_stop: Some(Rc::new(move |session_id, window, cx| {
-                        if let Some(session) = sessions_for_stop
-                            .iter()
-                            .find(|s| s.session_id == session_id)
-                            .cloned()
-                        {
-                            launcher_for_stop.update(cx, |this, cx| {
+                        launcher_for_stop.update(cx, |this, cx| {
+                            if let Some(session) = this.find_session(&session_id) {
                                 this.pending_stop = Some(session);
                                 window.focus(&this.focus_handle, cx);
                                 cx.notify();
-                            });
-                        }
+                            }
+                        });
                     })),
                     on_select_filter: Rc::new(move |filter, _, cx| {
                         launcher_for_filter.update(cx, |this, cx| {
@@ -1107,6 +1396,82 @@ impl Render for Launcher {
                     }),
                 ))
             })
+            .when_some(self.pending_sign_out, |view, source| {
+                view.child(session::sign_out_confirm_modal(
+                    &theme,
+                    &server,
+                    source,
+                    cx.listener(|this, _, _, cx| {
+                        this.pending_sign_out = None;
+                        cx.notify();
+                    }),
+                    cx.listener(|this, _, _, cx| this.sign_out(cx)),
+                ))
+            })
+            // Last, so it sits above the Launch Dialog and both confirmations.
+            .when_some(self.toast.as_ref(), |view, toast| {
+                view.child(components::toast_layer(&theme, toast))
+            })
+    }
+}
+
+/// How often "Started … ago" labels refresh; minutes are the finest unit they show.
+const AGE_TICK: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoadKind {
+    Connect,
+    Refresh,
+    /// The Refresh button: success shows a toast.
+    ManualRefresh,
+}
+
+/// The server generation a piece of async work started in; its result is used only if the
+/// Launcher hasn't left that server since.
+#[derive(Clone, Copy)]
+struct LoadGate(u64);
+
+impl LoadGate {
+    fn admits(self, current: u64) -> bool {
+        self.0 == current
+    }
+}
+
+/// Where the signed-in key came from and whether Skerry saved it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignedInKey {
+    /// In config.toml: read at startup, or typed and saved.
+    Saved,
+    /// Typed, with its save still queued.
+    Saving,
+    Environment,
+    DotEnv,
+    /// Typed, and the save failed (or it connected through a retry that never saves).
+    Unsaved,
+}
+
+impl SignedInKey {
+    /// What a connect with a key from `source` leaves; `saving` when its save is queued.
+    fn of(source: KeySource, saving: bool) -> Self {
+        match (source, saving) {
+            (_, true) => Self::Saving,
+            (KeySource::ConfigFile, false) => Self::Saved,
+            (KeySource::Environment, false) => Self::Environment,
+            (KeySource::DotEnv, false) => Self::DotEnv,
+            (KeySource::Typed, false) => Self::Unsaved,
+        }
+    }
+
+    /// What Sign Out says about the key. `in_config`: config.toml holds this key now, which
+    /// makes it saved whatever way it connected (a paste saved, then a Refused retry).
+    fn label(signed_in: Option<Self>, in_config: impl FnOnce() -> bool) -> KeySourceLabel {
+        match signed_in {
+            Some(Self::Environment) => KeySourceLabel::Environment,
+            Some(Self::DotEnv) => KeySourceLabel::DotEnv,
+            Some(Self::Saved | Self::Saving) => KeySourceLabel::SavedFile,
+            _ if in_config() => KeySourceLabel::SavedFile,
+            _ => KeySourceLabel::ThisRunOnly,
+        }
     }
 }
 
@@ -1162,11 +1527,85 @@ fn decode_image(bytes: &[u8], max_edge: u32) -> Option<Arc<RenderImage>> {
     )])))
 }
 
+/// The apps and the sessions, as the Library draws them.
+type LibraryItems = (Rc<[AppItem]>, Rc<[SessionItem]>);
+
+/// The Library's cards and tiles, built once and shared until the Library, an icon or a
+/// thumbnail changes (or the age tick asks for fresh "Started … ago" labels).
+#[derive(Default)]
+struct ItemCache {
+    items: Option<LibraryItems>,
+}
+
+impl ItemCache {
+    fn invalidate(&mut self) {
+        self.items = None;
+    }
+
+    fn get(&mut self, build: impl FnOnce() -> LibraryItems) -> LibraryItems {
+        self.items.get_or_insert_with(build).clone()
+    }
+}
+
+fn build_items(
+    library: &Library,
+    icons: &HashMap<String, Arc<RenderImage>>,
+    thumbnails: &HashMap<String, Arc<RenderImage>>,
+    now: u64,
+) -> LibraryItems {
+    let apps = library
+        .apps
+        .iter()
+        .map(|app| AppItem {
+            id: app.id.clone(),
+            name: app.name.clone(),
+            categories: if app.kind.is_empty() {
+                Vec::new()
+            } else {
+                vec![app.kind.clone()]
+            },
+            recent: false,
+            icon: icons.get(&app.id).cloned(),
+        })
+        .collect();
+    let sessions = library
+        .sessions
+        .iter()
+        .map(|session| SessionItem {
+            id: session.session_id.clone(),
+            app_name: session.app_name.clone(),
+            started_label: format_started_ago_at(session.created_at, now),
+            gpu: session.gpu,
+            // No home means a cleanroom session; label it so every card shows its
+            // storage and the cards line up.
+            storage_label: Some(if session.home.is_empty() {
+                "Cleanroom".to_string()
+            } else {
+                session.home.clone()
+            }),
+            thumbnail: thumbnails.get(&session.session_id).cloned(),
+            app_icon: icons.get(&session.app_id).cloned(),
+        })
+        .collect();
+    (apps, sessions)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[cfg(test)]
 fn format_started_ago(created_at: f64) -> Option<String> {
+    format_started_ago_at(created_at, unix_now())
+}
+
+/// "Started … ago" for a session created at `created_at` (Unix seconds), seen at `now`.
+fn format_started_ago_at(created_at: f64, now: u64) -> Option<String> {
     if created_at <= 0.0 {
         return None;
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
     let elapsed = now.saturating_sub(created_at as u64);
     let label = if elapsed < 60 {
         "Just started".to_string()
@@ -1238,5 +1677,93 @@ mod tests {
             format_started_ago(now - 172_800.0).as_deref(),
             Some("Started 2 days ago")
         );
+    }
+
+    #[test]
+    fn format_started_ago_at_ticks_by_minute() {
+        let created = 1_000_000.0;
+        let at = |elapsed: u64| format_started_ago_at(created, 1_000_000 + elapsed);
+        assert_eq!(at(59).as_deref(), Some("Just started"));
+        assert_eq!(at(60).as_deref(), Some("Started 1m ago"));
+        assert_eq!(at(119).as_deref(), Some("Started 1m ago"));
+        assert_eq!(at(120).as_deref(), Some("Started 2m ago"));
+        assert_eq!(at(3_599).as_deref(), Some("Started 59m ago"));
+        assert_eq!(at(3_600).as_deref(), Some("Started 1h ago"));
+        assert_eq!(at(86_399).as_deref(), Some("Started 23h ago"));
+        assert_eq!(at(86_400).as_deref(), Some("Started 1 day ago"));
+        assert_eq!(at(172_799).as_deref(), Some("Started 1 day ago"));
+        assert_eq!(at(172_800).as_deref(), Some("Started 2 days ago"));
+        // Clock skew: a session "from the future" has just started.
+        assert_eq!(
+            format_started_ago_at(created, 999_000).as_deref(),
+            Some("Just started")
+        );
+    }
+
+    fn library_with_one_session() -> Library {
+        Library {
+            apps: Vec::new(),
+            sessions: vec![serde_json::from_value(serde_json::json!({
+                "session_id": "s1",
+                "app_id": "zen",
+                "app_name": "Zen",
+                "session_url": "/s1/",
+                "created_at": 1_000.0,
+            }))
+            .unwrap()],
+            status: Default::default(),
+            homes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_load_from_before_sign_out_is_dropped() {
+        let gate = LoadGate(3);
+        assert!(gate.admits(3));
+        assert!(!gate.admits(4));
+    }
+
+    #[test]
+    fn sign_out_removes_only_keys_skerry_saved() {
+        // A config-file key reused by a retry keeps its source (and is removed).
+        assert_eq!(
+            SignedInKey::of(KeySource::ConfigFile, false),
+            SignedInKey::Saved
+        );
+        assert_eq!(SignedInKey::of(KeySource::Typed, true), SignedInKey::Saving);
+        assert_eq!(
+            SignedInKey::of(KeySource::Typed, false),
+            SignedInKey::Unsaved
+        );
+        let label = |key, in_config| SignedInKey::label(Some(key), move || in_config);
+        assert_eq!(label(SignedInKey::Saving, false), KeySourceLabel::SavedFile);
+        assert_eq!(
+            label(SignedInKey::Unsaved, false),
+            KeySourceLabel::ThisRunOnly
+        );
+        // Pasted and saved, then a Refused Refresh and a retry: the client still says
+        // Typed, but config.toml holds the key, so Sign Out removes it.
+        assert_eq!(label(SignedInKey::Unsaved, true), KeySourceLabel::SavedFile);
+        // An environment or .env key is never removed, even if the file has the same key.
+        assert_eq!(label(SignedInKey::DotEnv, true), KeySourceLabel::DotEnv);
+        assert_eq!(
+            label(SignedInKey::Environment, true),
+            KeySourceLabel::Environment
+        );
+    }
+
+    #[test]
+    fn library_items_rebuild_only_when_dirty() {
+        let library = library_with_one_session();
+        let none = HashMap::new();
+        let mut cache = ItemCache::default();
+        let build = || build_items(&library, &none, &none, 1_000);
+        let (_, first) = cache.get(build);
+        let (_, again) = cache.get(build);
+        assert!(Rc::ptr_eq(&first, &again));
+        cache.invalidate();
+        let (_, rebuilt) = cache.get(build);
+        assert!(!Rc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt[0].started_label.as_deref(), Some("Just started"));
     }
 }

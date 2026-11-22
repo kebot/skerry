@@ -11,6 +11,8 @@ mod launch_options;
 #[cfg(target_os = "macos")]
 mod pasteboard;
 #[cfg(target_os = "macos")]
+mod persist;
+#[cfg(target_os = "macos")]
 mod sealskin;
 #[cfg(target_os = "macos")]
 mod selkies;

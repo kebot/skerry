@@ -1,3 +1,4 @@
+mod keys;
 mod pinch;
 
 use crate::app::ToggleSessionControls;
@@ -19,7 +20,6 @@ use gpui_kit::{
 use reqwest::Url;
 use skerry_ui::session;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -41,6 +41,9 @@ pub struct NativeSession {
     view: Entity<Desktop>,
     input: mpsc::UnboundedSender<Input>,
     task: tokio::task::JoinHandle<()>,
+    /// Set on drop, so a transport still connecting stops before it talks to the server.
+    cancel: watch::Sender<bool>,
+    runtime: Handle,
     _pinch: Option<pinch::Monitor>,
 }
 
@@ -63,9 +66,12 @@ impl NativeSession {
         });
         let focus = view.read(cx).focus.clone();
         window.focus(&focus, cx);
+        let (cancel, cancelled) = watch::channel(false);
         let task = runtime.spawn(async move {
-            if let Err(message) =
-                transport::run(address, frame_tx, commands, motion, options, &events).await
+            if let Err(message) = transport::run(
+                address, frame_tx, commands, motion, options, &events, cancelled,
+            )
+            .await
             {
                 let _ = events.send(SessionEvent::Error(message.into()));
             }
@@ -74,6 +80,8 @@ impl NativeSession {
             view,
             input,
             task,
+            cancel,
+            runtime: runtime.clone(),
             _pinch: pinch,
         }
     }
@@ -146,6 +154,12 @@ impl NativeSession {
                 desktop.command(format!("ku,{key}"));
             }
         });
+    }
+
+    /// Lifts every key and modifier the session holds. Idempotent; called before a child
+    /// window (Session Controls, Files) or a full-screen change takes the keyboard.
+    pub fn release_keys(&self, cx: &mut App) {
+        self.view.update(cx, |desktop, _| desktop.release_input());
     }
 
     pub fn set_resolution(&self, request: DisplayRequest) {
@@ -226,10 +240,26 @@ impl NativeSession {
 }
 
 impl Drop for NativeSession {
+    /// Closes the stream in order (`ARCH-GAP-DC-09`): `Input::Close` queues behind the `ku`s
+    /// that `release_focus` sent, so the transport sends them, then a close frame. Aborting
+    /// here would drop them, and the server would hold those keys through its reconnect
+    /// grace. A watchdog aborts a transport that hasn't finished within a second.
     fn drop(&mut self) {
-        self.task.abort();
+        let _ = self.cancel.send(true);
+        let _ = self.input.send(Input::Close);
+        let abort = self.task.abort_handle();
+        self.runtime.spawn(async move {
+            tokio::time::sleep(CLOSE_WATCHDOG).await;
+            if !abort.is_finished() {
+                transport::trace_input_event("watchdog abort");
+                abort.abort();
+            }
+        });
     }
 }
+
+/// How long a closing transport may take to send its key releases and close frame.
+const CLOSE_WATCHDOG: Duration = Duration::from_secs(1);
 
 struct Desktop {
     focus: FocusHandle,
@@ -242,8 +272,7 @@ struct Desktop {
     pointer: watch::Sender<Option<Pointer>>,
     buttons: u8,
     position: Option<(Resolution, (u16, u16))>,
-    keys: HashMap<String, u32>,
-    modifiers: Modifiers,
+    keys: keys::KeyLedger,
     scroll: (f32, f32),
     finger_scroll_allowed: bool,
     finger_scroll_task: Option<Task<()>>,
@@ -354,8 +383,7 @@ impl Desktop {
             pointer,
             buttons: 0,
             position: None,
-            keys: HashMap::new(),
-            modifiers: Modifiers::default(),
+            keys: keys::KeyLedger::default(),
             scroll: (0.0, 0.0),
             finger_scroll_allowed: false,
             finger_scroll_task: None,
@@ -444,6 +472,12 @@ impl Desktop {
 
     fn command(&self, text: String) {
         let _ = self.input.send(Input::Command(text));
+    }
+
+    fn commands(&self, commands: Vec<String>) {
+        for text in commands {
+            self.command(text);
+        }
     }
 
     fn mouse_position(&mut self, point: Point<Pixels>, clamp: bool) -> bool {
@@ -546,26 +580,15 @@ impl Desktop {
         }
     }
 
-    fn modifiers(&mut self, mut next: Modifiers) {
-        next.control |= self.settings.command_as_control && next.platform;
-        next.platform = false;
-        for (current, next, key) in [
-            (self.modifiers.shift, next.shift, 0xffe1),
-            (self.modifiers.control, next.control, 0xffe3),
-            (self.modifiers.alt, next.alt, 0xffe9),
-        ] {
-            if current != next {
-                self.command(format!("{},{key}", if next { "kd" } else { "ku" }));
-            }
-        }
-        self.modifiers = next;
+    fn modifiers(&mut self, next: Modifiers) {
+        let next = keys::Mods::from_mac(next, self.settings.command_as_control);
+        let commands = self.keys.set_mods(next);
+        self.commands(commands);
     }
 
     fn release_input(&mut self) {
-        for (_, key) in std::mem::take(&mut self.keys) {
-            self.command(format!("ku,{key}"));
-        }
-        self.modifiers(Modifiers::default());
+        let commands = self.keys.release_all();
+        self.commands(commands);
         self.marked.clear();
         self.selection = 0..0;
         self.ime_click = None;
@@ -634,8 +657,7 @@ impl EntityInputHandler for Desktop {
             if let Some(command) = commit_command(text) {
                 self.modifiers(Modifiers::default());
                 if let Some(key) = keysym(text, None) {
-                    self.command(format!("kd,{key}"));
-                    self.command(format!("ku,{key}"));
+                    self.commands(self.keys.tap(key));
                 } else {
                     self.command(command);
                 }
@@ -893,7 +915,7 @@ impl Render for Desktop {
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
                 let stroke = &event.keystroke;
-                if stroke.modifiers.platform && !desktop.settings.command_as_control {
+                if !keys::sends_key_down(stroke.modifiers, desktop.settings.command_as_control) {
                     return;
                 }
                 let shortcut = stroke.modifiers.control || stroke.modifiers.platform;
@@ -911,20 +933,21 @@ impl Render for Desktop {
                 desktop.modifiers(stroke.modifiers);
                 let text = (!shortcut).then_some(stroke.key_char.as_deref()).flatten();
                 if let Some(key) = keysym(&stroke.key, text) {
-                    let paste = (key == KEY_V && desktop.modifiers.control)
-                        || (key == KEY_INSERT && desktop.modifiers.shift);
+                    let paste = (key == KEY_V && desktop.keys.control())
+                        || (key == KEY_INSERT && desktop.keys.shift());
                     if paste {
                         // Ordered socket: the clipboard lands before the paste keystroke.
                         desktop.sync_to_session(false);
                     }
-                    desktop.keys.insert(event.keystroke.key.clone(), key);
-                    desktop.command(format!("kd,{key}"));
+                    let commands = desktop.keys.press(event.keystroke.key.clone(), key);
+                    desktop.commands(commands);
                     cx.stop_propagation();
                 }
             }))
             .on_key_up(cx.listener(|desktop, event: &KeyUpEvent, _, cx| {
-                if let Some(key) = desktop.keys.remove(&event.keystroke.key) {
-                    desktop.command(format!("ku,{key}"));
+                let commands = desktop.keys.release(&event.keystroke.key);
+                if !commands.is_empty() {
+                    desktop.commands(commands);
                     cx.stop_propagation();
                 }
             }))
@@ -1110,6 +1133,48 @@ fn keysym(key: &str, text: Option<&str>) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a Super regression would come from: no GPUI key name maps to Super or Meta.
+    #[test]
+    fn no_key_name_maps_to_super_or_meta() {
+        let names = [
+            "cmd",
+            "command",
+            "super",
+            "meta",
+            "platform",
+            "win",
+            "hyper",
+            "shift",
+            "control",
+            "ctrl",
+            "alt",
+            "option",
+            "fn",
+            "function",
+            "capslock",
+            "escape",
+            "tab",
+            "space",
+            "a",
+            "z",
+            "1",
+            "f1",
+            "f12",
+            "f13",
+            "left",
+            "delete",
+            "backspace",
+            "enter",
+        ];
+        for name in names {
+            for text in [None, Some(name)] {
+                if let Some(key) = keysym(name, text) {
+                    assert!(!(0xffe7..=0xffee).contains(&key), "{name} -> {key:#x}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn ime_anchor_uses_click_pointer_or_visible_picture() {

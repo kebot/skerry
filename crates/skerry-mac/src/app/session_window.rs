@@ -11,17 +11,17 @@ use super::{
     ToggleFiles, ToggleFullScreen, ToggleSessionControls, APP_NAME,
 };
 use crate::input::InputFeature;
+use crate::persist::WriteQueue;
 use crate::sealskin::{RemoteSession, SealSkinClient};
-use crate::settings::{
-    self, Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings,
-};
+use crate::settings::{Key, Preferences, ScreenChange, ScreenPolicy, Settings, VideoSettings};
 use crate::stats;
 use crate::transport::{DisplayRequest, SessionEvent, SessionOptions, StreamInfo, StreamSample};
 use crate::video::Codec;
 use crate::view::NativeSession;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
-    div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, Task, WeakEntity, Window,
+    div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, ScrollHandle, Task,
+    WeakEntity, Window,
 };
 use skerry_ui::session;
 use std::collections::VecDeque;
@@ -66,11 +66,13 @@ fn refresh_library(cx: &mut App) {
         .and_then(|windows| windows.library.as_ref())
         .map(|(_, launcher)| launcher.clone());
     if let Some(launcher) = library {
-        let _ = launcher.update(cx, |launcher, cx| launcher.refresh(cx));
+        let _ = launcher.update(cx, |launcher, cx| launcher.refresh(false, cx));
     }
 }
 
 pub(super) struct SessionWindow {
+    /// This session's own window, for async updates (`ARCH-015`).
+    window: AnyWindowHandle,
     rt: Handle,
     api: SealSkinClient,
     pub(super) remote: RemoteSession,
@@ -82,6 +84,9 @@ pub(super) struct SessionWindow {
     pub(super) video: Option<bool>,
     pub(super) settings: Option<Settings>,
     controls: Option<AnyWindowHandle>,
+    /// Session Controls' scroll position, kept here so it survives closing and reopening
+    /// the panel while this window stays open.
+    pub(super) controls_scroll: ScrollHandle,
     pub(super) stats: Option<StreamSample>,
     /// Whether the Stats section is open in Session Controls, which is what
     /// subscribes the session to the server's `stream_stats` (`ARCH-019`).
@@ -111,6 +116,8 @@ pub(super) struct SessionWindow {
     pub(super) pending_settings: VideoSettings,
     settings_task: Option<Task<()>>,
     status: Option<String>,
+    /// Last seen full-screen state; a change releases held keys (`ARCH-GAP-DC-09`).
+    fullscreen: bool,
 }
 
 impl SessionWindow {
@@ -121,8 +128,10 @@ impl SessionWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let preferences = settings::load(api.server());
+        // The queue's copy includes changes another window queued that aren't on disk yet.
+        let preferences = cx.global::<WriteQueue>().read(api.server());
         let mut this = Self {
+            window: Window::window_handle(window),
             rt,
             api,
             remote,
@@ -134,6 +143,7 @@ impl SessionWindow {
             video: None,
             settings: None,
             controls: None,
+            controls_scroll: ScrollHandle::new(),
             stats: None,
             stats_open: false,
             stats_history: VecDeque::new(),
@@ -156,6 +166,7 @@ impl SessionWindow {
             pending_settings: VideoSettings::new(),
             settings_task: None,
             status: None,
+            fullscreen: window.is_fullscreen(),
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -166,6 +177,10 @@ impl SessionWindow {
             // Leaving full screen restores the standard title bar; hide it again so it doesn't
             // cover the top of the remote picture.
             session_chrome(window, false);
+            if this.fullscreen != window.is_fullscreen() {
+                this.fullscreen = window.is_fullscreen();
+                this.release_keys(cx);
+            }
             this.resize_display(window, cx)
         })
         .detach();
@@ -316,14 +331,30 @@ impl SessionWindow {
         self.open(window, cx);
     }
 
-    /// Saves one preference change for the next session on this server. Re-reads the file
-    /// first, so another window's changes to other preferences survive (`ARCH-022`).
-    fn save(&mut self, what: &str, change: impl FnOnce(&mut Preferences)) -> bool {
-        let saved = settings::update(self.api.server(), change).is_ok();
-        if !saved {
-            self.status = Some(format!("Couldn’t save {what}."));
-        }
-        saved
+    /// Queues one preference change for the next session on this server. The queue re-reads
+    /// the file first, so another window's changes to other preferences survive
+    /// (`ARCH-022`). The change already applies here; a failed save shows in the banner.
+    fn save(
+        &self,
+        what: &'static str,
+        change: impl Fn(&mut Preferences) + Send + Sync + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        let done = cx
+            .global::<WriteQueue>()
+            .preferences(self.api.server(), change);
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            if !matches!(done.await, Ok(Ok(()))) {
+                let _ = window.update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.status = Some(format!("Couldn’t save {what}."));
+                        cx.notify();
+                    })
+                });
+            }
+        })
+        .detach();
     }
 
     pub(super) fn change_codec(
@@ -339,10 +370,7 @@ impl SessionWindow {
         {
             return;
         }
-        if !self.save("the codec preference", |p| p.codec = codec) {
-            cx.notify();
-            return;
-        }
+        self.save("the codec preference", move |p| p.codec = codec, cx);
         self.preferences.codec = codec;
         self.reconnect(window, cx);
     }
@@ -359,7 +387,7 @@ impl SessionWindow {
             stream.set_input_settings(self.preferences.input, window, cx);
         }
         let input = self.preferences.input;
-        self.save("input preferences", |p| p.input = input);
+        self.save("input preferences", move |p| p.input = input, cx);
         cx.notify();
     }
 
@@ -380,7 +408,11 @@ impl SessionWindow {
                 self.preferences.clipboard.apply(action);
                 stream.set_clipboard_settings(self.preferences.clipboard, window, cx);
                 let clipboard = self.preferences.clipboard;
-                self.save("clipboard preferences", |p| p.clipboard = clipboard);
+                self.save(
+                    "clipboard preferences",
+                    move |p| p.clipboard = clipboard,
+                    cx,
+                );
             }
         }
         cx.notify();
@@ -400,7 +432,7 @@ impl SessionWindow {
         self.settings_task = Some(cx.spawn(async move |this, cx| {
             timer.await;
             let _ = this.update(cx, |this, cx| {
-                this.apply_settings();
+                this.apply_settings(cx);
                 cx.notify();
             });
         }));
@@ -408,7 +440,7 @@ impl SessionWindow {
     }
 
     /// Sends the pending video settings and saves those the person chose.
-    fn apply_settings(&mut self) {
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let changes = std::mem::take(&mut self.pending_settings);
         if let Some(stream) = &self.current {
             stream.set_settings(changes.iter().map(|(&key, &value)| (key, value)).collect());
@@ -418,7 +450,11 @@ impl SessionWindow {
             .filter_map(|key| self.preferences.video.get(key).map(|&value| (*key, value)))
             .collect();
         if !chosen.is_empty() {
-            self.save("video preferences", |p| p.video.extend(chosen));
+            self.save(
+                "video preferences",
+                move |p| p.video.extend(chosen.iter().copied()),
+                cx,
+            );
         }
     }
 
@@ -437,8 +473,8 @@ impl SessionWindow {
             })
             .collect();
         self.preferences.video.clear();
-        self.save("video preferences", |p| p.video.clear());
-        self.apply_settings();
+        self.save("video preferences", |p| p.video.clear(), cx);
+        self.apply_settings(cx);
         cx.notify();
     }
 
@@ -484,12 +520,31 @@ impl SessionWindow {
         }));
     }
 
+    /// The server this session runs on.
+    pub(super) fn server(&self) -> &str {
+        self.api.server()
+    }
+
+    /// Shows `status` in this window's banner.
+    pub(super) fn set_status(&mut self, status: String) {
+        self.status = Some(status);
+    }
+
+    /// Lifts every key the session holds, before something else takes the keyboard.
+    fn release_keys(&self, cx: &mut App) {
+        if let Some(stream) = &self.current {
+            stream.release_keys(cx);
+        }
+    }
+
     fn toggle_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.controls.is_some() {
             self.close_controls(window, cx);
             return;
         }
         if self.current.is_some() {
+            // The panel may open without taking focus while a key is held (cmd-shift-m).
+            self.release_keys(cx);
             let display_mode = self.display_mode;
             let owner_window = Window::window_handle(window);
             let session = cx.entity();
@@ -536,6 +591,7 @@ impl SessionWindow {
             cx.notify();
             return;
         }
+        self.release_keys(cx);
         let title = self.remote.app_name.clone();
         let storage =
             crate::sealskin::has_storage(&self.remote.home).then(|| files_window::Storage {
@@ -602,10 +658,10 @@ impl SessionWindow {
     }
 
     /// Ends the stream; the window and Session Controls stay for a reconnect.
-    fn end_stream(&mut self, window: &mut Window, cx: &mut App) {
+    fn end_stream(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.settings_task = None;
         if !self.pending_settings.is_empty() {
-            self.apply_settings();
+            self.apply_settings(cx);
         }
         self.settings = None;
         self.screen_policy = ScreenPolicy::default();
@@ -621,6 +677,9 @@ impl SessionWindow {
         self.resize_allowed = false;
         self.resize_task = None;
         self.stream_events = None;
+        // `release_focus` queues `ku` for held keys; dropping the stream then queues
+        // `Input::Close` behind them, so they reach the server before the close frame
+        // (`ARCH-GAP-DC-09`).
         if let Some(stream) = self.current.take() {
             stream.release_focus(window, cx);
         }
@@ -667,6 +726,7 @@ impl Render for SessionWindow {
             )
             .on_action(cx.listener(|this, _: &ToggleFullScreen, window, cx| {
                 this.close_controls(window, cx);
+                this.release_keys(cx);
                 window.toggle_fullscreen();
             }))
             .when_some(self.current.as_ref(), |root, stream| {

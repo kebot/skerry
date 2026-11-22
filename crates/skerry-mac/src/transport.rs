@@ -406,6 +406,63 @@ pub enum Input {
     Clipboard(clipboard::Content),
     /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
     Stats(bool),
+    /// End the stream: release every held key, then send a close frame (`ARCH-GAP-DC-09`).
+    Close,
+}
+
+/// What a closing stream sends before its close frame: a `ku` for every key the session
+/// still holds. No `kr`: on a clean close the server already resets the keyboard of the
+/// departing input owner, and every reset injects Super, Meta and Escape releases.
+fn closing_commands(held: &BTreeSet<u32>) -> Vec<String> {
+    held.iter().map(|key| format!("ku,{key}")).collect()
+}
+
+/// Whether `SKERRY_INPUT_TRACE=1` asks for a trace of key traffic on stderr. Read once.
+fn input_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("SKERRY_INPUT_TRACE").is_ok_and(|value| value == "1"))
+}
+
+/// Logs one key command (`kd`, `ku`, `kh`, `kr`) the transport writes, when tracing.
+fn trace_input(text: &str) {
+    if input_trace_enabled() {
+        if let Some(line) = redact_key_command(text) {
+            eprintln!("skerry input: {line}");
+        }
+    }
+}
+
+/// Logs a stream event that matters to key traffic (close frame, watchdog abort).
+pub fn trace_input_event(event: &str) {
+    if input_trace_enabled() {
+        eprintln!("skerry input: {event}");
+    }
+}
+
+/// A key command with every printable keysym hidden, so the trace never records typed
+/// text. Modifiers, function and navigation keys (0xff00 to 0xffff) keep their numbers.
+/// Anything other than `kd`, `ku`, `kh` and `kr` gives `None`.
+fn redact_key_command(text: &str) -> Option<String> {
+    if text == "kr" {
+        return Some(text.into());
+    }
+    let (verb, keys) = text.split_once(',')?;
+    if !matches!(verb, "kd" | "ku" | "kh") {
+        return None;
+    }
+    let keys: Vec<String> = keys
+        .split(',')
+        .map(|key| match key.parse::<u32>() {
+            // Keypad digits and operators (0xff80 to 0xffbd) are typed text too.
+            Ok(keysym)
+                if (0xff00..=0xffff).contains(&keysym) && !(0xff80..=0xffbd).contains(&keysym) =>
+            {
+                keysym.to_string()
+            }
+            _ => "<char>".into(),
+        })
+        .collect();
+    Some(format!("{verb},{}", keys.join(",")))
 }
 
 pub struct SessionOptions {
@@ -475,6 +532,22 @@ fn finger_scroll_capability(text: &str) -> Option<bool> {
     Some(data["finger_scroll"].as_bool().unwrap_or(false))
 }
 
+/// Runs `work` unless the stream is cancelled first (`None`). A dropped sender counts as
+/// cancelled: the session that owned it is gone.
+async fn unless_cancelled<T>(
+    cancel: &mut watch::Receiver<bool>,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.wait_for(|cancelled| *cancelled) => None,
+        out = work => Some(out),
+    }
+}
+
+/// Runs one Selkies stream. `cancel` turns true when the session drops this stream: until
+/// the main loop reads `Input::Close`, the transport checks it so a stream dropped while
+/// still connecting never opens its socket or sends SETTINGS (`ARCH-GAP-DC-09`).
 pub async fn run(
     url: Url,
     frames: watch::Sender<Frame>,
@@ -482,8 +555,12 @@ pub async fn run(
     pointer: watch::Receiver<Option<Pointer>>,
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<(), &'static str> {
-    let (template, access) = socket_request(url).await?;
+    let Some(requested) = unless_cancelled(&mut cancel, socket_request(url)).await else {
+        return Ok(());
+    };
+    let (template, access) = requested?;
     if let Some(access) = access {
         let _ = events.send(SessionEvent::Files(access));
     }
@@ -501,13 +578,17 @@ pub async fn run(
         let attempt = tokio::time::timeout(
             Duration::from_secs(10),
             tokio_tungstenite::connect_async_with_config(request, Some(config), false),
-        )
-        .await
-        .map_err(|_| "The Selkies WebSocket did not respond.")?;
-        match attempt {
+        );
+        let Some(attempt) = unless_cancelled(&mut cancel, attempt).await else {
+            return Ok(());
+        };
+        match attempt.map_err(|_| "The Selkies WebSocket did not respond.")? {
             Ok((socket, _)) => break socket,
             Err(error) if transient_socket_error(&error) && Instant::now() < give_up => {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let wait = tokio::time::sleep(Duration::from_millis(1500));
+                if unless_cancelled(&mut cancel, wait).await.is_none() {
+                    return Ok(());
+                }
             }
             Err(_) => return Err("Couldn’t connect to the Selkies WebSocket."),
         }
@@ -534,6 +615,12 @@ pub async fn run(
     settings["displayId"] = json!("primary");
     settings["audioRedundancy"] = json!(false);
     let disconnected = "The Selkies stream disconnected. Choose Reconnect to resume.";
+    if *cancel.borrow() {
+        // Dropped while the handshake finished: leave without sending the stale SETTINGS.
+        trace_input_event("close frame (cancelled before SETTINGS)");
+        let _ = socket.close(None).await;
+        return Ok(());
+    }
     socket
         .send(format!("SETTINGS,{settings}").into())
         .await
@@ -774,6 +861,7 @@ pub async fn run(
                     Some(Input::Zoom(notches, position)) => {
                         let control_held = held.contains(&0xffe3) || held.contains(&0xffe4);
                         for command in zoom_commands(notches, position, active_size, control_held) {
+                            trace_input(&command);
                             socket.send(command.into()).await.map_err(|_| disconnected)?;
                         }
                         continue;
@@ -834,18 +922,31 @@ pub async fn run(
                         if !ready { continue; }
                         format!("_stats,{}", u8::from(on))
                     }
-                    None => { let _ = socket.close(None).await; return Ok(()); }
+                    // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
+                    // an explicit close: release held keys, then close cleanly.
+                    Some(Input::Close) | None => {
+                        for command in closing_commands(&held) {
+                            trace_input(&command);
+                            let _ = socket.send(command.into()).await;
+                        }
+                        trace_input_event("close frame");
+                        let _ = socket.close(None).await;
+                        return Ok(());
+                    }
                 };
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
                     held.insert(key);
                 } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
                     held.remove(&key);
                 }
+                trace_input(&text);
                 socket.send(text.into()).await.map_err(|_| disconnected)?;
             }
             _ = heartbeat.tick(), if !held.is_empty() => {
                 let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-                socket.send(format!("kh,{keys}").into()).await.map_err(|_| disconnected)?;
+                let text = format!("kh,{keys}");
+                trace_input(&text);
+                socket.send(text.into()).await.map_err(|_| disconnected)?;
             }
             _ = sample_tick.tick() => {
                 let now = Instant::now();
@@ -1083,6 +1184,115 @@ async fn socket_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_options() -> SessionOptions {
+        SessionOptions {
+            preferences: Vec::new(),
+            dark: false,
+            muted: true,
+            codec: Codec::Jpeg,
+            display: None,
+            stats: false,
+        }
+    }
+
+    /// Runs a stream against `listener` with `cancel`, and returns how it ended and every
+    /// connection the listener saw (each one's first bytes) within `wait`.
+    async fn run_against(
+        listener: tokio::net::TcpListener,
+        cancel: watch::Receiver<bool>,
+        wait: Duration,
+    ) -> (Result<(), &'static str>, Vec<String>) {
+        use tokio::io::AsyncReadExt as _;
+        let address = listener.local_addr().unwrap();
+        let url = Url::parse(&format!("http://{address}/s/?access_token=t")).unwrap();
+        let seen = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            // Accept everything, answer nothing: the HTTP step hangs as on a slow server.
+            let mut held = Vec::new();
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+            {
+                let mut buf = [0u8; 256];
+                let read = tokio::time::timeout(Duration::from_millis(100), stream.read(&mut buf))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(0);
+                seen.push(String::from_utf8_lossy(&buf[..read]).to_string());
+                held.push(stream);
+            }
+            seen
+        });
+        let (frames, _) = watch::channel(Frame::default());
+        let (_input_tx, input) = mpsc::unbounded_channel();
+        let (_pointer_tx, pointer) = watch::channel(None);
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        let ended = tokio::time::timeout(
+            wait,
+            run(url, frames, input, pointer, test_options(), &events, cancel),
+        )
+        .await
+        .expect("a cancelled stream ends at once");
+        (ended, seen.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_stream_cancelled_before_it_starts_never_connects() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cancel_tx, cancel) = watch::channel(true);
+        let (ended, seen) = run_against(listener, cancel, Duration::from_millis(200)).await;
+        drop(cancel_tx);
+        assert_eq!(ended, Ok(()));
+        assert!(seen.is_empty(), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn a_stream_dropped_while_connecting_stops_without_settings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (cancel_tx, cancel) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // What `NativeSession::drop` does: set the flag, then drop the sender.
+            let _ = cancel_tx.send(true);
+        });
+        let (ended, seen) = run_against(listener, cancel, Duration::from_secs(2)).await;
+        assert_eq!(ended, Ok(()));
+        // Only the hung HTTP request ever reached the server: no WebSocket, no SETTINGS.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("GET /s/?access_token=t"), "{seen:?}");
+        assert!(!seen.iter().any(|request| request.contains("SETTINGS")));
+    }
+
+    #[test]
+    fn closing_releases_every_held_key_then_closes() {
+        let held = BTreeSet::from([0x61, 0xffe3]);
+        assert_eq!(closing_commands(&held), ["ku,97", "ku,65507"]);
+    }
+
+    #[test]
+    fn closing_with_nothing_held_sends_nothing() {
+        assert!(closing_commands(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn the_input_trace_hides_typed_characters() {
+        assert_eq!(redact_key_command("kd,97").as_deref(), Some("kd,<char>"));
+        assert_eq!(
+            redact_key_command("ku,16777729").as_deref(),
+            Some("ku,<char>")
+        );
+        assert_eq!(redact_key_command("kd,65507").as_deref(), Some("kd,65507"));
+        assert_eq!(redact_key_command("ku,65307").as_deref(), Some("ku,65307"));
+        assert_eq!(
+            redact_key_command("kh,97,65505,32").as_deref(),
+            Some("kh,<char>,65505,<char>")
+        );
+        assert_eq!(redact_key_command("kd,65457").as_deref(), Some("kd,<char>"));
+        assert_eq!(redact_key_command("kr").as_deref(), Some("kr"));
+        assert_eq!(redact_key_command("m2,0,0,1,0"), None);
+        assert_eq!(redact_key_command("SETTINGS,{}"), None);
+    }
 
     #[test]
     fn reads_selkies_prefixed_display_capabilities() {
