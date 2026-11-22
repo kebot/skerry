@@ -355,6 +355,8 @@ pub enum SessionEvent {
     Files(selkies::SelkiesClient),
     FilePolicy(selkies::Policy),
     Error(String),
+    /// The start-up grace ran out with the session still answering like one starting.
+    StartupTimeout,
 }
 
 #[derive(Clone, Copy)]
@@ -480,10 +482,69 @@ pub struct SessionOptions {
     pub display: Option<DisplayRequest>,
     /// Whether the Stats section is open, so the session subscribes once ready.
     pub stats: bool,
+    /// How long start-up errors are retried before [`RunError::StartupTimeout`]: 45 s, or
+    /// [`KEEP_WAITING_GRACE`] after the person chose Keep Waiting (`ARCH-027`).
+    pub startup_grace: Duration,
+    /// The waiting overlay's text until the first frame.
+    pub waiting: String,
     /// The saved output device's Core Audio UID; `None` follows the Mac's default.
     pub audio_output: Option<String>,
     /// The saved audio bitrate (bps), requested once ready if the server offers it.
     pub audio_bitrate: Option<u32>,
+}
+
+/// Why a stream ended with an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunError {
+    /// The session kept answering like one still starting until the grace ran out: it
+    /// may still be booting, so the window offers Retry and Keep Waiting.
+    StartupTimeout,
+    Other(&'static str),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StartupTimeout => f.write_str("The session hasn’t answered yet."),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<&'static str> for RunError {
+    fn from(message: &'static str) -> Self {
+        Self::Other(message)
+    }
+}
+
+/// Whether a failed WebSocket attempt looks like a session still starting: `None` is an
+/// attempt that timed out (the session accepts TCP but hangs, R7), like a refusal or a
+/// proxy's 404/5xx.
+fn attempt_transient(failure: Result<(), Option<&tokio_tungstenite::tungstenite::Error>>) -> bool {
+    match failure {
+        Ok(()) => false,
+        Err(None) => true,
+        Err(Some(error)) => transient_socket_error(error),
+    }
+}
+
+/// What to do after one failed WebSocket attempt during start-up.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    Again,
+    Timeout,
+    Fail,
+}
+
+/// A start-up error (a proxy's 404/5xx, a refused connection, or an attempt that timed
+/// out while the session accepts TCP but hangs) is retried until `give_up`, then becomes a
+/// [`RunError::StartupTimeout`]. Anything else fails at once.
+fn retry_decision(transient: bool, now: Instant, give_up: Instant) -> Retry {
+    match (transient, now < give_up) {
+        (true, true) => Retry::Again,
+        (true, false) => Retry::Timeout,
+        (false, _) => Retry::Fail,
+    }
 }
 
 struct HardwareVideo {
@@ -567,7 +628,7 @@ pub async fn run(
     options: SessionOptions,
     events: &mpsc::UnboundedSender<SessionEvent>,
     mut cancel: watch::Receiver<bool>,
-) -> Result<(), &'static str> {
+) -> Result<(), RunError> {
     let Some(requested) = unless_cancelled(&mut cancel, socket_request(url)).await else {
         return Ok(());
     };
@@ -578,7 +639,7 @@ pub async fn run(
     let config = WebSocketConfig::default().max_message_size(Some(16 * 1024 * 1024));
     // A just-launched session answers 404/5xx or refuses connections until Selkies is up, so
     // keep retrying transient failures for a while instead of failing the first attempt.
-    let give_up = Instant::now() + SOCKET_STARTUP_GRACE;
+    let give_up = Instant::now() + options.startup_grace;
     let mut socket = loop {
         let mut request = template
             .uri()
@@ -593,15 +654,20 @@ pub async fn run(
         let Some(attempt) = unless_cancelled(&mut cancel, attempt).await else {
             return Ok(());
         };
-        match attempt.map_err(|_| "The Selkies WebSocket did not respond.")? {
-            Ok((socket, _)) => break socket,
-            Err(error) if transient_socket_error(&error) && Instant::now() < give_up => {
+        let transient = match attempt {
+            Ok(Ok((socket, _))) => break socket,
+            Ok(Err(error)) => attempt_transient(Err(Some(&error))),
+            Err(_) => attempt_transient(Err(None)),
+        };
+        match retry_decision(transient, Instant::now(), give_up) {
+            Retry::Again => {
                 let wait = tokio::time::sleep(Duration::from_millis(1500));
                 if unless_cancelled(&mut cancel, wait).await.is_none() {
                     return Ok(());
                 }
             }
-            Err(_) => return Err("Couldn’t connect to the Selkies WebSocket."),
+            Retry::Timeout => return Err(RunError::StartupTimeout),
+            Retry::Fail => return Err("Couldn’t connect to the Selkies WebSocket.".into()),
         }
     };
     let mut codec = if options.codec.supported() {
@@ -760,7 +826,7 @@ pub async fn run(
                         }
                     }
                     if text.starts_with("MODE ") && text != "MODE websockets" {
-                        return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.");
+                        return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.".into());
                     }
                     if let Some(finger_scroll) = finger_scroll_capability(&text) {
                         let _ = events.send(SessionEvent::FingerScroll(finger_scroll));
@@ -780,7 +846,7 @@ pub async fn run(
                                 let width = dimension(&data["width"])?;
                                 let height = dimension(&data["height"])?;
                                 if !valid_resolution(width, height) {
-                                    return Err("The remote display resolution is outside the supported range.");
+                                    return Err("The remote display resolution is outside the supported range.".into());
                                 }
                                 jpeg_size = Resolution(width, height);
                                 active_size = jpeg_size;
@@ -869,7 +935,7 @@ pub async fn run(
                     }
                 }
                 Some(Ok(Message::Ping(_))) => { socket.flush().await.map_err(|_| disconnected)?; }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(disconnected),
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return Err(disconnected.into()),
                 _ => {}
             },
             command = input.recv() => {
@@ -1004,7 +1070,7 @@ pub async fn run(
             _ = present.tick() => {
                 if video_playing != Some(false) && hardware.as_ref().is_some_and(|video| video.expired(Instant::now())) {
                     if !capabilities.codecs.contains(&Codec::Jpeg) {
-                        return Err("Hardware video decoding failed and the server does not allow JPEG fallback.");
+                        return Err("Hardware video decoding failed and the server does not allow JPEG fallback.".into());
                     }
                     codec = Codec::Jpeg;
                     hardware = None;
@@ -1029,7 +1095,8 @@ pub async fn run(
                     "The server did not switch to JPEG. Enable JPEG for this session and reconnect."
                 } else {
                     "No video arrived from Selkies. Choose Reconnect to try again."
-                });
+                }
+                .into());
             }
         }
     }
@@ -1149,7 +1216,9 @@ fn dimension(value: &Value) -> Result<u16, &'static str> {
 }
 
 /// How long to keep retrying the WebSocket while a newly launched session starts.
-const SOCKET_STARTUP_GRACE: Duration = Duration::from_secs(45);
+pub const SOCKET_STARTUP_GRACE: Duration = Duration::from_secs(45);
+/// How long Keep Waiting keeps retrying a session that hasn't answered yet.
+pub const KEEP_WAITING_GRACE: Duration = Duration::from_secs(300);
 
 fn transient_socket_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
     use tokio_tungstenite::tungstenite::Error;
@@ -1248,9 +1317,52 @@ mod tests {
             codec: Codec::Jpeg,
             display: None,
             stats: false,
+            startup_grace: SOCKET_STARTUP_GRACE,
+            waiting: String::new(),
             audio_output: None,
             audio_bitrate: None,
         }
+    }
+
+    #[test]
+    fn an_attempt_timeout_is_retried_then_becomes_a_startup_timeout() {
+        use tokio_tungstenite::tungstenite::Error;
+        // The attempt's own 10 s timeout maps to transient, as a refused connection does.
+        assert!(attempt_transient(Err(None)));
+        let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(attempt_transient(Err(Some(&refused))));
+        assert!(!attempt_transient(Err(Some(&Error::Utf8(String::new())))));
+        let start = Instant::now();
+        let give_up = start + SOCKET_STARTUP_GRACE;
+        assert_eq!(
+            retry_decision(attempt_transient(Err(None)), start, give_up),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_decision(attempt_transient(Err(None)), give_up, give_up),
+            Retry::Timeout
+        );
+    }
+
+    #[test]
+    fn startup_grace_expiry_is_a_startup_timeout_not_a_generic_error() {
+        let start = Instant::now();
+        let give_up = start + SOCKET_STARTUP_GRACE;
+        assert_eq!(retry_decision(true, start, give_up), Retry::Again);
+        assert_eq!(retry_decision(true, give_up, give_up), Retry::Timeout);
+        assert_eq!(retry_decision(false, start, give_up), Retry::Fail);
+        assert_eq!(retry_decision(false, give_up, give_up), Retry::Fail);
+        // An attempt that timed out counts as transient (the caller passes `true`), so a
+        // session that accepts TCP but hangs is retried, then times out the same way.
+        assert_eq!(
+            retry_decision(true, start + Duration::from_secs(44), give_up),
+            Retry::Again
+        );
+        assert_eq!(
+            RunError::from("x").to_string(),
+            "x",
+            "other errors keep their message"
+        );
     }
 
     fn selkies_audio_settings(value: &str) -> Settings {
@@ -1307,7 +1419,7 @@ mod tests {
         listener: tokio::net::TcpListener,
         cancel: watch::Receiver<bool>,
         wait: Duration,
-    ) -> (Result<(), &'static str>, Vec<String>) {
+    ) -> (Result<(), RunError>, Vec<String>) {
         use tokio::io::AsyncReadExt as _;
         let address = listener.local_addr().unwrap();
         let url = Url::parse(&format!("http://{address}/s/?access_token=t")).unwrap();

@@ -395,6 +395,117 @@ impl ControlsSections {
     }
 }
 
+/// The most apps the Recent row remembers, as SealSkin's web launcher (`RECENT_MAX`).
+pub const RECENT_MAX: usize = 8;
+/// The most ids one Library list keeps; past it the oldest go first.
+pub const LIST_CAP: usize = 512;
+
+/// How the person organized this server's Library (`ARCH-027`). Kept only here: SealSkin
+/// 0.5 has no per-user API for it, and its web launcher keeps the same lists in the browser.
+/// Ids of apps the server no longer lists stay (an app can come back) and are skipped when
+/// drawing.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LibraryOrganization {
+    /// App ids, oldest favorite first.
+    #[serde(
+        default,
+        deserialize_with = "capped_oldest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub favorites: Vec<String>,
+    #[serde(
+        default,
+        deserialize_with = "capped_oldest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub hidden: Vec<String>,
+    /// App ids, newest launch first, at most [`RECENT_MAX`].
+    #[serde(
+        default,
+        deserialize_with = "capped_newest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub recent: Vec<String>,
+}
+
+/// The ids in a saved list: entries that aren't strings are dropped one by one (a list
+/// that isn't a list reads as empty), and duplicates go.
+fn read_ids<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
+/// Favorites and hidden apps, capped on load at the newest [`LIST_CAP`].
+fn capped_oldest_first<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut ids = read_ids(deserializer)?;
+    if ids.len() > LIST_CAP {
+        ids.drain(..ids.len() - LIST_CAP);
+    }
+    Ok(ids)
+}
+
+/// Recents, capped on load at the newest [`RECENT_MAX`].
+fn capped_newest_first<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut ids = read_ids(deserializer)?;
+    ids.truncate(RECENT_MAX);
+    Ok(ids)
+}
+
+impl LibraryOrganization {
+    pub fn is_empty(&self) -> bool {
+        self.favorites.is_empty() && self.hidden.is_empty() && self.recent.is_empty()
+    }
+
+    pub fn is_favorite(&self, app_id: &str) -> bool {
+        self.favorites.iter().any(|id| id == app_id)
+    }
+
+    pub fn is_hidden(&self, app_id: &str) -> bool {
+        self.hidden.iter().any(|id| id == app_id)
+    }
+
+    /// Adds `app_id` at the end of Favorites, or removes it. Setting, not toggling, so the
+    /// write queue can apply the same change to its copy and to the file.
+    pub fn set_favorite(&mut self, app_id: &str, favorite: bool) {
+        set_member(&mut self.favorites, app_id, favorite);
+    }
+
+    pub fn set_hidden(&mut self, app_id: &str, hidden: bool) {
+        set_member(&mut self.hidden, app_id, hidden);
+    }
+
+    /// Moves `app_id` to the front of Recent, keeping the newest [`RECENT_MAX`].
+    pub fn record_launch(&mut self, app_id: &str) {
+        self.recent.retain(|id| id != app_id);
+        self.recent.insert(0, app_id.to_string());
+        self.recent.truncate(RECENT_MAX);
+    }
+}
+
+/// Adds `app_id` at the end of `list` or removes it, dropping duplicates and, past
+/// [`LIST_CAP`], the oldest ids.
+fn set_member(list: &mut Vec<String>, app_id: &str, member: bool) {
+    let mut seen = std::collections::HashSet::new();
+    list.retain(|id| id != app_id && seen.insert(id.clone()));
+    if member {
+        list.push(app_id.to_string());
+    }
+    if list.len() > LIST_CAP {
+        list.drain(..list.len() - LIST_CAP);
+    }
+}
+
 /// The audio choices saved for a server.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -421,16 +532,39 @@ impl AudioPreferences {
 pub struct Preferences {
     #[serde(default)]
     pub codec: Codec,
-    #[serde(default, skip_serializing_if = "InputSettings::is_default")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "InputSettings::is_default"
+    )]
     pub input: InputSettings,
-    #[serde(default, skip_serializing_if = "ClipboardSettings::is_default")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "ClipboardSettings::is_default"
+    )]
     pub clipboard: ClipboardSettings,
     /// The Launch Dialog options each app last launched with, by app id.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub launch: BTreeMap<String, LaunchMemory>,
     /// Which Session Controls sections were open last on this server.
-    #[serde(default, skip_serializing_if = "ControlsSections::is_default")]
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "ControlsSections::is_default"
+    )]
     pub controls: ControlsSections,
+    /// Favorites, hidden apps, and recents (`ARCH-027`); never written while empty.
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "LibraryOrganization::is_empty"
+    )]
+    pub library: LibraryOrganization,
     #[serde(default, skip_serializing_if = "AudioPreferences::is_default")]
     pub audio: AudioPreferences,
     #[serde(flatten, deserialize_with = "lenient_video")]
@@ -450,6 +584,17 @@ fn lenient_video<'de, D: serde::Deserializer<'de>>(
             Some((key, serde_json::from_value::<u32>(value).ok()?))
         })
         .collect())
+}
+
+/// Reads a field, or its default when the value has another shape (a newer build's, or a
+/// hand edit), so one bad field never fails the whole `Preferences`.
+fn or_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::de::DeserializeOwned,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
 /// Where `server`'s preferences live. Writes go only through `persist::WriteQueue`.
@@ -532,6 +677,7 @@ fn read_file(path: &Path) -> Loaded {
             "clipboard" => field(value, &mut prefs.clipboard),
             "launch" => field(value, &mut prefs.launch),
             "controls" => field(value, &mut prefs.controls),
+            "library" => field(value, &mut prefs.library),
             "audio" => field(value, &mut prefs.audio),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
@@ -575,6 +721,162 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn library_organization_is_absent_from_old_files_and_never_written_empty() {
+        let prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
+        assert!(prefs.library.is_empty());
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert!(saved.get("library").is_none(), "{saved}");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.library.set_favorite("zen", true)).unwrap();
+        update_at(&path, |p| p.library.set_favorite("zen", false)).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("library").is_none(), "{saved}");
+    }
+
+    #[test]
+    fn library_organization_round_trips_with_launch_and_video_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"jpeg": 45, "launch": {"zen": {"gpu": "intel-gpu"}}}"#,
+        )
+        .unwrap();
+        update_at(&path, |p| {
+            p.library.set_favorite("zen", true);
+            p.library.set_hidden("krita", true);
+            p.library.record_launch("obsidian");
+        })
+        .unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.library.favorites, ["zen"]);
+        assert_eq!(saved.library.hidden, ["krita"]);
+        assert_eq!(saved.library.recent, ["obsidian"]);
+        assert!(saved.launch.contains_key("zen"));
+        assert_eq!(saved.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(saved.video.len(), 1);
+        // A clean file leaves no backup.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unknown_top_level_keys_do_not_reset_preferences() {
+        let prefs: Preferences = serde_json::from_value(
+            json!({"codec": "hevc", "jpeg": 45, "sidebar": {"width": 3}, "fps": "fast"}),
+        )
+        .unwrap();
+        assert_eq!(prefs.codec, Codec::Hevc);
+        assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
+        assert_eq!(prefs.video.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_library_entry_costs_only_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"library": {"favorites": ["a", 5, "b", "a"], "hidden": ["z"], "recent": "x"}}"#,
+        )
+        .unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.library.favorites, ["a", "b"]);
+        assert_eq!(loaded.library.hidden, ["z"]);
+        assert!(loaded.library.recent.is_empty());
+    }
+
+    #[test]
+    fn library_lists_are_capped_on_load() {
+        let ids: Vec<String> = (0..600).map(|n| format!("app{n}")).collect();
+        let prefs: Preferences = serde_json::from_value(
+            json!({"library": {"favorites": ids, "hidden": ids, "recent": ids}}),
+        )
+        .unwrap();
+        assert_eq!(prefs.library.favorites.len(), LIST_CAP);
+        assert_eq!(prefs.library.favorites[0], "app88");
+        assert_eq!(prefs.library.hidden.len(), LIST_CAP);
+        assert_eq!(prefs.library.recent, ids[..RECENT_MAX]);
+    }
+
+    #[test]
+    fn a_malformed_library_keeps_every_other_preference() {
+        for library in [json!(5), json!({"favorites": [1]}), json!({"hidden": "x"})] {
+            let raw = json!({"codec": "hevc", "jpeg": 45, "library": library,
+                "launch": {"zen": {"gpu": "intel-gpu"}}, "controls": {"video": true}});
+            let prefs: Preferences = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(prefs.codec, Codec::Hevc);
+            assert!(prefs.library.is_empty());
+            assert!(prefs.launch.contains_key("zen"));
+            assert!(prefs.controls.video);
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("server.json");
+            std::fs::write(&path, raw.to_string()).unwrap();
+            let loaded = load_at(&path);
+            assert_eq!(loaded.codec, Codec::Hevc);
+            assert_eq!(loaded.video.get(&Key::Jpeg), Some(&45));
+            assert!(loaded.launch.contains_key("zen"));
+            assert!(loaded.library.is_empty());
+        }
+    }
+
+    #[test]
+    fn unknown_keys_survive_a_round_trip_through_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, r#"{"jpeg": 45, "future": [1, 2], "theme": "plum"}"#).unwrap();
+        update_at(&path, |p| p.library.set_favorite("zen", true)).unwrap();
+        update_at(&path, |p| p.library.record_launch("zen")).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["future"], json!([1, 2]));
+        assert_eq!(saved["theme"], json!("plum"));
+        assert_eq!(
+            saved["library"],
+            json!({"favorites": ["zen"], "recent": ["zen"]})
+        );
+    }
+
+    #[test]
+    fn favorite_saved_by_launcher_survives_a_session_windows_codec_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        update_at(&path, |p| p.library.set_favorite("zen", true)).unwrap();
+        update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
+        let saved = load_at(&path);
+        assert_eq!(saved.codec, Codec::Hevc);
+        assert!(saved.library.is_favorite("zen"));
+    }
+
+    #[test]
+    fn recents_keep_the_newest_eight_without_duplicates() {
+        let mut library = LibraryOrganization::default();
+        for id in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "b"] {
+            library.record_launch(id);
+        }
+        assert_eq!(library.recent, ["b", "i", "h", "g", "f", "e", "d", "c"]);
+    }
+
+    #[test]
+    fn toggles_deduplicate_and_cap_each_list() {
+        let mut library = LibraryOrganization {
+            favorites: vec!["a".into(), "a".into(), "b".into()],
+            ..LibraryOrganization::default()
+        };
+        library.set_favorite("c", true);
+        library.set_favorite("c", true);
+        assert_eq!(library.favorites, ["a", "b", "c"]);
+        library.set_favorite("a", false);
+        assert_eq!(library.favorites, ["b", "c"]);
+        for n in 0..LIST_CAP + 10 {
+            library.set_hidden(&format!("app{n}"), true);
+        }
+        assert_eq!(library.hidden.len(), LIST_CAP);
+        // The oldest go first.
+        assert_eq!(library.hidden[0], "app10");
+        assert!(library.is_hidden(&format!("app{}", LIST_CAP + 9)));
+    }
+
+    #[test]
     fn controls_sections_default_is_not_written() {
         let saved = serde_json::to_value(Preferences::default()).unwrap();
         assert!(saved.get("controls").is_none(), "{saved}");
@@ -598,7 +900,7 @@ mod tests {
     #[test]
     fn unknown_preferences_from_a_newer_build_dont_wipe_the_file() {
         let prefs: Preferences = serde_json::from_value(
-            json!({"codec": "hevc", "jpeg": 45, "library": {"favorites": ["zen"]}}),
+            json!({"codec": "hevc", "jpeg": 45, "future": {"favorites": ["zen"]}}),
         )
         .unwrap();
         assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
@@ -609,10 +911,10 @@ mod tests {
     fn unknown_top_level_keys_survive_a_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("server.json");
-        std::fs::write(&path, r#"{"jpeg": 45, "library": {"favorites": ["zen"]}}"#).unwrap();
+        std::fs::write(&path, r#"{"jpeg": 45, "future": {"favorites": ["zen"]}}"#).unwrap();
         update_at(&path, |p| p.codec = Codec::Hevc).unwrap();
         let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(saved["library"], json!({"favorites": ["zen"]}));
+        assert_eq!(saved["future"], json!({"favorites": ["zen"]}));
         assert_eq!(saved["jpeg"], json!(45));
         assert_eq!(saved["codec"], json!("hevc"));
         // A clean file leaves no backup.

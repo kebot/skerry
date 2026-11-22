@@ -5,11 +5,12 @@ mod files_window;
 mod promise;
 mod session_window;
 
-use crate::launch_options::{self, LaunchContext, LaunchSelection};
+use crate::launch_options::{self, LaunchContext, LaunchMemory, LaunchSelection};
+use crate::launch_progress::{self, Flight, Outcome, RowState};
 use crate::persist::{self, WriteQueue};
 use crate::sealskin::{
-    Credential, KeySource, LaunchParams, Library, LibraryError, RemoteApp, RemoteSession,
-    SealSkinClient,
+    Credential, KeySource, LaunchError, LaunchParams, Library, LibraryError, RemoteApp,
+    RemoteSession, SealSkinClient,
 };
 use crate::settings::Preferences;
 use crate::transport::{DisplayRequest, Resolution};
@@ -33,16 +34,19 @@ use skerry_ui::{
     connect::{self, ConnectProps},
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
-        LaunchOptions, LaunchSelect,
+        LaunchOptions, LaunchSelect, RunningMatch,
     },
-    library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
+    library::{
+        self, AppItem, Filter, FlightAction, LaunchNotice, LaunchingItem, LibraryHandlers,
+        LibraryProps, SessionItem, StageRow, StageState,
+    },
     session::{self, KeySourceLabel},
 };
 use smallvec::smallvec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 const APP_NAME: &str = "SealSkin Native";
@@ -255,7 +259,14 @@ struct Launcher {
     preferences: Preferences,
     key_input: Entity<InputState>,
     search_input: Entity<InputState>,
-    selected_filter: String,
+    selected_filter: Filter,
+    /// Launches in progress, newest first; at most one per app (`ARCH-027`). They live
+    /// with this window: closing the Library abandons them (the server still finishes,
+    /// and the session shows under Running sessions when the Library opens again).
+    flights: Vec<Flight>,
+    /// Sessions a launch added locally, and when: a Refresh fetched before then must not
+    /// drop them (the server list it brings predates the launch).
+    launched_at: HashMap<String, Instant>,
     app_icons: HashMap<String, Arc<RenderImage>>,
     session_thumbnails: HashMap<String, Arc<RenderImage>>,
     launch_dialog: Option<(RemoteApp, LaunchDialogProps, LaunchDialogSelects)>,
@@ -322,7 +333,9 @@ impl Launcher {
             preferences: Preferences::default(),
             key_input,
             search_input,
-            selected_filter: "All".into(),
+            selected_filter: Filter::All,
+            flights: Vec::new(),
+            launched_at: HashMap::new(),
             app_icons: HashMap::new(),
             session_thumbnails: HashMap::new(),
             launch_dialog: None,
@@ -459,6 +472,7 @@ impl Launcher {
         let client = api.clone();
         let pending = self.rt.spawn(async move { client.library().await });
         let saved_startup_key = connecting && save.is_none();
+        let requested = Instant::now();
         cx.spawn(async move |this, cx| {
             let result = pending.await.unwrap_or_else(|_| {
                 Err(LibraryError::Failed(
@@ -472,7 +486,15 @@ impl Launcher {
                 }
                 this.busy = None;
                 match result {
-                    Ok(library) => {
+                    Ok(mut library) => {
+                        if let Some(old) = &this.library {
+                            merge_fresh_sessions(
+                                &mut library.sessions,
+                                &old.sessions,
+                                &mut this.launched_at,
+                                requested,
+                            );
+                        }
                         let apps = library.apps.clone();
                         let sessions = library.sessions.clone();
                         if save.is_some() {
@@ -669,7 +691,8 @@ impl Launcher {
 
     /// Shows `message` as a toast for 3 s, replacing any toast showing. The same message
     /// again just restarts the timer.
-    fn show_toast(&mut self, message: &'static str, cx: &mut Context<Self>) {
+    fn show_toast(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let message = message.into();
         let id = match &self.toast {
             Some(toast) if toast.message == message && !toast.leaving => toast.id,
             _ => {
@@ -679,7 +702,7 @@ impl Launcher {
         };
         self.toast = Some(Toast {
             id,
-            message: SharedString::from(message),
+            message,
             kind: ToastKind::Success,
             leaving: false,
         });
@@ -818,6 +841,7 @@ impl Launcher {
         }
         self.launch_dialog = None;
         self.pending_stop = None;
+        drop_flights(&mut self.flights, &mut self.launched_at);
     }
 
     fn find_app(&self, app_id: &str) -> Option<RemoteApp> {
@@ -865,8 +889,8 @@ impl Launcher {
             app_id: app.id.clone(),
             app_name: app.name.clone(),
             app_icon: self.app_icons.get(&app.id).cloned(),
-            favorite: false,
-            hidden: false,
+            favorite: self.preferences.library.is_favorite(&app.id),
+            hidden: self.preferences.library.is_hidden(&app.id),
             storage_options: context.storage_options(&app),
             selected_storage: selection.home_dir,
             gpu_options: context.gpu_options(&app),
@@ -881,8 +905,9 @@ impl Launcher {
             wayland: selection.wayland,
             busy: false,
             show_copy_link: true,
-            show_organize: false,
+            show_organize: true,
             link_copied: false,
+            running_match: None,
         };
         let selects = LaunchDialogSelects::from_props(&props, window, cx);
         let fields = [
@@ -898,9 +923,30 @@ impl Launcher {
             }
         }
         self.launch_dialog = Some((app, props, selects));
+        self.update_running_match();
         // Take focus off the search field so Escape reaches the dialog.
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// The running session the dialog's current choices would duplicate (`ARCH-027`).
+    fn running_match(&self) -> Option<RemoteSession> {
+        let (app, dialog, _) = self.launch_dialog.as_ref()?;
+        let library = self.library.as_ref()?;
+        self.launch_context()
+            .matching_session(app, &selection_of(dialog), &library.sessions)
+            .cloned()
+    }
+
+    /// Recomputes the dialog's running match after its storage or room flag changed.
+    fn update_running_match(&mut self) {
+        let found = self.running_match().map(|session| RunningMatch {
+            started_label: format_started_ago_at(session.created_at, unix_now())
+                .map(|label| lowercase_first(&label)),
+        });
+        if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
+            dialog.running_match = found;
+        }
     }
 
     /// Writes a confirmed dropdown choice into the dialog. A new VPN brings its own endpoints,
@@ -950,6 +996,7 @@ impl Launcher {
                         }
                     }
                 }
+                this.update_running_match();
                 cx.notify();
             },
         )
@@ -966,20 +1013,33 @@ impl Launcher {
             LaunchDialogAction::Close => {
                 self.launch_dialog = None;
             }
+            // Saved at once; the dialog stays open so the change can be undone there.
             LaunchDialogAction::ToggleFavorite => {
-                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
-                    dialog.favorite = !dialog.favorite;
+                if let Some((app, dialog, _)) = self.launch_dialog.as_ref() {
+                    let (app_id, favorite) = (app.id.clone(), !dialog.favorite);
+                    self.set_favorite(&app_id, favorite, cx);
                 }
             }
             LaunchDialogAction::ToggleHidden => {
-                if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
-                    dialog.hidden = !dialog.hidden;
+                if let Some((app, dialog, _)) = self.launch_dialog.as_ref() {
+                    let (app_id, hidden) = (app.id.clone(), !dialog.hidden);
+                    self.set_hidden(&app_id, hidden, false, cx);
                 }
             }
             LaunchDialogAction::SetCollaborative(enabled) => {
                 if let Some((_, dialog, _)) = self.launch_dialog.as_mut() {
                     dialog.collaborative = enabled;
                     dialog.link_copied = false;
+                }
+                self.update_running_match();
+            }
+            LaunchDialogAction::OpenRunning => {
+                // Close the dialog first, in this same update; `open_session` defers the
+                // window open (ARCH-006, ARCH-022).
+                let running = self.running_match();
+                self.launch_dialog = None;
+                if let Some(session) = running {
+                    self.open_session(session, window, cx);
                 }
             }
             LaunchDialogAction::SetWayland(enabled) => {
@@ -1010,98 +1070,372 @@ impl Launcher {
                         &selection,
                         launch_options::mac_timezone(),
                     );
-                    self.launch_with_options(app, params, Some(selection), window, cx);
+                    self.start_launch(app, params, Some(selection), cx);
                 }
             }
         }
         cx.notify();
     }
 
-    /// Launches `app`; once it runs, `remember` becomes the app's remembered options.
-    fn launch_with_options(
+    /// Launches `app_id` with its remembered options at once (Option-click, the hover ▶,
+    /// or the tile menu). Without remembered options it opens the dialog. It always starts
+    /// a new session: reuse is what the session card's Open is for.
+    fn quick_launch(&mut self, app_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(app) = self.find_app(app_id) else {
+            return;
+        };
+        match quick_launch_plan(self.preferences.launch.get(app_id)) {
+            QuickLaunch::Dialog => self.open_launch_dialog(app, window, cx),
+            QuickLaunch::Launch(memory) => {
+                // Revalidated as the dialog would be, so the two never disagree (ARCH-016).
+                let context = self.launch_context();
+                let default_language =
+                    launch_options::default_language(&launch_options::mac_locale());
+                let selection = context.selection(&app, &memory, &default_language);
+                let params = context.params(&app, &selection, launch_options::mac_timezone());
+                self.start_launch(app, params, Some(selection), cx);
+            }
+        }
+    }
+
+    fn session_ids(&self) -> HashSet<String> {
+        self.library
+            .as_ref()
+            .map(|library| {
+                library
+                    .sessions
+                    .iter()
+                    .map(|session| session.session_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn flight_mut(&mut self, launch_id: &str) -> Option<&mut Flight> {
+        self.flights
+            .iter_mut()
+            .find(|flight| flight.launch_id == launch_id)
+    }
+
+    /// Starts following a launch of `app`; once ready, `remember` becomes the app's
+    /// remembered options. One launch per app at a time; the Library stays usable.
+    fn start_launch(
         &mut self,
         app: RemoteApp,
         params: LaunchParams,
         remember: Option<LaunchSelection>,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(api) = self.api.clone().filter(|_| self.busy.is_none()) else {
+        if self.api.is_none() || !can_start(&self.flights, &app.id) {
+            return;
+        }
+        // A failed card for this app gives way to the new launch.
+        self.flights.retain(|flight| flight.app.id != app.id);
+        let flight = Flight::new(
+            app,
+            params,
+            remember,
+            self.session_ids(),
+            Instant::now(),
+            unix_now_f64(),
+        );
+        let launch_id = flight.launch_id.clone();
+        self.flights.insert(0, flight);
+        self.status = None;
+        self.post_flight(&launch_id, cx);
+        self.poll_flight(launch_id, cx);
+        cx.notify();
+    }
+
+    /// Sends (or resends, under the same id) the flight's launch request.
+    fn post_flight(&mut self, launch_id: &str, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else {
             return;
         };
-        let app_id = app.id.clone();
-        self.status = None;
-        self.busy = Some(format!("Launching {}…", app.name));
-        let pending = self
-            .rt
-            .spawn(async move { api.launch_with_options(app, params).await });
-        // Resolve the Launcher window by handle: gpui-pre's `update_in` uses the entity's
-        // *current* window, which is Session Controls whenever that panel last rendered the
-        // Launcher (ARCH-015).
-        let launcher_window = Window::window_handle(window);
+        let Some(flight) = self.flight_mut(launch_id) else {
+            return;
+        };
+        flight.begin_attempt();
+        let (app, params) = (flight.app.clone(), flight.params.clone());
+        let (sent, on_sent) = tokio::sync::oneshot::channel();
+        let pending = self.rt.spawn(async move {
+            api.launch_with_options(app, params, move || {
+                let _ = sent.send(());
+            })
+            .await
+        });
+        // Applied through the Library window's handle: gpui-pre's `update_in` uses the
+        // entity's *current* window, which is Session Controls whenever that panel last
+        // rendered the Launcher (ARCH-015).
+        let window = self.window;
         let gate = LoadGate(self.server_generation);
+        let launch_id = launch_id.to_string();
         cx.spawn(async move |this, cx| {
-            let result = pending
-                .await
-                .unwrap_or_else(|_| Err("The launch was interrupted.".into()));
-            let _ = launcher_window.update(cx, |_, window, cx| {
+            if on_sent.await.is_ok() {
+                let now = Instant::now();
+                let _ = window.update(cx, |_, _, cx| {
+                    this.update(cx, |this, _| {
+                        if let Some(flight) = this.flight_mut(&launch_id) {
+                            flight.sent(now);
+                        }
+                    })
+                });
+            }
+            let result = pending.await.unwrap_or_else(|_| {
+                Err(LaunchError::Network("The launch was interrupted.".into()))
+            });
+            let _ = window.update(cx, |_, window, cx| {
                 this.update(cx, |this, cx| {
                     if !gate.admits(this.server_generation) {
                         return;
                     }
-                    this.busy = None;
-                    match result {
-                        Ok(session) => {
-                            this.edit_library(|library| {
-                                library.sessions.insert(0, session.clone());
-                                if session.home.starts_with("auto-")
-                                    && !library.homes.contains(&session.home)
-                                {
-                                    library.homes.push(session.home.clone());
-                                }
-                            });
-                            if let Some(selection) = &remember {
-                                this.remember_launch(&app_id, selection, cx);
-                            }
-                            this.open_session(session, window, cx);
-                        }
-                        Err(error) => this.status = Some(error),
+                    if let Some(flight) = this.flight_mut(&launch_id) {
+                        flight.posted(result, Instant::now());
+                        this.flight_changed(&launch_id, window, cx);
                     }
-                    cx.notify();
                 })
             });
         })
         .detach();
+    }
+
+    /// Polls the progress route while the flight runs. The loop ends once the flight is
+    /// gone (Dismiss, sign-out, a fresh Retry under a new id) or no longer running, or the
+    /// Library window has closed.
+    fn poll_flight(&mut self, launch_id: String, cx: &mut Context<Self>) {
+        let window = self.window;
+        let gate = LoadGate(self.server_generation);
+        cx.spawn(async move |this, cx| loop {
+            let next = window
+                .update(cx, |_, _, cx| {
+                    this.update(cx, |this, _| {
+                        let api = this.api.clone()?;
+                        let rt = this.rt.clone();
+                        let flight = this.flight_mut(&launch_id)?;
+                        flight
+                            .is_running()
+                            .then(|| (flight.poll_interval(Instant::now()), api, rt))
+                    })
+                })
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            let Some((interval, api, rt)) = next else {
+                break;
+            };
+            cx.background_executor().timer(interval).await;
+            let id = launch_id.clone();
+            let answer = rt
+                .spawn(async move { api.launch_progress(&id).await })
+                .await
+                .unwrap_or_else(|_| Err("interrupted".into()));
+            let applied = window.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    if !gate.admits(this.server_generation) {
+                        return;
+                    }
+                    let Some(flight) = this.flight_mut(&launch_id) else {
+                        return;
+                    };
+                    match &answer {
+                        Ok(answer) => flight.observe(answer, Instant::now()),
+                        Err(_) => flight.poll_failed(),
+                    }
+                    if matches!(flight.outcome, Outcome::Checking) {
+                        this.check_sessions(&launch_id, cx);
+                    }
+                    this.flight_changed(&launch_id, window, cx);
+                })
+            });
+            if !matches!(applied, Ok(Ok(()))) {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// The one sessions lookup before a lost launch gives up: a new session of the app
+    /// may be the launch, started by a request whose answer was lost.
+    fn check_sessions(&mut self, launch_id: &str, cx: &mut Context<Self>) {
+        let Some(api) = self.api.clone() else {
+            return;
+        };
+        let pending = self.rt.spawn(async move { api.sessions().await });
+        let window = self.window;
+        let gate = LoadGate(self.server_generation);
+        let launch_id = launch_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let sessions = pending.await.ok().and_then(Result::ok);
+            let _ = window.update(cx, |_, window, cx| {
+                this.update(cx, |this, cx| {
+                    if !gate.admits(this.server_generation) {
+                        return;
+                    }
+                    if let Some(flight) = this.flight_mut(&launch_id) {
+                        flight.sessions_checked(sessions.as_deref(), Instant::now());
+                        this.flight_changed(&launch_id, window, cx);
+                    }
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Acts on a flight's new state: a ready launch opens its session.
+    fn flight_changed(&mut self, launch_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let ready = self.flights.iter().position(|flight| {
+            flight.launch_id == launch_id && matches!(flight.outcome, Outcome::Ready(_))
+        });
+        if let Some(index) = ready {
+            let flight = self.flights.remove(index);
+            if let Outcome::Ready(session) = flight.outcome {
+                self.finish_launch(
+                    &flight.app.id,
+                    flight.remember.as_ref(),
+                    session,
+                    window,
+                    cx,
+                );
+            }
+        } else if self
+            .flights
+            .iter()
+            .any(|flight| flight.launch_id == launch_id && flight.signed_out && !flight.in_flight())
+        {
+            // Reported as a Refresh reports a refused key.
+            self.status = Some(launch_progress::KEY_REFUSED.into());
+        }
         cx.notify();
     }
 
-    /// Keeps `selection` as the options `app_id` opens with next time (saved per server).
-    fn remember_launch(
+    /// A launch is ready: list its session (once), record it as recent, remember its
+    /// options, and open its window.
+    fn finish_launch(
         &mut self,
         app_id: &str,
-        selection: &LaunchSelection,
+        remember: Option<&LaunchSelection>,
+        session: RemoteSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.launched_at
+            .insert(session.session_id.clone(), Instant::now());
+        self.edit_library(|library| {
+            if !library
+                .sessions
+                .iter()
+                .any(|listed| listed.session_id == session.session_id)
+            {
+                library.sessions.insert(0, session.clone());
+            }
+            if session.home.starts_with("auto-") && !library.homes.contains(&session.home) {
+                library.homes.push(session.home.clone());
+            }
+        });
+        let memory = remember.map(LaunchSelection::memory);
+        let id = app_id.to_string();
+        // The recent and the remembered options go out as one queued write.
+        self.save_organization(
+            move |p| {
+                p.library.record_launch(&id);
+                if let Some(memory) = &memory {
+                    p.launch.insert(id.clone(), memory.clone());
+                }
+            },
+            cx,
+        );
+        self.open_session(session, window, cx);
+    }
+
+    fn flight_action(&mut self, launch_id: &str, action: FlightAction, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let known = self.session_ids();
+        let Some(flight) = self.flight_mut(launch_id) else {
+            return;
+        };
+        match action {
+            FlightAction::KeepWaiting => flight.keep_waiting(now),
+            FlightAction::Dismiss => self.flights.retain(|f| f.launch_id != launch_id),
+            FlightAction::Retry if flight.can_retry_same() => {
+                // The same id: the server joins the launch if it still runs.
+                flight.retry_same(now);
+                self.post_flight(launch_id, cx);
+            }
+            FlightAction::Retry if !flight.in_flight() => {
+                flight.retry_fresh(known, now, unix_now_f64());
+                let fresh = flight.launch_id.clone();
+                self.post_flight(&fresh, cx);
+                self.poll_flight(fresh, cx);
+            }
+            FlightAction::Retry => {}
+        }
+        cx.notify();
+    }
+
+    /// Queues one change to this server's preferences: applied to the Launcher's copy now
+    /// and through the write queue (one writer, re-read first, `ARCH-022`). Tiles rebuild.
+    fn save_organization(
+        &mut self,
+        change: impl Fn(&mut Preferences) + Send + Sync + 'static,
         cx: &mut Context<Self>,
     ) {
         let Some(api) = &self.api else {
             return;
         };
-        let memory = selection.memory();
-        self.preferences
-            .launch
-            .insert(app_id.to_string(), memory.clone());
-        let app_id = app_id.to_string();
-        // The queue re-reads first, so a session window's saved codec or input changes
-        // survive (ARCH-022).
-        let done = cx
-            .global::<WriteQueue>()
-            .preferences(api.server(), move |p| {
-                p.launch.insert(app_id.clone(), memory.clone());
-            });
+        organize(&mut self.preferences, &mut self.items, &change);
+        let done = cx.global::<WriteQueue>().preferences(api.server(), change);
+        // The in-memory change stays, so the Library doesn't flicker back; the next write
+        // that succeeds saves it.
         self.on_written(
             done,
-            |this, _| this.status = Some("Couldn’t save this app’s launch options.".into()),
+            |this, _| this.status = Some("Couldn’t save your Library changes.".into()),
             cx,
         );
+    }
+
+    fn set_favorite(&mut self, app_id: &str, favorite: bool, cx: &mut Context<Self>) {
+        let id = app_id.to_string();
+        self.save_organization(move |p| p.library.set_favorite(&id, favorite), cx);
+        if let Some((app, dialog, _)) = self.launch_dialog.as_mut() {
+            if app.id == app_id {
+                dialog.favorite = favorite;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Hides or shows an app. `toast`: from the tile menu, where the tile leaves (or comes
+    /// back) and a toast says where it went.
+    fn set_hidden(&mut self, app_id: &str, hidden: bool, toast: bool, cx: &mut Context<Self>) {
+        let id = app_id.to_string();
+        self.save_organization(move |p| p.library.set_hidden(&id, hidden), cx);
+        if let Some((app, dialog, _)) = self.launch_dialog.as_mut() {
+            if app.id == app_id {
+                dialog.hidden = hidden;
+            }
+        }
+        // Ids of apps the server no longer lists don't count: with no listed app hidden,
+        // the Hidden chip is gone, so the selection goes back to All.
+        let any_hidden = self.library.as_ref().is_some_and(|library| {
+            library
+                .apps
+                .iter()
+                .any(|app| self.preferences.library.is_hidden(&app.id))
+        });
+        if self.selected_filter == Filter::Hidden && !any_hidden {
+            self.selected_filter = Filter::All;
+        }
+        if toast {
+            if let Some(app) = self.find_app(app_id) {
+                let message = if hidden {
+                    format!("{} hidden. Find it under Hidden.", app.name)
+                } else {
+                    format!("{} is back in the Library.", app.name)
+                };
+                self.show_toast(message, cx);
+            }
+        }
+        cx.notify();
     }
 
     fn stop_session(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
@@ -1288,23 +1622,49 @@ impl Render for Launcher {
         let (apps, sessions) = self.items.get(|| {
             build_items(
                 library,
+                &self.preferences,
                 &self.app_icons,
                 &self.session_thumbnails,
                 unix_now(),
             )
         });
+        // Flights change on every poll, so they stay out of the cached items.
+        let now = Instant::now();
         let props = LibraryProps {
             app_name: APP_NAME.to_string(),
             server: server.clone(),
             apps,
             sessions,
+            favorites: self.preferences.library.favorites.clone(),
+            recent: self.preferences.library.recent.clone(),
+            launching: self
+                .flights
+                .iter()
+                .map(|flight| launching_item(flight, self.app_icons.get(&flight.app.id), now))
+                .collect(),
+            launching_apps: self
+                .flights
+                .iter()
+                .filter(|flight| flight.in_flight())
+                .map(|flight| {
+                    (
+                        flight.app.id.clone(),
+                        SharedString::from(flight.stage().tile_label()),
+                    )
+                })
+                .collect(),
             search_query: self.search_input.read(cx).value().to_string(),
             selected_filter: self.selected_filter.clone(),
             status: self.status.clone(),
             busy: self.busy.clone(),
         };
 
+        // Handlers capture only the entity and look the app or flight up by id (ARCH-026).
         let launcher_for_launch = cx.entity().clone();
+        let launcher_for_quick = cx.entity().clone();
+        let launcher_for_favorite = cx.entity().clone();
+        let launcher_for_hidden = cx.entity().clone();
+        let launcher_for_flight = cx.entity().clone();
         let launcher_for_resume = cx.entity().clone();
         let launcher_for_stop = cx.entity().clone();
         let launcher_for_filter = cx.entity().clone();
@@ -1345,6 +1705,26 @@ impl Render for Launcher {
                                 this.open_launch_dialog(app, window, cx);
                             }
                         });
+                    }),
+                    on_quick_launch: Rc::new(move |app_id, window, cx| {
+                        launcher_for_quick
+                            .update(cx, |this, cx| this.quick_launch(&app_id, window, cx));
+                    }),
+                    on_toggle_favorite: Rc::new(move |app_id, _, cx| {
+                        launcher_for_favorite.update(cx, |this, cx| {
+                            let favorite = !this.preferences.library.is_favorite(&app_id);
+                            this.set_favorite(&app_id, favorite, cx);
+                        });
+                    }),
+                    on_toggle_hidden: Rc::new(move |app_id, _, cx| {
+                        launcher_for_hidden.update(cx, |this, cx| {
+                            let hidden = !this.preferences.library.is_hidden(&app_id);
+                            this.set_hidden(&app_id, hidden, true, cx);
+                        });
+                    }),
+                    on_flight_action: Rc::new(move |launch_id, action, _, cx| {
+                        launcher_for_flight
+                            .update(cx, |this, cx| this.flight_action(&launch_id, action, cx));
                     }),
                     on_resume: Rc::new(move |session_id, window, cx| {
                         launcher_for_resume.update(cx, |this, cx| {
@@ -1549,10 +1929,12 @@ impl ItemCache {
 
 fn build_items(
     library: &Library,
+    preferences: &Preferences,
     icons: &HashMap<String, Arc<RenderImage>>,
     thumbnails: &HashMap<String, Arc<RenderImage>>,
     now: u64,
 ) -> LibraryItems {
+    let organization = &preferences.library;
     let apps = library
         .apps
         .iter()
@@ -1564,7 +1946,9 @@ fn build_items(
             } else {
                 vec![app.kind.clone()]
             },
-            recent: false,
+            favorite: organization.is_favorite(&app.id),
+            hidden: organization.is_hidden(&app.id),
+            remembered: preferences.launch.contains_key(&app.id),
             icon: icons.get(&app.id).cloned(),
         })
         .collect();
@@ -1594,6 +1978,136 @@ fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+fn unix_now_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
+}
+
+/// "Started 12m ago" → "started 12m ago", for use after a "·".
+fn lowercase_first(label: &str) -> String {
+    let mut chars = label.chars();
+    chars
+        .next()
+        .map(|first| first.to_lowercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// Applies a preference change to the Launcher's copy and marks the tiles for a rebuild,
+/// since favorites, hidden apps, and remembered options live in the cached items.
+fn organize(
+    preferences: &mut Preferences,
+    items: &mut ItemCache,
+    change: &dyn Fn(&mut Preferences),
+) {
+    change(preferences);
+    items.invalidate();
+}
+
+/// Leaving a server ends every launch: their poll and request tasks find no flight and
+/// end (the server still finishes each launch, which shows at the next sign-in).
+fn drop_flights(flights: &mut Vec<Flight>, launched_at: &mut HashMap<String, Instant>) {
+    flights.clear();
+    launched_at.clear();
+}
+
+/// Keeps sessions a launch added after a Refresh was requested: that Refresh's list
+/// predates them. Entries the server now lists, or older than the request (stopped since),
+/// are forgotten.
+fn merge_fresh_sessions(
+    fetched: &mut Vec<RemoteSession>,
+    shown: &[RemoteSession],
+    launched_at: &mut HashMap<String, Instant>,
+    requested: Instant,
+) {
+    let listed: HashSet<String> = fetched.iter().map(|s| s.session_id.clone()).collect();
+    for session in shown.iter().rev() {
+        let fresh = launched_at
+            .get(&session.session_id)
+            .is_some_and(|at| *at >= requested);
+        if fresh && !listed.contains(&session.session_id) {
+            fetched.insert(0, session.clone());
+        }
+    }
+    launched_at.retain(|id, at| *at >= requested && !listed.contains(id));
+}
+
+/// At most one launch per app is in flight; its tile and menu are disabled meanwhile.
+fn can_start(flights: &[Flight], app_id: &str) -> bool {
+    !flights
+        .iter()
+        .any(|flight| flight.app.id == app_id && flight.in_flight())
+}
+
+/// What a one-click launch does.
+#[derive(Debug, PartialEq)]
+enum QuickLaunch {
+    /// Launch with these remembered options (revalidated first).
+    Launch(LaunchMemory),
+    /// Nothing remembered: open the Launch Dialog.
+    Dialog,
+}
+
+fn quick_launch_plan(memory: Option<&LaunchMemory>) -> QuickLaunch {
+    memory.map_or(QuickLaunch::Dialog, |memory| {
+        QuickLaunch::Launch(memory.clone())
+    })
+}
+
+/// A flight as its card in Running sessions shows it.
+fn launching_item(flight: &Flight, icon: Option<&Arc<RenderImage>>, now: Instant) -> LaunchingItem {
+    let stages = flight
+        .checklist(now)
+        .into_iter()
+        .map(|row| StageRow {
+            label: row.stage.label().to_string(),
+            time: row
+                .seconds
+                .filter(|_| row.state != RowState::Pending)
+                .map(launch_progress::stage_time),
+            state: match row.state {
+                RowState::Done => StageState::Done,
+                RowState::Current => StageState::Current,
+                RowState::Pending => StageState::Pending,
+                RowState::Failed => StageState::Failed,
+                RowState::Stalled => StageState::Stalled,
+            },
+        })
+        .collect();
+    let notice = if let Some(body) = flight.failure_body() {
+        Some(LaunchNotice::Failed {
+            headline: format!("Couldn’t launch {}", flight.app.name),
+            body: body.to_string(),
+        })
+    } else if flight.stalled(now) {
+        let stage = flight.stage();
+        Some(LaunchNotice::Stalled {
+            message: stage.stall_message(flight.stage_minutes(now)),
+            hint: stage.stall_hint().map(str::to_string),
+            can_retry: flight.can_retry_same(),
+        })
+    } else {
+        None
+    };
+    let status = if flight.failure_body().is_some() {
+        "Launch failed".to_string()
+    } else {
+        format!(
+            "Launching · {}",
+            launch_progress::clock(flight.elapsed(now).as_secs())
+        )
+    };
+    LaunchingItem {
+        launch_id: flight.launch_id.clone(),
+        app_name: flight.app.name.clone(),
+        app_icon: icon.cloned(),
+        stages,
+        detail: Some(flight.detail_line()),
+        status,
+        notice,
+    }
 }
 
 #[cfg(test)]
@@ -1752,12 +2266,123 @@ mod tests {
         );
     }
 
+    fn test_flight(app_id: &str) -> Flight {
+        let app: RemoteApp =
+            serde_json::from_value(serde_json::json!({"id": app_id, "name": app_id})).unwrap();
+        Flight::new(
+            app,
+            LaunchParams::default(),
+            None,
+            HashSet::new(),
+            Instant::now(),
+            1_000.0,
+        )
+    }
+
+    #[test]
+    fn quick_launch_without_memory_opens_the_dialog() {
+        assert_eq!(quick_launch_plan(None), QuickLaunch::Dialog);
+        let memory = LaunchMemory {
+            gpu: Some("intel-gpu".into()),
+            ..LaunchMemory::default()
+        };
+        assert_eq!(
+            quick_launch_plan(Some(&memory)),
+            QuickLaunch::Launch(memory.clone())
+        );
+    }
+
+    #[test]
+    fn one_flight_per_app() {
+        let mut flights = vec![test_flight("zen")];
+        assert!(!can_start(&flights, "zen"));
+        assert!(can_start(&flights, "firefox"));
+        // A failed launch no longer holds the app.
+        flights[0].outcome = Outcome::Failed(None);
+        assert!(can_start(&flights, "zen"));
+    }
+
+    #[test]
+    fn leave_server_drops_flights() {
+        let mut flights = vec![test_flight("zen"), test_flight("firefox")];
+        let mut launched = HashMap::from([("s1".to_string(), Instant::now())]);
+        drop_flights(&mut flights, &mut launched);
+        assert!(flights.is_empty());
+        assert!(launched.is_empty());
+        // Nothing holds the apps any more.
+        assert!(can_start(&flights, "zen"));
+    }
+
+    fn listed(id: &str) -> RemoteSession {
+        serde_json::from_value(serde_json::json!({
+            "session_id": id, "app_id": "zen", "app_name": "Zen", "session_url": "/x/",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_refresh_from_before_a_launch_keeps_its_session() {
+        let requested = Instant::now();
+        let later = requested + Duration::from_secs(1);
+        let earlier = requested - Duration::from_secs(1);
+        let shown = [listed("new"), listed("stopped"), listed("old")];
+        let mut launched =
+            HashMap::from([("new".to_string(), later), ("stopped".to_string(), earlier)]);
+        let mut fetched = vec![listed("old")];
+        merge_fresh_sessions(&mut fetched, &shown, &mut launched, requested);
+        let ids: Vec<&str> = fetched.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["new", "old"]);
+        assert!(launched.contains_key("new") && !launched.contains_key("stopped"));
+        // Once the server lists it, it is forgotten.
+        let mut fetched = vec![listed("new"), listed("old")];
+        merge_fresh_sessions(&mut fetched, &shown, &mut launched, requested);
+        assert_eq!(fetched.len(), 2);
+        assert!(launched.is_empty());
+    }
+
+    #[test]
+    fn toggles_mark_items_dirty() {
+        let library = library_with_one_session();
+        let none = HashMap::new();
+        let mut prefs = Preferences::default();
+        let mut cache = ItemCache::default();
+        let (first, _) = cache.get(|| build_items(&library, &prefs, &none, &none, 1_000));
+        organize(&mut prefs, &mut cache, &|p: &mut Preferences| {
+            p.library.set_favorite("zen", true)
+        });
+        assert!(prefs.library.is_favorite("zen"));
+        let (rebuilt, _) = cache.get(|| build_items(&library, &prefs, &none, &none, 1_000));
+        assert!(!Rc::ptr_eq(&first, &rebuilt));
+    }
+
+    #[test]
+    fn launching_cards_show_stages_and_the_stall_notice() {
+        let flight = test_flight("firefox");
+        let item = launching_item(&flight, None, Instant::now() + Duration::from_secs(16));
+        assert_eq!(item.status, "Launching · 0:16");
+        assert_eq!(item.stages[0].state, StageState::Current);
+        assert_eq!(item.stages[0].time.as_deref(), Some("16 s"));
+        assert_eq!(item.stages.last().unwrap().time, None);
+        assert_eq!(item.detail.as_deref(), Some("Sending the launch request"));
+        assert!(item.notice.is_none());
+        let stalled = launching_item(&flight, None, Instant::now() + Duration::from_secs(200));
+        assert!(matches!(
+            stalled.notice,
+            Some(LaunchNotice::Stalled {
+                can_retry: false,
+                ..
+            })
+        ));
+        assert_eq!(lowercase_first("Started 12m ago"), "started 12m ago");
+    }
+
     #[test]
     fn library_items_rebuild_only_when_dirty() {
         let library = library_with_one_session();
         let none = HashMap::new();
+        let prefs = Preferences::default();
         let mut cache = ItemCache::default();
-        let build = || build_items(&library, &none, &none, 1_000);
+        let build = || build_items(&library, &prefs, &none, &none, 1_000);
         let (_, first) = cache.get(build);
         let (_, again) = cache.get(build);
         assert!(Rc::ptr_eq(&first, &again));

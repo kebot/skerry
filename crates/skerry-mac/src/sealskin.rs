@@ -233,7 +233,7 @@ fn write_saved_key(path: &Path, raw: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RemoteApp {
     pub id: String,
     pub name: String,
@@ -339,7 +339,7 @@ pub fn has_storage(home: &str) -> bool {
     !home.is_empty() && home != "cleanroom" && valid_path_segment(home)
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RemoteSession {
     pub session_id: String,
     #[serde(default)]
@@ -352,10 +352,16 @@ pub struct RemoteSession {
     pub home: String,
     #[serde(default)]
     pub gpu: bool,
+    /// A collaborative (room) session; reuse never mixes it with a solo one (`ARCH-027`).
+    #[serde(default)]
+    pub is_collaboration: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct LaunchParams {
+    /// The id this launch reports progress under, also sent as `X-Idempotency-Key` so a
+    /// resend joins the attempt already running instead of starting a second container.
+    pub launch_id: Option<String>,
     /// A named home, `cleanroom`, or `None` (only a meta app's own Auto home).
     pub home_name: Option<String>,
     /// Create `home_name` first when the server doesn't have it yet (the Auto home).
@@ -372,6 +378,7 @@ pub struct LaunchParams {
 impl Default for LaunchParams {
     fn default() -> Self {
         Self {
+            launch_id: None,
             home_name: None,
             create_home: false,
             language: None,
@@ -391,6 +398,7 @@ impl LaunchParams {
         let mut body = serde_json::Map::new();
         body.insert("application_id".into(), json!(app_id));
         let optional = [
+            ("launch_id", &self.launch_id),
             ("home_name", &self.home_name),
             ("language", &self.language),
             ("timezone", &self.timezone),
@@ -433,6 +441,99 @@ struct Launched {
 #[derive(Deserialize)]
 struct ServerVersion {
     version: String,
+}
+
+/// One launch's progress, as `GET /companion/api/launch/progress/<id>` reports it.
+/// `session_url` and `session_id` come with `ready`, `error` with `failed`.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct LaunchProgress {
+    pub stage: String,
+    #[serde(default)]
+    pub detail: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub elapsed: f64,
+    #[serde(default)]
+    pub session_url: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// What the progress route said about a launch.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProgressAnswer {
+    Known(LaunchProgress),
+    /// 404: the server isn't following this id (not seen yet, pruned, or never followed).
+    Unknown,
+    /// 401: the key no longer works.
+    SignedOut,
+}
+
+/// Why a launch request ended without a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchError {
+    /// The request may not have reached the server, or its answer was lost: a connect,
+    /// reset, or timeout, or a gateway's 502/503/504 without SealSkin's JSON `detail`. The
+    /// launch may still be running; progress decides.
+    Network(String),
+    /// SealSkin answered and refused.
+    Server(String),
+}
+
+/// The ceiling on one launch request: the server's 900 s pending limit plus a margin. A
+/// launch that outlives it is still followed through progress.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(960);
+
+/// A launch id is a UUID (8-4-4-4-12 hex), as the server's progress route expects.
+pub fn valid_launch_id(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .zip([8, 4, 4, 4, 12])
+            .all(|(group, len)| group.len() == len && group.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The session a launch of `app` with `params` started, as the Library lists it until the
+/// next Refresh brings the server's own record.
+pub fn launched_session(
+    app: &RemoteApp,
+    params: &LaunchParams,
+    session_id: String,
+    session_url: String,
+) -> RemoteSession {
+    RemoteSession {
+        session_id,
+        app_id: app.id.clone(),
+        app_name: app.name.clone(),
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |elapsed| elapsed.as_secs_f64()),
+        session_url,
+        // The server lists a cleanroom session with no home.
+        home: params
+            .home_name
+            .clone()
+            .filter(|home| home != "cleanroom")
+            .unwrap_or_default(),
+        gpu: params.selected_gpu.is_some(),
+        is_collaboration: params.launch_in_room_mode,
+    }
+}
+
+/// The session a launch reached `ready` with, when its own request was lost.
+pub fn session_from_progress(
+    app: &RemoteApp,
+    params: &LaunchParams,
+    progress: &LaunchProgress,
+) -> Option<RemoteSession> {
+    if progress.stage != "ready" {
+        return None;
+    }
+    let session_id = progress.session_id.clone()?;
+    let session_url = progress.session_url.clone()?;
+    valid_path_segment(&session_id).then(|| launched_session(app, params, session_id, session_url))
 }
 
 #[derive(Deserialize)]
@@ -627,33 +728,69 @@ impl SealSkinClient {
         ))
     }
 
+    /// Launches `app`. `on_send` runs just before the launch request goes out (after any
+    /// Auto home is created), so a follower counts "unseen" time from then.
+    ///
+    /// With a `launch_id`, the request carries it as `X-Idempotency-Key` too: SealSkin runs
+    /// a keyed request at most once per credential and key for 600 s, so a resend joins
+    /// the first attempt. The key is scoped by the request's cookie and authorization, so
+    /// the authed client must never keep a cookie store: a cookie that changed between two
+    /// attempts would make them different requests.
     pub async fn launch_with_options(
         &self,
         app: RemoteApp,
         params: LaunchParams,
-    ) -> Result<RemoteSession, String> {
+        on_send: impl FnOnce() + Send,
+    ) -> Result<RemoteSession, LaunchError> {
         if let (true, Some(home_name)) = (params.create_home, &params.home_name) {
-            self.create_home_directory(home_name).await?;
+            self.create_home_directory(home_name)
+                .await
+                .map_err(LaunchError::Server)?;
         }
-        let response: Launched = send(
-            self.request(Method::POST, "/companion/api/launch/simple")
-                .timeout(Duration::from_secs(180))
-                .json(&params.body(&app.id)),
-        )
-        .await?;
-        Ok(RemoteSession {
-            session_id: response.session_id,
-            app_id: app.id,
-            app_name: app.name,
-            created_at: 0.0,
-            session_url: response.session_url,
-            // The server lists a cleanroom session with no home.
-            home: params
-                .home_name
-                .filter(|home| home != "cleanroom")
-                .unwrap_or_default(),
-            gpu: params.selected_gpu.is_some(),
-        })
+        let mut request = self
+            .request(Method::POST, "/companion/api/launch/simple")
+            .timeout(LAUNCH_TIMEOUT)
+            .json(&params.body(&app.id));
+        if let Some(launch_id) = &params.launch_id {
+            request = request.header("X-Idempotency-Key", launch_id);
+        }
+        on_send();
+        let response: Launched = send_launch(request).await?;
+        Ok(launched_session(
+            &app,
+            &params,
+            response.session_id,
+            response.session_url,
+        ))
+    }
+
+    /// Where launch `launch_id` has got to (`GET /companion/api/launch/progress/<id>`).
+    pub async fn launch_progress(&self, launch_id: &str) -> Result<ProgressAnswer, String> {
+        if !valid_launch_id(launch_id) {
+            return Err("Invalid launch identifier.".into());
+        }
+        let path = format!("/companion/api/launch/progress/{launch_id}");
+        let response = self
+            .request(Method::GET, &path)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| "Couldn’t reach the SealSkin server.".to_string())?;
+        match response.status() {
+            StatusCode::NOT_FOUND => Ok(ProgressAnswer::Unknown),
+            StatusCode::UNAUTHORIZED => Ok(ProgressAnswer::SignedOut),
+            status if status.is_success() => response
+                .json()
+                .await
+                .map(ProgressAnswer::Known)
+                .map_err(|_| "The server returned an unexpected response.".into()),
+            status => Err(format!("SealSkin returned HTTP {}.", status.as_u16())),
+        }
+    }
+
+    /// The user's running sessions (`GET /companion/api/sessions`).
+    pub async fn sessions(&self) -> Result<Vec<RemoteSession>, String> {
+        send(self.request(Method::GET, "/companion/api/sessions")).await
     }
 
     pub async fn stop_session(&self, session_id: &str) -> Result<(), String> {
@@ -876,6 +1013,70 @@ fn unsupported_version(found: Option<&str>) -> String {
     }
 }
 
+/// Sends a launch request, telling a lost request (`Network`) from a refusal (`Server`).
+async fn send_launch<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, LaunchError> {
+    let response = request.send().await.map_err(|error| {
+        LaunchError::Network(
+            if error.is_timeout() {
+                "The server took too long to answer the launch request."
+            } else {
+                "The launch request didn’t reach the server."
+            }
+            .into(),
+        )
+    })?;
+    let status = response.status();
+    if status.is_success() {
+        return response
+            .json()
+            .await
+            .map_err(|_| LaunchError::Network("The server’s answer was cut off.".into()));
+    }
+    let detail = response
+        .json::<Failure>()
+        .await
+        .ok()
+        .map(|failure| failure.detail);
+    match (status.as_u16(), detail) {
+        // A proxy in front of SealSkin gave up on the long request; the launch goes on.
+        (502..=504, None) => Err(LaunchError::Network(format!(
+            "A gateway returned HTTP {} for the launch request.",
+            status.as_u16()
+        ))),
+        (401 | 403, detail) => Err(LaunchError::Server(failure_message(
+            status,
+            detail.as_deref(),
+        ))),
+        (_, Some(detail)) if !detail.trim().is_empty() => Err(LaunchError::Server(detail)),
+        _ => Err(LaunchError::Server(format!(
+            "SealSkin returned HTTP {}.",
+            status.as_u16()
+        ))),
+    }
+}
+
+/// The message for a failed request's status and SealSkin `detail`.
+fn failure_message(status: StatusCode, detail: Option<&str>) -> String {
+    let error = match (status, detail) {
+        (StatusCode::UNAUTHORIZED, Some("client")) => {
+            "The account must allow the Other client type for application keys."
+        }
+        (StatusCode::UNAUTHORIZED, Some("expired")) => {
+            "This application key has expired. Create a new key in SealSkin."
+        }
+        (StatusCode::UNAUTHORIZED, Some("disabled")) => {
+            "Application keys are disabled for this account."
+        }
+        (StatusCode::UNAUTHORIZED, Some("dormant")) => {
+            "This key is dormant. Sign in to the SealSkin web app before retrying."
+        }
+        (StatusCode::UNAUTHORIZED, _) => "The server didn’t accept this application key.",
+        (StatusCode::FORBIDDEN, _) => "This account doesn’t have permission for that action.",
+        _ => return format!("SealSkin returned HTTP {}.", status.as_u16()),
+    };
+    error.into()
+}
+
 async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, String> {
     let response = request.send().await.map_err(|error| {
         if error.is_timeout() {
@@ -896,24 +1097,7 @@ async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, String>
         .await
         .ok()
         .map(|failure| failure.detail);
-    let error = match (status, detail.as_deref()) {
-        (StatusCode::UNAUTHORIZED, Some("client")) => {
-            "The account must allow the Other client type for application keys."
-        }
-        (StatusCode::UNAUTHORIZED, Some("expired")) => {
-            "This application key has expired. Create a new key in SealSkin."
-        }
-        (StatusCode::UNAUTHORIZED, Some("disabled")) => {
-            "Application keys are disabled for this account."
-        }
-        (StatusCode::UNAUTHORIZED, Some("dormant")) => {
-            "This key is dormant. Sign in to the SealSkin web app before retrying."
-        }
-        (StatusCode::UNAUTHORIZED, _) => "The server didn’t accept this application key.",
-        (StatusCode::FORBIDDEN, _) => "This account doesn’t have permission for that action.",
-        _ => return Err(format!("SealSkin returned HTTP {}.", status.as_u16())),
-    };
-    Err(error.into())
+    Err(failure_message(status, detail.as_deref()))
 }
 
 #[cfg(test)]
@@ -921,14 +1105,25 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
+    const NOT_FOUND: &str =
+        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
     /// Answers `count` HTTP requests with 404 and returns each raw request, lowercased.
     async fn capture_requests(count: usize) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
+        answer_requests(vec![NOT_FOUND.to_string(); count]).await
+    }
+
+    /// Answers one request per response, in order, and returns each raw request (its
+    /// head), lowercased.
+    async fn answer_requests(
+        responses: Vec<String>,
+    ) -> (Url, tokio::task::JoinHandle<Vec<String>>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let task = tokio::spawn(async move {
             let mut seen = Vec::new();
-            for _ in 0..count {
+            for response in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut chunk = [0u8; 1024];
@@ -939,12 +1134,7 @@ mod tests {
                     }
                     request.extend_from_slice(&chunk[..read]);
                 }
-                stream
-                    .write_all(
-                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-                    )
-                    .await
-                    .unwrap();
+                stream.write_all(response.as_bytes()).await.unwrap();
                 seen.push(String::from_utf8_lossy(&request).to_lowercase());
             }
             seen
@@ -990,6 +1180,215 @@ mod tests {
             request.contains("authorization: bearer ssk_id_secret"),
             "{request}"
         );
+    }
+
+    fn reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn firefox() -> RemoteApp {
+        serde_json::from_value(json!({"id": "firefox", "name": "Firefox"})).unwrap()
+    }
+
+    const LAUNCH_ID: &str = "0b9c3e2a-4f1d-4c8e-9a7b-2d6f5e1c3a90";
+
+    #[tokio::test]
+    async fn launch_request_sends_idempotency_key_equal_to_launch_id() {
+        let (base, requests) = capture_requests(1).await;
+        let params = LaunchParams {
+            launch_id: Some(LAUNCH_ID.into()),
+            home_name: Some("cleanroom".into()),
+            ..LaunchParams::default()
+        };
+        let mut sent = false;
+        let result = test_client(base)
+            .launch_with_options(firefox(), params, || sent = true)
+            .await;
+        assert!(matches!(result, Err(LaunchError::Server(_))), "{result:?}");
+        assert!(sent);
+        let request = requests.await.unwrap().remove(0);
+        assert!(request.starts_with("post /companion/api/launch/simple "));
+        assert!(
+            request.contains(&format!("x-idempotency-key: {LAUNCH_ID}")),
+            "{request}"
+        );
+    }
+
+    #[test]
+    fn launch_body_carries_launch_id_when_following_progress() {
+        let params = LaunchParams {
+            launch_id: Some(LAUNCH_ID.into()),
+            ..LaunchParams::default()
+        };
+        assert_eq!(params.body("firefox")["launch_id"], json!(LAUNCH_ID));
+        assert!(LaunchParams::default()
+            .body("firefox")
+            .get("launch_id")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn progress_401_is_signed_out_and_404_is_unknown() {
+        let ready = r#"{"stage":"ready","detail":{},"elapsed":12.5,"session_url":"/s/abc/","session_id":"abc"}"#;
+        let (base, requests) = answer_requests(vec![
+            reply("401 Unauthorized", r#"{"detail":"expired"}"#),
+            NOT_FOUND.to_string(),
+            reply("200 OK", ready),
+        ])
+        .await;
+        let client = test_client(base);
+        assert_eq!(
+            client.launch_progress(LAUNCH_ID).await,
+            Ok(ProgressAnswer::SignedOut)
+        );
+        assert_eq!(
+            client.launch_progress(LAUNCH_ID).await,
+            Ok(ProgressAnswer::Unknown)
+        );
+        let Ok(ProgressAnswer::Known(progress)) = client.launch_progress(LAUNCH_ID).await else {
+            panic!("no progress");
+        };
+        assert_eq!(progress.stage, "ready");
+        assert_eq!(progress.session_id.as_deref(), Some("abc"));
+        let requests = requests.await.unwrap();
+        assert!(
+            requests[0].starts_with(&format!("get /companion/api/launch/progress/{LAUNCH_ID} "))
+        );
+        assert!(requests[0].contains("authorization: bearer ssk_id_secret"));
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_count_as_a_lost_request() {
+        let (base, _requests) = answer_requests(vec![
+            reply("504 Gateway Timeout", "<html>timeout</html>"),
+            reply("502 Bad Gateway", ""),
+            reply(
+                "503 Service Unavailable",
+                r#"{"detail":"Launch capacity reached."}"#,
+            ),
+            reply(
+                "400 Bad Request",
+                r#"{"detail":"No GPU is free on any node."}"#,
+            ),
+        ])
+        .await;
+        let client = test_client(base);
+        let launch = || {
+            client.launch_with_options(
+                firefox(),
+                LaunchParams {
+                    launch_id: Some(LAUNCH_ID.into()),
+                    ..LaunchParams::default()
+                },
+                || {},
+            )
+        };
+        assert!(matches!(launch().await, Err(LaunchError::Network(_))));
+        assert!(matches!(launch().await, Err(LaunchError::Network(_))));
+        assert_eq!(
+            launch().await.err(),
+            Some(LaunchError::Server("Launch capacity reached.".into()))
+        );
+        assert_eq!(
+            launch().await.err(),
+            Some(LaunchError::Server("No GPU is free on any node.".into()))
+        );
+    }
+
+    #[test]
+    fn decodes_launch_progress_stages_ready_and_failed() {
+        let forwarding: LaunchProgress = serde_json::from_value(
+            json!({"stage": "forwarding", "detail": {"node": "n2"}, "elapsed": 1.2}),
+        )
+        .unwrap();
+        assert_eq!(forwarding.detail["node"], json!("n2"));
+        assert_eq!(forwarding.session_url, None);
+        let failed: LaunchProgress = serde_json::from_value(
+            json!({"stage": "failed", "detail": {}, "elapsed": 41.0, "error": "No GPU"}),
+        )
+        .unwrap();
+        assert_eq!(failed.error.as_deref(), Some("No GPU"));
+        let minimal: LaunchProgress = serde_json::from_value(json!({"stage": "placing"})).unwrap();
+        assert!(minimal.detail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_progress_refuses_ids_that_are_not_uuids() {
+        let client = test_client(Url::parse("http://127.0.0.1:9/").unwrap());
+        for id in [
+            "",
+            "abc",
+            "../admin",
+            "0b9c3e2a-4f1d-4c8e-9a7b-2d6f5e1c3a9z",
+        ] {
+            assert!(!valid_launch_id(id), "{id}");
+            assert!(client.launch_progress(id).await.is_err());
+        }
+        assert!(valid_launch_id(LAUNCH_ID));
+        assert!(valid_launch_id(&uuid::Uuid::new_v4().to_string()));
+    }
+
+    #[test]
+    fn session_from_progress_matches_what_the_post_would_return() {
+        let params = LaunchParams {
+            home_name: Some("auto-firefox".into()),
+            selected_gpu: Some("intel-gpu".into()),
+            launch_in_room_mode: true,
+            ..LaunchParams::default()
+        };
+        let progress = LaunchProgress {
+            stage: "ready".into(),
+            session_id: Some("abc".into()),
+            session_url: Some("/s/abc/".into()),
+            ..LaunchProgress::default()
+        };
+        let from_progress = session_from_progress(&firefox(), &params, &progress).unwrap();
+        let posted = launched_session(&firefox(), &params, "abc".into(), "/s/abc/".into());
+        assert_eq!(from_progress.session_id, posted.session_id);
+        assert_eq!(from_progress.session_url, posted.session_url);
+        assert_eq!(from_progress.home, "auto-firefox");
+        assert!(from_progress.gpu && from_progress.is_collaboration);
+        let waiting = LaunchProgress {
+            stage: "waiting".into(),
+            ..progress
+        };
+        assert!(session_from_progress(&firefox(), &params, &waiting).is_none());
+    }
+
+    #[test]
+    fn launched_session_has_a_current_created_at() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let session = launched_session(
+            &firefox(),
+            &LaunchParams {
+                home_name: Some("cleanroom".into()),
+                ..LaunchParams::default()
+            },
+            "abc".into(),
+            "/s/abc/".into(),
+        );
+        assert!((session.created_at - now).abs() < 5.0);
+        assert_eq!(session.home, "");
+    }
+
+    #[test]
+    fn sessions_decode_is_collaboration_with_default_false() {
+        let solo: RemoteSession = serde_json::from_value(json!({
+            "session_id": "a", "app_name": "Zen", "session_url": "/a/"
+        }))
+        .unwrap();
+        assert!(!solo.is_collaboration);
+        let room: RemoteSession = serde_json::from_value(json!({
+            "session_id": "b", "app_name": "Zen", "session_url": "/b/", "is_collaboration": true
+        }))
+        .unwrap();
+        assert!(room.is_collaboration);
     }
 
     #[test]
@@ -1188,6 +1587,7 @@ mod tests {
             json!({"application_id": "zen", "wayland_mode": true, "launch_in_room_mode": false})
         );
         let params = LaunchParams {
+            launch_id: None,
             home_name: Some("auto-zen".into()),
             create_home: true,
             language: Some("de_DE.UTF-8".into()),

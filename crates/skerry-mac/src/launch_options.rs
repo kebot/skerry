@@ -3,7 +3,7 @@
 //! which fields show, what each offers, what is pre-selected, what a launch sends, and what
 //! Copy link writes. Everything here is pure so it can be tested without a server or a window.
 
-use crate::sealskin::{GpuInfo, LaunchParams, RemoteApp, ServerStatus};
+use crate::sealskin::{GpuInfo, LaunchParams, RemoteApp, RemoteSession, ServerStatus};
 use serde::{Deserialize, Serialize};
 use skerry_ui::launch_dialog::LaunchOption;
 
@@ -462,18 +462,15 @@ impl LaunchContext {
         selection: &LaunchSelection,
         timezone: Option<String>,
     ) -> LaunchParams {
-        let (home_name, create_home) = if !self.has_storage(app) {
-            (CLEANROOM.to_string(), false)
-        } else if selection.home_dir == AUTO {
-            let name = auto_home_name(&app.name);
-            let create = !app.is_meta_app && !self.homes.contains(&name);
-            (name, create)
-        } else {
-            (selection.home_dir.clone(), false)
-        };
+        let home_name = self.resolved_home(app, selection);
+        let create_home = self.has_storage(app)
+            && selection.home_dir == AUTO
+            && !app.is_meta_app
+            && !self.homes.contains(&home_name);
         let chosen = |value: &str| (!value.is_empty()).then(|| value.to_string());
         let vpn = chosen(&selection.vpn);
         LaunchParams {
+            launch_id: None,
             home_name: Some(home_name),
             create_home,
             language: Some(selection.language.clone()),
@@ -484,6 +481,50 @@ impl LaunchContext {
             wayland_mode: selection.wayland,
             launch_in_room_mode: selection.room,
         }
+    }
+
+    /// The storage a launch with `selection` uses: the app's Auto home (`auto-<app>`),
+    /// `cleanroom`, or a named home.
+    pub fn resolved_home(&self, app: &RemoteApp, selection: &LaunchSelection) -> String {
+        if !self.has_storage(app) || selection.home_dir.is_empty() {
+            CLEANROOM.to_string()
+        } else if selection.home_dir == AUTO {
+            auto_home_name(&app.name)
+        } else {
+            selection.home_dir.clone()
+        }
+    }
+
+    /// The running session a launch with `selection` would duplicate, as SealSkin's web app
+    /// address page decides (`open.js`): the same app, the same storage, and the same room
+    /// flag. GPU, VPN, language, and Wayland only describe how a new session starts. The
+    /// oldest match wins.
+    pub fn matching_session<'a>(
+        &self,
+        app: &RemoteApp,
+        selection: &LaunchSelection,
+        sessions: &'a [RemoteSession],
+    ) -> Option<&'a RemoteSession> {
+        let home = self.resolved_home(app, selection);
+        let same_storage = |session_home: &str| {
+            if home == CLEANROOM {
+                session_home.is_empty() || session_home == CLEANROOM
+            } else {
+                session_home == home
+            }
+        };
+        sessions
+            .iter()
+            .filter(|session| {
+                session.app_id == app.id
+                    && same_storage(&session.home)
+                    && session.is_collaboration == selection.room
+            })
+            .min_by(|a, b| {
+                a.created_at
+                    .total_cmp(&b.created_at)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
     }
 
     /// The query Copy link adds to `/app/<id>/`, as the web launcher writes it: only what
@@ -810,6 +851,128 @@ mod tests {
         assert_eq!(selection.gpu, "");
         assert_eq!(selection.vpn_endpoint, "de");
         assert_eq!(selection.language, "de_DE.UTF-8");
+    }
+
+    fn session(id: &str, app: &str, home: &str, room: bool, created_at: f64) -> RemoteSession {
+        serde_json::from_value(serde_json::json!({
+            "session_id": id,
+            "app_id": app,
+            "app_name": app,
+            "session_url": format!("/{id}/"),
+            "home": home,
+            "is_collaboration": room,
+            "created_at": created_at,
+        }))
+        .unwrap()
+    }
+
+    fn select(home: &str, room: bool) -> LaunchSelection {
+        LaunchSelection {
+            home_dir: home.into(),
+            gpu: String::new(),
+            vpn: String::new(),
+            vpn_endpoint: String::new(),
+            language: DEFAULT_LANGUAGE.into(),
+            wayland: true,
+            room,
+        }
+    }
+
+    #[test]
+    fn resolved_home_is_auto_name_cleanroom_or_named_home() {
+        let ctx = context();
+        let code = app("VS Code", false, true);
+        assert_eq!(
+            ctx.resolved_home(&code, &select("auto", false)),
+            "auto-vs-code"
+        );
+        assert_eq!(
+            ctx.resolved_home(&code, &select("cleanroom", false)),
+            "cleanroom"
+        );
+        assert_eq!(ctx.resolved_home(&code, &select("work", false)), "work");
+    }
+
+    #[test]
+    fn resolved_home_without_storage_is_cleanroom() {
+        let mut ctx = context();
+        let zen = app("Zen", false, true);
+        assert_eq!(ctx.resolved_home(&zen, &select("", false)), "cleanroom");
+        ctx.status.settings.persistent_storage = false;
+        assert_eq!(ctx.resolved_home(&zen, &select("auto", false)), "cleanroom");
+    }
+
+    #[test]
+    fn matching_session_requires_same_app_storage_and_room() {
+        let ctx = context();
+        let zen = app("Zen", false, true);
+        let sessions = [
+            session("s1", "zen", "work", false, 10.0),
+            session("s2", "zen", "auto-zen", false, 20.0),
+        ];
+        let found = ctx.matching_session(&zen, &select("auto", false), &sessions);
+        assert_eq!(found.map(|s| s.session_id.as_str()), Some("s2"));
+        let found = ctx.matching_session(&zen, &select("work", false), &sessions);
+        assert_eq!(found.map(|s| s.session_id.as_str()), Some("s1"));
+        assert!(ctx
+            .matching_session(&zen, &select("cleanroom", false), &sessions)
+            .is_none());
+    }
+
+    #[test]
+    fn matching_session_skips_other_apps_and_room_mismatch() {
+        let ctx = context();
+        let zen = app("Zen", false, true);
+        let sessions = [
+            session("s1", "firefox", "auto-zen", false, 10.0),
+            session("s2", "zen", "auto-zen", true, 20.0),
+        ];
+        assert!(ctx
+            .matching_session(&zen, &select("auto", false), &sessions)
+            .is_none());
+        let found = ctx.matching_session(&zen, &select("auto", true), &sessions);
+        assert_eq!(found.map(|s| s.session_id.as_str()), Some("s2"));
+    }
+
+    #[test]
+    fn matching_session_ignores_gpu_language_and_wayland() {
+        let ctx = context();
+        let zen = app("Zen", false, true);
+        let sessions = [session("s1", "zen", "auto-zen", false, 10.0)];
+        let selection = LaunchSelection {
+            gpu: "intel-gpu".into(),
+            language: "ja_JP.UTF-8".into(),
+            wayland: false,
+            vpn: "mullvad".into(),
+            vpn_endpoint: "nl".into(),
+            ..select("auto", false)
+        };
+        assert!(ctx.matching_session(&zen, &selection, &sessions).is_some());
+    }
+
+    #[test]
+    fn matching_session_prefers_the_oldest() {
+        let ctx = context();
+        let zen = app("Zen", false, true);
+        let sessions = [
+            session("s3", "zen", "auto-zen", false, 30.0),
+            session("s2", "zen", "auto-zen", false, 10.0),
+            session("s1", "zen", "auto-zen", false, 10.0),
+        ];
+        let found = ctx.matching_session(&zen, &select("auto", false), &sessions);
+        assert_eq!(found.map(|s| s.session_id.as_str()), Some("s1"));
+    }
+
+    #[test]
+    fn cleanroom_matches_a_session_without_home() {
+        let ctx = context();
+        let zen = app("Zen", false, true);
+        let sessions = [
+            session("s1", "zen", "", false, 10.0),
+            session("s2", "zen", "cleanroom", false, 5.0),
+        ];
+        let found = ctx.matching_session(&zen, &select("cleanroom", false), &sessions);
+        assert_eq!(found.map(|s| s.session_id.as_str()), Some("s2"));
     }
 
     #[test]
