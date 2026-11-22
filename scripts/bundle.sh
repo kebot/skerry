@@ -225,5 +225,5 @@ echo "  $DMG"
 echo "  $ZIP"
 echo "  $SUMS"
 if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
-  echo "note: ad-hoc signed build; Gatekeeper users should install via Homebrew (--no-quarantine) or run: xattr -cr /Applications/${APP_NAME}.app"
+  echo "note: ad-hoc signed build; Gatekeeper users should install via Homebrew (brew tap kebot/skerry https://github.com/kebot/skerry && brew install --cask kebot/skerry/skerry) or run: xattr -cr /Applications/${APP_NAME}.app"
 fi
