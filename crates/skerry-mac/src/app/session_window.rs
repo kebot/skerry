@@ -1183,19 +1183,27 @@ impl SessionWindow {
         }
         let window = self.window;
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(crate::apps::PROBE_TIMEOUT)
-                .await;
-            let _ = window.update(cx, |_, _, cx| {
-                let _ = this.update(cx, |this, cx| {
-                    if this.apps_probe.on_timeout(generation, Instant::now()) {
-                        if let Some((_, apps)) = &this.apps_window {
-                            apps.update(cx, |apps, cx| apps.set_too_old(true, cx));
+            let mut wait = crate::apps::PROBE_TIMEOUT;
+            loop {
+                cx.background_executor().timer(wait).await;
+                // A timer that fires early waits out the rest instead of giving up.
+                let rest = window.update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        let now = Instant::now();
+                        if this.apps_probe.on_timeout(generation, now) {
+                            if let Some((_, apps)) = &this.apps_window {
+                                apps.update(cx, |apps, cx| apps.set_too_old(true, cx));
+                            }
+                            cx.notify();
                         }
-                        cx.notify();
-                    }
+                        this.apps_probe.remaining(generation, now)
+                    })
                 });
-            });
+                match rest {
+                    Ok(Ok(Some(rest))) => wait = rest,
+                    _ => break,
+                }
+            }
         })
         .detach();
     }

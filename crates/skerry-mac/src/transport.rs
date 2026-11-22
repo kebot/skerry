@@ -385,9 +385,10 @@ fn system_action(text: &str) -> Option<String> {
 fn system_event(action: &str) -> Option<SessionEvent> {
     match action.split_once(',').map_or(action, |(kind, _)| kind) {
         "rumble" => crate::gamepad::Rumble::parse(action).map(SessionEvent::Rumble),
-        "apps_state" | "apps_job" | "command_error" => {
-            crate::apps::parse_action(action).map(SessionEvent::Apps)
-        }
+        "apps_state" | "apps_job" | "command_error" => Some(SessionEvent::Apps(
+            // Unreadable JSON still shows the server speaks the apps protocol.
+            crate::apps::parse_action(action).unwrap_or(crate::apps::Event::Unreadable),
+        )),
         _ => None,
     }
 }
@@ -1845,8 +1846,11 @@ mod tests {
             system_frame(&frame("rumble,0,1,1,10")),
             Some(Some(SessionEvent::Rumble(_)))
         ));
-        // Malformed apps JSON and unknown actions are consumed, never parsed further.
-        assert!(matches!(system_frame(&frame("apps_job,{bad")), Some(None)));
+        // Malformed apps JSON still counts as an answer; unknown actions are consumed.
+        assert!(matches!(
+            system_frame(&frame("apps_job,{bad")),
+            Some(Some(SessionEvent::Apps(crate::apps::Event::Unreadable)))
+        ));
         assert!(matches!(system_frame(&frame("apps_other,{}")), Some(None)));
     }
 

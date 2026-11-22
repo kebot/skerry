@@ -426,6 +426,7 @@ impl AppsWindow {
             Event::Job(job) => {
                 self.board.apply_job(&job);
             }
+            Event::Unreadable => return,
             Event::CommandError(text) => {
                 if let Some((app, at)) = &self.last_launch {
                     if apps::launch_error_applies(Some(*at), Instant::now()) {

@@ -263,6 +263,21 @@ impl Probe {
         }
     }
 
+    /// How long the probe for `generation` still has to wait, if it is still waiting: a timer
+    /// that fires early re-arms for the rest rather than leaving the probe stuck.
+    pub fn remaining(&self, generation: u64, now: Instant) -> Option<Duration> {
+        match self.support {
+            Support::Probing {
+                since,
+                generation: probing,
+            } if probing == generation => {
+                let waited = now.saturating_duration_since(since);
+                (waited < PROBE_TIMEOUT).then(|| PROBE_TIMEOUT - waited)
+            }
+            _ => None,
+        }
+    }
+
     /// The stream ended: the next one probes again.
     pub fn reset(&mut self) {
         self.support = Support::Unknown;
@@ -536,6 +551,9 @@ pub enum Event {
     State(Value),
     Job(Value),
     CommandError(String),
+    /// An `apps_state` or `apps_job` whose JSON didn't parse: nothing to show, but the
+    /// server does speak the apps protocol.
+    Unreadable,
 }
 
 /// The apps event in a `system,` action (`apps_state,{…}`, `apps_job,{…}`,
@@ -1112,18 +1130,23 @@ fn css_server_classes(stylesheet: &str, servers: &HashMap<&str, ()>) -> (HashSet
             continue;
         }
         for selector in selectors.split(',') {
+            // Only plain class selectors (`.a`, `.a.b`, `.a .b`) are resolved; any other
+            // selector (`rect`, `#id`, `*`, `[x]`, `g > .a`) is taken to reach every element.
+            let plain = selector.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' ' | '\t' | '\n' | '\r')
+            });
             let mut named = false;
             for part in selector.split('.').skip(1) {
                 let name: String = part
                     .chars()
-                    .take_while(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
                     .collect();
                 if !name.is_empty() {
                     named = true;
                     classes.insert(name);
                 }
             }
-            every |= !named && !selector.trim().is_empty();
+            every |= !plain || (!named && !selector.trim().is_empty());
         }
     }
     (classes, every)
@@ -1145,6 +1168,13 @@ fn svg_nesting_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
         if tag == "style" {
             stylesheet.extend(node.descendants().filter_map(|n| n.text()));
         }
+        // CSS escapes (`url(#n\30)`, `.c\31`) would hide a reference from these checks.
+        if node
+            .attribute("style")
+            .is_some_and(|style| style.contains('\\'))
+        {
+            return false;
+        }
         if let Some(id) = node.attribute("id") {
             ids.entry(id).or_insert(node.id());
             if SVG_NESTING.contains(&tag) {
@@ -1152,6 +1182,9 @@ fn svg_nesting_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
                 roots.push(node.id());
             }
         }
+    }
+    if stylesheet.contains('\\') || stylesheet.to_ascii_lowercase().contains("@import") {
+        return false;
     }
     if roots.len() > SVG_MAX_PAINT_SERVERS {
         return false;
@@ -1184,16 +1217,13 @@ fn svg_nesting_ok(doc: &resvg::usvg::roxmltree::Document) -> bool {
         let Some(server) = doc.get_node(root) else {
             continue;
         };
+        // Everything the server's ancestors could pass down, by attribute, `style`, or a
+        // stylesheet class: the same rule as inside it.
         if server
             .ancestors()
             .skip(1)
             .filter(|n| n.is_element())
-            .any(|n| {
-                n.attributes().any(|a| {
-                    matches!(a.name(), "fill" | "stroke" | "style")
-                        && url_ids(a.value()).iter().any(|id| servers.contains_key(id))
-                })
-            })
+            .any(reaches)
         {
             return false;
         }
@@ -1690,6 +1720,30 @@ mod tests {
         assert!(!probe.supported());
         assert!(probe.on_policy(on, now).is_some());
         assert_eq!(probe.on_policy(on, now), None);
+    }
+
+    #[test]
+    fn an_early_probe_timer_rearms_for_the_rest() {
+        let on = Policy {
+            allowed: true,
+            local_repo: false,
+        };
+        let now = Instant::now();
+        let mut probe = Probe::default();
+        let generation = probe.on_policy(on, now).unwrap();
+        let early = now + Duration::from_millis(4_990);
+        assert!(!probe.on_timeout(generation, early));
+        assert_eq!(
+            probe.remaining(generation, early),
+            Some(Duration::from_millis(10))
+        );
+        assert!(probe.on_timeout(generation, early + Duration::from_millis(10)));
+        assert_eq!(probe.remaining(generation, early), None, "settled");
+        assert_eq!(
+            probe.remaining(generation + 1, now),
+            None,
+            "another stream's timer"
+        );
     }
 
     #[test]
@@ -2505,6 +2559,51 @@ include:
             without_filters(plain, &doc),
             Some(None),
             "nothing to rewrite"
+        );
+    }
+
+    #[test]
+    fn nesting_through_ancestor_classes_styles_and_imports_is_refused_quickly() {
+        // The reviewer's case (R2-H1): each pattern inherits `fill` from its ancestor's class.
+        let levels = 7;
+        let rules: String = (1..levels)
+            .map(|k| format!(".c{k}{{fill:url(#n{})}} ", k - 1))
+            .collect();
+        let mut svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><style>{rules}</style><defs><pattern id="n0" width="2" height="2" patternUnits="userSpaceOnUse"><rect width="1" height="1"/></pattern>"#
+        );
+        for k in 1..levels {
+            svg.push_str(&format!(
+                r#"<g class="c{k}"><pattern id="n{k}" width="10" height="10" patternUnits="userSpaceOnUse">{}</pattern></g>"#,
+                r#"<rect width="1" height="1"/>"#.repeat(10)
+            ));
+        }
+        svg.push_str(&format!(
+            r#"</defs><rect width="64" height="64" fill="url(#n{})"/></svg>"#,
+            levels - 1
+        ));
+        refused_fast(&svg);
+        // The class on a farther ancestor, and among several classes.
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><style>.x{fill:url(#a)}</style><pattern id="a" width="2" height="2"><rect width="1" height="1"/></pattern><g class="y x"><g><pattern id="b" width="3" height="3"><rect width="1" height="1"/></pattern></g></g><rect width="9" height="9" fill="url(#b)"/></svg>"##,
+        );
+        // A `style=` on an ancestor that references a paint server.
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><pattern id="a" width="2" height="2"><rect width="1" height="1"/></pattern><g style="fill:url(#a)"><pattern id="b" width="3" height="3"><rect width="1" height="1"/></pattern></g><rect width="9" height="9" fill="url(#b)"/></svg>"##,
+        );
+        // A non-class selector that references a server reaches every element.
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><style>g>rect{fill:url(#a)}</style><pattern id="a" width="2" height="2"><rect width="1" height="1"/></pattern><pattern id="b" width="3" height="3"><g><rect width="1" height="1"/></g></pattern><rect width="9" height="9" fill="url(#b)"/></svg>"##,
+        );
+        // `@import`, and CSS escapes that would hide a reference.
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><style>@import url(x.css);</style><mask id="a"><rect width="9" height="9"/></mask><rect width="9" height="9" mask="url(#a)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><style>.c{fill:url(#a\30)}</style><pattern id="a0" width="2" height="2"><rect width="1" height="1"/></pattern><pattern id="b" width="3" height="3"><rect class="c" width="1" height="1"/></pattern><rect width="9" height="9" fill="url(#b)"/></svg>"##,
+        );
+        refused_fast(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="9" height="9"><pattern id="a0" width="2" height="2"><rect width="1" height="1"/></pattern><pattern id="b" width="3" height="3"><rect style="fill:url(#a\30)" width="1" height="1"/></pattern><rect width="9" height="9" fill="url(#b)"/></svg>"##,
         );
     }
 
