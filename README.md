@@ -1,20 +1,54 @@
 # Skerry
 
-Skerry is a native macOS app for [SealSkin](https://docs.sealskin.app/latest/) and [Selkies](https://github.com/selkies-project/selkies). Connect to your SealSkin server—or directly to a Selkies stream—to launch, resume, and use remote desktop apps in native Mac windows without a browser.
+Skerry is a native macOS client for [SealSkin](https://docs.sealskin.app/latest/) and [Selkies](https://github.com/selkies-project/selkies). Connect to your SealSkin server—or directly to a Selkies stream—to launch, resume, and use remote desktop apps in dedicated Mac windows without a browser.
 
-## Features
+![Skerry streaming a remote app in a native macOS window with floating Session Controls](assets/screenshots/session-controls.png)
 
-- **Hardware-accelerated video:** H.264, H.265 (HEVC), and AV1 decoded natively with Apple VideoToolbox, plus JPEG fallback.
-- **Native Mac feel:** Retina/HiDPI scaling, smooth trackpad scrolling, pinch-to-zoom, Mac input method (IME) support, and Command-to-Control mapping.
-- **Audio, mic, and camera:** Stereo Opus audio with selectable output devices, plus optional microphone and webcam forwarding.
-- **Files & clipboard:** Two-way clipboard sync and a built-in **Files** window with upload, download, Quick Look, and drag-and-drop.
-- **Multi-window & second display:** Run multiple remote sessions side by side, or extend a session onto a second display.
-- **Gamepads, pointer capture, and printing:** Controller support, pointer lock (`⌃⌥⇧Z`) for 3D apps and games, and remote printing.
+## Why Skerry instead of the web client?
+
+The SealSkin/Selkies web client is great for quick access from any device, but browsers get in the way when you use remote apps every day. Skerry replaces the browser tab with a native Mac experience:
+
+- **No browser chrome or hijacked shortcuts:** Remote apps live in clean, dedicated macOS windows. Shortcuts like `⌘W`, `⌘T`, `⌘N`, and `⌘R` stay with the remote app instead of closing your tab or triggering browser actions, with optional **Command → Control** mapping and a per-server toggle for Mac shortcuts.
+- **Zero-copy Apple Silicon video:** Decodes H.264, H.265 (HEVC), and AV1 natively via **Apple VideoToolbox** straight into GPU-backed surfaces rendered with Metal—lower latency, lower memory usage, and no background browser tab throttling.
+- **Native macOS input & trackpad feel:** Smooth two-finger trackpad scrolling, pinch-to-zoom, native Mac input methods (IME) for CJK and accented text, Retina/HiDPI scaling, and automatic key release on focus loss so keys never get stuck.
+- **Seamless desktop integration:**
+  - **Clipboard without browser prompts:** Two-way `NSPasteboard` sync for text, rich HTML, and images, including `ConcealedType` support for secrets (auto-cleared after 60 seconds).
+  - **Native Files window & Finder drag-and-drop:** Browse remote folders, preview files with **Quick Look (`Space`)**, and drag files directly between Finder and the session.
+  - **Native printing & audio routing:** Remote print jobs open in the standard macOS PDF print sheet, and you can choose any Core Audio output device per session—plus hardware-encoded microphone and webcam forwarding.
+- **Multi-window & second display:** Run multiple remote apps side by side in separate windows, or extend a single session onto a **Second Display** window.
+- **Gaming & 3D apps:** Native pointer capture (`⌃⌥⇧Z`) for relative mouse movement, plus macOS `GameController` support (up to 4 slots) with **CoreHaptics** rumble.
+
+| | Skerry (Native Mac) | Web Client |
+|---|---|---|
+| **Windows & shortcuts** | Dedicated Mac windows; `⌘W` / app shortcuts go to the remote app | Browser tabs; browser intercepts `⌘W`, `⌘T`, `⌘R`, etc. |
+| **Video pipeline** | Native VideoToolbox → zero-copy Metal surfaces (H.264, H.265, AV1, JPEG) | Browser WebCodecs / Canvas compositor |
+| **Clipboard** | Direct `NSPasteboard` sync (text, HTML, images, concealed secrets) | Subject to browser clipboard API prompts & limits |
+| **Files** | Native Files window with Quick Look (`Space`) & Finder drag-and-drop | Browser upload/download dialogs |
+| **Audio & peripherals** | Per-session Core Audio output picker, GameController + CoreHaptics rumble | Limited by browser audio/gamepad APIs |
+| **Multi-display** | Native multi-window sessions & Second Display window | Separate browser tabs/windows |
+
+---
+
+## Screenshots
+
+### Library & Running Sessions
+
+Launch apps with per-app options (named storage, GPU, VPN, locale, Wayland, collaborative mode), preview running sessions, and reconnect in one click.
+
+![Skerry Library showing running sessions, recent apps, and application catalog](assets/screenshots/library.png)
+
+### Native Files Window
+
+Press `⌘⇧F` in any session to browse remote folders, upload or download files, preview with Quick Look (`Space`), or drag files straight to and from Finder.
+
+![Skerry Files window browsing remote session files](assets/screenshots/files.png)
+
+---
 
 ## Requirements
 
 - **Mac:** Apple Silicon (M1 or newer) running **macOS 13 Ventura** or later.
-- **Server:** SealSkin **0.5.0+** (over trusted HTTPS with the **Other** client type enabled), or a direct Selkies server.
+- **Server:** SealSkin **0.5.0+** (over trusted HTTPS with the **Other** client type enabled), or a direct Selkies server (WebSockets mode).
 
 ---
 
@@ -58,7 +92,7 @@ When you open Skerry, choose either **SealSkin** or **Selkies** at the top of th
 3. Copy the entire key (including `@your-server-address`).
 4. Paste it into the **SealSkin** tab in Skerry and click **Connect**.
 
-Skerry saves your key locally in `~/.config/skerry/config.toml` (readable only by your user) so you stay signed in next time.
+Skerry saves your key locally in `~/.config/skerry/config.toml` (`0600` permissions, readable only by your user) so you stay signed in next time.
 
 ### Connect directly to a Selkies server
 
@@ -71,30 +105,30 @@ Skerry saves your key locally in `~/.config/skerry/config.toml` (readable only b
 
 ### Library & Sessions
 
-- **Launch or resume:** Click an app in the Library to start a new session, or click a running session to reconnect to it. You can open multiple sessions in separate windows at the same time.
-- **Launch options:** Configure per-app options such as named home storage, GPU, VPN, language, timezone, or collaborative mode before launching.
-- **Open local files or links:** From the Library, use **File → Open… (`⌘O`)** or **File → Open Location… (`⌘L`)** to open a file or URL in a remote app.
+- **Launch or resume:** Click an app in the Library to configure and start a new session, or click **Open** on a running session to reconnect. You can run multiple sessions in separate windows at the same time.
+- **Launch options:** Configure per-app options such as named home storage, GPU, VPN, language, timezone, Wayland mode, or collaborative mode before launching. Choices are remembered per app.
+- **Open local files or links:** From the Library, use **File → Open… (`⌘O`)** or **File → Open Location… (`⌘L`)** to open a local file or URL in a remote app.
 - **Manage home storage:** Use **Window → Storage (`⌘⇧I`)** to view and manage your SealSkin home directories and shared files.
 - **Disconnecting vs. Stopping:** Closing a session window (or choosing **Window → Disconnect Session**) disconnects your Mac while leaving the remote session running so you can resume later. To shut a session down completely, stop it from the Library.
 
 ### Session Controls (`⌘⇧M`)
 
-Press `⌘⇧M` (or choose **View → Session Controls**) while in a session to open the floating controls panel. From there you can adjust:
+Press `⌘⇧M` (or choose **View → Session Controls**) in any session to open the floating controls panel:
 
-- **Input:** Toggle Command-as-Control, remote cursor, smooth trackpad scrolling, Mac input method (IME), or send remote chords like `Alt+Tab` and `Ctrl+Alt+Delete`.
-- **Shortcuts:** Switch between keeping Mac shortcuts active locally or passing them through to the remote session.
-- **Gamepads:** View and manage connected controllers.
-- **Clipboard:** Control clipboard sync between your Mac and the remote desktop.
-- **Printing:** Configure remote printing when enabled by the server.
-- **Screen:** Adjust scaling/HiDPI mode or open a **Second Display** window.
-- **Video:** Switch codec (H.264, H.265, AV1, JPEG), quality, and framerate.
-- **Audio:** Pick your Mac audio output device and control volume/mute.
-- **Microphone & Camera:** Toggle microphone and webcam forwarding (macOS will ask for permission the first time you enable them).
-- **Stats:** View live codec, framerate, bitrate, and latency stats, or toggle the overlay strip over the stream.
+- **Input:** Toggle Command-as-Control, remote cursor, smooth trackpad scrolling, Mac input method (IME), pointer capture, or send remote chords like `Alt+Tab` and `Ctrl+Alt+Delete`.
+- **Shortcuts:** Switch between keeping Mac shortcuts active locally or passing them through to the remote session (`⌘Q` and `⌃⌥⇧Z` always stay local).
+- **Gamepads:** View and manage up to 4 connected controllers with rumble support.
+- **Clipboard:** Switch between seamless automatic sync and on-demand send/copy.
+- **Printing:** View and print incoming remote PDF print jobs.
+- **Screen:** Adjust scaling/HiDPI mode (**Match Window**, **Match Retina**, **Scale Locally**, or fixed presets) or open a **Second Display** window.
+- **Video:** Switch codec (H.264, H.265, AV1, JPEG), bitrate/quality, and framerate.
+- **Audio:** Pick your Mac Core Audio output device, bitrate, and volume/mute.
+- **Microphone & Camera:** Toggle microphone and webcam forwarding (macOS prompts for permission the first time you enable them).
+- **Stats:** View live codec, framerate, bitrate, latency, and host CPU/GPU/memory metrics, or toggle the compact stats strip over the stream.
 
 ### Files (`⌘⇧F`)
 
-Press `⌘⇧F` (or choose **View → Files**) in a session to open the session's **Files** window:
+Press `⌘⇧F` (or choose **View → Files**) in a session to open its **Files** window:
 
 - Browse folders, create new folders (`⌘⇧N`), upload files (`⌘⇧U`), or download selected files.
 - Preview remote files with **Quick Look** (`Space`), copy/paste (`⌘C` / `⌘V`), or drag files directly between Finder and the Files window.
