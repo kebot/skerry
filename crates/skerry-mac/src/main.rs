@@ -1,11 +1,17 @@
 #[cfg(target_os = "macos")]
 mod app;
 #[cfg(target_os = "macos")]
+mod apps;
+#[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
 mod clipboard;
+#[cfg(target_os = "macos")]
+mod config_store;
+#[cfg(target_os = "macos")]
+mod direct;
 #[cfg(target_os = "macos")]
 mod gamepad;
 #[cfg(target_os = "macos")]
@@ -40,6 +46,8 @@ mod settings;
 mod shortcuts;
 mod stats;
 #[cfg(target_os = "macos")]
+mod tls;
+#[cfg(target_os = "macos")]
 mod transport;
 #[cfg(target_os = "macos")]
 mod video;
@@ -48,6 +56,10 @@ mod view;
 
 #[cfg(target_os = "macos")]
 fn main() {
+    // The SVG icon worker (`ARCH-035`): before GPUI, Tokio, or anything else starts.
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(apps::SVG_WORKER_FLAG)) {
+        std::process::exit(apps::svg_worker_main());
+    }
     app::run();
 }
 

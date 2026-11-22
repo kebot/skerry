@@ -10,7 +10,6 @@ id: 067NC4KG01SKERRY0000000003
 <!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-09 concept="native-mac-app-presence" question="Give remote applications first-class native macOS app presence (separate Dock icon, Cmd+Tab entry, and optionally Spotlight); decide in a future compose turn between generated .app shims, automatic per-app helper processes, or both, and how relaunch behaves when a session is already running." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-13 concept="direct-selkies-sessions" question="Connect to a standalone Selkies server with no SealSkin in front (its own Basic or secure-mode token login), through `SelkiesClient` alone: what the Library shows for it, and how the credential is kept. The Files window already needs only `SelkiesClient` (`ARCH-024`); Delete stays SealSkin-only." -->
 
 ### Goal
 
@@ -62,6 +61,11 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - Manage SealSkin homes, shared files, direct remote file opening without re-upload, and public share links (password, expiry, revocation).
 - `cluster-and-session-origins` (unresolved: `ARCH-GAP-LS-07`):
   - Automatic/pool/node placement, storage move evaluation, and validated token handoff to isolated per-session origins without leaking the control-plane application key.
+- `direct-selkies-sessions` (settled: `ARCH-036`):
+  - Connect's **Selkies** side reaches a standalone Selkies server with a link, Basic login or token, through `SelkiesClient` alone.
+  - Credentials and the leaf-certificate SHA-256 pin live in `0600` `config.toml` `[[selkies]]` entries (at most 5).
+  - The gate is WebSockets mode plus an authorised `api/sessions`.
+  - The Library shows one Desktop card and a server menu. SealSkin-only features (catalog, launch, Stop, account, Delete) are hidden.
 - `multi-window-sessions` (settled: `ARCH-010`, `ARCH-022`):
   - Resuming a session that is already open brings its window to the front. Skerry never opens a second connection to it.
   - The Library window can close while sessions stream. **Window → Library** (`cmd-0`) or a Dock-icon click reopens it. `cmd-q` disconnects every session and stops none.

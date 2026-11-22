@@ -64,6 +64,45 @@ pub fn status_banner_with_actions(
         )
 }
 
+/// A stream that can't come back by reconnecting (a direct Selkies server refused the
+/// login, `ARCH-036`): danger tone, and Disconnect only.
+pub fn fatal_banner(
+    theme: &Theme,
+    status: impl Into<String>,
+    on_disconnect: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    div()
+        .id("session-fatal-banner")
+        .absolute()
+        .bottom_3()
+        .left_3()
+        .right_3()
+        .p_3()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.danger.opacity(0.4))
+        .bg(theme.popover)
+        .text_color(theme.foreground)
+        .occlude()
+        .h_flex()
+        .items_center()
+        .gap_3()
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.danger)
+                .child(gpui_kit::component::IconName::CircleX),
+        )
+        .child(div().flex_1().min_w_0().child(status.into()))
+        .child(
+            Button::new("session-banner-disconnect")
+                .outline()
+                .small()
+                .label("Disconnect")
+                .on_click(on_disconnect),
+        )
+}
+
 /// What a print notice's or a Printing card row's button asks (`ARCH-033`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrintJobAction {
@@ -679,6 +718,30 @@ pub fn sign_out_confirm_modal(
             ],
             confirm_label: "Sign Out",
             confirm_icon: Some(gpui_kit::assets::IconName::LogOut.into()),
+        },
+        on_cancel,
+        on_confirm,
+    )
+}
+
+/// Confirmation before forgetting a direct Selkies server (`ARCH-036`).
+pub fn forget_server_confirm_modal(
+    theme: &Theme,
+    display_name: &str,
+    on_cancel: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_confirm: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::Stateful<Div> {
+    confirm_modal(
+        theme,
+        ConfirmCopy {
+            id: "forget-server",
+            title: format!("Forget {display_name}?"),
+            body: vec![
+                "Skerry removes its address, login and trusted certificate from ~/.config/skerry/config.toml.".into(),
+                "Open session windows stay connected.".into(),
+            ],
+            confirm_label: "Forget",
+            confirm_icon: Some(gpui_kit::assets::IconName::Trash.into()),
         },
         on_cancel,
         on_confirm,

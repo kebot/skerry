@@ -22,7 +22,6 @@ use gpui_kit::{
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollDelta, ScrollEvent, SharedString, Task,
     UTF16Selection, Window,
 };
-use reqwest::Url;
 use skerry_ui::session;
 use std::cell::RefCell;
 use std::ops::Range;
@@ -55,7 +54,7 @@ pub struct NativeSession {
 
 impl NativeSession {
     pub fn open(
-        address: Url,
+        address: transport::SessionTarget,
         window: &mut Window,
         cx: &mut App,
         runtime: &Handle,
@@ -267,6 +266,12 @@ impl NativeSession {
         if !slots.is_empty() {
             let _ = self.input.send(Input::ForgetPads(slots));
         }
+    }
+
+    /// Sends an `apps,` request (`ARCH-035`). It holds no secrets, so the input trace may
+    /// print it as is.
+    pub fn send_apps(&self, request: String) {
+        let _ = self.input.send(Input::Command(request));
     }
 
     /// Sends each command in order (the gamepads' `js,…`).

@@ -1,4 +1,5 @@
-//! The one writer of Skerry's files: preferences and the saved application key.
+//! The one writer of Skerry's files: preferences, and config.toml (the saved application
+//! key, the direct Selkies servers and `start_with`, `ARCH-011`/`ARCH-036`).
 //!
 //! Every write is a job on one FIFO queue. A single consumer task on the Tokio runtime runs
 //! each job with `spawn_blocking`, one at a time, so two read-modify-writes never interleave
@@ -6,6 +7,7 @@
 //! stays correct). GPUI code queues a job and gets the result back on a oneshot channel; it
 //! never calls `settings::update_at` or the key writers itself.
 
+use crate::direct::{self, SavedServer};
 use crate::sealskin::{self, Credential};
 use crate::settings::{self, Preferences};
 use gpui_kit::Global;
@@ -27,17 +29,28 @@ enum Job {
         change: Change,
         done: oneshot::Sender<io::Result<()>>,
     },
-    Key {
-        raw: KeyWrite,
+    Config {
+        write: ConfigWrite,
         done: oneshot::Sender<Result<(), String>>,
     },
+    /// The saved Selkies servers, read after every write queued before it.
+    Servers(oneshot::Sender<Result<Vec<SavedServer>, String>>),
     Flush(oneshot::Sender<()>),
 }
 
-enum KeyWrite {
-    Save(String),
+/// A change to config.toml.
+enum ConfigWrite {
+    /// The application key, and `start_with = "sealskin"`.
+    SaveKey(String),
     /// Remove the saved key if it is this one.
-    Forget(String),
+    ForgetKey(String),
+    /// A direct server at the front of `[[selkies]]`, and `start_with = "selkies"`;
+    /// `remember` keeps its password and token.
+    SaveServer(Box<SavedServer>, bool),
+    /// Remove a direct server's entry (and `start_with`).
+    ForgetServer(String),
+    /// Disconnect: the entry stays, startup no longer reconnects.
+    ClearStartWith,
 }
 
 /// Where the files live: the real locations, or a test folder.
@@ -59,7 +72,7 @@ impl Root {
         }
     }
 
-    fn key(&self) -> Result<PathBuf, String> {
+    fn config(&self) -> Result<PathBuf, String> {
         match self {
             Self::Home => sealskin::config_file(),
             #[cfg(test)]
@@ -87,12 +100,23 @@ impl Job {
                     .and_then(|path| settings::update_at(&path, |p| change(p)));
                 let _ = done.send(result);
             }
-            Self::Key { raw, done } => {
-                let result = root.key().and_then(|path| match raw {
-                    KeyWrite::Save(raw) => sealskin::save_key_at(&path, &raw),
-                    KeyWrite::Forget(raw) => sealskin::forget_key_at(&path, &raw),
+            Self::Config { write, done } => {
+                let result = root.config().and_then(|path| match write {
+                    ConfigWrite::SaveKey(raw) => sealskin::save_key_at(&path, &raw),
+                    ConfigWrite::ForgetKey(raw) => sealskin::forget_key_at(&path, &raw),
+                    ConfigWrite::SaveServer(server, remember) => {
+                        direct::save_server_at(&path, &server, remember)
+                    }
+                    ConfigWrite::ForgetServer(url) => direct::forget_server_at(&path, &url),
+                    ConfigWrite::ClearStartWith => direct::clear_start_with_at(&path),
                 });
                 let _ = done.send(result);
+            }
+            Self::Servers(done) => {
+                let _ = done.send(
+                    root.config()
+                        .and_then(|path| direct::saved_servers_at(&path)),
+                );
             }
             Self::Flush(done) => {
                 let _ = done.send(());
@@ -172,17 +196,43 @@ impl WriteQueue {
     }
 
     pub fn save_key(&self, credential: &Credential) -> oneshot::Receiver<Result<(), String>> {
-        self.key(KeyWrite::Save(credential.raw().to_string()))
+        self.config(ConfigWrite::SaveKey(credential.raw().to_string()))
     }
 
     /// Removes `application_key` from config.toml if it holds this key (`raw`).
     pub fn forget_key(&self, raw: &str) -> oneshot::Receiver<Result<(), String>> {
-        self.key(KeyWrite::Forget(raw.to_string()))
+        self.config(ConfigWrite::ForgetKey(raw.to_string()))
     }
 
-    fn key(&self, raw: KeyWrite) -> oneshot::Receiver<Result<(), String>> {
+    /// Saves a direct server (`ARCH-036`); with `remember` off, without its secrets.
+    pub fn save_server(
+        &self,
+        server: SavedServer,
+        remember: bool,
+    ) -> oneshot::Receiver<Result<(), String>> {
+        self.config(ConfigWrite::SaveServer(Box::new(server), remember))
+    }
+
+    /// Removes a direct server's entry, its secrets and `start_with`.
+    pub fn forget_server(&self, url: &str) -> oneshot::Receiver<Result<(), String>> {
+        self.config(ConfigWrite::ForgetServer(url.to_string()))
+    }
+
+    /// Removes `start_with`, so startup reconnects to nothing.
+    pub fn clear_start_with(&self) -> oneshot::Receiver<Result<(), String>> {
+        self.config(ConfigWrite::ClearStartWith)
+    }
+
+    /// The saved direct servers, after every write queued before this read.
+    pub fn saved_servers(&self) -> oneshot::Receiver<Result<Vec<SavedServer>, String>> {
         let (done, result) = oneshot::channel();
-        self.send(Job::Key { raw, done });
+        self.send(Job::Servers(done));
+        result
+    }
+
+    fn config(&self, write: ConfigWrite) -> oneshot::Receiver<Result<(), String>> {
+        let (done, result) = oneshot::channel();
+        self.send(Job::Config { write, done });
         result
     }
 
@@ -302,6 +352,35 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_clears_start_with_and_forget_removes_the_entry() {
+        let rt = runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let queue = start_at(rt.handle(), Root::Under(dir.path().into()));
+        let server = SavedServer {
+            url: "https://h.example/".into(),
+            username: Some("ubuntu".into()),
+            password: Some("pw".into()),
+            ..SavedServer::default()
+        };
+        drop(queue.save_server(server.clone(), true));
+        drop(queue.clear_start_with());
+        let read = queue.saved_servers();
+        let path = sealskin::config_file_in(dir.path());
+        let servers = rt.block_on(read).unwrap().unwrap();
+        assert_eq!(servers, vec![server]);
+        assert_eq!(crate::config_store::start_with(&path).unwrap(), None);
+        let forgotten = queue.forget_server("https://h.example");
+        rt.block_on(forgotten).unwrap().unwrap();
+        assert!(rt
+            .block_on(queue.saved_servers())
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("pw"), "{text}");
+    }
+
+    #[test]
     fn reads_see_writes_still_in_the_queue() {
         let rt = runtime();
         let dir = tempfile::tempdir().unwrap();
@@ -325,8 +404,18 @@ mod tests {
             "save_key_at(",
             "forget_key_at(",
             "write_saved_key(",
+            "save_server_at(",
+            "forget_server_at(",
+            "clear_start_with_at(",
+            "edit_config(",
         ];
-        let allowed = ["persist.rs", "settings.rs", "sealskin.rs"];
+        let allowed = [
+            "persist.rs",
+            "settings.rs",
+            "sealskin.rs",
+            "direct.rs",
+            "config_store.rs",
+        ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![src];
         while let Some(dir) = stack.pop() {
@@ -337,7 +426,9 @@ mod tests {
                     continue;
                 }
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
-                if allowed.contains(&name.as_str()) || !name.ends_with(".rs") {
+                // direct.rs's own tests write through the blocking writers too.
+                let direct_tests = path.ends_with("direct/tests.rs");
+                if allowed.contains(&name.as_str()) || direct_tests || !name.ends_with(".rs") {
                     continue;
                 }
                 let text = std::fs::read_to_string(&path).unwrap();

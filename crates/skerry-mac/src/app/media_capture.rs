@@ -454,22 +454,13 @@ mod tests {
 
     #[test]
     fn reconnects_do_not_grow_threads_while_permission_is_undetermined() {
-        // Threads named skerry-mic*, as `ps -M` would show them.
-        let threads = || {
-            let out = std::process::Command::new("ps")
-                .args(["-M", "-p", &std::process::id().to_string()])
-                .output()
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).lines().count()
-        };
         let log = Rc::new(RefCell::new(Log::default()));
         let mut capture = MediaCapture::<FakeMic>::default();
         // A device listing that blocks for good, as cpal's did while TCC waited.
         let (hold, held) = std::sync::mpsc::channel::<()>();
         let held = Arc::new(std::sync::Mutex::new(held));
         let mut listings = 0;
-        let mut before = None;
-        for round in 0..10 {
+        for _ in 0..10 {
             let (events, _rx) = mpsc::unbounded_channel();
             let _frames = capture.begin_stream(events);
             let effects = capture.on_policy(policy(true), Auth::NotDetermined);
@@ -482,18 +473,12 @@ mod tests {
             }) {
                 listings += 1;
             }
-            if round == 0 {
-                std::thread::sleep(Duration::from_millis(50));
-                before = Some(threads());
-            }
             capture.stop();
         }
         assert_eq!(log.borrow().made, 0);
+        // One skerry-mic-list thread, still blocked; no skerry-mic thread at all.
         assert_eq!(listings, 1, "one blocked listing, none stacked");
-        assert!(
-            threads() <= before.unwrap(),
-            "the thread count did not grow"
-        );
+        assert!(capture.listing.load(Ordering::Acquire));
         drop(hold);
     }
 

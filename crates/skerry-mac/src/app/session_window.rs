@@ -4,12 +4,13 @@
 //! its Session Controls. The Library (`Launcher`) only opens these windows and keeps track
 //! of them through the [`OpenWindows`] global.
 
+use super::apps_window::{self, AppsOwner, AppsWindow};
 use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::gamepads::Gamepads;
 use super::media_capture::{self, MediaCapture};
 use super::{
-    dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
+    dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher, ToggleApps,
     ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSessionControls, ToggleStatsStrip,
     APP_NAME,
 };
@@ -124,11 +125,55 @@ fn refresh_library(cx: &mut App) {
     }
 }
 
+/// The server a session window streams from (`ARCH-024`, `ARCH-036`).
+#[derive(Clone)]
+pub(super) enum SessionServer {
+    SealSkin(SealSkinClient),
+    Selkies(crate::direct::SelkiesServer),
+}
+
+impl SessionServer {
+    /// The preferences file's name.
+    pub(super) fn server_key(&self) -> String {
+        match self {
+            Self::SealSkin(api) => api.server().to_string(),
+            Self::Selkies(server) => server.prefs_key(),
+        }
+    }
+
+    pub(super) fn target(
+        &self,
+        remote: &RemoteSession,
+    ) -> Result<crate::transport::SessionTarget, String> {
+        match self {
+            Self::SealSkin(api) => api
+                .session_url(&remote.session_url)
+                .map(crate::transport::SessionTarget::SealSkin),
+            Self::Selkies(server) => Ok(crate::transport::SessionTarget::Selkies(server.clone())),
+        }
+    }
+
+    /// SealSkin's storage routes for Delete; a direct server has none.
+    pub(super) fn storage(&self, remote: &RemoteSession) -> Option<files_window::Storage> {
+        match self {
+            Self::SealSkin(api) => {
+                crate::sealskin::has_storage(&remote.home).then(|| files_window::Storage {
+                    client: api.clone(),
+                    home: remote.home.clone(),
+                })
+            }
+            Self::Selkies(_) => None,
+        }
+    }
+}
+
 pub(super) struct SessionWindow {
     /// This session's own window, for async updates (`ARCH-015`).
     window: AnyWindowHandle,
     rt: Handle,
-    api: SealSkinClient,
+    api: SessionServer,
+    /// `api.server_key()`, the preferences file's name.
+    server_key: String,
     pub(super) remote: RemoteSession,
     pub(super) current: Option<NativeSession>,
     stream_events: Option<Task<()>>,
@@ -164,6 +209,14 @@ pub(super) struct SessionWindow {
     /// The session's file routes and what the server allows (`ARCH-023`).
     file_access: Option<crate::selkies::SelkiesClient>,
     file_policy: Option<crate::selkies::Policy>,
+    /// The session's Apps window (`ARCH-035`); it stays open across reconnects.
+    pub(super) apps_window: Option<(AnyWindowHandle, Entity<AppsWindow>)>,
+    /// What this stream's `server_settings` allows Apps; `None` while disconnected.
+    pub(super) apps_policy: Option<crate::apps::Policy>,
+    /// Whether this stream's Selkies answers the apps protocol; reset on reconnect.
+    apps_probe: crate::apps::Probe,
+    /// An Apps window open is deferred: a second toggle must not open another.
+    apps_opening: bool,
     pub(super) dpi_override: Option<u16>,
     ui_scale: display::UiScale,
     pub(super) applied_resolution: Option<DisplayRequest>,
@@ -219,17 +272,19 @@ const AUTO_PRINT_MAX_BYTES: u64 = 200_000_000;
 impl SessionWindow {
     pub(super) fn new(
         rt: Handle,
-        api: SealSkinClient,
+        api: SessionServer,
         remote: RemoteSession,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let server_key = api.server_key();
         // The queue's copy includes changes another window queued that aren't on disk yet.
-        let preferences = cx.global::<WriteQueue>().read(api.server());
+        let preferences = cx.global::<WriteQueue>().read(&server_key);
         let mut this = Self {
             window: Window::window_handle(window),
             rt,
             api,
+            server_key,
             remote,
             current: None,
             stream_events: None,
@@ -254,6 +309,10 @@ impl SessionWindow {
             files_window: None,
             file_access: None,
             file_policy: None,
+            apps_window: None,
+            apps_policy: None,
+            apps_probe: crate::apps::Probe::default(),
+            apps_opening: false,
             dpi_override: None,
             ui_scale: display::UiScale::default(),
             applied_resolution: None,
@@ -387,7 +446,7 @@ impl SessionWindow {
         let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel();
         // A fresh frame channel for this stream's microphone (`ARCH-038`).
         let mic = self.capture.begin_stream(events.clone());
-        let stream = self.api.session_url(&self.remote.session_url).map(|url| {
+        let stream = self.api.target(&self.remote).map(|url| {
             NativeSession::open(
                 url,
                 window,
@@ -524,7 +583,40 @@ impl SessionWindow {
                     stream.set_clipboard_policy(policy, window, cx);
                 }
             }
-            SessionEvent::Files(access) => self.file_access = Some(access),
+            SessionEvent::Files(access) => {
+                if let Some((_, apps)) = &self.apps_window {
+                    let access = Some(access.clone());
+                    apps.update(cx, |apps, cx| apps.set_access(access, cx));
+                }
+                self.file_access = Some(access);
+            }
+            SessionEvent::AppsPolicy(policy) => {
+                let changed = self.apps_policy != Some(policy);
+                self.apps_policy = Some(policy);
+                if let Some((_, apps)) = &self.apps_window {
+                    apps.update(cx, |apps, cx| apps.set_policy(policy, cx));
+                }
+                if let Some(generation) = self.apps_probe.on_policy(policy, Instant::now()) {
+                    self.probe_apps(generation, cx);
+                }
+                if changed {
+                    cx.notify();
+                }
+            }
+            SessionEvent::Apps(event) => {
+                if !matches!(event, crate::apps::Event::CommandError(_))
+                    && self.apps_probe.on_answer()
+                {
+                    if let Some((_, apps)) = &self.apps_window {
+                        apps.update(cx, |apps, cx| apps.set_too_old(false, cx));
+                    }
+                    cx.notify();
+                }
+                // Ignored while no Apps window is open: opening one lists the whole state.
+                if let Some((_, apps)) = &self.apps_window {
+                    apps.update(cx, |apps, cx| apps.receive(event, cx));
+                }
+            }
             SessionEvent::FilePolicy(policy) => {
                 self.file_policy = Some(policy);
                 // Whichever Files window shows this session, a Library-opened one too.
@@ -632,7 +724,7 @@ impl SessionWindow {
     ) {
         let done = cx
             .global::<WriteQueue>()
-            .preferences(self.api.server(), change);
+            .preferences(&self.server_key, change);
         let window = self.window;
         cx.spawn(async move |this, cx| {
             if !matches!(done.await, Ok(Ok(()))) {
@@ -996,7 +1088,7 @@ impl SessionWindow {
 
     /// The server this session runs on.
     pub(super) fn server(&self) -> &str {
-        self.api.server()
+        &self.server_key
     }
 
     /// Shows `status` in this window's banner.
@@ -1066,7 +1158,11 @@ impl SessionWindow {
     /// The Selkies session whose slot table this window's pads use: each session has its
     /// own, even on one SealSkin host.
     fn gamepad_session(&self) -> String {
-        format!("{}|{}", self.api.server(), self.remote.session_id)
+        match &self.api {
+            SessionServer::SealSkin(_) => format!("{}|{}", self.server_key, self.remote.session_id),
+            // `selkies|<prefs key>`: one slot table per direct server.
+            SessionServer::Selkies(_) => self.remote.session_id.clone(),
+        }
     }
 
     /// A print sheet is open, opening, or about to open on its own.
@@ -1234,11 +1330,7 @@ impl SessionWindow {
         }
         self.release_keys(cx);
         let title = self.remote.app_name.clone();
-        let storage =
-            crate::sealskin::has_storage(&self.remote.home).then(|| files_window::Storage {
-                client: self.api.clone(),
-                home: self.remote.home.clone(),
-            });
+        let storage = self.api.storage(&self.remote);
         let rt = self.rt.clone();
         let owner_window = Window::window_handle(window);
         let session = cx.entity();
@@ -1272,6 +1364,125 @@ impl SessionWindow {
                 });
             });
         });
+    }
+
+    /// Asks the stream for `list` and waits [`crate::apps::PROBE_TIMEOUT`] for `apps_state`:
+    /// a Selkies older than the apps protocol never answers, and Apps stays hidden for it.
+    fn probe_apps(&mut self, generation: u64, cx: &mut Context<Self>) {
+        if let Some(list) = crate::apps::request(crate::apps::Op::List, None, None) {
+            self.send_apps(list);
+        }
+        let window = self.window;
+        cx.spawn(async move |this, cx| {
+            let mut wait = crate::apps::PROBE_TIMEOUT;
+            loop {
+                cx.background_executor().timer(wait).await;
+                // A timer that fires early waits out the rest instead of giving up.
+                let rest = window.update(cx, |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        let now = Instant::now();
+                        if this.apps_probe.on_timeout(generation, now) {
+                            if let Some((_, apps)) = &this.apps_window {
+                                apps.update(cx, |apps, cx| apps.set_too_old(true, cx));
+                            }
+                            cx.notify();
+                        }
+                        this.apps_probe.remaining(generation, now)
+                    })
+                });
+                match rest {
+                    Ok(Ok(Some(rest))) => wait = rest,
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Apps is offered: the server allows it and answered the support probe.
+    pub(super) fn apps_available(&self) -> bool {
+        self.apps_policy.is_some_and(|policy| policy.allowed) && self.apps_probe.supported()
+    }
+
+    /// Opens the session's Apps window, or brings it forward (`ARCH-035`). Only opens; it
+    /// doesn't close an open window, as Files.
+    pub(super) fn toggle_apps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.apps_opening {
+            // A deferred open is on its way: never a second window.
+            return;
+        }
+        if let Some((handle, _)) = &self.apps_window {
+            if handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok()
+            {
+                return;
+            }
+        }
+        self.apps_window = None;
+        if self.current.is_none() {
+            return;
+        }
+        let Some(policy) = self.apps_policy.filter(|_| self.apps_available()) else {
+            self.status = Some(match self.apps_policy {
+                None => "Apps are available once the session has connected.".into(),
+                Some(policy) if !policy.allowed => {
+                    "The server doesn’t allow installing apps in this session.".into()
+                }
+                Some(_) if self.apps_probe.unsupported() => {
+                    "This session’s Selkies is too old for the Apps catalog.".into()
+                }
+                Some(_) => "Checking whether this session supports Apps…".into(),
+            });
+            cx.notify();
+            return;
+        };
+        self.release_keys(cx);
+        let source = apps_window::AppsSource {
+            title: self.remote.app_name.clone(),
+            policy,
+            selkies: self.file_access.clone(),
+            server: self.server_key.clone(),
+            saved_filter: self.preferences.apps_category.clone(),
+        };
+        let rt = self.rt.clone();
+        let owner_window = Window::window_handle(window);
+        let session = cx.entity();
+        self.apps_opening = true;
+        cx.defer(move |cx| {
+            let opened = owner_window.update(cx, |_, window, cx| {
+                let owner = AppsOwner {
+                    window: owner_window,
+                    session: session.downgrade(),
+                };
+                let result = AppsWindow::open(source, rt, window, owner, cx);
+                session.update(cx, |session, cx| {
+                    session.apps_opening = false;
+                    match result {
+                        Ok(apps) => session.apps_window = Some(apps),
+                        Err(_) => session.status = Some("Couldn’t open Apps.".into()),
+                    }
+                    cx.notify();
+                });
+            });
+            if opened.is_err() {
+                // The session window went away first.
+                session.update(cx, |session, _| session.apps_opening = false);
+            }
+        });
+    }
+
+    /// Sends an `apps,` request on the current stream; the Apps window has checked it.
+    pub(super) fn send_apps(&self, request: String) {
+        if let Some(stream) = &self.current {
+            stream.send_apps(request);
+        }
+    }
+
+    fn close_apps(&mut self, cx: &mut App) {
+        if let Some((handle, _)) = self.apps_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
     }
 
     fn close_files(&mut self, cx: &mut App) {
@@ -1375,6 +1586,12 @@ impl SessionWindow {
         self.print_policy = None;
         self.print_settings_at = None;
         self.close_files(cx);
+        // Apps stays open across a reconnect, waiting (`ARCH-035`); teardown closes it.
+        self.apps_policy = None;
+        self.apps_probe.reset();
+        if let Some((_, apps)) = &self.apps_window {
+            apps.update(cx, |apps, cx| apps.disconnect(cx));
+        }
         self.applied_resolution = None;
         self.applied_dpi = None;
         self.stats = None;
@@ -1424,6 +1641,8 @@ impl SessionWindow {
     ) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
         self.remove_controls(cx);
         self.end_stream(window, cx);
+        // After `end_stream`'s disconnect, so nothing is sent from a closing window.
+        self.close_apps(cx);
         let sheet =
             super::native_window(window).filter(|native| print_dialog::sheet_attached(native));
         self.print_tick = None;
@@ -1884,6 +2103,12 @@ impl Render for SessionWindow {
             .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
                 this.toggle_files(window, cx);
             }))
+            // Only while Apps is offered, so View → Apps is disabled otherwise.
+            .when(self.apps_available(), |root| {
+                root.on_action(cx.listener(|this, _: &ToggleApps, window, cx| {
+                    this.toggle_apps(window, cx);
+                }))
+            })
             .on_action(
                 cx.listener(|this, _: &DisconnectSession, window, cx| this.disconnect(window, cx)),
             )
@@ -1948,19 +2173,36 @@ impl Render for SessionWindow {
                     }),
                 ))
             })
-            .when_some(self.status.clone(), |root, status| {
-                root.child(session::status_banner_with_actions(
-                    &theme,
-                    status,
-                    cx.listener(|this, _, window, cx| {
-                        this.status = None;
-                        this.keep_waiting = false;
-                        this.reconnect(window, cx);
-                        cx.notify();
-                    }),
-                    cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
-                ))
-            })
+            .when_some(
+                self.status
+                    .clone()
+                    .filter(|status| crate::direct::is_fatal_session_error(status)),
+                |root, status| {
+                    root.child(session::fatal_banner(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
+            .when_some(
+                self.status
+                    .clone()
+                    .filter(|status| !crate::direct::is_fatal_session_error(status)),
+                |root, status| {
+                    root.child(session::status_banner_with_actions(
+                        &theme,
+                        status,
+                        cx.listener(|this, _, window, cx| {
+                            this.status = None;
+                            this.keep_waiting = false;
+                            this.reconnect(window, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|this, _, window, cx| this.disconnect(window, cx)),
+                    ))
+                },
+            )
             .when_some(
                 self.startup_stalled.filter(|_| self.status.is_none()),
                 |root, after_waiting| {

@@ -1,4 +1,5 @@
 pub mod account;
+pub mod apps;
 pub mod assets;
 pub mod components;
 pub mod connect;
@@ -6,5 +7,6 @@ pub mod controls;
 pub mod files;
 pub mod launch_dialog;
 pub mod library;
+pub mod selkies;
 pub mod session;
 pub mod stats;

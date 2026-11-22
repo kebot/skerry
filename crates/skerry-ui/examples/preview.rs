@@ -11,6 +11,10 @@ use gpui_kit::{
 };
 use skerry_ui::{
     account::{self, AccessChip, AccountProps, Limits, StorageMeasure, StorageUse},
+    apps::{
+        self as apps_ui, ActivityRow, AppTile, AppsAction, AppsProps, Badge, Banner, ButtonKind,
+        CatalogView, CategoryRow, ConsoleProps, FilterId, Inspector, InspectorButtons, JobBadge,
+    },
     components::{self, Toast, ToastKind},
     connect::{
         self, ConnectHandler, ConnectHandlers, ConnectProps, EnvNote, KeyProblem, ProblemKind,
@@ -125,6 +129,7 @@ enum Story {
     ControlsPrintingEmpty,
     ControlsPrintingJobs,
     ControlsPrintingOff,
+    ControlsApps,
     AudioDefault,
     AudioChosen,
     AudioMissing,
@@ -164,6 +169,24 @@ enum Story {
     PrintNoticeStack,
     PrintNoticeWithStrip,
     PrintNoticeNarrow,
+    ConnectSelkiesRecent,
+    ConnectSelkiesToken,
+    ConnectSelkiesBadLogin,
+    ConnectSelkiesWebRtc,
+    ConnectSelkiesUnreachable,
+    ConnectCertificate,
+    ConnectCertificateChanged,
+    SelkiesHomeOpen,
+    SelkiesHomeMenu,
+    SelkiesHomeForget,
+    AppsLoading,
+    AppsBrowsing,
+    AppsInstalled,
+    AppsInstalling,
+    AppsFailed,
+    AppsSearchEmpty,
+    AppsCatalogError,
+    AppsOffline,
 }
 
 impl Story {
@@ -243,6 +266,7 @@ impl Story {
         Story::ControlsPrintingEmpty,
         Story::ControlsPrintingJobs,
         Story::ControlsPrintingOff,
+        Story::ControlsApps,
         Story::AudioDefault,
         Story::AudioChosen,
         Story::AudioMissing,
@@ -282,6 +306,24 @@ impl Story {
         Story::PrintNoticeStack,
         Story::PrintNoticeWithStrip,
         Story::PrintNoticeNarrow,
+        Story::ConnectSelkiesRecent,
+        Story::ConnectSelkiesToken,
+        Story::ConnectSelkiesBadLogin,
+        Story::ConnectSelkiesWebRtc,
+        Story::ConnectSelkiesUnreachable,
+        Story::ConnectCertificate,
+        Story::ConnectCertificateChanged,
+        Story::SelkiesHomeOpen,
+        Story::SelkiesHomeMenu,
+        Story::SelkiesHomeForget,
+        Story::AppsLoading,
+        Story::AppsBrowsing,
+        Story::AppsInstalled,
+        Story::AppsInstalling,
+        Story::AppsFailed,
+        Story::AppsSearchEmpty,
+        Story::AppsCatalogError,
+        Story::AppsOffline,
     ];
 
     fn group(self) -> &'static str {
@@ -360,7 +402,8 @@ impl Story {
             | Story::GamepadsServerOff
             | Story::ControlsPrintingEmpty
             | Story::ControlsPrintingJobs
-            | Story::ControlsPrintingOff => "Session Controls",
+            | Story::ControlsPrintingOff
+            | Story::ControlsApps => "Session Controls",
             Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -398,6 +441,24 @@ impl Story {
             | Story::PrintNoticeStack
             | Story::PrintNoticeWithStrip
             | Story::PrintNoticeNarrow => "Session Printing",
+            Story::ConnectSelkiesRecent
+            | Story::ConnectSelkiesToken
+            | Story::ConnectSelkiesBadLogin
+            | Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => "Connect",
+            Story::SelkiesHomeOpen | Story::SelkiesHomeMenu | Story::SelkiesHomeForget => {
+                "Selkies Library"
+            }
+            Story::AppsLoading
+            | Story::AppsBrowsing
+            | Story::AppsInstalled
+            | Story::AppsInstalling
+            | Story::AppsFailed
+            | Story::AppsSearchEmpty
+            | Story::AppsCatalogError
+            | Story::AppsOffline => "Session Apps",
         }
     }
 
@@ -512,11 +573,31 @@ impl Story {
             Story::ControlsPrintingEmpty => "Printing · Empty",
             Story::ControlsPrintingJobs => "Printing · Jobs, Auto Off",
             Story::ControlsPrintingOff => "Printing · Off by Server",
+            Story::ControlsApps => "Header · Apps Button",
+            Story::AppsLoading => "Loading Catalog",
+            Story::AppsBrowsing => "Browsing + Activity",
+            Story::AppsInstalled => "Installed App",
+            Story::AppsInstalling => "Installing",
+            Story::AppsFailed => "Failed + Error Notice",
+            Story::AppsSearchEmpty => "No Search Results",
+            Story::AppsCatalogError => "Catalog Error",
+            Story::AppsOffline => "Waiting, Narrow (720×460)",
+
             Story::PrintNoticeStates => "Every Notice State",
             Story::PrintNoticeLongName => "Long Name",
             Story::PrintNoticeStack => "Stack + More",
             Story::PrintNoticeWithStrip => "Below the Stats Strip",
             Story::PrintNoticeNarrow => "Narrow Window",
+            Story::ConnectSelkiesRecent => "Selkies · Recent Servers",
+            Story::ConnectSelkiesToken => "Selkies · Token Link",
+            Story::ConnectSelkiesBadLogin => "Selkies · Wrong Password",
+            Story::ConnectSelkiesWebRtc => "Selkies · WebRTC Server",
+            Story::ConnectSelkiesUnreachable => "Selkies · Unreachable",
+            Story::ConnectCertificate => "Selkies · Trust Certificate",
+            Story::ConnectCertificateChanged => "Selkies · Certificate Changed",
+            Story::SelkiesHomeOpen => "Open Here",
+            Story::SelkiesHomeMenu => "Server Menu",
+            Story::SelkiesHomeForget => "Forget Server",
         }
     }
 
@@ -631,11 +712,31 @@ impl Story {
             Story::ControlsPrintingEmpty => "story-controls-printing-empty",
             Story::ControlsPrintingJobs => "story-controls-printing-jobs",
             Story::ControlsPrintingOff => "story-controls-printing-off",
+            Story::ControlsApps => "story-controls-apps",
+            Story::AppsLoading => "story-apps-loading",
+            Story::AppsBrowsing => "story-apps-browsing",
+            Story::AppsInstalled => "story-apps-installed",
+            Story::AppsInstalling => "story-apps-installing",
+            Story::AppsFailed => "story-apps-failed",
+            Story::AppsSearchEmpty => "story-apps-search-empty",
+            Story::AppsCatalogError => "story-apps-catalog-error",
+            Story::AppsOffline => "story-apps-offline",
+
             Story::PrintNoticeStates => "story-print-notice-states",
             Story::PrintNoticeLongName => "story-print-notice-long-name",
             Story::PrintNoticeStack => "story-print-notice-stack",
             Story::PrintNoticeWithStrip => "story-print-notice-strip",
             Story::PrintNoticeNarrow => "story-print-notice-narrow",
+            Story::ConnectSelkiesRecent => "story-connect-selkies-recent",
+            Story::ConnectSelkiesToken => "story-connect-selkies-token",
+            Story::ConnectSelkiesBadLogin => "story-connect-selkies-bad-login",
+            Story::ConnectSelkiesWebRtc => "story-connect-selkies-webrtc",
+            Story::ConnectSelkiesUnreachable => "story-connect-selkies-unreachable",
+            Story::ConnectCertificate => "story-connect-certificate",
+            Story::ConnectCertificateChanged => "story-connect-certificate-changed",
+            Story::SelkiesHomeOpen => "story-selkies-home-open",
+            Story::SelkiesHomeMenu => "story-selkies-home-menu",
+            Story::SelkiesHomeForget => "story-selkies-home-forget",
         }
     }
 
@@ -712,6 +813,7 @@ impl Story {
                 | Story::ControlsPrintingEmpty
                 | Story::ControlsPrintingJobs
                 | Story::ControlsPrintingOff
+                | Story::ControlsApps
         ) || self.is_audio()
             || self.is_capture()
     }
@@ -913,7 +1015,13 @@ struct PreviewApp {
     height: Entity<InputState>,
     files_props: FilesProps,
     folder_name: Entity<InputState>,
+    selkies_inputs: skerry_ui::selkies::SelkiesInputs,
     files_scroll: gpui_kit::UniformListScrollHandle,
+    apps_props: AppsProps,
+    apps_search: Entity<InputState>,
+    apps_grid: gpui_kit::UniformListScrollHandle,
+    apps_focus: gpui_kit::FocusHandle,
+    apps_console: gpui_kit::ScrollHandle,
     /// The account menu is open (controlled, as in the Launcher).
     account_open: bool,
     /// A fixed story canvas width, to check wide layouts on a small screen.
@@ -1021,7 +1129,6 @@ impl PreviewApp {
             story,
             appearance,
             last_event: story.note().map(Into::into),
-            assets,
             key_input,
             search_input,
             selected_filter: story.filter(),
@@ -1032,10 +1139,556 @@ impl PreviewApp {
             height,
             files_props: Self::fixture_files(story),
             folder_name: cx.new(|cx| InputState::new(window, cx).default_value("untitled folder")),
+            selkies_inputs: Self::fixture_selkies_inputs(story, window, cx),
             files_scroll: gpui_kit::UniformListScrollHandle::new(),
+            apps_props: Self::fixture_apps(story, &assets),
+            apps_search: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Search Apps")
+                    .default_value(Self::apps_query(story))
+            }),
+            apps_grid: gpui_kit::UniformListScrollHandle::new(),
+            apps_focus: cx.focus_handle(),
+            apps_console: gpui_kit::ScrollHandle::new(),
             canvas_width,
             account_open: story.account_open(),
+            assets,
         }
+    }
+
+    /// The Apps search field's text for a story.
+    fn apps_query(story: Story) -> &'static str {
+        if story == Story::AppsSearchEmpty {
+            "zzz"
+        } else {
+            ""
+        }
+    }
+
+    /// The Apps window's props for a story (`ARCH-035`): the Network category's nine
+    /// browsers, two with embedded icons, the rest initials.
+    fn fixture_apps(story: Story, assets: &PreviewAssets) -> AppsProps {
+        use gpui_kit::assets::IconName as I;
+        let offline = story == Story::AppsOffline;
+        let installed_filter = story == Story::AppsInstalled;
+        let selected = match story {
+            Story::AppsInstalled | Story::AppsOffline => Some("firefox"),
+            Story::AppsInstalling => Some("chromium"),
+            Story::AppsFailed => Some("brave"),
+            _ => None,
+        };
+        let installed = ["firefox", "zen", "vivaldi"];
+        let browsers = [
+            ("brave", "Brave"),
+            ("chromium", "Chromium"),
+            ("firefox", "Firefox"),
+            ("librewolf", "LibreWolf"),
+            ("mullvad-browser", "Mullvad Browser"),
+            ("opera", "Opera"),
+            ("tor-browser", "Tor Browser"),
+            ("vivaldi", "Vivaldi"),
+            ("zen", "Zen Browser"),
+        ];
+        let tile = |name: &str, full_name: &str| {
+            let is_installed = !offline && installed.contains(&name);
+            let (badge, progress, state) = match (story, name) {
+                (Story::AppsBrowsing | Story::AppsInstalling, "chromium") => {
+                    (Badge::Running, Some(45.), Some("Downloading 45%"))
+                }
+                (Story::AppsBrowsing, "brave") => {
+                    (Badge::Queued, None, Some("Waiting to install…"))
+                }
+                (Story::AppsFailed, "brave") => (Badge::Failed, None, Some("Failed (exit 1)")),
+                _ if is_installed => (Badge::Installed, None, Some("Installed")),
+                _ => (Badge::None, None, None),
+            };
+            AppTile {
+                name: name.into(),
+                full_name: full_name.into(),
+                initial: full_name.chars().next().unwrap_or('?'),
+                icon: match name {
+                    "firefox" => Some(assets.icon_firefox.clone()),
+                    "zen" => Some(assets.icon_zen.clone()),
+                    _ => None,
+                },
+                want_icon: false,
+                badge,
+                progress,
+                tooltip: match state {
+                    Some(state) => format!("{full_name} — {state}"),
+                    None => full_name.into(),
+                },
+                selected: selected == Some(name),
+            }
+        };
+        let tiles: Vec<AppTile> = match story {
+            Story::AppsLoading | Story::AppsSearchEmpty | Story::AppsCatalogError => Vec::new(),
+            Story::AppsInstalled => browsers
+                .iter()
+                .filter(|(name, _)| installed.contains(name))
+                .map(|(name, full)| tile(name, full))
+                .collect(),
+            _ => browsers
+                .iter()
+                .map(|(name, full)| tile(name, full))
+                .collect(),
+        };
+        let category = |id: &str, label: &str, icon: I, count: usize| CategoryRow {
+            id: FilterId::Category(id.into()),
+            label: label.into(),
+            icon,
+            count: Some(count),
+            selected: !installed_filter && id == "Network",
+        };
+        let categories = if story == Story::AppsLoading {
+            Vec::new()
+        } else {
+            vec![
+                CategoryRow {
+                    id: FilterId::Installed,
+                    label: "Installed".into(),
+                    icon: I::PackageCheck,
+                    count: (!offline && story != Story::AppsCatalogError).then_some(3),
+                    selected: installed_filter,
+                },
+                CategoryRow {
+                    id: FilterId::All,
+                    label: "All Apps".into(),
+                    icon: I::LayoutGrid,
+                    count: (story != Story::AppsCatalogError).then_some(161),
+                    selected: false,
+                },
+                category("AI", "AI", I::Sparkles, 8),
+                category("AudioVideo", "Audio Video", I::Clapperboard, 21),
+                category("Creative", "Creative", I::Palette, 23),
+                category("Development", "Development", I::Code, 14),
+                category("Education", "Education", I::GraduationCap, 2),
+                category("Game", "Game", I::Gamepad2, 27),
+                category("Network", "Network", I::Network, 9),
+                category("Office", "Office", I::FileText, 16),
+                category("Science", "Science", I::FlaskConical, 2),
+                category("System", "System", I::Cpu, 4),
+                category("Utility", "Utility", I::Wrench, 12),
+            ]
+        };
+        let lines: String = (1..=30)
+            .map(|i| format!("[{i:02}/30] Pulling layer sha256:{:012x}… done\n", i * 7919))
+            .collect();
+        let console = |job, status: &str, state, code, progress, text: String| ConsoleProps {
+            job,
+            status: status.into(),
+            state,
+            code,
+            progress,
+            text: text.into(),
+            can_cancel: !offline && matches!(state, JobBadge::Queued | JobBadge::Running),
+            can_clear: !offline && !matches!(state, JobBadge::Queued | JobBadge::Running),
+        };
+        let inspector = selected.map(|name| {
+            let full_name = browsers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map_or(name, |(_, full)| *full);
+            let is_installed = !offline && installed.contains(&name);
+            let (buttons, console) = match story {
+                Story::AppsInstalling => (
+                    InspectorButtons {
+                        shown_installed: false,
+                        pending: Some(ButtonKind::Install),
+                        pending_tooltip: Some("Downloading 45%".into()),
+                        enabled: false,
+                    },
+                    Some(console(
+                        12,
+                        "Downloading 45%",
+                        JobBadge::Running,
+                        None,
+                        Some(45.),
+                        format!("{lines}Downloading chromium: 45% (88.1 MB of 196 MB)"),
+                    )),
+                ),
+                Story::AppsFailed => (
+                    InspectorButtons {
+                        shown_installed: false,
+                        pending: None,
+                        pending_tooltip: None,
+                        enabled: true,
+                    },
+                    Some(console(
+                        9,
+                        "Failed (exit 1)",
+                        JobBadge::Failed,
+                        Some(1),
+                        None,
+                        "Resolving ghcr.io/linuxserver/proot-apps:brave…\nerror: manifest unknown\nproot-apps: install failed".into(),
+                    )),
+                ),
+                Story::AppsInstalled => (
+                    InspectorButtons {
+                        shown_installed: true,
+                        pending: None,
+                        pending_tooltip: None,
+                        enabled: true,
+                    },
+                    Some(console(
+                        4,
+                        "Updated",
+                        JobBadge::Done,
+                        Some(0),
+                        None,
+                        "Checking ghcr.io/linuxserver/proot-apps:firefox…\nfirefox is up to date".into(),
+                    )),
+                ),
+                _ => (
+                    InspectorButtons {
+                        shown_installed: is_installed,
+                        pending: None,
+                        pending_tooltip: None,
+                        enabled: !offline,
+                    },
+                    None,
+                ),
+            };
+            Inspector {
+                name: name.into(),
+                full_name: full_name.into(),
+                description: "A free and open-source web browser developed by the Mozilla Foundation, with tracking protection and extensions.".into(),
+                icon: match name {
+                    "firefox" => Some(assets.icon_firefox.clone()),
+                    "zen" => Some(assets.icon_zen.clone()),
+                    _ => None,
+                },
+                initial: full_name.chars().next().unwrap_or('?'),
+                installed: is_installed,
+                buttons,
+                console,
+            }
+        });
+        let activity = match story {
+            Story::AppsBrowsing => vec![
+                ActivityRow {
+                    id: 12,
+                    app: "chromium".into(),
+                    full_name: "Chromium".into(),
+                    status: "Downloading 45%".into(),
+                    state: JobBadge::Running,
+                    progress: Some(45.),
+                    canceling: false,
+                },
+                ActivityRow {
+                    id: 13,
+                    app: "brave".into(),
+                    full_name: "Brave".into(),
+                    status: "Waiting to install…".into(),
+                    state: JobBadge::Queued,
+                    progress: None,
+                    canceling: false,
+                },
+                ActivityRow {
+                    id: 11,
+                    app: "vivaldi".into(),
+                    full_name: "Vivaldi".into(),
+                    status: "Installed".into(),
+                    state: JobBadge::Done,
+                    progress: None,
+                    canceling: false,
+                },
+            ],
+            Story::AppsInstalling => vec![ActivityRow {
+                id: 12,
+                app: "chromium".into(),
+                full_name: "Chromium".into(),
+                status: "Downloading 45%".into(),
+                state: JobBadge::Running,
+                progress: Some(45.),
+                canceling: false,
+            }],
+            Story::AppsFailed => vec![ActivityRow {
+                id: 9,
+                app: "brave".into(),
+                full_name: "Brave".into(),
+                status: "Failed (exit 1)".into(),
+                state: JobBadge::Failed,
+                progress: None,
+                canceling: false,
+            }],
+            _ => Vec::new(),
+        };
+        let width = px(if offline { 720. } else { 980. });
+        let (source, inspector_width) = apps_ui::pane_widths(width);
+        AppsProps {
+            categories,
+            filter: if installed_filter {
+                FilterId::Installed
+            } else {
+                FilterId::Category("Network".into())
+            },
+            search: Self::apps_query(story).into(),
+            tiles: Rc::new(tiles),
+            columns: apps_ui::columns(width - px(source + inspector_width + 2.)),
+            inspector,
+            activity,
+            catalog: match story {
+                Story::AppsLoading => CatalogView::Loading,
+                Story::AppsCatalogError => CatalogView::Failed(
+                    "Couldn’t load the app catalog. Check the Mac’s internet connection.".into(),
+                ),
+                _ => CatalogView::Ready,
+            },
+            installed_count: (!offline).then_some(3),
+            notice: (story == Story::AppsFailed).then(|| Notice {
+                text: "Couldn’t open “Firefox”: firefox: command not found".into(),
+                error: true,
+            }),
+            banner: offline.then_some(Banner::Waiting),
+            enabled: !offline,
+            focused: true,
+            width,
+        }
+    }
+
+    fn fixture_selkies_inputs(
+        story: Story,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> skerry_ui::selkies::SelkiesInputs {
+        let inputs = skerry_ui::selkies::new_selkies_inputs(window, cx);
+        let (address, user, password) = match story {
+            Story::ConnectSelkiesToken => ("https://gpu.example.com/kasm/", "", ""),
+            Story::ConnectSelkiesBadLogin => {
+                ("https://desktop.lab:8443/", "ubuntu", "wrong-password")
+            }
+            Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => {
+                ("https://desktop.lab:8443/", "ubuntu", "mypasswd")
+            }
+            _ => ("", "", ""),
+        };
+        for (input, value) in [
+            (&inputs.address, address),
+            (&inputs.username, user),
+            (&inputs.password, password),
+        ] {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+        inputs
+    }
+
+    fn selkies_connect_props(story: Story) -> skerry_ui::selkies::SelkiesConnectProps {
+        use skerry_ui::selkies::{
+            AlertTone, CertificateProps, RecentServerRow, SelkiesConnectProps, SelkiesField,
+            SelkiesProblem,
+        };
+        let fingerprint = |seed: u8| {
+            (0..32u8)
+                .map(|i| format!("{:02X}", i.wrapping_mul(37).wrapping_add(seed)))
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        let base = SelkiesConnectProps {
+            remember: true,
+            ..SelkiesConnectProps::default()
+        };
+        match story {
+            Story::ConnectSelkiesRecent => SelkiesConnectProps {
+                recent: vec![
+                    RecentServerRow {
+                        url: "https://desktop.lab:8443/".into(),
+                        label: "desktop.lab:8443".into(),
+                        login: "ubuntu@".into(),
+                        pinned: true,
+                        loopback: false,
+                    },
+                    RecentServerRow {
+                        url: "https://gpu.example.com/kasm/".into(),
+                        label: "gpu.example.com/kasm/".into(),
+                        login: "Session token".into(),
+                        pinned: false,
+                        loopback: false,
+                    },
+                    RecentServerRow {
+                        url: "http://localhost:8080/".into(),
+                        label: "localhost:8080".into(),
+                        login: "No login".into(),
+                        pinned: false,
+                        loopback: true,
+                    },
+                ],
+                ..base
+            },
+            Story::ConnectSelkiesToken => SelkiesConnectProps {
+                token_chip: true,
+                remember: false,
+                ..base
+            },
+            Story::ConnectSelkiesBadLogin => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Field {
+                    field: SelkiesField::Login,
+                    text: "The username or password is incorrect.".into(),
+                }),
+                ..base
+            },
+            Story::ConnectSelkiesWebRtc => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Alert {
+                    tone: AlertTone::Warning,
+                    title: "This server streams over WebRTC".into(),
+                    body: "Skerry needs the WebSockets mode: ask its operator to run Selkies with --mode=websockets. Dual mode is on, but the server is in WebRTC mode right now; Skerry won’t switch it, because that would change the stream for everyone watching.".into(),
+                    server: Some("desktop.lab:8443".into()),
+                    switch_to_sealskin: false,
+                }),
+                ..base
+            },
+            Story::ConnectSelkiesUnreachable => SelkiesConnectProps {
+                problem: Some(SelkiesProblem::Alert {
+                    tone: AlertTone::Danger,
+                    title: "Couldn’t reach desktop.lab:8443".into(),
+                    body: "Nothing is listening at that address and port. Check the address, and that the server is running.".into(),
+                    server: Some("desktop.lab:8443".into()),
+                    switch_to_sealskin: false,
+                }),
+                ..base
+            },
+            Story::ConnectCertificate => SelkiesConnectProps {
+                certificate: Some(CertificateProps {
+                    host: "desktop.lab".into(),
+                    host_port: "desktop.lab:8443".into(),
+                    fingerprint: fingerprint(0x3F),
+                    previous: None,
+                }),
+                ..base
+            },
+            Story::ConnectCertificateChanged => SelkiesConnectProps {
+                certificate: Some(CertificateProps {
+                    host: "desktop.lab".into(),
+                    host_port: "desktop.lab:8443".into(),
+                    fingerprint: fingerprint(0x3F),
+                    previous: Some(fingerprint(0x91)),
+                }),
+                ..base
+            },
+            _ => base,
+        }
+    }
+
+    fn render_selkies_connect(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use skerry_ui::selkies::{ConnectTab, SelkiesConnectHandlers};
+        let entity = cx.entity().clone();
+        let click = |label: &'static str| -> skerry_ui::selkies::Click {
+            let entity = entity.clone();
+            Rc::new(move |_, _, cx| entity.update(cx, |this, cx| this.record_event(label, cx)))
+        };
+        let url = |label: &'static str| -> skerry_ui::selkies::UrlHandler {
+            let entity = entity.clone();
+            Rc::new(move |url, _, cx| {
+                entity.update(cx, |this, cx| {
+                    this.record_event(format!("{label} {url}"), cx)
+                })
+            })
+        };
+        let e = entity.clone();
+        let handlers = SelkiesConnectHandlers {
+            on_tab: Rc::new(move |tab, _, cx| {
+                e.update(cx, |this, cx| {
+                    this.record_event(format!("Tab: {tab:?}"), cx)
+                })
+            }),
+            on_connect: click("Selkies: Connect"),
+            on_recent: url("Recent:"),
+            on_recent_remove: url("Remove recent:"),
+            on_remember: {
+                let e = entity.clone();
+                Rc::new(move |on, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.record_event(format!("Remember: {on}"), cx)
+                    })
+                })
+            },
+            on_drop_token: click("Drop token"),
+            on_trust: click("Trust certificate"),
+            on_cert_cancel: click("Cancel certificate"),
+            on_switch_sealskin: click("Switch to SealSkin"),
+        };
+        let selkies = Self::selkies_connect_props(self.story);
+        connect::render_with_tabs(
+            theme,
+            &ConnectProps::default(),
+            &self.key_input,
+            ConnectHandlers::new(|_, _, _| {}),
+            connect::ConnectTabs {
+                tab: ConnectTab::Selkies,
+                selkies: &selkies,
+                inputs: &self.selkies_inputs,
+                handlers,
+            },
+        )
+    }
+
+    fn render_selkies_home(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui_kit::Div {
+        use skerry_ui::selkies::{SecurityBadge, SelkiesHomeHandlers, SelkiesHomeProps};
+        let entity = cx.entity().clone();
+        let click = |label: &'static str| -> skerry_ui::selkies::Click {
+            let entity = entity.clone();
+            Rc::new(move |_, _, cx| entity.update(cx, |this, cx| this.record_event(label, cx)))
+        };
+        let open = self.story == Story::SelkiesHomeOpen;
+        let props = SelkiesHomeProps {
+            app_name: "SealSkin Native".into(),
+            display_name: "desktop.lab:8443".into(),
+            base_url: "https://desktop.lab:8443/".into(),
+            login_label: "ubuntu@".into(),
+            security: Some(SecurityBadge::Pinned),
+            fingerprint: Some(
+                (0..32u8)
+                    .map(|i| format!("{:02X}", i.wrapping_mul(37)))
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+            open_here: open,
+            others: usize::from(open),
+            thumbnail: open.then(|| self.assets.thumb_zen.clone()),
+            accepts_drop: true,
+            can_open_web: true,
+            menu_open: self.story == Story::SelkiesHomeMenu,
+            ..SelkiesHomeProps::default()
+        };
+        let e = entity.clone();
+        let handlers = SelkiesHomeHandlers {
+            on_open: click("Desktop: Open"),
+            on_files: click("Desktop: Files"),
+            on_refresh: click("Refresh"),
+            on_menu_open: Rc::new(move |open, _, cx| {
+                e.update(cx, |this, cx| {
+                    this.record_event(format!("Menu open: {open}"), cx)
+                })
+            }),
+            on_open_web: click("Open in Browser"),
+            on_disconnect: click("Disconnect"),
+            on_forget: click("Forget This Server…"),
+            on_drop: {
+                let e = entity.clone();
+                Rc::new(move |paths, _, cx| {
+                    e.update(cx, |this, cx| {
+                        this.record_event(format!("Drop {} items", paths.len()), cx)
+                    })
+                })
+            },
+            on_copy_pending: click("Copy to Desktop"),
+            on_cancel_pending: click("Cancel copy"),
+        };
+        div()
+            .size_full()
+            .relative()
+            .child(skerry_ui::selkies::render_home(theme, &props, handlers))
+            .when(self.story == Story::SelkiesHomeForget, |view| {
+                view.child(session::forget_server_confirm_modal(
+                    theme,
+                    "desktop.lab:8443",
+                    |_, _, _| {},
+                    |_, _, _| {},
+                ))
+            })
     }
 
     fn fixture_files(story: Story) -> FilesProps {
@@ -1180,6 +1833,10 @@ impl PreviewApp {
         self.story = story;
         self.account_open = story.account_open();
         self.files_props = Self::fixture_files(story);
+        self.apps_props = Self::fixture_apps(story, &self.assets);
+        let query = Self::apps_query(story);
+        self.apps_search
+            .update(cx, |state, cx| state.set_value(query, window, cx));
         self.last_event = story.note().map(Into::into);
         if let Some(dialog) = Self::story_dialog(story, &self.assets) {
             let selects = Self::bind_launch_selects(&dialog, window, cx);
@@ -2270,6 +2927,7 @@ impl PreviewApp {
             ControlsAction::OpenPrivacySettings(_) => {}
             ControlsAction::Reconnect
             | ControlsAction::OpenFiles
+            | ControlsAction::OpenApps
             | ControlsAction::Disconnect
             | ControlsAction::SendChord(_)
             | ControlsAction::ResetVideo => {}
@@ -2313,6 +2971,7 @@ impl PreviewApp {
 
         match story {
             Story::ControlsJpeg => ControlsProps {
+                apps_available: story == Story::ControlsApps,
                 app_name: "Zen Browser".into(),
                 fullscreen: false,
                 audio: Some(true),
@@ -2413,6 +3072,7 @@ impl PreviewApp {
                 media_capture: Some(Self::fixture_media_capture(Story::CaptureOff)),
             },
             Story::ControlsServerLocked => ControlsProps {
+                apps_available: story == Story::ControlsApps,
                 app_name: "Locked Enterprise Desktop".into(),
                 fullscreen: true,
                 audio: Some(true),
@@ -2517,6 +3177,7 @@ impl PreviewApp {
                 props
             }
             _ => ControlsProps {
+                apps_available: story == Story::ControlsApps,
                 app_name: "Visual Studio Code".into(),
                 fullscreen: false,
                 audio: Some(true),
@@ -3563,6 +4224,7 @@ impl PreviewApp {
             | Story::ControlsPrintingEmpty
             | Story::ControlsPrintingJobs
             | Story::ControlsPrintingOff
+            | Story::ControlsApps
             | Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -3675,6 +4337,64 @@ impl PreviewApp {
                             handler,
                         )),
                 )
+            }
+            Story::AppsLoading
+            | Story::AppsBrowsing
+            | Story::AppsInstalled
+            | Story::AppsInstalling
+            | Story::AppsFailed
+            | Story::AppsSearchEmpty
+            | Story::AppsCatalogError
+            | Story::AppsOffline => {
+                let entity = entity.clone();
+                let handler: apps_ui::AppsHandler =
+                    Rc::new(move |action: AppsAction, _, cx: &mut App| {
+                        if matches!(action, AppsAction::IconsVisible(_)) {
+                            return;
+                        }
+                        entity.update(cx, |this, cx| {
+                            if let AppsAction::DismissNotice = action {
+                                this.apps_props.notice = None;
+                            }
+                            this.record_event(format!("Apps: {action:?}"), cx);
+                            cx.notify();
+                        });
+                    });
+                let (w, h) = if self.story == Story::AppsOffline {
+                    (720., 460.)
+                } else {
+                    (980., 640.)
+                };
+                div()
+                    .size_full()
+                    .bg(theme.secondary)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p_6()
+                    .child(
+                        div()
+                            .id("apps-preview-frame")
+                            .w(px(w))
+                            .h(px(h))
+                            .flex_none()
+                            .rounded_xl()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.background)
+                            .text_color(theme.foreground)
+                            .text_sm()
+                            .child(apps_ui::render(
+                                theme,
+                                &self.apps_props,
+                                &self.apps_search,
+                                &self.apps_grid,
+                                &self.apps_focus,
+                                &self.apps_console,
+                                handler,
+                            )),
+                    )
             }
             Story::SessionOverlays => {
                 let entity = entity.clone();
@@ -3918,6 +4638,16 @@ impl PreviewApp {
                     Some(&strip),
                     entity,
                 ))
+            }
+            Story::ConnectSelkiesRecent
+            | Story::ConnectSelkiesToken
+            | Story::ConnectSelkiesBadLogin
+            | Story::ConnectSelkiesWebRtc
+            | Story::ConnectSelkiesUnreachable
+            | Story::ConnectCertificate
+            | Story::ConnectCertificateChanged => self.render_selkies_connect(theme, cx),
+            Story::SelkiesHomeOpen | Story::SelkiesHomeMenu | Story::SelkiesHomeForget => {
+                self.render_selkies_home(theme, cx)
             }
             Story::PrintNoticeNarrow => {
                 let strip = Self::fixture_strip(false);

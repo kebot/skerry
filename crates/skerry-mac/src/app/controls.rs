@@ -68,6 +68,7 @@ enum Command {
     FullScreen,
     Reconnect,
     Files,
+    Apps,
     Disconnect,
     Audio(bool),
     Playback(bool),
@@ -271,6 +272,7 @@ impl ControlPanel {
                         }
                         Command::Reconnect => session.reconnect(window, cx),
                         Command::Files => session.toggle_files(window, cx),
+                        Command::Apps => session.toggle_apps(window, cx),
                         Command::Disconnect => session.disconnect(window, cx),
                         Command::Audio(enabled) => {
                             if let Some(stream) = &session.current {
@@ -411,6 +413,7 @@ impl ControlPanel {
             }
             ControlsAction::Reconnect => Self::send(self.owner.clone(), Command::Reconnect, cx),
             ControlsAction::OpenFiles => Self::send(self.owner.clone(), Command::Files, cx),
+            ControlsAction::OpenApps => Self::send(self.owner.clone(), Command::Apps, cx),
             ControlsAction::Disconnect => Self::send(self.owner.clone(), Command::Disconnect, cx),
             ControlsAction::SetInput { id, enabled } => {
                 if let Some((feature, _)) = InputFeature::ALL
@@ -710,6 +713,7 @@ impl ControlPanel {
                 chosen: session.preferences.audio.input_device.as_deref(),
                 saved_name: session.preferences.audio.input_device_name.as_deref(),
             }),
+            apps_available: session.apps_available(),
         }
     }
 }

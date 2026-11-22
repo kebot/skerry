@@ -240,11 +240,11 @@
 | **Clipboard** | The server clipboard's text, editable (sent on blur, `clipboardUpdateFromUI`); image upload when binary clipboard is on (`enable_binary_clipboard`); masked-secret copy button | Clipboard section: Send to Session, Receive from Session, Seamless; Send Mac Clipboard / Copy Session Clipboard when Seamless is off; `NSPasteboard` sync on focus (`ARCH-017`). No editable text box: the Mac's own pasteboard is the clipboard | Settled: `ARCH-017` (`ARCH-GAP-DC-01`) |
 | **Files** | Opens the file manager: browse the session's directories, upload and download (shown when the server allows either transfer) | A native **Files** window per session (⌘⇧F, Session Controls → Files): browse, transfers, Finder copy/paste and drag both ways, Delete via SealSkin storage (`ARCH-023`, `ARCH-024`) | Settled (`ARCH-GAP-DC-02`); mount `ARCH-GAP-DC-14`, rename/move `ARCH-GAP-DC-15` |
 | **Printing** | Shown once a document arrives: auto-print switch and every printed document with Print and Save (`printDocument`, `printRequest`) | — | `ARCH-GAP-DC-04` | `desktop-and-collaboration` | `remote-printing` | settled (`ARCH-033`) | One-shot PDF fetch, notices with Print…/Open/Save…, the macOS print sheet, Open Print Dialog Automatically, and cache cleanup. |
-| **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` |
+| **Apps** | "Manage Apps" opens the proot-apps catalog by category with search, install / remove / update / launch, and each job's console; needs the server's `command_enabled` | — | `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | settled (`ARCH-035`) | An Apps window per session over `apps,{op}`. Support is detected, the GitHub catalog is fetched with no credentials, and icons are rasterised in a sandboxed worker process. |
 | **Sharing** | Copyable links for the viewer (`#shared`) and controller slots (`#player2`–`#player4`), each gated by its server setting | — | `ARCH-GAP-DC-07` |
 | **Gamepads** | Gamepad input switch, touch gamepad switch, Rumble on/off (`gamepad_rumble`), live picture of each pad (`gamepadButtonUpdate`, `gamepadAxisUpdate`) | — | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | **Shortcuts** | The dashboard's own chords (Ctrl+Shift+F fullscreen, Ctrl+Shift+X gaming mode, Ctrl+Shift+M dashboard, Ctrl+Shift+G virtual gamepad, Ctrl+Shift+Left Click pointer lock) and a "Shortcuts active" switch that hands them to the session instead | `cmd-shift-m` opens Session Controls; Send Key Combination (Alt+Tab, Ctrl+Alt+Delete) in **Input** | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
-| **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` |
+| **Pelorus** (first, when the server serves `/pelorus`) | A prompt against the server's Pelorus API, which describes the desktop as text (windows, positions, accessibility tree) for a caller without vision, with a pop-out page | — | `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | excluded (`ARCH-035`) | An agent loop that can act on the desktop and needs a model key; not surfaced to people. |
 | Footer | "Cite our paper academically" link | — | Excluded |
 
 - **Affected Contracts:** `src/skerry/video-and-screen.prose.md`, `src/skerry/desktop-and-collaboration.prose.md`
@@ -641,6 +641,78 @@
 - **Not verified live** (screen locked): real-app CPU, WindowServer and VTDecoder deltas, GPU memory, visual seams and tearing, and the top-to-bottom stripe order on a live server (use the trace).
 - **Affected Rust:** `transport.rs`, `view.rs`, `view/stripes.rs` (new), `Cargo.toml` (zune-jpeg 0.5).
 
+## ARCH-035: Apps Catalog Window; Pelorus Excluded (Task J)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-DC-11`. Closes `ARCH-GAP-DC-13` (Pelorus) as excluded. Amends the index rule that Skerry talks only to SealSkin and Selkies: one keyless catalog fetch from GitHub is allowed.
+- **Process:** plan → design → review (13 required changes) → build → QA (1 high: older Selkies; 1 medium: SVG CPU bombs) → code review (4 rounds; an entity bomb, a marker bomb, an ancestor-class bypass and a `url()` whitespace bypass found and fixed, then a worker process added) by subagents (`ARCH-025`). Branch `task-j-apps`.
+- **Protocol (Selkies 715df7c, c72a9ef7 or newer):**
+  - The client sends `apps,{"op":install|remove|update|launch|list|cancel|clear,...}` on the session WebSocket.
+  - The server replies with the system actions `apps_state` (replaces the state) and `apps_job` (console `append`/`reset`), plus `command_error`.
+  - Gated by `command_enabled`, and hidden by `ui_sidebar_show_apps`.
+  - One shared `system_action` match in the transport routes these and `ARCH-032`'s rumble.
+- **Decision:**
+  - **Window:** one **Apps** window per session, like Files (`ARCH-023`): source list (Installed, All Apps, categories with counts, Activity), a 112×104 icon grid, and a 300 pt detail pane. Installed apps get Open, then Update and Remove…, with a confirm. The pane also has a monospace console with auto-scroll, Copy, and Cancel ("Canceling…", since cancel gets no reply). ⌘⌫ removes.
+  - **Opening:** from a Session Controls header button and View → Apps, with no chord. It stays open across a reconnect, and teardown closes it.
+  - **Support detection:** older Selkies drop the ops silently. Skerry sends `list` once per stream and waits 5 s for `apps_state`. If nothing comes, the button hides, the View item is disabled, and an open window shows "This session's Selkies is too old for the Apps catalog." A late reply re-enables it. There is no old-protocol fallback.
+  - **Catalog:**
+    - From the Selkies web client's GitHub raw URL: a separate HTTP client with no key, cookie or user agent, HTTPS only, at most 3 redirects, size-capped, 5 s timeout. This is the one sanctioned third-party fetch.
+    - Or from the session's local repository (`api/apps/`, with the session cookie), whose generated entries may have no icon, description or category.
+    - YAML is parsed under a budget.
+  - **Icons (untrusted SVG):**
+    - Refused outright: any `<!ENTITY` or internal DTD subset, `<marker>`, CSS escapes and `@import`, and `<use>` or element or depth counts over budget.
+    - Removed rather than refused: filters, so drop shadows are dropped.
+    - Checked: nested mask, clipPath and pattern references are resolved through attributes, `style=` and stylesheet classes on the element and its ancestors. `url()` is read exactly as svgtypes reads it, and anything unreadable counts as a reference.
+    - SVGs up to 1 MiB.
+    - Rasterising runs in a child process (`--skerry-svg-worker`, checked first in `main`). It has RLIMIT_CPU 2 s, a 3 s kill, at most 2 at a time, an empty environment, and only stdin and stdout. Output is size-capped and bounds-checked.
+    - PNG icons are capped at 2048 px and 32 MB.
+    - All 137 real catalog icons decode.
+    - Textures retire through a queue drained in render, with a generation counter (`ARCH-014`).
+- **Pelorus excluded (`DC-13`):** `/pelorus/api/run` is an agent loop of up to 50 steps that clicks, types and can run shell commands, so even a "describe" prompt can change the desktop. The panel is aimed at agents, and it needs a model key that Skerry would have to store. Revisit if VoiceOver-style reading of remote windows becomes a goal.
+- **QA:**
+  - Hostile inputs were refused in 0.03–25 ms.
+  - The GitHub fetch got 161 apps in 218 ms with only `accept` and `host` headers.
+  - The live server runs a Selkies older than c72a9ef7, so install, remove and the job console were not verified live, nor anything on screen (screen locked).
+- **Affected Rust:** `apps.rs` (new), `app/apps_window.rs`, `transport.rs`, `app/session_window.rs`, `app/controls.rs`, `app.rs`, `main.rs`, `crates/skerry-ui/src/{apps.rs,controls.rs,assets.rs}`, `examples/preview.rs`, `tests/fixtures/proot-apps-metadata.yml`.
+
+## ARCH-036: Direct Selkies Servers, with No SealSkin in Front (Task K)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-13`. Amends `ARCH-011`: Selkies credentials may be kept in the same `0600` `config.toml`, never the Keychain. Amends `ARCH-009`: Selkies reports no version, so a capability gate replaces the version check.
+- **Process:** plan → design → review (15 required changes) → build (live against a stock Selkies container) → QA (2 medium, against a local container) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-k-selkies`.
+- **Decision:**
+  - **Connect card:**
+    - A **SealSkin | Selkies** segmented switch. The Selkies side takes the browser link (a `#token=` fragment becomes the token, form-decoded), Username and Password, **Remember on this Mac**, and Recent Servers (up to 5).
+    - Pasting a URL into the key field switches tabs.
+    - Prior art: Windows App splits Add Workspace from Add PC, and Finder ⌘K and Screens use an address plus a login.
+  - **Storage:**
+    - Up to 5 `[[selkies]]` entries in `config.toml` (`url`, `username`, `password`, `token`, `certificate_sha256`), newest first, with a warning comment above them. One connection at a time.
+    - The certificate pin is saved even when Remember is off.
+    - `SKERRY_SELKIES_URL` and `SKERRY_SELKIES_CERT_SHA256` are read for QA and never saved.
+  - **Auth:**
+    - Basic is sent on HTTP requests and on the WebSocket upgrade.
+    - A token goes as Bearer on HTTP, and on the WebSocket as the `selkies.token.` subprotocol plus the `selkies_token` cookie.
+    - No Origin header.
+    - Credentials go only to the configured origin, with redirects off.
+    - A token from a pasted link is dropped when the address changes to another host.
+  - **TLS:**
+    - HTTPS only, plus plain HTTP to loopback. Userinfo is refused, and so is port 0.
+    - The stock container makes its own certificate per install, so it is trusted once by the SHA-256 of the leaf certificate. The Mac's trust store and the hostname are checked first, and the pin is tried only when they fail. Signature checks stay with rustls.
+    - A changed certificate is a hard stop, including on the session socket, with no startup retry.
+    - rustls is ring-only (`default-features = false`, `builder_with_provider`). aws-lc-rs would make the SealSkin tungstenite connector panic, and `cargo tree -i aws-lc-rs` is empty.
+  - **Gate (instead of a version):**
+    - The open `GET /api/status` must report WebSockets mode. A WebRTC-mode server is refused with its own message.
+    - A logged-in `GET /api/sessions` must answer 200.
+    - `GET /api/tokens` tells secure mode apart, and a token is checked on its own with Bearer.
+    - 401 bodies tell "needs password", "wrong password" and "needs token" apart.
+    - A bad token shows up as Close 4001 after the upgrade, and is fatal, never retried.
+  - **Library:**
+    - One Desktop card (thumbnail from `api/screenshot`, login, an "n other pages connected" line, Files, and Open).
+    - A server menu replaces the account menu: Address, Login, Security, Mode, Open in Browser (hidden for token-only servers), Disconnect, and Forget This Server… with a confirmation.
+    - There is no catalog, launch, Stop, account, or Delete in Files (`ARCH-024`).
+    - Stream, audio, clipboard, gamepads, printing, Files and Apps all work.
+    - Connecting to Selkies clears SealSkin recovery, pending saves, and queued opens. A Refresh that fails on the network keeps the Library.
+- **QA (live):** run against `selkies/desktop:latest-ubuntu26.04` on a remote host by the builder, and against a local Selkies 2.2.1 by QA. Basic login, Files, first-trust pin, pin mismatch after the container was recreated, wrong password, needs-token, bad token (no loop), WebRTC refused, and the `config.toml` rules all passed. No request reached another origin under redirects. Not verified: anything on screen (screen locked), and plain-HTTP localhost.
+- **Affected Rust:** `tls.rs` (new), `config_store.rs` (moved out of `sealskin.rs`), `direct.rs`, `app/selkies_home.rs`, `selkies.rs`, `transport.rs`, `persist.rs`, `app.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{connect.rs,selkies.rs,library.rs}`, `Cargo.toml`, `examples/preview.rs`.
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -672,11 +744,11 @@
 | `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | settled (`ARCH-034`) | Per-stripe RenderImages, NEON decode, present on the bottom stripe or after a 2 ms settle; about 27–30 % fewer cycles. |
 | `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | mostly settled (`ARCH-018`, `ARCH-026`) | Settled: web-sidebar cards, section memory per server, scroll per window, theme-aware dropdown shadow. Open: the web's stream-toggle tile row (`ARCH-020`). |
 | `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | settled (`ARCH-026`) | Sign Out… with confirmation, 1200 pt Library column, success toasts, live "Started … ago". |
-| `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | unresolved (goal) | Connect to a standalone Selkies server with no SealSkin, through `SelkiesClient` alone (`ARCH-024`). |
+| `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | settled (`ARCH-036`) | Connect to a standalone Selkies server: Basic or token login, a pinned self-signed certificate, up to 5 servers in `config.toml`, and a Desktop card. |
 | `ARCH-GAP-LS-11` | `launcher-and-sessions` | `control-plane-hardening` | settled (`ARCH-026`) | Key only on `/companion/api/`, single FIFO write queue off the main thread, cached Library items. |
 | `ARCH-GAP-DC-09` | `desktop-and-collaboration` | `stray-super-key` | settled client-side (`ARCH-026`) | Key releases are sent before the socket closes; no `kr`; `KeyLedger`. A live input trace is still to be taken. |
 | `ARCH-GAP-DC-10` | `desktop-and-collaboration` | `clipboard-shortcuts` | settled (`ARCH-017`) | ⌘C/⌘X/⌘V stay on the Mac while Command sends Control is off; sessions use Control+C/X/V. |
 | `ARCH-GAP-VS-06` | `video-and-screen` | `stats-overlay` | settled (`ARCH-031`) | The web's over-the-stream strip, with no hitbox and saved per server; the floating gauges were not built. |
-| `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | unresolved (backlog) | The web's Apps panel: proot-apps catalog by category with search, install/remove/update/launch and job consoles, gated by the server's `command_enabled` (`ARCH-020`). |
+| `ARCH-GAP-DC-11` | `desktop-and-collaboration` | `apps-catalog` | settled (`ARCH-035`) | An Apps window per session over `apps,{op}`. Support is detected, the GitHub catalog is fetched with no credentials, and icons are rasterised in a sandboxed worker process. |
 | `ARCH-GAP-DC-12` | `desktop-and-collaboration` | `session-shortcuts` | settled (`ARCH-031`) | A Shortcuts card listing `shortcuts::CHORDS`, with "Mac shortcuts active" handing them to the session as Ctrl chords; ⌘Q always stays local. |
-| `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | unresolved (backlog) | The web's Pelorus panel: a prompt against the server's `/pelorus/api`, which describes the desktop as text for a caller without vision; evaluate whether Skerry should surface it (`ARCH-020`). |
+| `ARCH-GAP-DC-13` | `desktop-and-collaboration` | `pelorus` | excluded (`ARCH-035`) | An agent loop that can act on the desktop and needs a model key; not surfaced to people. |
