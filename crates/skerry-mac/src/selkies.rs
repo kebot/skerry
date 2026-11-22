@@ -6,6 +6,9 @@
 //! to its file-manager folder; paths here are relative to it, `/`-separated. No request carries
 //! an `Origin` header: Selkies treats a request without one as same-origin, which `mkdir` needs.
 
+use crate::print_jobs::{
+    has_pdf_header, FetchFailure, Fetched, MAX_PRINT_BYTES, PDF_HEADER_WINDOW,
+};
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use reqwest::header::{HeaderValue, CONTENT_TYPE, COOKIE, RANGE};
 use reqwest::{Method, StatusCode, Url};
@@ -14,7 +17,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// Files above this go up as slices of this size, as in the web client, so no request body
@@ -361,6 +364,108 @@ impl SelkiesClient {
         Ok(())
     }
 
+    /// `api/print/<name>`, the name encoded as one path segment.
+    fn print_url(&self, name: &str) -> Url {
+        self.url(&format!("api/print/{}", encode_component(name)))
+    }
+
+    /// Fetches a printed document into `file` (`ARCH-033`). One plain `GET`, never a
+    /// `Range` and never through [`download`](Self::download): Selkies deletes the document
+    /// as it answers 200, so only a whole 200 body is a document. The headers and every
+    /// chunk must each come within `stall` (no total deadline: a large, slow, healthy
+    /// transfer finishes). Failures before the 200 leave the document in the spool
+    /// ([`FetchFailure::Retry`]).
+    pub async fn print_document(
+        &self,
+        name: &str,
+        file: &mut tokio::fs::File,
+        progress: &Progress,
+        stall: Duration,
+    ) -> Result<Fetched, FetchFailure> {
+        self.print_document_capped(name, file, progress, stall, MAX_PRINT_BYTES)
+            .await
+    }
+
+    async fn print_document_capped(
+        &self,
+        name: &str,
+        file: &mut tokio::fs::File,
+        progress: &Progress,
+        stall: Duration,
+        cap: u64,
+    ) -> Result<Fetched, FetchFailure> {
+        let retry = |why: String| FetchFailure::Retry(why);
+        let request = self.request(Method::GET, self.print_url(name)).send();
+        let mut response = match tokio::time::timeout(stall, request).await {
+            Err(_) => return Err(retry("no answer in time".into())),
+            Ok(Err(error)) => return Err(retry(Error::from(error).to_string())),
+            Ok(Ok(response)) => response,
+        };
+        let status = response.status();
+        if status != StatusCode::OK {
+            let body = match tokio::time::timeout(stall, response.text()).await {
+                Ok(Ok(body)) => body,
+                _ => String::new(),
+            };
+            return Err(match status.as_u16() {
+                404 => FetchFailure::Gone,
+                403 => FetchFailure::Refused(sentence(&server_message(status, &body))),
+                // A 206 deletes nothing; any other answer (a sign-in redirect, a proxy's
+                // 5xx) never reached the document either.
+                _ => retry(format!("HTTP {status}")),
+            });
+        }
+        let length = response.content_length();
+        if let Some(length) = length.filter(|&length| length > cap) {
+            return Err(FetchFailure::TooLarge(length));
+        }
+        let limit = length.unwrap_or(cap);
+        let printed_at = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+            .map(SystemTime::from);
+        let mut head = Vec::with_capacity(PDF_HEADER_WINDOW);
+        let mut written = 0u64;
+        let unsaved = |error: std::io::Error| FetchFailure::Unsaved(error.to_string());
+        loop {
+            let chunk = match tokio::time::timeout(stall, response.chunk()).await {
+                Err(_) => return Err(FetchFailure::Broken("stalled".into())),
+                Ok(Err(error)) => return Err(FetchFailure::Broken(Error::from(error).to_string())),
+                Ok(Ok(None)) => break,
+                Ok(Ok(Some(chunk))) => chunk,
+            };
+            written += chunk.len() as u64;
+            if written > limit {
+                return Err(if written > cap {
+                    FetchFailure::TooLarge(written)
+                } else {
+                    FetchFailure::Broken("longer than its length".into())
+                });
+            }
+            if head.len() < PDF_HEADER_WINDOW {
+                let take = (PDF_HEADER_WINDOW - head.len()).min(chunk.len());
+                head.extend_from_slice(&chunk[..take]);
+                if head.len() == PDF_HEADER_WINDOW && !has_pdf_header(&head) {
+                    return Err(FetchFailure::NotPdf);
+                }
+            }
+            file.write_all(&chunk).await.map_err(unsaved)?;
+            progress.store(written, Ordering::Relaxed);
+        }
+        if length.is_some_and(|length| written != length) {
+            return Err(FetchFailure::Broken("shorter than its length".into()));
+        }
+        if !has_pdf_header(&head) {
+            return Err(FetchFailure::NotPdf);
+        }
+        Ok(Fetched {
+            bytes: written,
+            printed_at,
+        })
+    }
+
     fn files_url(&self, remote: &str) -> Url {
         let path = remote
             .split('/')
@@ -616,6 +721,23 @@ mod tests {
     }
 
     #[test]
+    fn print_urls_encode_the_name_like_encode_uri_component() {
+        let access = SelkiesClient::new(
+            Url::parse("https://seal.example/sess-1/").unwrap(),
+            HeaderValue::from_static("session=abc"),
+        )
+        .unwrap();
+        assert_eq!(
+            access.print_url("Report (2).pdf").as_str(),
+            "https://seal.example/sess-1/api/print/Report%20(2).pdf"
+        );
+        assert_eq!(
+            access.print_url("Résumé #2 50%?.pdf").as_str(),
+            "https://seal.example/sess-1/api/print/R%C3%A9sum%C3%A9%20%232%2050%25%3F.pdf"
+        );
+    }
+
+    #[test]
     fn resumed_downloads_ask_for_the_rest() {
         assert_eq!(range_from(1024), "bytes=1024-");
         assert_eq!(
@@ -684,6 +806,27 @@ mod tests {
             chunked: Mutex<HashMap<PathBuf, (String, u64)>>,
             /// Cut the next whole-file download off halfway, as a dropped connection.
             cut_next_download: AtomicBool,
+            /// The print spool by name; a 200 takes the document, as Selkies deletes it.
+            prints: Mutex<HashMap<String, PrintReply>>,
+        }
+
+        #[derive(Clone)]
+        enum PrintReply {
+            Pdf(Vec<u8>),
+            /// Claims `claimed` bytes, sends `sent`, then closes.
+            Truncate {
+                claimed: usize,
+                sent: Vec<u8>,
+            },
+            Status(&'static str, &'static str),
+            /// No `Content-Length`: the body runs until the connection closes.
+            NoLength(Vec<u8>),
+            /// Claims a length over the cap.
+            Huge,
+            /// Never answers.
+            HoldHeaders,
+            /// Sends the headers and part of the body, then goes quiet.
+            StallBody(Vec<u8>),
         }
 
         struct Server {
@@ -844,6 +987,10 @@ mod tests {
                     let rel = decode(&files["files/".len()..]);
                     download(&mut stream, &fake, &rel, &headers).await
                 }
+                ("GET", print) if print.starts_with("print/") => {
+                    let name = decode(&print["print/".len()..]);
+                    print_document(&mut stream, &fake, &name, &headers).await
+                }
                 _ => error(&mut stream, "404 Not Found", "no route").await,
             }
         }
@@ -983,6 +1130,66 @@ mod tests {
                 return; // dropped: the connection closes short of Content-Length
             }
             respond(stream, "200 OK", &disposition, &bytes).await
+        }
+
+        /// `handle_print_document`: the spool's document whole with a 200 (taken from the
+        /// spool as the answer is built), 206 for a `Range` (kept), 404 when absent.
+        async fn print_document(
+            stream: &mut TcpStream,
+            fake: &Fake,
+            name: &str,
+            headers: &HashMap<String, String>,
+        ) {
+            let reply = fake.prints.lock().unwrap().get(name).cloned();
+            let Some(reply) = reply else {
+                let plain = [("Content-Type", "text/plain; charset=utf-8".to_owned())];
+                return respond(stream, "404 Not Found", &plain, b"Not Found").await;
+            };
+            let modified = [("Last-Modified", "Sun, 22 Nov 2026 04:47:00 GMT".to_owned())];
+            if headers.contains_key("range") {
+                return respond(stream, "206 Partial Content", &modified, b"%PDF-").await;
+            }
+            let taken = !matches!(reply, PrintReply::Status(..));
+            if taken {
+                fake.prints.lock().unwrap().remove(name);
+            }
+            match reply {
+                PrintReply::Pdf(bytes) => respond(stream, "200 OK", &modified, &bytes).await,
+                PrintReply::Status(status, message) => error(stream, status, message).await,
+                PrintReply::Truncate { claimed, sent } => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {claimed}\r\n\r\n"
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(&sent).await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+                PrintReply::NoLength(bytes) => {
+                    let head = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    let _ = stream.write_all(&bytes).await;
+                    let _ = stream.flush().await;
+                }
+                PrintReply::Huge => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n%PDF-",
+                        MAX_PRINT_BYTES + 1
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+                PrintReply::HoldHeaders => tokio::time::sleep(Duration::from_secs(5)).await,
+                PrintReply::StallBody(bytes) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        bytes.len() * 2
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                    stream.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
 
         fn requests(fake: &Fake, method: &str, prefix: &str) -> Vec<Seen> {
@@ -1182,6 +1389,251 @@ mod tests {
                 .unwrap();
             assert!(std::fs::read(&destination).unwrap() == bytes);
             assert!(!partial.exists());
+        }
+
+        fn pdf(len: usize) -> Vec<u8> {
+            let mut bytes = b"%PDF-1.7\n".to_vec();
+            bytes.extend(pattern(len.saturating_sub(bytes.len())));
+            bytes
+        }
+
+        fn spool(fake: &Fake, name: &str, reply: PrintReply) {
+            fake.prints.lock().unwrap().insert(name.into(), reply);
+        }
+
+        const STALL: Duration = Duration::from_secs(5);
+
+        /// `print_jobs::fetch` into a fresh job folder; returns the result and the folder.
+        async fn fetch_print(
+            access: &SelkiesClient,
+            name: &str,
+            stall: Duration,
+        ) -> (crate::print_jobs::FetchResult, tempfile::TempDir, PathBuf) {
+            let local = tempfile::tempdir().unwrap();
+            let job_dir = local.path().join("w1/1");
+            let closed = AtomicBool::new(false);
+            let result = crate::print_jobs::fetch(
+                access,
+                name,
+                &job_dir,
+                &crate::print_jobs::local_file_name(name),
+                &Progress::default(),
+                &closed,
+                stall,
+            )
+            .await;
+            (result, local, job_dir)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_printed_document_is_fetched_once_with_the_cookie_and_no_origin() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            let bytes = pdf(10_000);
+            spool(fake, "Report (2).pdf", PrintReply::Pdf(bytes.clone()));
+            let (result, _local, job_dir) = fetch_print(access, "Report (2).pdf", STALL).await;
+            let fetched = result.unwrap();
+            assert_eq!(fetched.bytes, 10_000);
+            assert!(fetched.printed_at.is_some(), "Last-Modified is read");
+            assert!(std::fs::read(job_dir.join("Report (2).pdf")).unwrap() == bytes);
+            assert!(!job_dir.join(".partial").exists());
+            let gets = requests(fake, "GET", "/sess-1/api/print/");
+            assert_eq!(gets.len(), 1);
+            assert_eq!(gets[0].target, "/sess-1/api/print/Report%20(2).pdf");
+            assert_eq!(gets[0].headers["cookie"], COOKIE_VALUE);
+            assert!(!gets[0].headers.contains_key("origin"));
+            assert!(!gets[0].headers.contains_key("range"));
+            // The server took it: a second fetch finds nothing, quietly.
+            let (again, _local, _) = fetch_print(access, "Report (2).pdf", STALL).await;
+            assert_eq!(again, Err(FetchFailure::Gone));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_truncated_print_fails_and_leaves_no_file() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            spool(
+                fake,
+                "cut.pdf",
+                PrintReply::Truncate {
+                    claimed: 10_000,
+                    sent: pdf(4_000),
+                },
+            );
+            let (result, _local, job_dir) = fetch_print(access, "cut.pdf", STALL).await;
+            assert!(matches!(result, Err(FetchFailure::Broken(_))), "{result:?}");
+            assert!(!job_dir.join("cut.pdf").exists());
+            assert!(!job_dir.join(".partial").exists());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_print_keeps_the_server_sentence() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            spool(
+                fake,
+                "a.pdf",
+                PrintReply::Status("403 Forbidden", "Forbidden: printing disabled"),
+            );
+            let (result, _local, job_dir) = fetch_print(access, "a.pdf", STALL).await;
+            assert_eq!(
+                result,
+                Err(FetchFailure::Refused(
+                    "Forbidden: printing disabled.".into()
+                ))
+            );
+            assert!(!job_dir.join(".partial").exists());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_print_that_is_not_a_pdf_is_refused() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            spool(fake, "page.pdf", PrintReply::Pdf(vec![b'<'; 4096]));
+            let (result, _local, job_dir) = fetch_print(access, "page.pdf", STALL).await;
+            assert_eq!(result, Err(FetchFailure::NotPdf));
+            assert!(!job_dir.join("page.pdf").exists());
+            // A short body is checked at its end.
+            spool(fake, "tiny.pdf", PrintReply::Pdf(b"hello".to_vec()));
+            let (result, _local, _) = fetch_print(access, "tiny.pdf", STALL).await;
+            assert_eq!(result, Err(FetchFailure::NotPdf));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_local_failure_sends_no_request() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            spool(fake, "a.pdf", PrintReply::Pdf(pdf(100)));
+            let local = tempfile::tempdir().unwrap();
+            // A file where the window's folder should be.
+            std::fs::write(local.path().join("w1"), b"").unwrap();
+            let result = crate::print_jobs::fetch(
+                access,
+                "a.pdf",
+                &local.path().join("w1/1"),
+                "a.pdf",
+                &Progress::default(),
+                &AtomicBool::new(false),
+                STALL,
+            )
+            .await;
+            assert!(matches!(result, Err(FetchFailure::Local(_))), "{result:?}");
+            assert!(requests(fake, "GET", "/sess-1/api/print/").is_empty());
+            assert!(fake.prints.lock().unwrap().contains_key("a.pdf"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_print_never_sends_range_even_with_a_stale_partial() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            let bytes = pdf(5_000);
+            spool(fake, "a.pdf", PrintReply::Pdf(bytes.clone()));
+            let local = tempfile::tempdir().unwrap();
+            let job_dir = local.path().join("1");
+            std::fs::create_dir_all(&job_dir).unwrap();
+            std::fs::write(job_dir.join(".partial"), vec![b'x'; 9_000]).unwrap();
+            crate::print_jobs::fetch(
+                access,
+                "a.pdf",
+                &job_dir,
+                "a.pdf",
+                &Progress::default(),
+                &AtomicBool::new(false),
+                STALL,
+            )
+            .await
+            .unwrap();
+            assert!(std::fs::read(job_dir.join("a.pdf")).unwrap() == bytes);
+            let gets = requests(fake, "GET", "/sess-1/api/print/");
+            assert!(!gets[0].headers.contains_key("range"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_partial_content_answer_fails() {
+            let server = start().await;
+            let local = tempfile::tempdir().unwrap();
+            let mut file = tokio::fs::File::create(local.path().join("p"))
+                .await
+                .unwrap();
+            spool(
+                &server.fake,
+                "b.pdf",
+                PrintReply::Status("206 Partial Content", "x"),
+            );
+            let result = server
+                .access
+                .print_document("b.pdf", &mut file, &Progress::default(), STALL)
+                .await;
+            assert!(matches!(result, Err(FetchFailure::Retry(_))), "{result:?}");
+            assert_eq!(std::fs::metadata(local.path().join("p")).unwrap().len(), 0);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_body_longer_than_its_length_or_the_cap_is_cut_and_removed() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            let local = tempfile::tempdir().unwrap();
+            let mut file = tokio::fs::File::create(local.path().join("p"))
+                .await
+                .unwrap();
+            // No length: cut once past the cap.
+            spool(fake, "long.pdf", PrintReply::NoLength(pdf(9_000)));
+            let result = access
+                .print_document_capped("long.pdf", &mut file, &Progress::default(), STALL, 4_000)
+                .await;
+            assert!(
+                matches!(result, Err(FetchFailure::TooLarge(_))),
+                "{result:?}"
+            );
+            // A length over the cap: refused before the first byte is written.
+            spool(fake, "huge.pdf", PrintReply::Huge);
+            let mut file = tokio::fs::File::create(local.path().join("q"))
+                .await
+                .unwrap();
+            let result = access
+                .print_document("huge.pdf", &mut file, &Progress::default(), STALL)
+                .await;
+            assert_eq!(result, Err(FetchFailure::TooLarge(MAX_PRINT_BYTES + 1)));
+            assert_eq!(std::fs::metadata(local.path().join("q")).unwrap().len(), 0);
+            // Through `fetch`, the partial file is removed.
+            spool(fake, "huge.pdf", PrintReply::Huge);
+            let (result, _dir, job_dir) = fetch_print(access, "huge.pdf", STALL).await;
+            assert!(matches!(result, Err(FetchFailure::TooLarge(_))));
+            assert!(!job_dir.join(".partial").exists());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn header_and_chunk_stalls_time_out() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            let stall = Duration::from_millis(300);
+            spool(fake, "held.pdf", PrintReply::HoldHeaders);
+            let (result, _local, _) = fetch_print(access, "held.pdf", stall).await;
+            assert!(matches!(result, Err(FetchFailure::Retry(_))), "{result:?}");
+            spool(fake, "quiet.pdf", PrintReply::StallBody(pdf(2_000)));
+            let (result, _local, job_dir) = fetch_print(access, "quiet.pdf", stall).await;
+            assert_eq!(result, Err(FetchFailure::Broken("stalled".into())));
+            assert!(!job_dir.join(".partial").exists());
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_fetch_whose_window_closed_removes_its_folder() {
+            let server = start().await;
+            spool(&server.fake, "a.pdf", PrintReply::Pdf(pdf(100)));
+            let local = tempfile::tempdir().unwrap();
+            let job_dir = local.path().join("w1/1");
+            let result = crate::print_jobs::fetch(
+                &server.access,
+                "a.pdf",
+                &job_dir,
+                "a.pdf",
+                &Progress::default(),
+                &AtomicBool::new(true),
+                STALL,
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(!job_dir.exists());
         }
     }
 }

@@ -634,15 +634,15 @@ impl Story {
         match self {
             // Input, Shortcuts and Video open, Screen closed: what a server remembered.
             Story::ControlsRestoredSections => ControlsUiState::default()
-                .with_sections([true, true, false, false, true, false, false]),
+                .with_sections([true, true, false, false, false, true, false, false]),
             _ if self.is_audio() => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, true, false]),
+                .with_sections([false, false, false, false, false, false, true, false]),
             Story::ControlsShortcutsActive
             | Story::ControlsShortcutsOff
             | Story::ControlsShortcutsLocked => ControlsUiState::default()
-                .with_sections([false, true, false, false, false, false, false]),
+                .with_sections([false, true, false, false, false, false, false, false]),
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, true]),
+                .with_sections([false, false, false, false, false, false, false, true]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()

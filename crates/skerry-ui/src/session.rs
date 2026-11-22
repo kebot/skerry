@@ -64,6 +64,24 @@ pub fn status_banner_with_actions(
         )
 }
 
+/// A size as Finder writes it, in decimal units: "512 bytes", "12 KB", "3.4 MB", "1 GB".
+pub fn size_label(bytes: u64) -> String {
+    match bytes {
+        1 => "1 byte".into(),
+        0..1000 => format!("{bytes} bytes"),
+        1000..999_500 => format!("{} KB", (bytes as f64 / 1e3).round()),
+        _ => {
+            let (value, unit) = if bytes < 999_950_000 {
+                (bytes as f64 / 1e6, "MB")
+            } else {
+                (bytes as f64 / 1e9, "GB")
+            };
+            let text = format!("{value:.1}");
+            format!("{} {unit}", text.trim_end_matches(".0"))
+        }
+    }
+}
+
 /// Inline macOS IME marked-text composition box positioned near the active cursor/click.
 pub fn ime_preedit(anchor: Point<Pixels>, text: impl Into<SharedString>) -> Div {
     div()
@@ -336,4 +354,22 @@ fn confirm_modal(
                         .child(confirm),
                 ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sizes_read_like_finder() {
+        assert_eq!(size_label(0), "0 bytes");
+        assert_eq!(size_label(1), "1 byte");
+        assert_eq!(size_label(999), "999 bytes");
+        assert_eq!(size_label(12_345), "12 KB");
+        assert_eq!(size_label(3_400_000), "3.4 MB");
+        assert_eq!(size_label(3_000_000), "3 MB");
+        assert_eq!(size_label(999_999), "1 MB");
+        assert_eq!(size_label(1_400_000_000), "1.4 GB");
+        assert_eq!(size_label(1 << 30), "1.1 GB");
+    }
 }

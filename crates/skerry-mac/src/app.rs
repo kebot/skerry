@@ -73,6 +73,19 @@ pub fn run() {
         .build()
         .expect("create SealSkin runtime");
     let handle = runtime.handle().clone();
+    // Print jobs a crash, an orphaned download, or an Opened file left behind (`ARCH-033`).
+    handle.spawn_blocking(|| {
+        if let Some(root) = crate::print_jobs::cache_root() {
+            let swept = crate::print_jobs::sweep(
+                &root,
+                std::time::SystemTime::now(),
+                crate::print_jobs::SWEEP_AGE,
+            );
+            if let Err(error) = swept {
+                eprintln!("Couldn’t sweep the print cache: {error}");
+            }
+        }
+    });
     let reopen_handle = handle.clone();
     let application = gpui_kit::application().with_assets(skerry_ui::assets::SkerryAssets);
     // A Dock-icon click brings the Library back (ARCH-022).

@@ -353,6 +353,7 @@ pub struct ControlsSections {
     pub input: bool,
     pub shortcuts: bool,
     pub clipboard: bool,
+    pub printing: bool,
     pub screen: bool,
     pub video: bool,
     pub audio: bool,
@@ -365,6 +366,7 @@ impl Default for ControlsSections {
             input: false,
             shortcuts: false,
             clipboard: false,
+            printing: false,
             screen: true,
             video: false,
             audio: false,
@@ -378,12 +380,14 @@ impl ControlsSections {
         *self == Self::default()
     }
 
-    /// In Session Controls order: Input, Shortcuts, Clipboard, Screen, Video, Audio, Stats.
-    pub fn to_array(self) -> [bool; 7] {
+    /// In Session Controls order: Input, Shortcuts, Clipboard, Printing, Screen, Video,
+    /// Audio, Stats.
+    pub fn to_array(self) -> [bool; 8] {
         [
             self.input,
             self.shortcuts,
             self.clipboard,
+            self.printing,
             self.screen,
             self.video,
             self.audio,
@@ -392,12 +396,13 @@ impl ControlsSections {
     }
 
     pub fn from_array(
-        [input, shortcuts, clipboard, screen, video, audio, stats]: [bool; 7],
+        [input, shortcuts, clipboard, printing, screen, video, audio, stats]: [bool; 8],
     ) -> Self {
         Self {
             input,
             shortcuts,
             clipboard,
+            printing,
             screen,
             video,
             audio,
@@ -539,6 +544,26 @@ impl AudioPreferences {
     }
 }
 
+/// Remote printing choices for a server (`ARCH-033`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrintingPreferences {
+    /// **Open Print Dialog Automatically**: on, as the web client's `print_auto`.
+    pub auto_print: bool,
+}
+
+impl Default for PrintingPreferences {
+    fn default() -> Self {
+        Self { auto_print: true }
+    }
+}
+
+impl PrintingPreferences {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Preferences {
     #[serde(default)]
@@ -584,6 +609,13 @@ pub struct Preferences {
     /// **Show over the stream**: the stats strip (`ARCH-031`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stats_strip: bool,
+    /// Remote printing (`ARCH-033`).
+    #[serde(
+        default,
+        deserialize_with = "or_default",
+        skip_serializing_if = "PrintingPreferences::is_default"
+    )]
+    pub printing: PrintingPreferences,
     #[serde(flatten, deserialize_with = "lenient_video")]
     pub video: VideoSettings,
 }
@@ -698,6 +730,7 @@ fn read_file(path: &Path) -> Loaded {
             "audio" => field(value, &mut prefs.audio),
             "mac_shortcuts" => field(value, &mut prefs.mac_shortcuts),
             "stats_strip" => field(value, &mut prefs.stats_strip),
+            "printing" => field(value, &mut prefs.printing),
             _ => match serde_json::from_value::<Key>(Value::String(name.clone())) {
                 Ok(key) => serde_json::from_value::<u32>(value)
                     .map(|number| {
@@ -905,13 +938,13 @@ mod tests {
     fn controls_sections_round_trip_beside_video_settings() {
         let mut prefs: Preferences = serde_json::from_value(json!({"jpeg": 45})).unwrap();
         prefs.controls =
-            ControlsSections::from_array([true, false, false, false, true, true, false]);
+            ControlsSections::from_array([true, false, false, false, false, true, true, false]);
         let saved = serde_json::to_value(&prefs).unwrap();
         let restored: Preferences = serde_json::from_value(saved).unwrap();
         // `controls` is read as the struct, not swallowed by the flattened video map.
         assert_eq!(
             restored.controls.to_array(),
-            [true, false, false, false, true, true, false]
+            [true, false, false, false, false, true, true, false]
         );
         assert_eq!(restored.video.get(&Key::Jpeg), Some(&45));
         assert_eq!(restored.video.len(), 1);
@@ -919,8 +952,8 @@ mod tests {
 
     #[test]
     fn controls_sections_round_trip_with_shortcuts() {
-        for bits in 0..128u8 {
-            let open: [bool; 7] = std::array::from_fn(|i| bits & (1 << i) != 0);
+        for bits in 0..=255u8 {
+            let open: [bool; 8] = std::array::from_fn(|i| bits & (1 << i) != 0);
             assert_eq!(ControlsSections::from_array(open).to_array(), open);
         }
         let dir = tempfile::tempdir().unwrap();
@@ -928,6 +961,62 @@ mod tests {
         std::fs::write(&path, r#"{"controls": {"stats": true}}"#).unwrap();
         let old = load_at(&path).controls;
         assert!(old.stats && !old.shortcuts && old.screen);
+    }
+
+    #[test]
+    fn controls_sections_round_trip_with_printing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        // Files from before Shortcuts, before Printing, and with every key of today.
+        for old in [
+            r#"{"controls": {"input": true, "clipboard": true, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+            r#"{"controls": {"input": true, "shortcuts": true, "clipboard": true, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+            r#"{"controls": {"input": true, "shortcuts": true, "clipboard": true, "printing": false, "screen": false, "video": true, "audio": true, "stats": true}}"#,
+        ] {
+            std::fs::write(&path, old).unwrap();
+            let loaded = load_at(&path).controls;
+            assert!(!loaded.printing, "{old}");
+            assert!(loaded.input && loaded.clipboard && !loaded.screen && loaded.stats);
+        }
+        let open = ControlsSections {
+            printing: true,
+            ..ControlsSections::default()
+        };
+        assert!(open.to_array()[3], "Printing follows Clipboard");
+        assert_eq!(ControlsSections::from_array(open.to_array()), open);
+    }
+
+    #[test]
+    fn printing_preferences_default_to_auto_print_and_round_trip() {
+        assert!(Preferences::default().printing.auto_print);
+        let saved = serde_json::to_value(Preferences::default()).unwrap();
+        assert!(saved.get("printing").is_none(), "{saved}");
+        let mut prefs = Preferences::default();
+        prefs.printing.auto_print = false;
+        let saved = serde_json::to_value(&prefs).unwrap();
+        assert_eq!(saved["printing"], json!({"auto_print": false}));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(&path, saved.to_string()).unwrap();
+        assert!(!load_at(&path).printing.auto_print);
+        // A damaged value falls back to the default.
+        std::fs::write(&path, r#"{"printing": 3}"#).unwrap();
+        assert!(load_at(&path).printing.auto_print);
+    }
+
+    #[test]
+    fn a_preferences_file_without_printing_keeps_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        let old = json!({"codec": "jpeg", "jpeg": 45, "stats_strip": true, "future_key": [1]});
+        std::fs::write(&path, old.to_string()).unwrap();
+        let loaded = read_file(&path);
+        assert!(loaded.preferences.printing.auto_print);
+        assert!(loaded.preferences.stats_strip);
+        assert_eq!(loaded.preferences.video.get(&Key::Jpeg), Some(&45));
+        assert!(loaded.extra.contains_key("future_key"));
+        let written = serde_json::to_value(&loaded.preferences).unwrap();
+        assert!(written.get("printing").is_none(), "{written}");
     }
 
     #[test]
@@ -1287,7 +1376,7 @@ mod tests {
         let saved = load_at(&path);
         assert_eq!(
             saved.controls.to_array(),
-            [true, false, false, false, true, false, true]
+            [true, false, false, false, false, true, false, true]
         );
     }
 

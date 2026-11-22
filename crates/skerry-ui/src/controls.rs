@@ -23,6 +23,7 @@ pub enum Section {
     Input,
     Shortcuts,
     Clipboard,
+    Printing,
     Screen,
     Video,
     Audio,
@@ -31,10 +32,11 @@ pub enum Section {
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Input,
         Self::Shortcuts,
         Self::Clipboard,
+        Self::Printing,
         Self::Screen,
         Self::Video,
         Self::Audio,
@@ -47,6 +49,7 @@ pub struct ControlsUiState {
     pub input_open: bool,
     pub shortcuts_open: bool,
     pub clipboard_open: bool,
+    pub printing_open: bool,
     pub screen_open: bool,
     pub video_open: bool,
     pub audio_open: bool,
@@ -65,6 +68,7 @@ impl Default for ControlsUiState {
             input_open: false,
             shortcuts_open: false,
             clipboard_open: false,
+            printing_open: false,
             screen_open: true,
             video_open: false,
             audio_open: false,
@@ -82,6 +86,7 @@ impl ControlsUiState {
             Section::Input => self.input_open,
             Section::Shortcuts => self.shortcuts_open,
             Section::Clipboard => self.clipboard_open,
+            Section::Printing => self.printing_open,
             Section::Screen => self.screen_open,
             Section::Video => self.video_open,
             Section::Audio => self.audio_open,
@@ -95,6 +100,7 @@ impl ControlsUiState {
             Section::Input => &mut self.input_open,
             Section::Shortcuts => &mut self.shortcuts_open,
             Section::Clipboard => &mut self.clipboard_open,
+            Section::Printing => &mut self.printing_open,
             Section::Screen => &mut self.screen_open,
             Section::Video => &mut self.video_open,
             Section::Audio => &mut self.audio_open,
@@ -105,12 +111,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 7] {
+    pub fn sections(&self) -> [bool; 8] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 7]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 8]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -1596,7 +1602,7 @@ mod tests {
     #[test]
     fn sections_round_trip_in_section_order() {
         // Input, Shortcuts, Video and Audio open, Screen closed.
-        let open = [true, true, false, false, true, true, false];
+        let open = [true, true, false, false, false, true, true, false];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
         assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
@@ -1604,7 +1610,17 @@ mod tests {
         assert_eq!(Section::ALL[1], Section::Shortcuts);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, false, true, false, false, false]
+            [false, false, false, false, true, false, false, false]
         );
+    }
+
+    #[test]
+    fn printing_follows_clipboard_in_section_order() {
+        let clipboard = Section::ALL.iter().position(|s| *s == Section::Clipboard);
+        let printing = Section::ALL.iter().position(|s| *s == Section::Printing);
+        assert_eq!(printing, clipboard.map(|index| index + 1));
+        let state = ControlsUiState::default()
+            .with_sections([false, false, false, true, false, false, false, false]);
+        assert!(state.printing_open && !state.screen_open);
     }
 }

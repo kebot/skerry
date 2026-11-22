@@ -415,6 +415,10 @@ impl SessionWindow {
                     stream.receive_clipboard(incoming, cx);
                 }
             }
+            SessionEvent::PrintPolicy(on) => {
+                let _ = on;
+            }
+            SessionEvent::PrintDocument(announcement) => drop(announcement),
             SessionEvent::StartupTimeout => {
                 self.resize_allowed = false;
                 self.settings = None;
