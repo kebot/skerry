@@ -7,13 +7,18 @@
 //! (channel 0, or the mean of the first two), and feeds an `AudioConverter` that resamples to
 //! 24 kHz and encodes 20 ms Opus packets at 32 kbps.
 //!
-//! It lists devices from the start (the picker works with the microphone off) and opens no
-//! stream until it is told to capture. A stream is rebuilt on an error, a stall, a default
-//! change, or the chosen device coming back, at most once a second and with backoff.
+//! The thread exists only while the microphone captures: the window starts it after macOS
+//! granted the permission, and drops it to stop. Devices are listed from plain CoreAudio
+//! properties (`input_devices`), never through cpal's input enumeration, which builds an
+//! input AudioUnit per device and so raises the TCC request (M-QA-1). A cpal device is opened
+//! only to capture. A stream is rebuilt on an error, a stall, a default change, or the chosen
+//! device coming back, at most once a second and with backoff.
 //!
-//! It stops its own stream as soon as the session's frame channel closes, so the device goes
-//! off even if the window misses the stream's end. Dropping `Microphone` never blocks: it
-//! sends `Shutdown` and detaches the thread.
+//! It stops its own stream as soon as the session's frame channel closes, and while the
+//! channel has stayed full for 2 s (a stalled socket), so the device goes off even if the
+//! window misses the stream's end. Dropping `Microphone` never blocks: it sends `Shutdown`
+//! and detaches the thread; `alive()` says whether that thread has actually ended, so a
+//! blocked one is never stacked with a new one.
 
 use crate::audio::{self, OutputDevice};
 use crate::capture;
@@ -41,6 +46,8 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(5);
 const BUILD_RETRY: Duration = Duration::from_secs(2);
 /// The rate the encoder is probed at when the thread starts.
 const PROBE_RATE: u32 = 48_000;
+/// A frame channel full this long means the socket stalled: the device closes.
+const SINK_STALL: Duration = Duration::from_secs(2);
 
 /// Why the microphone isn't capturing where the person asked, when it isn't.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,35 +99,50 @@ enum MicControl {
 /// The window's handle on its `skerry-mic` thread.
 pub struct Microphone {
     control: Sender<MicControl>,
+    alive: Arc<AtomicBool>,
+}
+
+/// Clears the thread's `alive` flag when the thread ends, however it ends.
+struct AliveGuard(Arc<AtomicBool>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Microphone {
-    /// Starts the thread, listing devices only. `sink` takes `0x02` frames; `report` gets each
-    /// new status. `None` only if the thread can't start.
+    /// Starts the thread, capturing at once: call it only once macOS granted the permission.
+    /// `sink` takes `0x02` frames; `report` gets each new status. `None` only if the thread
+    /// can't start.
     pub fn new(
         chosen: Option<String>,
         sink: tokio::sync::mpsc::Sender<Vec<u8>>,
         report: impl Fn(MicStatus) + Send + 'static,
     ) -> Option<Self> {
         let (control, controls) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let guard = AliveGuard(alive.clone());
+        let _ = control.send(MicControl::Capture(true));
         std::thread::Builder::new()
             .name("skerry-mic".into())
             .spawn(move || {
+                let _guard = guard;
                 let engine = Engine::new(CpalInput::new(), AudioToolboxOpus::new, chosen, sink);
                 run(engine, &controls, report);
             })
             .ok()?;
-        Some(Self { control })
+        Some(Self { control, alive })
+    }
+
+    /// The thread's own flag: true until it has ended (a blocked call keeps it true).
+    pub fn alive(&self) -> Arc<AtomicBool> {
+        self.alive.clone()
     }
 
     /// Captures from `chosen` from now on (`None` follows the Mac's default). Never blocks.
     pub fn set_input(&self, chosen: Option<String>) {
         let _ = self.control.send(MicControl::Choose(chosen));
-    }
-
-    /// Opens or closes the device. Never blocks.
-    pub fn set_capture(&self, on: bool) {
-        let _ = self.control.send(MicControl::Capture(on));
     }
 }
 
@@ -144,6 +166,8 @@ struct InputHooks {
 /// callback).
 fn deliver(data: &[f32], hooks: &InputHooks, limit: usize) {
     hooks.beats.fetch_add(1, Ordering::Relaxed);
+    // Never more than the queue holds, so it never grows past its preallocated size.
+    let data = &data[data.len().saturating_sub(limit)..];
     if let Ok(mut queue) = hooks.queue.try_lock() {
         audio::push_bounded(&mut queue, data, limit);
     }
@@ -205,14 +229,15 @@ trait OpusEncode {
 
 struct CpalInput {
     host: cpal::Host,
-    devices: Vec<(String, cpal::Device)>,
+    /// The default from the last listing.
+    default_uid: Option<String>,
 }
 
 impl CpalInput {
     fn new() -> Self {
         Self {
             host: cpal::default_host(),
-            devices: Vec::new(),
+            default_uid: None,
         }
     }
 }
@@ -220,37 +245,24 @@ impl CpalInput {
 impl MicBackend for CpalInput {
     type Stream = cpal::Stream;
 
+    /// Plain CoreAudio properties: never cpal's `input_devices()` (M-QA-1).
     fn devices(&mut self) -> Option<Vec<(String, Option<String>)>> {
-        self.devices = self
-            .host
-            .input_devices()
-            .ok()?
-            .filter_map(|device| Some((device.id().ok()?.1, device)))
-            .collect();
-        Some(
-            self.devices
-                .iter()
-                .map(|(uid, device)| {
-                    let name = device
-                        .description()
-                        .ok()
-                        .map(|description| description.name().to_string());
-                    (uid.clone(), name)
-                })
-                .collect(),
-        )
+        let list = crate::input_devices::list_inputs()?;
+        self.default_uid = list.default_uid;
+        Some(list.devices)
     }
 
     fn default_uid(&mut self) -> Option<String> {
-        Some(self.host.default_input_device()?.id().ok()?.1)
+        self.default_uid.clone()
     }
 
     fn open(&mut self, uid: &str, hooks: InputHooks) -> Result<(cpal::Stream, u32, u16), ()> {
+        // All devices, unfiltered (`input_devices()` would build an AudioUnit per device).
         let device = self
-            .devices
-            .iter()
-            .find(|(known, _)| known == uid)
-            .map(|(_, device)| device.clone())
+            .host
+            .devices()
+            .map_err(|_| ())?
+            .find(|device| device.id().is_ok_and(|id| id.1 == uid))
             .ok_or(())?;
         let default = device.default_input_config().map_err(|_| ())?;
         let (rate, channels) = (default.sample_rate(), default.channels().max(1));
@@ -260,6 +272,10 @@ impl MicBackend for CpalInput {
             buffer_size: cpal::BufferSize::Default,
         };
         let limit = queue_limit(rate, channels);
+        // Allocated here, never in the IO callback.
+        if let Ok(mut queue) = hooks.queue.lock() {
+            queue.reserve(limit);
+        }
         let errored = hooks.errored.clone();
         let stream = device
             .build_input_stream(
@@ -323,6 +339,8 @@ struct Engine<B: MicBackend, E: OpusEncode, F: FnMut(u32) -> Result<E, ()>> {
     sink: tokio::sync::mpsc::Sender<Vec<u8>>,
     /// The session's frame channel closed: the stream ended, so this thread captures no more.
     sink_closed: bool,
+    /// Since when every packet found the frame channel full.
+    full_since: Option<Instant>,
     capture: bool,
     chosen: Option<String>,
     devices: Vec<InputDevice>,
@@ -356,6 +374,7 @@ impl<B: MicBackend, E: OpusEncode, F: FnMut(u32) -> Result<E, ()>> Engine<B, E, 
             encoder_ok,
             sink,
             sink_closed: false,
+            full_since: None,
             capture: false,
             chosen,
             devices: Vec::new(),
@@ -464,7 +483,18 @@ impl<B: MicBackend, E: OpusEncode, F: FnMut(u32) -> Result<E, ()>> Engine<B, E, 
             self.enumerated = Some(now);
         }
         let target = self.target();
-        if !self.capture || !self.encoder_ok || self.sink_closed {
+        if self.sink.is_closed() {
+            self.sink_closed = true;
+        }
+        // The socket stopped taking frames: close the device until it drains (M-QA-2).
+        let stalled = self
+            .full_since
+            .is_some_and(|since| now.duration_since(since) >= SINK_STALL)
+            && self.sink.capacity() == 0;
+        if !stalled && self.sink.capacity() > 0 {
+            self.full_since = None;
+        }
+        if !self.capture || !self.encoder_ok || self.sink_closed || stalled {
             self.close();
             self.encoder = None;
             self.picked = false;
@@ -588,7 +618,10 @@ impl<B: MicBackend, E: OpusEncode, F: FnMut(u32) -> Result<E, ()>> Engine<B, E, 
         let packets = std::mem::take(&mut self.packets);
         for packet in &packets {
             match self.sink.try_send(capture::mic_frame(packet)) {
-                Ok(()) | Err(TrySendError::Full(_)) => {}
+                Ok(()) => self.full_since = None,
+                Err(TrySendError::Full(_)) => {
+                    self.full_since.get_or_insert(now);
+                }
                 Err(TrySendError::Closed(_)) => {
                     // The stream that owned this thread ended: stop now, whatever the window
                     // does (`ARCH-038`).
@@ -1285,6 +1318,51 @@ mod tests {
         let status = rig.tick(20);
         assert!(status.live);
         assert_eq!(rig.received(), [vec![0x02, 5, 0xAA]]);
+    }
+
+    #[test]
+    fn engine_closes_while_the_sink_stays_full() {
+        let mut rig = Rig::new(Fake::with(&[BUILTIN], Some("BuiltIn")), 1);
+        rig.engine.set_capture(true);
+        rig.tick(0);
+        let mut ms = 10;
+        // Nobody reads the frames: the channel stays full.
+        while ms <= 2500 {
+            rig.fake.callback(480, 0.1);
+            rig.tick(ms);
+            ms += 10;
+        }
+        assert_eq!(rig.fake.live(), 0, "closed after 2 s full");
+        assert!(!rig.tick(ms).live);
+        // The socket drains: capture comes back.
+        rig.received();
+        rig.tick(ms + 1100);
+        assert_eq!(rig.fake.live(), 1);
+    }
+
+    #[test]
+    fn engine_never_opens_once_the_sink_is_closed() {
+        let fake = Fake::with(&[BUILTIN], Some("BuiltIn"));
+        let (sink, frames) = tokio::sync::mpsc::channel(10);
+        drop(frames);
+        let mut engine: TestEngine = Engine::new(fake.clone(), working, None, sink);
+        engine.set_capture(true);
+        let status = engine.tick(Instant::now());
+        assert!(!status.live);
+        assert!(fake.opens().is_empty());
+    }
+
+    #[test]
+    fn delivery_never_grows_past_the_limit() {
+        let hooks = InputHooks::default();
+        hooks.queue.lock().unwrap().reserve(8);
+        let capacity = hooks.queue.lock().unwrap().capacity();
+        deliver(&[1.0; 20], &hooks, 8);
+        deliver(&[2.0; 3], &hooks, 8);
+        let queue = hooks.queue.lock().unwrap();
+        assert_eq!(queue.len(), 8);
+        assert_eq!(queue.capacity(), capacity, "no reallocation");
+        assert_eq!(queue.back(), Some(&2.0));
     }
 
     #[test]

@@ -2655,9 +2655,6 @@ impl Launcher {
     }
 }
 
-/// Quit skips the windows' close handlers (`cx.quit()`), so every session window's print
-/// jobs are cleaned up here, synchronously with `std::fs`: the runtime is going away. Then
-/// the cache is swept, so Opened files don't wait for a launch a day later (`ARCH-033`).
 /// Stops every session window's capture devices.
 fn quit_capture_stop(cx: &mut App) {
     let sessions: Vec<_> = cx
@@ -2675,6 +2672,9 @@ fn quit_capture_stop(cx: &mut App) {
     }
 }
 
+/// Quit skips the windows' close handlers (`cx.quit()`), so every session window's print
+/// jobs are cleaned up here, synchronously with `std::fs`: the runtime is going away. Then
+/// the cache is swept, so Opened files don't wait for a launch a day later (`ARCH-033`).
 fn quit_print_cleanup(cx: &mut App) {
     let sessions: Vec<_> = cx
         .try_global::<OpenWindows>()

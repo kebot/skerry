@@ -619,6 +619,30 @@ pub enum SessionEvent {
     /// late one from a thread already stopped is ignored. Raised by the window, not the
     /// server.
     MicStatus(u64, crate::microphone::MicStatus),
+    /// The card's input list, from plain CoreAudio properties, tagged with its stream.
+    /// Raised by the window.
+    MicInputs(u64, crate::input_devices::InputList),
+}
+
+/// No message from the server for this long, while pings go out every second: the peer is
+/// gone (a dead network keeps TCP up for minutes).
+const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+const SILENT: &str = "The Selkies stream stopped answering. Choose Reconnect to resume.";
+
+fn peer_silent(last_inbound: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_inbound) >= PEER_TIMEOUT
+}
+
+/// The socket's next message, noting when anything arrived.
+async fn inbound<S, T, E>(socket: &mut S, last_inbound: &mut Instant) -> Option<Result<T, E>>
+where
+    S: futures_util::Stream<Item = Result<T, E>> + Unpin,
+{
+    let next = socket.next().await;
+    if matches!(next, Some(Ok(_))) {
+        *last_inbound = Instant::now();
+    }
+    next
 }
 
 /// A capture reply's event; `None` for any other text.
@@ -1087,6 +1111,9 @@ pub async fn run(
     diagnostics.set_stats(options.stats);
     let mut sample_start = Instant::now();
     let mut ping = None;
+    // Anything from the server, pongs included; silence past `PEER_TIMEOUT` ends the stream,
+    // so the window's stop runs and the microphone closes (M-QA-2).
+    let mut last_inbound = Instant::now();
     let mut sample_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(1),
         Duration::from_secs(1),
@@ -1256,7 +1283,7 @@ pub async fn run(
                     socket.send(message).await.map_err(|_| disconnected)?;
                 }
             }
-            incoming = socket.next() => match incoming {
+            incoming = inbound(&mut socket, &mut last_inbound) => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
                     diagnostics.received_bytes += data.len() as u64;
@@ -1487,10 +1514,14 @@ pub async fn run(
             },
             _ = sample_tick.tick() => {
                 let now = Instant::now();
+                if peer_silent(last_inbound, now) {
+                    return Err(SILENT.into());
+                }
                 let sample = diagnostics.sample(now.duration_since(sample_start), active_size.0, active_size.1);
                 let _ = events.send(SessionEvent::Stats(sample));
                 sample_start = now;
-                if ping.is_none() {
+                // A lost pong is re-pinged, so a quiet but healthy session never reads as gone.
+                if ping.is_none_or(|sent: Instant| now.duration_since(sent) >= Duration::from_secs(3)) {
                     socket.send(Message::Ping(b"sealskin-rtt".as_slice().into())).await.map_err(|_| disconnected)?;
                     ping = Some(now);
                 }
@@ -1816,6 +1847,28 @@ mod tests {
             Some(Message::Binary(bytes)) => assert_eq!(bytes.as_ref(), [0x02, 0x68, 0x01]),
             other => panic!("expected a binary frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_silent_peer_ends_the_stream_after_ten_seconds() {
+        let start = Instant::now();
+        assert!(!peer_silent(start, start + Duration::from_secs(9)));
+        assert!(peer_silent(start, start + PEER_TIMEOUT));
+        assert!(!peer_silent(start + Duration::from_secs(1), start));
+        // The error reaches the window as `SessionEvent::Error`, which stops capture.
+        assert_eq!(RunError::from(SILENT).to_string(), SILENT);
+    }
+
+    #[tokio::test]
+    async fn any_inbound_message_counts_as_alive() {
+        let old = Instant::now() - Duration::from_secs(30);
+        let mut last = old;
+        let mut stream = futures_util::stream::iter(vec![Ok::<_, ()>(1), Err(())]);
+        assert_eq!(inbound(&mut stream, &mut last).await, Some(Ok(1)));
+        assert!(last > old);
+        let noted = last;
+        assert_eq!(inbound(&mut stream, &mut last).await, Some(Err(())));
+        assert_eq!(last, noted, "an error is not a sign of life");
     }
 
     #[test]

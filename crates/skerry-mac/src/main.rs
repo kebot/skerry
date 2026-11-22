@@ -11,6 +11,8 @@ mod gamepad;
 #[cfg(target_os = "macos")]
 mod input;
 #[cfg(target_os = "macos")]
+mod input_devices;
+#[cfg(target_os = "macos")]
 mod launch_options;
 #[cfg(target_os = "macos")]
 mod launch_progress;

@@ -464,9 +464,7 @@ impl SessionWindow {
     fn handle_event(&mut self, event: SessionEvent, window: &mut Window, cx: &mut Context<Self>) {
         // A server close, a network drop or the start-up timeout ends the stream without
         // `end_stream`: the microphone stops here (`ARCH-038`).
-        if media_capture::ends_stream(&event) {
-            self.capture.stop();
-        }
+        self.capture.on_stream_event(&event);
         match event {
             SessionEvent::Audio(enabled) => self.audio = Some(enabled),
             SessionEvent::AudioUnavailable(reason) => self.audio_unavailable = Some(reason),
@@ -568,9 +566,10 @@ impl SessionWindow {
                 }
             }
             SessionEvent::CapturePolicy(policy) => {
-                let chosen = self.preferences.audio.input_device.clone();
-                let effects = self.capture.on_policy(policy, chosen);
+                let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
+                let effects = self.capture.on_policy(policy, auth);
                 self.apply_capture(effects, cx);
+                self.ensure_input_ticker(cx);
             }
             SessionEvent::Capture(reply) => {
                 let auth = crate::permissions::authorization(crate::capture::Subject::Microphone);
@@ -578,9 +577,13 @@ impl SessionWindow {
                 self.apply_capture(effects, cx);
             }
             SessionEvent::MicStatus(id, status) => {
-                self.remember_input_name(&status, cx);
                 let effects = self.capture.on_status(id, status);
                 self.apply_capture(effects, cx);
+                self.remember_input_name(cx);
+            }
+            SessionEvent::MicInputs(id, inputs) => {
+                self.capture.on_inputs(id, inputs);
+                self.remember_input_name(cx);
             }
             SessionEvent::Error(error) => {
                 // The capture ends with the stream; the banner explains, so no hint.
@@ -761,7 +764,8 @@ impl SessionWindow {
     /// Runs capture effects; a permission prompt answers back through this window's handle,
     /// and an answer that no longer matches its request starts nothing (`ARCH-038`).
     fn apply_capture(&mut self, effects: Vec<crate::capture::Effect>, cx: &mut Context<Self>) {
-        for ticket in self.capture.apply(effects) {
+        let chosen = self.preferences.audio.input_device.clone();
+        for ticket in self.capture.apply(effects, chosen) {
             let answer = crate::permissions::request(ticket.subject);
             let handle = self.window;
             cx.spawn(async move |this, cx| {
@@ -778,6 +782,34 @@ impl SessionWindow {
         }
     }
 
+    /// Lists inputs for the card once a second while the server allows the microphone, from
+    /// plain CoreAudio properties: never the microphone itself (M-QA-1).
+    fn ensure_input_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.capture.ticker.is_some() || !self.capture.wants_inputs() {
+            return;
+        }
+        let handle = self.window;
+        self.capture.ticker = Some(cx.spawn(async move |this, cx| loop {
+            let keep = handle
+                .update(cx, |_, _, cx| {
+                    this.update(cx, |this, _| {
+                        let wanted = this.capture.wants_inputs();
+                        if wanted {
+                            this.capture.refresh_inputs();
+                        }
+                        wanted
+                    })
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(false);
+            if !keep {
+                break;
+            }
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+        }));
+    }
+
     /// The **Microphone** switch (`ARCH-038`). Never saved: a later launch never opens the
     /// microphone because of a past choice.
     pub(super) fn set_microphone(&mut self, on: bool, cx: &mut Context<Self>) {
@@ -792,10 +824,11 @@ impl SessionWindow {
     pub(super) fn change_input_device(&mut self, uid: Option<String>, cx: &mut Context<Self>) {
         let name = uid.as_deref().and_then(|uid| {
             self.capture
-                .mic_status
-                .as_ref()
-                .and_then(|status| status.device(uid))
-                .map(|device| device.name.clone())
+                .devices()
+                .0
+                .into_iter()
+                .find(|device| device.uid == uid)
+                .map(|device| device.name)
         });
         let audio = &mut self.preferences.audio;
         audio.input_device = uid.clone();
@@ -823,16 +856,12 @@ impl SessionWindow {
         self.capture.stop();
     }
 
-    fn remember_input_name(
-        &mut self,
-        status: &crate::microphone::MicStatus,
-        cx: &mut Context<Self>,
-    ) {
+    fn remember_input_name(&mut self, cx: &mut Context<Self>) {
         let audio = &self.preferences.audio;
         let Some(name) = media_capture::input_name_to_save(
             audio.input_device.as_deref(),
             audio.input_device_name.as_deref(),
-            status,
+            &self.capture.devices().0,
         ) else {
             return;
         };

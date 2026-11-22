@@ -657,6 +657,24 @@ impl ControlPanel {
             stats::props(session.stream_info.as_ref(), &history, framerate)
         });
 
+        // The capturing thread's status while it runs; otherwise the card's own device list
+        // (the thread exists only while capturing, `ARCH-038`).
+        let mic_card_status = session.capture.mic_status.clone().or_else(|| {
+            let (devices, default_uid) = session.capture.devices();
+            (session.capture.inputs.is_some() || session.capture.encoder_unavailable).then(|| {
+                MicStatus {
+                    devices,
+                    default_uid,
+                    chosen: session.preferences.audio.input_device.clone(),
+                    problem: session
+                        .capture
+                        .encoder_unavailable
+                        .then_some(MicProblem::EncoderUnavailable),
+                    ..MicStatus::default()
+                }
+            })
+        });
+
         ControlsProps {
             app_name,
             fullscreen: self.fullscreen,
@@ -688,7 +706,7 @@ impl ControlPanel {
             media_capture: media_capture_props(&MicInputs {
                 policy: session.capture.state.policy,
                 state: session.capture.state.mic,
-                status: session.capture.mic_status.as_ref(),
+                status: mic_card_status.as_ref(),
                 chosen: session.preferences.audio.input_device.as_deref(),
                 saved_name: session.preferences.audio.input_device_name.as_deref(),
             }),
@@ -1736,6 +1754,13 @@ mod tests {
             .unwrap()
             .mic;
         assert!(props.locked && !props.picker_locked);
+        // Locked on starts like on_start (M-QA-3): the switch shows on, and disabled.
+        let status = mic_status(true);
+        let mut inputs = mic_inputs(Some(mic_policy(true, true)), Some(&status));
+        inputs.state.wanted = true;
+        inputs.state.phase = Phase::On;
+        let props = media_capture_props(&inputs).unwrap().mic;
+        assert!(props.on && props.locked && props.live);
     }
 
     #[test]

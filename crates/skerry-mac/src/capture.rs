@@ -66,7 +66,9 @@ impl CapturePolicy {
         let enabled = &settings["microphone_enabled"];
         let locked = enabled["locked"].as_bool() == Some(true);
         let on = truthy(enabled);
-        let audio_off = settings["audio_enabled"]["value"].as_bool() == Some(false);
+        let audio = &settings["audio_enabled"];
+        let audio = audio.get("value").unwrap_or(audio);
+        let audio_off = audio.as_bool() == Some(false) || audio.as_str() == Some("false");
         let start = &settings["microphone_on_start"];
         Self {
             mic: DevicePolicy {
@@ -219,7 +221,10 @@ impl CaptureState {
         }
     }
 
-    /// Turns the device off.
+    /// Turns the device off. It clears `wanted` on purpose, whatever turned it off (a toggle,
+    /// a lock, `*_DISABLED`, demand 0): a person's "on" is never restored by itself after the
+    /// server takes the microphone away and gives it back. They flip the switch again
+    /// (the safe direction, as the web client; M-QA-4).
     fn stop(&mut self, subject: Subject) -> Vec<Effect> {
         let device = self.device(subject);
         device.wanted = false;
@@ -244,6 +249,11 @@ impl CaptureState {
         if !self.permitted(subject) {
             return self.stop(subject);
         }
+        // Locked on counts as on_start true, on every settings (M-QA-3): it starts after the
+        // permission, and the switch shows on and disabled. A refused prompt stays latched.
+        if rules.locked && device.phase == Phase::Off && !device.refused && !device.denied {
+            return self.start(subject, true, mic_auth);
+        }
         if !first || device.phase != Phase::Off {
             return Vec::new();
         }
@@ -261,6 +271,13 @@ impl CaptureState {
 
     /// The person flipped the switch.
     pub fn on_toggle(&mut self, subject: Subject, on: bool, auth: Auth) -> Vec<Effect> {
+        // A locked switch is the server's (the card disables it).
+        if self
+            .device_policy(subject)
+            .is_some_and(|policy| policy.locked)
+        {
+            return Vec::new();
+        }
         let permitted = self.permitted(subject);
         let device = self.device(subject);
         device.touched = true;
@@ -291,7 +308,10 @@ impl CaptureState {
             }
             Reply::Demand(subject, false) => {
                 let device = *self.device(subject);
-                if device.touched || !device.by_server {
+                let locked = self
+                    .device_policy(subject)
+                    .is_some_and(|policy| policy.locked);
+                if device.touched || !device.by_server || locked {
                     return Vec::new();
                 }
                 self.stop(subject)
@@ -462,11 +482,54 @@ mod tests {
     }
 
     #[test]
+    fn locked_on_mic_starts_like_on_start() {
+        let locked_on = CapturePolicy::from_server(&json!({
+            "microphone_enabled": {"value": true, "locked": true},
+            "microphone_on_start": {"value": false}
+        }));
+        let mut state = CaptureState::default();
+        let ticket = ticket(&state.on_policy(locked_on, Auth::NotDetermined));
+        assert_eq!(state.on_auth(ticket, true), [Effect::Start(MIC)]);
+        // The switch and demand 0 can't turn it off.
+        assert!(state.on_toggle(MIC, false, Auth::Authorized).is_empty());
+        assert!(state
+            .on_reply(Reply::Demand(MIC, false), Auth::Authorized)
+            .is_empty());
+        assert_eq!(state.mic.phase, Phase::On);
+        // Locked on by a live change: it starts then too.
+        let mut state = CaptureState::default();
+        state.on_policy(policy(false, false), Auth::Authorized);
+        assert_eq!(
+            state.on_policy(locked_on, Auth::Authorized),
+            [Effect::Start(MIC)]
+        );
+        // Refused at the prompt: no loop of prompts.
+        let mut state = CaptureState::default();
+        state.on_policy(locked_on, Auth::Denied);
+        assert!(state.mic.refused);
+        assert!(state.on_policy(locked_on, Auth::Denied).is_empty());
+    }
+
+    #[test]
+    fn a_persons_on_is_not_restored_after_a_lock() {
+        let mut state = CaptureState::default();
+        state.on_policy(policy(false, false), Auth::Authorized);
+        state.on_toggle(MIC, true, Auth::Authorized);
+        state.on_policy(locked_off(), Auth::Authorized);
+        assert!(state
+            .on_policy(policy(false, false), Auth::Authorized)
+            .is_empty());
+        assert!(!state.mic.wanted);
+    }
+
+    #[test]
     fn audio_disabled_forbids_microphone() {
         let policy = CapturePolicy::from_server(&json!({
             "microphone_enabled": {"value": true, "locked": false},
             "audio_enabled": {"value": false}
         }));
+        assert!(!policy.mic.permitted && policy.mic.audio_off);
+        let policy = CapturePolicy::from_server(&json!({"audio_enabled": {"value": "false"}}));
         assert!(!policy.mic.permitted && policy.mic.audio_off);
     }
 
