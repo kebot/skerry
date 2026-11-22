@@ -483,6 +483,50 @@ impl LaunchContext {
         }
     }
 
+    /// Storage choices when opening a Shared Files file (`ARCH-037`): Auto and named homes,
+    /// never Cleanroom, which `launch/file_path` refuses.
+    pub fn stored_storage_options(&self, app: &RemoteApp) -> Vec<LaunchOption> {
+        self.storage_options(app)
+            .into_iter()
+            .filter(|option| option.id != CLEANROOM)
+            .collect()
+    }
+
+    /// A selection for opening a Shared Files file: a remembered Cleanroom falls back to
+    /// Auto, and there is no collaborative launch (`launch/file_path` has no room flag).
+    pub fn stored_selection(
+        &self,
+        app: &RemoteApp,
+        mut selection: LaunchSelection,
+    ) -> LaunchSelection {
+        if self.has_storage(app)
+            && (selection.home_dir == CLEANROOM || selection.home_dir.is_empty())
+        {
+            selection.home_dir = AUTO.into();
+        }
+        selection.room = false;
+        selection
+    }
+
+    /// What opening a Shared Files file sends: as a launch, but never Cleanroom. A meta app
+    /// without homes still mounts its own `auto-<name>` (the server makes it); the Auto
+    /// home of any other app is created first, as for a launch.
+    pub fn stored_params(
+        &self,
+        app: &RemoteApp,
+        selection: &LaunchSelection,
+        timezone: Option<String>,
+    ) -> LaunchParams {
+        let selection = self.stored_selection(app, selection.clone());
+        let mut params = self.params(app, &selection, timezone);
+        if params.home_name.as_deref() == Some(CLEANROOM) && app.is_meta_app {
+            params.home_name = Some(crate::storage::meta_auto_home(&app.name));
+            params.create_home = false;
+        }
+        params.launch_in_room_mode = false;
+        params
+    }
+
     /// The storage a launch with `selection` uses: the app's Auto home (`auto-<app>`),
     /// `cleanroom`, or a named home.
     pub fn resolved_home(&self, app: &RemoteApp, selection: &LaunchSelection) -> String {
@@ -990,6 +1034,50 @@ mod tests {
         let zen = app("Zen", false, true);
         let params = ctx.params(&zen, &selection, None);
         assert_eq!(params.home_name.as_deref(), Some("auto-zen"));
+        assert!(!params.create_home);
+    }
+
+    #[test]
+    fn opening_a_stored_file_offers_no_cleanroom_and_falls_back_to_auto() {
+        let ctx = context();
+        let zen = app("Zen", false, true);
+        let ids: Vec<String> = ctx
+            .stored_storage_options(&zen)
+            .into_iter()
+            .map(|option| option.id)
+            .collect();
+        assert!(!ids.contains(&"cleanroom".to_string()), "{ids:?}");
+        assert!(ids.contains(&"auto".to_string()));
+        let memory = LaunchMemory {
+            home_dir: Some("cleanroom".into()),
+            room: Some(true),
+            ..LaunchMemory::default()
+        };
+        let remembered = ctx.selection(&zen, &memory, DEFAULT_LANGUAGE);
+        assert_eq!(remembered.home_dir, "cleanroom");
+        let stored = ctx.stored_selection(&zen, remembered.clone());
+        assert_eq!(stored.home_dir, "auto");
+        assert!(!stored.room);
+        let params = ctx.stored_params(&zen, &remembered, None);
+        assert_eq!(params.home_name.as_deref(), Some("auto-zen"));
+        assert!(!params.launch_in_room_mode);
+    }
+
+    #[test]
+    fn stored_launch_creates_the_auto_home_first() {
+        let ctx = context();
+        let code = app("VS Code", false, true);
+        let selection = ctx.selection(&code, &LaunchMemory::default(), DEFAULT_LANGUAGE);
+        let params = ctx.stored_params(&code, &selection, None);
+        assert_eq!(params.home_name.as_deref(), Some("auto-vs-code"));
+        assert!(params.create_home);
+        // A meta app without homes mounts its own Auto home; never Cleanroom.
+        let mut desk = app("My Desk", false, true);
+        desk.home_directories = false;
+        desk.is_meta_app = true;
+        let selection = ctx.selection(&desk, &LaunchMemory::default(), DEFAULT_LANGUAGE);
+        let params = ctx.stored_params(&desk, &selection, None);
+        assert_eq!(params.home_name.as_deref(), Some("auto-my-desk"));
         assert!(!params.create_home);
     }
 
