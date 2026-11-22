@@ -12,11 +12,143 @@ use std::time::Duration;
 const KEY_VARIABLE: &str = "SEALSKIN_APPLICATION_KEY";
 
 /// Why a Library load failed. `Refused` means the server failed the minimum-version gate
-/// (ARCH-009): Skerry must not keep using that server, even on Refresh.
+/// (ARCH-009): Skerry must not keep using that server, even on Refresh. `Key` and `Account`
+/// are SealSkin refusing the key or the account (`ARCH-029`).
 #[derive(Debug)]
 pub enum LibraryError {
     Refused(String),
     Failed(String),
+    Key(KeyRefusal),
+    Account(AccountBlock),
+}
+
+/// Why SealSkin refused the application key: a 401 and its `detail` code, as SealSkin 0.5's
+/// `application_keys.authenticate` documents them (`docs/content/api.md`). The codes are
+/// matched exactly, as SealSkin's own shells do (`client/src/shell/host.js` `keyRefusal`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyRefusal {
+    /// `unknown`: revoked (the record is deleted) or never existed.
+    Revoked,
+    /// `expired`.
+    Expired,
+    /// `dormant`: asleep until a web sign-in at `<origin>/?wake=1`.
+    Dormant,
+    /// `disabled`: the account's settings turn application keys off.
+    KeysDisabled,
+    /// `client`: the account doesn't allow the "Other clients" type Skerry sends.
+    ClientNotAllowed,
+    /// Any other 401, with its detail (`Invalid token.`, a proxy's page, a lane setting).
+    Other(String),
+}
+
+/// An account state SealSkin refuses every route for (403). Only `Held` has a structural
+/// signal (`held: true` in `admin/status`); the 403 texts are prose, pinned to 0.5.0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountBlock {
+    /// 403 `User account is inactive.`
+    Inactive,
+    /// Waiting for an administrator to place it in a group.
+    Held,
+    /// Every Library request answered the same 403 nobody recognises; its text verbatim.
+    Other(String),
+}
+
+/// A failed control-plane request, classified (`classify`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ApiError {
+    Key(KeyRefusal),
+    Account(AccountBlock),
+    /// A 403 Skerry doesn't recognise, with the server's detail.
+    Forbidden(String),
+    /// Everything else, as user-facing text.
+    Message(String),
+}
+
+impl ApiError {
+    /// The key or the account was refused: the Library can't go on with this key.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Self::Key(_) | Self::Account(_))
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::Key(KeyRefusal::Revoked) => {
+                "This application key no longer signs you in. Open the Library to paste a new one."
+            }
+            Self::Key(KeyRefusal::Expired) => {
+                "This application key has expired. Open the Library to paste a new one."
+            }
+            Self::Key(KeyRefusal::Dormant) => {
+                "The key for this server is asleep. Open the Library to sign in again."
+            }
+            Self::Key(KeyRefusal::KeysDisabled) => {
+                "Application keys are turned off for this account."
+            }
+            Self::Key(KeyRefusal::ClientNotAllowed) => {
+                "The account must allow “Other clients” to use application keys."
+            }
+            Self::Key(KeyRefusal::Other(_)) => "The server didn’t accept this application key.",
+            Self::Account(AccountBlock::Inactive) => "This SealSkin account is turned off.",
+            Self::Account(AccountBlock::Held) => {
+                "This account is waiting for an administrator to add it to a group."
+            }
+            Self::Account(AccountBlock::Other(detail)) | Self::Forbidden(detail)
+                if !detail.trim().is_empty() =>
+            {
+                return write!(f, "SealSkin refused this account: {}", detail.trim());
+            }
+            Self::Account(AccountBlock::Other(_)) | Self::Forbidden(_) => {
+                "This account doesn’t have permission for that action."
+            }
+            Self::Message(message) => message,
+        };
+        f.write_str(text)
+    }
+}
+
+impl From<ApiError> for String {
+    fn from(error: ApiError) -> Self {
+        error.to_string()
+    }
+}
+
+const HELD_DETAIL: &str = "This account waits for an administrator to place it in a group.";
+const INACTIVE_DETAIL: &str = "User account is inactive.";
+
+/// Classifies a failed response from its status and SealSkin `detail` (`None` when the body
+/// isn't SealSkin's JSON, a proxy's HTML page for one). Only the 401 codes and `held` are
+/// SealSkin contract; the two 403 texts are best-effort, pinned to 0.5.0 by a test.
+pub(crate) fn classify(status: StatusCode, detail: Option<&str>) -> ApiError {
+    match (status, detail) {
+        (StatusCode::UNAUTHORIZED, Some("unknown")) => ApiError::Key(KeyRefusal::Revoked),
+        (StatusCode::UNAUTHORIZED, Some("expired")) => ApiError::Key(KeyRefusal::Expired),
+        (StatusCode::UNAUTHORIZED, Some("dormant")) => ApiError::Key(KeyRefusal::Dormant),
+        (StatusCode::UNAUTHORIZED, Some("disabled")) => ApiError::Key(KeyRefusal::KeysDisabled),
+        (StatusCode::UNAUTHORIZED, Some("client")) => ApiError::Key(KeyRefusal::ClientNotAllowed),
+        (StatusCode::UNAUTHORIZED, detail) => ApiError::Key(KeyRefusal::Other(
+            detail.unwrap_or_default().trim().to_string(),
+        )),
+        (StatusCode::FORBIDDEN, Some(INACTIVE_DETAIL)) => ApiError::Account(AccountBlock::Inactive),
+        (StatusCode::FORBIDDEN, Some(HELD_DETAIL)) => ApiError::Account(AccountBlock::Held),
+        (StatusCode::FORBIDDEN, detail) => {
+            ApiError::Forbidden(detail.unwrap_or_default().trim().to_string())
+        }
+        _ => ApiError::Message(format!("SealSkin returned HTTP {}.", status.as_u16())),
+    }
+}
+
+/// Reads a failed response's SealSkin `detail` (if its body is SealSkin's JSON) and
+/// classifies it.
+async fn classify_response(response: reqwest::Response) -> ApiError {
+    let status = response.status();
+    let detail = response
+        .json::<Failure>()
+        .await
+        .ok()
+        .map(|failure| failure.detail);
+    classify(status, detail.as_deref())
 }
 
 /// The oldest SealSkin server version Skerry supports (ARCH-009). Older servers are refused.
@@ -279,8 +411,9 @@ pub struct VpnChoice {
     pub endpoints: Vec<VpnEndpoint>,
 }
 
-/// The launch rights in the user's effective settings.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+/// The user's effective settings: launch rights, groups, and limits. A negative limit means
+/// unlimited, as SealSkin's `UserSettings` says (`models.py`); a missing one reads unlimited.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct UserSettings {
     #[serde(default)]
     pub persistent_storage: bool,
@@ -288,9 +421,75 @@ pub struct UserSettings {
     pub gpu: bool,
     #[serde(default)]
     pub vpn: bool,
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// GB (binary) per node.
+    #[serde(default = "unlimited", deserialize_with = "whole_number")]
+    pub storage_limit: i64,
+    /// Sessions at once, across nodes.
+    #[serde(default = "unlimited", deserialize_with = "whole_number")]
+    pub session_limit: i64,
+    #[serde(default = "unlimited_f")]
+    pub session_cpus: f64,
+    #[serde(default = "unlimited", deserialize_with = "whole_number")]
+    pub session_memory_mb: i64,
+    #[serde(default = "unlimited_f")]
+    pub session_hours: f64,
+    #[serde(default = "unlimited_f")]
+    pub session_idle_minutes: f64,
+    /// Hours after the last web sign-in before a key sleeps; negative: never.
+    #[serde(default = "unlimited_f")]
+    pub application_key_dormant_hours: f64,
+    /// A key sleeps when the web sign-in ends.
+    #[serde(default)]
+    pub application_key_follow_sign_in: bool,
 }
 
-/// What `POST /companion/api/admin/status` says about the user's launch choices.
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            persistent_storage: false,
+            gpu: false,
+            vpn: false,
+            groups: Vec::new(),
+            storage_limit: -1,
+            session_limit: -1,
+            session_cpus: -1.,
+            session_memory_mb: -1,
+            session_hours: -1.,
+            session_idle_minutes: -1.,
+            application_key_dormant_hours: -1.,
+            application_key_follow_sign_in: false,
+        }
+    }
+}
+
+fn unlimited() -> i64 {
+    -1
+}
+
+fn unlimited_f() -> f64 {
+    -1.
+}
+
+/// An integer limit, accepting any JSON number (pydantic may write `40.0`).
+fn whole_number<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+    let number = f64::deserialize(deserializer)?;
+    Ok(number.round() as i64)
+}
+
+/// Hours of session time per period, and how many are used (`quota.py`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Allowance {
+    pub hours: f64,
+    #[serde(default)]
+    pub period: String,
+    #[serde(default)]
+    pub used: f64,
+}
+
+/// What `POST /companion/api/admin/status` says about the user: their launch choices,
+/// account, limits, and allowance (`AdminStatusResponse`).
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct ServerStatus {
     #[serde(default)]
@@ -299,6 +498,19 @@ pub struct ServerStatus {
     pub gpus: Vec<GpuInfo>,
     #[serde(default)]
     pub vpns: Vec<VpnChoice>,
+    #[serde(default)]
+    pub is_admin: bool,
+    #[serde(default)]
+    pub held: bool,
+    /// Empty when the status couldn't be read.
+    #[serde(default)]
+    pub username: String,
+    /// `None` for admins and unlimited accounts.
+    #[serde(default)]
+    pub allowance: Option<Allowance>,
+    /// Bytes in the user's storage, only when asked with `?storage=1`.
+    #[serde(default)]
+    pub storage_used: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -466,8 +678,8 @@ pub enum ProgressAnswer {
     Known(LaunchProgress),
     /// 404: the server isn't following this id (not seen yet, pruned, or never followed).
     Unknown,
-    /// 401: the key no longer works.
-    SignedOut,
+    /// 401: the key no longer works, and why.
+    SignedOut(KeyRefusal),
 }
 
 /// Why a launch request ended without a session.
@@ -479,11 +691,26 @@ pub enum LaunchError {
     Network(String),
     /// SealSkin answered and refused.
     Server(String),
+    /// SealSkin refused the key or the account (`ApiError::is_refusal`); the Launcher
+    /// handles it as a refused Library load (`ARCH-029`).
+    Refused(ApiError),
 }
 
 /// The ceiling on one launch request: the server's 900 s pending limit plus a margin. A
 /// launch that outlives it is still followed through progress.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(960);
+
+/// The ceiling on `admin/status?storage=1`: with no earlier measure the server walks every
+/// file in the user's storage (`storage_usage.py`), which can outlast the usual 30 s.
+const STORAGE_MEASURE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The `<id>` in `ssk_<id>_<secret>@<host>`, which isn't secret (the web lists key ids).
+fn key_id_of(raw: &str) -> &str {
+    raw.trim()
+        .strip_prefix("ssk_")
+        .and_then(|rest| rest.split_once('_'))
+        .map_or("", |(id, _)| id)
+}
 
 /// A launch id is a UUID (8-4-4-4-12 hex), as the server's progress route expects.
 pub fn valid_launch_id(id: &str) -> bool {
@@ -548,6 +775,49 @@ pub struct Library {
     pub status: ServerStatus,
     /// The user's home directories, when they have persistent storage.
     pub homes: Vec<String>,
+}
+
+/// A Library load's outcome from its three requests, most decisive first: a refused key,
+/// then `held: true` (structural, so it wins over any English text), then a refused account,
+/// then the same unrecognised 403 on all three, then the first failure. `status` is the
+/// status's `held` flag, or its error.
+fn library_parts<A, S>(
+    apps: Result<A, ApiError>,
+    sessions: Result<S, ApiError>,
+    status: Result<bool, &ApiError>,
+) -> Result<(A, S), LibraryError> {
+    let refused = {
+        let errors: Vec<&ApiError> = [apps.as_ref().err(), sessions.as_ref().err(), status.err()]
+            .into_iter()
+            .flatten()
+            .collect();
+        let key = errors.iter().find_map(|error| match error {
+            ApiError::Key(refusal) => Some(LibraryError::Key(refusal.clone())),
+            _ => None,
+        });
+        let account = errors.iter().find_map(|error| match error {
+            ApiError::Account(block) => Some(LibraryError::Account(block.clone())),
+            _ => None,
+        });
+        let forbidden = match errors.as_slice() {
+            [ApiError::Forbidden(a), ApiError::Forbidden(b), ApiError::Forbidden(c)]
+                if a == b && b == c =>
+            {
+                Some(LibraryError::Account(AccountBlock::Other(a.clone())))
+            }
+            _ => None,
+        };
+        key.or((status == Ok(true)).then_some(LibraryError::Account(AccountBlock::Held)))
+            .or(account)
+            .or(forbidden)
+    };
+    if let Some(refused) = refused {
+        return Err(refused);
+    }
+    match (apps, sessions) {
+        (Ok(apps), Ok(sessions)) => Ok((apps, sessions)),
+        (Err(error), _) | (_, Err(error)) => Err(LibraryError::Failed(error.to_string())),
+    }
 }
 
 /// The only paths that get the application key.
@@ -681,16 +951,11 @@ impl SealSkinClient {
                 .json(&json!({})),
         );
         let sessions = send(self.request(Method::GET, "/companion/api/sessions"));
-        let status = send::<ServerStatus>(
-            self.request(Method::POST, "/companion/api/admin/status")
-                .json(&json!({})),
-        );
+        let status = self.account(false);
         let (apps, sessions, status) = tokio::join!(apps, sessions, status);
-        let (apps, sessions) = (
-            apps.map_err(LibraryError::Failed)?,
-            sessions.map_err(LibraryError::Failed)?,
-        );
-        // Launch choices are extras: without the status the dialog offers what it always did.
+        let (apps, sessions) = library_parts(apps, sessions, status.as_ref().map(|s| s.held))?;
+        // Launch choices and the account menu are extras: without the status the dialog
+        // offers what it always did and the menu says the account is unavailable.
         let status = status.unwrap_or_default();
         let homes = if status.settings.persistent_storage {
             self.home_directories().await.unwrap_or_default()
@@ -705,27 +970,76 @@ impl SealSkinClient {
         })
     }
 
-    async fn home_directories(&self) -> Result<Vec<String>, String> {
+    /// The user's account, limits, and launch choices (`POST /companion/api/admin/status`,
+    /// open to every signed-in user, a held one too). `measure_storage` asks the server to
+    /// walk the user's storage (`?storage=1`), which can take a while, so it has its own
+    /// longer timeout; only the account menu asks for it.
+    pub async fn account(&self, measure_storage: bool) -> Result<ServerStatus, ApiError> {
+        let mut request = self
+            .request(Method::POST, "/companion/api/admin/status")
+            .json(&json!({}));
+        if measure_storage {
+            request = request
+                .query(&[("storage", "1")])
+                .timeout(STORAGE_MEASURE_TIMEOUT);
+        }
+        send(request).await
+    }
+
+    /// Whether the key signs in now: the wake poll's one cheap request.
+    pub async fn key_works(&self) -> Result<(), ApiError> {
+        self.account(false).await.map(|_| ())
+    }
+
+    /// Where a dormant key wakes: the server's web app at `/?wake=1`, opened in the browser.
+    /// It carries no part of the key; the browser signs in on its own (`ARCH-029`).
+    pub fn wake_url(&self) -> Url {
+        let mut url = self.web_url();
+        url.set_query(Some("wake=1"));
+        url
+    }
+
+    /// The server's web app (`/`), without the key.
+    pub fn web_url(&self) -> Url {
+        let mut url = self.base.clone();
+        url.set_path("/");
+        url.set_query(None);
+        url.set_fragment(None);
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url
+    }
+
+    /// The key's id, the non-secret `<id>` in `ssk_<id>_<secret>`.
+    pub fn key_id(&self) -> &str {
+        key_id_of(&self.raw_key)
+    }
+
+    async fn home_directories(&self) -> Result<Vec<String>, ApiError> {
         let homes: HomeDirectories =
             send(self.request(Method::GET, "/companion/api/homedirs")).await?;
         Ok(homes.home_dirs)
     }
 
-    async fn create_home_directory(&self, home_name: &str) -> Result<(), String> {
+    async fn create_home_directory(&self, home_name: &str) -> Result<(), ApiError> {
         let response = self
             .request(Method::POST, "/companion/api/homedirs")
             .json(&json!({ "home_name": home_name }))
             .send()
             .await
-            .map_err(|_| "Couldn’t reach the SealSkin server to create the home.".to_string())?;
+            .map_err(|_| {
+                ApiError::Message("Couldn’t reach the SealSkin server to create the home.".into())
+            })?;
         // 409: it exists already (made elsewhere since the Library loaded).
         if response.status().is_success() || response.status() == StatusCode::CONFLICT {
             return Ok(());
         }
-        Err(format!(
-            "SealSkin returned HTTP {} while creating the home “{home_name}”.",
-            response.status().as_u16()
-        ))
+        Err(match classify_response(response).await {
+            ApiError::Message(_) => {
+                ApiError::Message(format!("SealSkin couldn’t create the home “{home_name}”."))
+            }
+            error => error,
+        })
     }
 
     /// Launches `app`. `on_send` runs just before the launch request goes out (after any
@@ -745,7 +1059,13 @@ impl SealSkinClient {
         if let (true, Some(home_name)) = (params.create_home, &params.home_name) {
             self.create_home_directory(home_name)
                 .await
-                .map_err(LaunchError::Server)?;
+                .map_err(|error| {
+                    if error.is_refusal() {
+                        LaunchError::Refused(error)
+                    } else {
+                        LaunchError::Server(error.to_string())
+                    }
+                })?;
         }
         let mut request = self
             .request(Method::POST, "/companion/api/launch/simple")
@@ -778,7 +1098,10 @@ impl SealSkinClient {
             .map_err(|_| "Couldn’t reach the SealSkin server.".to_string())?;
         match response.status() {
             StatusCode::NOT_FOUND => Ok(ProgressAnswer::Unknown),
-            StatusCode::UNAUTHORIZED => Ok(ProgressAnswer::SignedOut),
+            StatusCode::UNAUTHORIZED => match classify_response(response).await {
+                ApiError::Key(refusal) => Ok(ProgressAnswer::SignedOut(refusal)),
+                _ => Ok(ProgressAnswer::SignedOut(KeyRefusal::Other(String::new()))),
+            },
             status if status.is_success() => response
                 .json()
                 .await
@@ -790,33 +1113,35 @@ impl SealSkinClient {
 
     /// The user's running sessions (`GET /companion/api/sessions`).
     pub async fn sessions(&self) -> Result<Vec<RemoteSession>, String> {
-        send(self.request(Method::GET, "/companion/api/sessions")).await
+        Ok(send(self.request(Method::GET, "/companion/api/sessions")).await?)
     }
 
-    pub async fn stop_session(&self, session_id: &str) -> Result<(), String> {
+    pub async fn stop_session(&self, session_id: &str) -> Result<(), ApiError> {
         if !valid_path_segment(session_id) {
-            return Err("Invalid session identifier.".into());
+            return Err(ApiError::Message("Invalid session identifier.".into()));
         }
         let path = format!("/companion/api/sessions/{session_id}");
         let response = self
             .request(Method::DELETE, &path)
             .send()
             .await
-            .map_err(|_| "Couldn’t reach the SealSkin server to stop the session.".to_string())?;
+            .map_err(|_| {
+                ApiError::Message("Couldn’t reach the SealSkin server to stop the session.".into())
+            })?;
         if response.status().is_success() || response.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
-        Err(format!(
-            "SealSkin returned HTTP {} while stopping the session.",
-            response.status().as_u16()
-        ))
+        Err(match classify_response(response).await {
+            ApiError::Message(_) => ApiError::Message("SealSkin couldn’t stop the session.".into()),
+            error => error,
+        })
     }
 
     /// The names in one folder of a home's persistent storage, every page of it
     /// (`GET /companion/api/files/list/<home>`, `ARCH-024`).
-    pub async fn storage_names(&self, home: &str, path: &str) -> Result<Vec<String>, String> {
+    pub async fn storage_names(&self, home: &str, path: &str) -> Result<Vec<String>, ApiError> {
         if !valid_path_segment(home) {
-            return Err("Invalid home name.".into());
+            return Err(ApiError::Message("Invalid home name.".into()));
         }
         let route = format!("/companion/api/files/list/{home}");
         let mut names = Vec::new();
@@ -833,7 +1158,9 @@ impl SealSkinClient {
                 return Ok(names);
             }
         }
-        Err("The folder holds too many items to compare.".into())
+        Err(ApiError::Message(
+            "The folder holds too many items to compare.".into(),
+        ))
     }
 
     /// Deletes `paths` (home-relative, `/`-rooted) from a home's persistent storage and waits
@@ -1043,10 +1370,10 @@ async fn send_launch<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, 
             "A gateway returned HTTP {} for the launch request.",
             status.as_u16()
         ))),
-        (401 | 403, detail) => Err(LaunchError::Server(failure_message(
-            status,
-            detail.as_deref(),
-        ))),
+        (401 | 403, detail) => match classify(status, detail.as_deref()) {
+            error if error.is_refusal() => Err(LaunchError::Refused(error)),
+            error => Err(LaunchError::Server(error.to_string())),
+        },
         (_, Some(detail)) if !detail.trim().is_empty() => Err(LaunchError::Server(detail)),
         _ => Err(LaunchError::Server(format!(
             "SealSkin returned HTTP {}.",
@@ -1055,55 +1382,356 @@ async fn send_launch<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, 
     }
 }
 
-/// The message for a failed request's status and SealSkin `detail`.
-fn failure_message(status: StatusCode, detail: Option<&str>) -> String {
-    let error = match (status, detail) {
-        (StatusCode::UNAUTHORIZED, Some("client")) => {
-            "The account must allow the Other client type for application keys."
-        }
-        (StatusCode::UNAUTHORIZED, Some("expired")) => {
-            "This application key has expired. Create a new key in SealSkin."
-        }
-        (StatusCode::UNAUTHORIZED, Some("disabled")) => {
-            "Application keys are disabled for this account."
-        }
-        (StatusCode::UNAUTHORIZED, Some("dormant")) => {
-            "This key is dormant. Sign in to the SealSkin web app before retrying."
-        }
-        (StatusCode::UNAUTHORIZED, _) => "The server didn’t accept this application key.",
-        (StatusCode::FORBIDDEN, _) => "This account doesn’t have permission for that action.",
-        _ => return format!("SealSkin returned HTTP {}.", status.as_u16()),
-    };
-    error.into()
-}
-
-async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, String> {
+/// Sends a key-bearing request and decodes its answer; every failure goes through
+/// [`classify`], so a refused key is recognised wherever it shows up.
+async fn send<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, ApiError> {
     let response = request.send().await.map_err(|error| {
-        if error.is_timeout() {
-            "The server took too long to respond. Refresh to check for running sessions."
-        } else {
-            "Couldn’t reach the SealSkin server. Check the address, network, and HTTPS certificate."
-        }
+        ApiError::Message(
+            if error.is_timeout() {
+                "The server took too long to respond. Refresh to check for running sessions."
+            } else {
+                "Couldn’t reach the SealSkin server. Check the address, network, and HTTPS certificate."
+            }
+            .into(),
+        )
     })?;
-    let status = response.status();
-    if status.is_success() {
+    if response.status().is_success() {
         return response
             .json()
             .await
-            .map_err(|_| "The server returned an unexpected response.".into());
+            .map_err(|_| ApiError::Message("The server returned an unexpected response.".into()));
     }
-    let detail = response
-        .json::<Failure>()
-        .await
-        .ok()
-        .map(|failure| failure.detail);
-    Err(failure_message(status, detail.as_deref()))
+    Err(classify_response(response).await)
+}
+
+/// An in-process SealSkin stand-in for tests: it answers every request by its path.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Every request the fake saw: its head, lowercased.
+    pub type Seen = Arc<Mutex<Vec<String>>>;
+
+    pub fn reply(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Serves until dropped (the test's runtime ends), answering each request with
+    /// `answer(path)`, where `path` is the request line's target.
+    pub async fn serve(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> (Url, Seen) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let seen: Seen = Arc::default();
+        let log = seen.clone();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (log, answer) = (log.clone(), answer.clone());
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(read) => request.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&request).to_string();
+                    let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                    log.lock().unwrap().push(head.to_lowercase());
+                    let _ = stream.write_all(answer(&target).as_bytes()).await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    pub fn client(base: Url) -> SealSkinClient {
+        let credential = Credential::parse("ssk_id_secret@seal.example").unwrap();
+        SealSkinClient::with_base(&credential, base)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn key_refusals_are_classified_from_status_and_detail() {
+        let unauthorized = |detail| classify(StatusCode::UNAUTHORIZED, detail);
+        assert_eq!(
+            unauthorized(Some("unknown")),
+            ApiError::Key(KeyRefusal::Revoked)
+        );
+        assert_eq!(
+            unauthorized(Some("expired")),
+            ApiError::Key(KeyRefusal::Expired)
+        );
+        assert_eq!(
+            unauthorized(Some("dormant")),
+            ApiError::Key(KeyRefusal::Dormant)
+        );
+        assert_eq!(
+            unauthorized(Some("disabled")),
+            ApiError::Key(KeyRefusal::KeysDisabled)
+        );
+        assert_eq!(
+            unauthorized(Some("client")),
+            ApiError::Key(KeyRefusal::ClientNotAllowed)
+        );
+        // The key's user was deleted.
+        assert_eq!(
+            unauthorized(Some("Invalid token.")),
+            ApiError::Key(KeyRefusal::Other("Invalid token.".into()))
+        );
+        assert_eq!(
+            unauthorized(Some("The companion lane takes application keys alone.")),
+            ApiError::Key(KeyRefusal::Other(
+                "The companion lane takes application keys alone.".into()
+            ))
+        );
+        // A proxy's HTML page has no detail.
+        assert_eq!(
+            unauthorized(None),
+            ApiError::Key(KeyRefusal::Other(String::new()))
+        );
+        // The codes are exact and case-sensitive, as in SealSkin's own shells.
+        for near in ["Dormant", " dormant", "dormant "] {
+            assert!(
+                matches!(
+                    unauthorized(Some(near)),
+                    ApiError::Key(KeyRefusal::Other(_))
+                ),
+                "{near:?}"
+            );
+        }
+        assert_eq!(
+            classify(StatusCode::TOO_MANY_REQUESTS, Some("locked")),
+            ApiError::Message("SealSkin returned HTTP 429.".into())
+        );
+        assert_eq!(
+            classify(StatusCode::INTERNAL_SERVER_ERROR, None),
+            ApiError::Message("SealSkin returned HTTP 500.".into())
+        );
+    }
+
+    #[test]
+    fn sealskin_0_5_0_account_refusals_are_recognised_and_others_show_their_text() {
+        // Pinned to SealSkin 0.5.0's `security.py` wording; only `held: true` is contract.
+        assert_eq!(
+            classify(StatusCode::FORBIDDEN, Some("User account is inactive.")),
+            ApiError::Account(AccountBlock::Inactive)
+        );
+        assert_eq!(
+            classify(
+                StatusCode::FORBIDDEN,
+                Some("This account waits for an administrator to place it in a group.")
+            ),
+            ApiError::Account(AccountBlock::Held)
+        );
+        let reworded = classify(StatusCode::FORBIDDEN, Some("Your account is paused."));
+        assert_eq!(
+            reworded,
+            ApiError::Forbidden("Your account is paused.".into())
+        );
+        assert!(!reworded.is_refusal());
+        assert_eq!(
+            reworded.to_string(),
+            "SealSkin refused this account: Your account is paused."
+        );
+        // Display never carries the key.
+        for error in [
+            ApiError::Key(KeyRefusal::Dormant),
+            ApiError::Key(KeyRefusal::Other("x".into())),
+        ] {
+            assert!(!error.to_string().contains("ssk_"));
+        }
+    }
+
+    #[test]
+    fn library_prefers_the_held_flag_over_any_403_text() {
+        let forbidden = || Err::<(), _>(ApiError::Forbidden("Some new wording.".into()));
+        // Held comes from `held: true` even when the 403s were reworded.
+        assert!(matches!(
+            library_parts(forbidden(), forbidden(), Ok(true)),
+            Err(LibraryError::Account(AccountBlock::Held))
+        ));
+        // A refused key wins over everything.
+        let dormant = ApiError::Key(KeyRefusal::Dormant);
+        assert!(matches!(
+            library_parts(Ok(()), forbidden(), Err(&dormant)),
+            Err(LibraryError::Key(KeyRefusal::Dormant))
+        ));
+        // The same unrecognised 403 everywhere: the account itself is refused, with its text.
+        let same = ApiError::Forbidden("Some new wording.".into());
+        match library_parts(forbidden(), forbidden(), Err(&same)) {
+            Err(LibraryError::Account(AccountBlock::Other(text))) => {
+                assert_eq!(text, "Some new wording.")
+            }
+            other => panic!("{other:?}"),
+        }
+        // A 403 on one request only is an ordinary failure.
+        let failure = ApiError::Message("down".into());
+        assert!(matches!(
+            library_parts(forbidden(), Ok(()), Err(&failure)),
+            Err(LibraryError::Failed(_))
+        ));
+        assert!(library_parts(Ok(()), Ok(()), Err(&failure)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn library_prefers_a_key_refusal_and_keeps_the_key_on_its_origin() {
+        let (base, seen) = fake::serve(|path| {
+            if path.starts_with("/companion/api/ui/version") {
+                fake::reply("200 OK", r#"{"version":"0.5.0"}"#)
+            } else if path.starts_with("/companion/api/applications") {
+                fake::reply("401 Unauthorized", r#"{"detail":"dormant"}"#)
+            } else if path.starts_with("/companion/api/sessions") {
+                fake::reply("200 OK", "[]")
+            } else {
+                fake::reply("403 Forbidden", r#"{"detail":"whatever"}"#)
+            }
+        })
+        .await;
+        let client = fake::client(base.clone());
+        assert!(matches!(
+            client.library().await,
+            Err(LibraryError::Key(KeyRefusal::Dormant))
+        ));
+        // One wake check, as the poll's tick sends it.
+        assert!(client.key_works().await.is_err());
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.len() >= 4, "{seen:?}");
+        for request in &seen {
+            let target = request.split_whitespace().nth(1).unwrap_or("");
+            assert!(target.starts_with("/companion/api/"), "{request}");
+            assert!(!target.contains("wake"), "{request}");
+            assert!(request.contains("authorization: bearer ssk_id_secret"));
+            let host = format!("host: {}", base.authority());
+            assert!(request.contains(&host), "{request}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_held_status_wins_over_reworded_403s() {
+        let (base, _) = fake::serve(|path| {
+            if path.starts_with("/companion/api/ui/version") {
+                fake::reply("200 OK", r#"{"version":"0.5.0"}"#)
+            } else if path.starts_with("/companion/api/admin/status") {
+                fake::reply(
+                    "200 OK",
+                    r#"{"held":true,"username":"new","is_admin":false}"#,
+                )
+            } else {
+                fake::reply("403 Forbidden", r#"{"detail":"Wait for a group, please."}"#)
+            }
+        })
+        .await;
+        assert!(matches!(
+            fake::client(base).library().await,
+            Err(LibraryError::Account(AccountBlock::Held))
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_and_home_creation_classify_a_refused_key() {
+        let (base, _) = fake::serve(|path| {
+            if path.starts_with("/companion/api/sessions/") {
+                fake::reply("401 Unauthorized", r#"{"detail":"dormant"}"#)
+            } else {
+                fake::reply("401 Unauthorized", r#"{"detail":"expired"}"#)
+            }
+        })
+        .await;
+        let client = fake::client(base);
+        assert_eq!(
+            client.stop_session("abc").await,
+            Err(ApiError::Key(KeyRefusal::Dormant))
+        );
+        let params = LaunchParams {
+            home_name: Some("auto-firefox".into()),
+            create_home: true,
+            ..LaunchParams::default()
+        };
+        assert_eq!(
+            client
+                .launch_with_options(firefox(), params, || {})
+                .await
+                .err(),
+            Some(LaunchError::Refused(ApiError::Key(KeyRefusal::Expired)))
+        );
+        let launch = client
+            .launch_with_options(firefox(), LaunchParams::default(), || {})
+            .await;
+        assert_eq!(
+            launch.err(),
+            Some(LaunchError::Refused(ApiError::Key(KeyRefusal::Expired)))
+        );
+    }
+
+    #[test]
+    fn wake_and_web_urls_stay_on_the_control_plane_and_carry_no_key() {
+        let credential = Credential::parse("ssk_abc123_s3cr3t@sealskin.example.com:8443").unwrap();
+        let api = SealSkinClient::new(&credential).unwrap();
+        let wake = api.wake_url();
+        let web = api.web_url();
+        assert_eq!(wake.as_str(), "https://sealskin.example.com:8443/?wake=1");
+        assert_eq!(web.as_str(), "https://sealskin.example.com:8443/");
+        for url in [&wake, &web] {
+            assert_eq!(url.origin(), credential.base.origin());
+            assert!(url.username().is_empty() && url.password().is_none());
+            for secret in ["abc123", "s3cr3t", "ssk_"] {
+                assert!(!url.as_str().contains(secret), "{url}");
+            }
+        }
+        assert_eq!(api.key_id(), "abc123");
+        assert_eq!(key_id_of("nonsense"), "");
+    }
+
+    #[test]
+    fn decodes_the_account_limits_and_allowance() {
+        let status: ServerStatus = serde_json::from_value(json!({
+            "is_admin": false,
+            "held": false,
+            "username": "kebot",
+            "via": "app_key",
+            "settings": {
+                "groups": ["users", "designers"],
+                "persistent_storage": true, "public_sharing": false, "gpu": true, "vpn": false,
+                "storage_limit": 50, "session_limit": 2.0, "session_cpus": 4,
+                "session_memory_mb": 8192, "session_hours": 8.0, "session_idle_minutes": 30,
+                "allowance_hours": 40, "allowance_period": "month",
+                "application_key_days": -1, "application_key_dormant_hours": 24,
+                "application_key_follow_sign_in": false
+            },
+            "allowance": {"hours": 40, "period": "month", "used": 12.5},
+            "storage_used": 1073741824u64,
+            "provider_groups": [], "clustered": false, "node_id": "",
+            "gpus": [], "vpns": []
+        }))
+        .unwrap();
+        assert_eq!(status.username, "kebot");
+        assert_eq!(status.settings.groups, ["users", "designers"]);
+        assert_eq!(status.settings.session_limit, 2);
+        assert_eq!(status.settings.storage_limit, 50);
+        assert_eq!(status.settings.session_cpus, 4.);
+        assert_eq!(status.settings.application_key_dormant_hours, 24.);
+        assert_eq!(status.allowance.as_ref().unwrap().used, 12.5);
+        assert_eq!(status.storage_used, Some(1 << 30));
+        let minimal: ServerStatus = serde_json::from_value(json!({"username": "x"})).unwrap();
+        assert_eq!(minimal.settings.session_limit, -1);
+        assert_eq!(minimal.settings.application_key_dormant_hours, -1.);
+        assert!(minimal.allowance.is_none() && minimal.storage_used.is_none());
+    }
 
     const NOT_FOUND: &str =
         "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
@@ -1242,7 +1870,7 @@ mod tests {
         let client = test_client(base);
         assert_eq!(
             client.launch_progress(LAUNCH_ID).await,
-            Ok(ProgressAnswer::SignedOut)
+            Ok(ProgressAnswer::SignedOut(KeyRefusal::Expired))
         );
         assert_eq!(
             client.launch_progress(LAUNCH_ID).await,
