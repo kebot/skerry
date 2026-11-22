@@ -479,6 +479,8 @@ impl Launcher {
                     // failed connect leaves it in place to fix or retry.
                     self.connect(credential, true, cx);
                 }
+                // Under the field while an alert shows, where the red line is hidden.
+                Err(error) if self.key_problem.is_some() => self.key_hint = Some(error),
                 Err(error) => self.status = Some(error),
             },
         }

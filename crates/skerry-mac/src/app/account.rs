@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 /// How often the wake poll checks the key.
 pub(super) const WAKE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long the wake poll keeps checking. Each refused check is audited on the server, so
-/// the poll is capped (36 checks); window activation checks again after that, which covers
-/// slow identity-provider round trips, so this cap needn't grow.
+/// the poll is capped (36 checks). Coming back to the window checks at once while waiting,
+/// and Try Again covers a sign-in that took longer, so this cap needn’t grow.
 pub(super) const WAKE_POLL_LIMIT: Duration = Duration::from_secs(180);
 
 /// The panel a dormant key or held account shows on the Connect screen.
@@ -494,12 +494,11 @@ impl Launcher {
         }
     }
 
-    /// The Library window came forward: if a wake is pending (or timed out), check once now,
+    /// The Library window came forward: while a wake is pending, check once now,
     /// unless a check or load is already running.
     pub(super) fn wake_check_on_activation(&mut self, cx: &mut Context<Self>) {
         let pending = self.recovery.as_ref().is_some_and(|recovery| {
-            recovery.kind == RecoveryKind::Dormant
-                && (recovery.waking_since.is_some() || recovery.timed_out)
+            recovery.kind == RecoveryKind::Dormant && recovery.waking_since.is_some()
         });
         if !pending || self.busy.is_some() || self.wake_check_in_flight {
             return;
