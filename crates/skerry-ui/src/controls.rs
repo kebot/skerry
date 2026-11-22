@@ -7,19 +7,21 @@ use gpui_kit::component::{
     popover::Popover,
     slider::{Slider, SliderEvent, SliderState},
     switch::Switch,
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, Theme,
+    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
     div, prelude::*, px, Anchor, AnyElement, App, ClickEvent, DismissEvent, Div, Entity,
-    FocusHandle, Focusable as _, FontWeight, SharedString, Window,
+    FocusHandle, Focusable as _, FontFeatures, FontWeight, SharedString, Window,
 };
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub type ControlsHandler = Rc<dyn Fn(ControlsAction, &mut Window, &mut App)>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Input,
+    Shortcuts,
     Clipboard,
     Screen,
     Video,
@@ -29,8 +31,9 @@ pub enum Section {
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Input,
+        Self::Shortcuts,
         Self::Clipboard,
         Self::Screen,
         Self::Video,
@@ -42,6 +45,7 @@ impl Section {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ControlsUiState {
     pub input_open: bool,
+    pub shortcuts_open: bool,
     pub clipboard_open: bool,
     pub screen_open: bool,
     pub video_open: bool,
@@ -59,6 +63,7 @@ impl Default for ControlsUiState {
     fn default() -> Self {
         Self {
             input_open: false,
+            shortcuts_open: false,
             clipboard_open: false,
             screen_open: true,
             video_open: false,
@@ -75,6 +80,7 @@ impl ControlsUiState {
     pub fn is_open(&self, section: Section) -> bool {
         match section {
             Section::Input => self.input_open,
+            Section::Shortcuts => self.shortcuts_open,
             Section::Clipboard => self.clipboard_open,
             Section::Screen => self.screen_open,
             Section::Video => self.video_open,
@@ -87,6 +93,7 @@ impl ControlsUiState {
     pub fn toggle(&mut self, section: Section) -> bool {
         let open = match section {
             Section::Input => &mut self.input_open,
+            Section::Shortcuts => &mut self.shortcuts_open,
             Section::Clipboard => &mut self.clipboard_open,
             Section::Screen => &mut self.screen_open,
             Section::Video => &mut self.video_open,
@@ -98,12 +105,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 6] {
+    pub fn sections(&self) -> [bool; 7] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 6]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 7]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -160,6 +167,33 @@ pub enum ControlsAction {
     /// Ask the server for this audio bitrate (bps).
     SetAudioBitrate(u32),
     CopyStats,
+    /// **Show over the stream** (`ARCH-031`).
+    SetStatsStrip(bool),
+    /// **Mac shortcuts active** (`ARCH-031`).
+    SetMacShortcuts(bool),
+}
+
+/// One row of the Shortcuts card, its chord in macOS menu glyphs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutRow {
+    pub label: String,
+    /// "⇧⌘", in ⌃⌥⇧⌘ order.
+    pub modifiers: String,
+    /// "M".
+    pub key: String,
+    /// "Sent as Ctrl+Shift+M" while the chord goes to the session.
+    pub remote: Option<String>,
+    /// Quit: "Always on the Mac", never dimmed.
+    pub always_local: bool,
+}
+
+/// The Shortcuts card (`ARCH-031`, `ARCH-GAP-DC-12`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShortcutsProps {
+    /// The effective value: the server's when locked.
+    pub mac_active: bool,
+    pub locked: bool,
+    pub rows: Vec<ShortcutRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,6 +350,9 @@ pub struct ControlsProps {
     pub stats: Option<crate::stats::StatsProps>,
     /// Shows the copy button's check for a moment after a copy.
     pub stats_copied: bool,
+    /// The stats strip is shown over the stream.
+    pub stats_strip: bool,
+    pub shortcuts: ShortcutsProps,
 }
 
 pub fn dpi_label(dpi: u16) -> String {
@@ -432,6 +469,13 @@ pub fn render(
                     state.input_open,
                     || render_input(props, &on_action),
                     toggle(Section::Input),
+                ))
+                .child(section(
+                    theme,
+                    "Shortcuts",
+                    state.shortcuts_open,
+                    || render_shortcuts(theme, &props.shortcuts, &on_action),
+                    toggle(Section::Shortcuts),
                 ))
                 .child(section(
                     theme,
@@ -927,15 +971,132 @@ fn render_audio(
 }
 
 fn render_stats(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
+    let strip = switch_row_with_detail(
+        theme,
+        "Show over the stream",
+        Some("Frame rate, video rate and latency at the top of the window.".into()),
+        props.stats_strip,
+        false,
+        ControlsAction::SetStatsStrip(!props.stats_strip),
+        on_action,
+    );
+    let panel = div().v_flex().gap(px(STACK_GAP)).child(strip);
     let Some(stats) = props.stats.as_ref() else {
-        return div()
-            .text_color(theme.muted_foreground)
-            .child("Waiting for stream stats…");
+        return panel.child(
+            div()
+                .text_color(theme.muted_foreground)
+                .child("Waiting for stream stats…"),
+        );
     };
     let on_action = Rc::clone(on_action);
-    crate::stats::render(theme, stats, props.stats_copied, move |window, cx| {
-        on_action(ControlsAction::CopyStats, window, cx)
-    })
+    panel.child(crate::stats::render(
+        theme,
+        stats,
+        props.stats_copied,
+        move |window, cx| on_action(ControlsAction::CopyStats, window, cx),
+    ))
+}
+
+/// The Shortcuts card: the switch, Skerry's chords as macOS menus write them, and, while
+/// they go to the session, where Session Controls still is (`ARCH-031`).
+fn render_shortcuts(theme: &Theme, shortcuts: &ShortcutsProps, on_action: &ControlsHandler) -> Div {
+    let detail = if shortcuts.locked {
+        "Set by the server."
+    } else {
+        "Let these chords act on the Mac. Off, they go to the remote session instead."
+    };
+    let rows = shortcuts.rows.iter().map(|row| {
+        let note = if row.always_local {
+            Some("Always on the Mac".to_string())
+        } else if shortcuts.mac_active {
+            None
+        } else {
+            row.remote.clone()
+        };
+        let dimmed = !shortcuts.mac_active && !row.always_local;
+        div()
+            .h_flex()
+            .items_start()
+            .justify_between()
+            .gap(px(10.))
+            .child(
+                div()
+                    .min_w_0()
+                    .v_flex()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .line_height(px(18.))
+                            .text_color(theme.foreground)
+                            .child(row.label.clone()),
+                    )
+                    .when_some(note, |label, note| {
+                        label.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .child(note),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .w(px(56.))
+                    .flex_none()
+                    .h_flex()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .text_color(theme.muted_foreground)
+                    .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                    .when(dimmed, |glyphs| glyphs.opacity(0.45))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_right()
+                            .whitespace_nowrap()
+                            .child(row.modifiers.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .child(row.key.clone()),
+                    ),
+            )
+    });
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_row_with_detail(
+            theme,
+            "Mac shortcuts active",
+            Some(detail.into()),
+            shortcuts.mac_active,
+            shortcuts.locked,
+            ControlsAction::SetMacShortcuts(!shortcuts.mac_active),
+            on_action,
+        ))
+        .child(div().v_flex().gap(px(8.)).children(rows))
+        .when(!shortcuts.mac_active, |panel| {
+            panel.child(
+                div()
+                    .h_flex()
+                    .items_start()
+                    .gap(px(6.))
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(
+                        div()
+                            .pt(px(2.))
+                            .child(Icon::new(IconName::Info).with_size(px(12.))),
+                    )
+                    .child(div().flex_1().min_w_0().child(
+                        "Session Controls is still in the View menu and behind the ⋯ button \
+                         at the top-right.",
+                    )),
+            )
+        })
 }
 
 fn action_button(
@@ -1335,6 +1496,48 @@ fn switch_row(
         .into_any_element()
 }
 
+/// A switch row with a muted 12 pt line under its label.
+fn switch_row_with_detail(
+    theme: &Theme,
+    label: impl Into<String>,
+    detail: Option<String>,
+    enabled: bool,
+    locked: bool,
+    action: ControlsAction,
+    on_action: &ControlsHandler,
+) -> AnyElement {
+    let Some(detail) = detail else {
+        return switch_row(label, enabled, locked, action, on_action);
+    };
+    let label = label.into();
+    let on_action = Rc::clone(on_action);
+    div()
+        .h_flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.))
+        .child(
+            div()
+                .min_w_0()
+                .v_flex()
+                .gap(px(2.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(label.clone()))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(detail),
+                ),
+        )
+        .child(
+            Switch::new(SharedString::from(label))
+                .checked(enabled)
+                .disabled(locked)
+                .on_click(move |_, window, cx| on_action(action.clone(), window, cx)),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,14 +1595,16 @@ mod tests {
 
     #[test]
     fn sections_round_trip_in_section_order() {
-        // Input, Video and Audio open, Screen closed.
-        let open = [true, false, false, true, true, false];
+        // Input, Shortcuts, Video and Audio open, Screen closed.
+        let open = [true, true, false, false, true, true, false];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
         assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
+        assert!(state.shortcuts_open);
+        assert_eq!(Section::ALL[1], Section::Shortcuts);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, true, false, false, false]
+            [false, false, false, true, false, false, false]
         );
     }
 }
