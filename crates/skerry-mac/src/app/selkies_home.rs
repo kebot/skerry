@@ -639,7 +639,7 @@ impl Launcher {
     ) {
         // One server at a time: any SealSkin state goes (`leave_server` bumps the
         // generation, so SealSkin work still in flight is dropped).
-        self.leave_server();
+        self.leave_server(cx);
         self.clear_sealskin_for_selkies();
         self.selkies_form.cert = None;
         self.selkies_form.problem = None;
@@ -718,7 +718,7 @@ impl Launcher {
         }
         if !connecting {
             // A refusal on Refresh: back to Connect, the form filled.
-            self.leave_server();
+            self.leave_server(cx);
             close_library_files(cx, |id| id.starts_with("selkies|"));
             self.connect_tab = ConnectTab::Selkies;
             let auth = server.auth();
@@ -963,7 +963,7 @@ impl Launcher {
             );
         }
         self.busy = None;
-        self.leave_server();
+        self.leave_server(cx);
         close_library_files(cx, |id| id.starts_with("selkies|"));
         self.connect_tab = ConnectTab::Selkies;
         self.reload_recent(cx);

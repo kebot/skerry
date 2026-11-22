@@ -155,6 +155,8 @@ enum Story {
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
+    StorageSharedFiles,
+    StorageHomeProtected,
     PrintNoticeStates,
     PrintNoticeLongName,
     PrintNoticeStack,
@@ -284,6 +286,8 @@ impl Story {
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
+        Story::StorageSharedFiles,
+        Story::StorageHomeProtected,
         Story::PrintNoticeStates,
         Story::PrintNoticeLongName,
         Story::PrintNoticeStack,
@@ -411,6 +415,7 @@ impl Story {
             | Story::SessionCaptureHintNarrow
             | Story::SessionCaptureHintLight => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
+            Story::StorageSharedFiles | Story::StorageHomeProtected => "Storage",
             Story::PrintNoticeStates
             | Story::PrintNoticeLongName
             | Story::PrintNoticeStack
@@ -537,6 +542,8 @@ impl Story {
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
+            Story::StorageSharedFiles => "Shared Files + Open in…",
+            Story::StorageHomeProtected => "Home + Protected Desktop",
             Story::ControlsPrintingEmpty => "Printing · Empty",
             Story::ControlsPrintingJobs => "Printing · Jobs, Auto Off",
             Story::ControlsPrintingOff => "Printing · Off by Server",
@@ -668,6 +675,8 @@ impl Story {
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
+            Story::StorageSharedFiles => "story-storage-shared-files",
+            Story::StorageHomeProtected => "story-storage-home-protected",
             Story::ControlsPrintingEmpty => "story-controls-printing-empty",
             Story::ControlsPrintingJobs => "story-controls-printing-jobs",
             Story::ControlsPrintingOff => "story-controls-printing-off",
@@ -1631,6 +1640,7 @@ impl PreviewApp {
             modified: modified.into(),
             size: size.into(),
             selected: false,
+            locked: false,
         };
         let mut rows = vec![
             row("Projects", true, "Yesterday at 18:02", "--"),
@@ -1677,6 +1687,7 @@ impl PreviewApp {
                 transfers: Vec::new(),
                 creating_folder: true,
                 selected: 0,
+                storage: None,
             },
             Story::FilesDownloadOnly => FilesProps {
                 crumbs,
@@ -1700,7 +1711,58 @@ impl PreviewApp {
                 transfers: Vec::new(),
                 creating_folder: false,
                 selected: 0,
+                storage: None,
             },
+            Story::StorageSharedFiles | Story::StorageHomeProtected => {
+                let home = story == Story::StorageHomeProtected;
+                let mut rows = if home {
+                    vec![
+                        row("Desktop", true, "Today at 09:12", "--"),
+                        row("Documents", true, "Yesterday at 18:40", "--"),
+                        row(".bashrc", false, "12 Nov 2026 at 08:00", "3 KB"),
+                    ]
+                } else {
+                    vec![
+                        row("Reports", true, "Today at 09:12", "--"),
+                        row("report.pdf", false, "Yesterday at 18:40", "2.4 MB"),
+                        row("notes.txt", false, "12 Nov 2026 at 10:04", "3 KB"),
+                    ]
+                };
+                rows[0].locked = home;
+                rows[1].selected = true;
+                let total = rows.len();
+                FilesProps {
+                    crumbs: vec![Crumb {
+                        label: if home { "work" } else { "Shared Files" }.into(),
+                        path: String::new(),
+                    }],
+                    can_back: false,
+                    can_forward: false,
+                    can_upload: true,
+                    can_download: true,
+                    can_delete: true,
+                    rows: Rc::new(rows),
+                    sort: SortColumn::Name,
+                    ascending: true,
+                    loading: false,
+                    error: None,
+                    notice: None,
+                    busy: None,
+                    transfers_open: true,
+                    focused: true,
+                    transfers: Vec::new(),
+                    creating_folder: false,
+                    selected: 1,
+                    storage: Some(files_ui::StoragePaneProps {
+                        open_in: (!home).then_some(true),
+                        total,
+                        filter: String::new(),
+                        empty_text: "This folder is empty.".into(),
+                        narrow: false,
+                        delete_enabled: true,
+                    }),
+                }
+            }
             _ => FilesProps {
                 crumbs,
                 can_back: true,
@@ -1758,6 +1820,7 @@ impl PreviewApp {
                 ],
                 creating_folder: false,
                 selected: 2,
+                storage: None,
             },
         }
     }
@@ -2204,6 +2267,7 @@ impl PreviewApp {
             busy: None,
             account: Self::fixture_account(self.story, server),
             account_open: self.account_open,
+            storage_button: true,
             omnibar: match story {
                 Story::LibraryOpenLink
                 | Story::LibraryOpenLinkPending
@@ -4139,9 +4203,83 @@ impl PreviewApp {
                             theme,
                             &self.files_props,
                             &self.folder_name,
+                            None,
                             &self.files_scroll,
                             handler,
                         )),
+                )
+            }
+            Story::StorageSharedFiles | Story::StorageHomeProtected => {
+                use skerry_ui::storage::{self as storage_ui, HomesState, QuotaState, QuotaTone};
+                let home = self.story == Story::StorageHomeProtected;
+                let sidebar = storage_ui::SidebarProps {
+                    selected: if home {
+                        storage_ui::SidebarRow::Home("work".into())
+                    } else {
+                        storage_ui::SidebarRow::Shared
+                    },
+                    homes: HomesState::Ready {
+                        named: vec!["default".into(), "work".into()],
+                        app: vec!["auto-firefox".into(), "auto-zen".into()],
+                    },
+                    deleting: None,
+                    focused: true,
+                    quota: QuotaState::Ready {
+                        text: if home {
+                            "42.6 GB of 50 GB used".into()
+                        } else {
+                            "12.3 GB of 50 GB used".into()
+                        },
+                        fraction: Some(if home { 0.85 } else { 0.25 }),
+                        tone: if home {
+                            QuotaTone::Warning
+                        } else {
+                            QuotaTone::Normal
+                        },
+                    },
+                    quota_tooltip: "Measured just now".into(),
+                };
+                let record = entity.clone();
+                let on_storage: storage_ui::StorageHandler = Rc::new(move |action, _, cx| {
+                    record.update(cx, |this, cx| {
+                        this.record_event(format!("Storage: {action:?}"), cx)
+                    });
+                });
+                let record = entity.clone();
+                let handler: files_ui::FilesHandler = Rc::new(move |action, _, cx| {
+                    if !matches!(action, FilesAction::DragOut(_) | FilesAction::Press(_)) {
+                        record.update(cx, |this, cx| {
+                            this.record_event(format!("Storage pane: {action:?}"), cx)
+                        });
+                    }
+                });
+                div().size_full().p_6().child(
+                    div()
+                        .size_full()
+                        .max_w(px(900.))
+                        .max_h(px(580.))
+                        .rounded_xl()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.background)
+                        .text_color(theme.foreground)
+                        .text_sm()
+                        .h_flex()
+                        .child(storage_ui::render_sidebar(
+                            theme,
+                            &sidebar,
+                            on_storage,
+                            Rc::new(|menu, _| menu),
+                        ))
+                        .child(div().flex_1().min_w_0().h_full().child(files_ui::render(
+                            theme,
+                            &self.files_props,
+                            &self.folder_name,
+                            Some(&self.apps_search),
+                            &self.files_scroll,
+                            handler,
+                        ))),
                 )
             }
             Story::AppsLoading
@@ -4606,6 +4744,7 @@ impl PreviewApp {
             on_clear_opening: Some(action("Chooser: Cancel")),
             on_skip_opening: Some(action("Chooser: Skip")),
             on_toggle_opening_apps: Some(action("Chooser: Show All")),
+            on_open_storage: Some(action("Library: Storage")),
             on_files: Some(Rc::new(move |id, _, cx| {
                 files_entity.update(cx, |this, cx| this.record_event(format!("Files: {id}"), cx));
             })),
