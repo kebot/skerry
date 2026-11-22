@@ -459,11 +459,24 @@ async fn checked(response: reqwest::Response) -> Result<reqwest::Response, Error
         return Ok(response);
     }
     let body = response.text().await.unwrap_or_default();
-    Err(Error::Server(status, server_message(&body)))
+    Err(Error::Server(status, server_message(status, &body)))
 }
 
-/// `{"status": "error", "message": …}`, or a short plain-text answer.
-fn server_message(body: &str) -> String {
+/// What a session's proxy answers while its container is still starting: nginx's HTML 404
+/// or a gateway error, before Selkies serves its routes (`ARCH-028`).
+pub const STILL_STARTING: &str = "The session is still starting. Try again in a moment.";
+
+/// `{"status": "error", "message": …}`, or a short plain-text answer. An HTML page (a
+/// proxy's, never Selkies') is never shown: on 404 or a gateway error it means the session
+/// is still starting; otherwise the status speaks for itself.
+fn server_message(status: StatusCode, body: &str) -> String {
+    if body.trim_start().starts_with('<') {
+        return if matches!(status.as_u16(), 404 | 502 | 503 | 504) {
+            STILL_STARTING.into()
+        } else {
+            String::new()
+        };
+    }
     if let Ok(value) = serde_json::from_str::<Value>(body) {
         if let Some(message) = value["message"].as_str() {
             return message.to_owned();
@@ -614,10 +627,31 @@ mod tests {
     #[test]
     fn server_errors_keep_their_message() {
         assert_eq!(
-            server_message(r#"{"status":"error","message":"uploads disabled"}"#),
+            server_message(
+                StatusCode::FORBIDDEN,
+                r#"{"status":"error","message":"uploads disabled"}"#
+            ),
             "uploads disabled"
         );
-        assert_eq!(server_message("  Forbidden \n"), "Forbidden");
+        assert_eq!(
+            server_message(StatusCode::FORBIDDEN, "  Forbidden \n"),
+            "Forbidden"
+        );
+        let nginx = "<html>\r\n<head><title>404 Not Found</title></head><center>nginx</center>";
+        assert_eq!(server_message(StatusCode::NOT_FOUND, nginx), STILL_STARTING);
+        assert_eq!(
+            server_message(StatusCode::BAD_GATEWAY, nginx),
+            STILL_STARTING
+        );
+        assert_eq!(server_message(StatusCode::FORBIDDEN, nginx), "");
+        assert_eq!(
+            Error::Server(
+                StatusCode::NOT_FOUND,
+                server_message(StatusCode::NOT_FOUND, nginx)
+            )
+            .to_string(),
+            STILL_STARTING
+        );
     }
 
     /// `SelkiesClient` end to end against an in-process stand-in for Selkies' file routes on

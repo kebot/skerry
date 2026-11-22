@@ -733,6 +733,7 @@ impl Launcher {
             recovery: self.recovery.as_ref().map(Recovery::props),
             different_key: self.different_key,
             hint: self.key_hint.clone(),
+            pending_open: super::pending_open_banner(&self.pending_opens),
         };
         let mut handlers =
             ConnectHandlers::new(cx.listener(|this, _, window, cx| this.submit_key(window, cx)));

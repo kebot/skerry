@@ -11,6 +11,8 @@ mod launch_options;
 #[cfg(target_os = "macos")]
 mod launch_progress;
 #[cfg(target_os = "macos")]
+mod open_target;
+#[cfg(target_os = "macos")]
 mod pasteboard;
 #[cfg(target_os = "macos")]
 mod persist;

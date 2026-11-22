@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -384,6 +385,12 @@ pub struct RemoteApp {
     /// The app runs on Intel/AMD (Mesa, DRI3) GPUs.
     #[serde(default)]
     pub dri3_support: bool,
+    /// The app opens web addresses: `/launch/url` and a session's `open_url` (`ARCH-028`).
+    #[serde(default)]
+    pub url_support: bool,
+    /// File extensions the app declares, as the catalog writes them (`pdf` or `.pdf`).
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 /// A GPU the server offers sessions: a render node on Docker (`/dev/dri/renderD128`), a
@@ -707,6 +714,77 @@ pub enum LaunchError {
 /// The ceiling on one launch request: the server's 900 s pending limit plus a margin. A
 /// launch that outlives it is still followed through progress.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(960);
+
+/// Which launch route a launch takes (`ARCH-028`).
+#[derive(Clone, Copy, Debug)]
+pub enum LaunchRoute<'a> {
+    Simple,
+    /// `/launch/url`; the address passed `open_target::validate_url`.
+    Url(&'a str),
+    /// `/launch/file`, after [`SealSkinClient::upload_for_launch`].
+    File(&'a Uploaded),
+}
+
+/// A finished chunked upload, ready for `/launch/file`. The server deletes it once a launch
+/// reassembles it, so a retry uploads again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uploaded {
+    pub upload_id: String,
+    pub total_chunks: u64,
+    /// The file's own name, no folders.
+    pub filename: String,
+}
+
+/// Why a running session didn't take a link.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OpenUrlError {
+    /// 409 (the app opens no addresses, or nothing took it) or 404 (not this user's).
+    NotTaken,
+    /// 422: the address failed the server's pattern.
+    Refused,
+    /// Unreachable, or another status.
+    Failed(String),
+    /// SealSkin refused the key or the account (`ARCH-029`): the Library handles it.
+    Key(ApiError),
+}
+
+/// Why a launch upload stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UploadError {
+    /// SealSkin refused the key or the account (`ARCH-029`): the Library handles it.
+    Refused(ApiError),
+    /// Everything else, as the flight card's text.
+    Failed(String),
+}
+
+impl From<String> for UploadError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for UploadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(error) => write!(f, "{error}"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// `/launch/file` chunks: 1 MiB, as the web client sends them (the server takes up to 8).
+pub const LAUNCH_UPLOAD_CHUNK: usize = 1 << 20;
+const UPLOAD_CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Deserialize)]
+struct Initiated {
+    upload_id: String,
+}
+
+/// An upload id is a lower-case UUID, as `uploads.py` makes them.
+fn valid_upload_id(id: &str) -> bool {
+    valid_launch_id(id) && !id.bytes().any(|b| b.is_ascii_uppercase())
+}
 
 /// The ceiling on `admin/status?storage=1`: with no earlier measure the server walks every
 /// file in the user's storage (`storage_usage.py`), which can outlast the usual 30 s.
@@ -1064,6 +1142,19 @@ impl SealSkinClient {
         params: LaunchParams,
         on_send: impl FnOnce() + Send,
     ) -> Result<RemoteSession, LaunchError> {
+        self.launch(app, params, LaunchRoute::Simple, on_send).await
+    }
+
+    /// Launches `app` through one of SealSkin's launch routes (`/launch/simple`,
+    /// `/launch/url`, `/launch/file`, `ARCH-028`). All three share the body, `launch_id` and
+    /// `X-Idempotency-Key`, the timeout, and the error mapping of a simple launch.
+    pub async fn launch(
+        &self,
+        app: RemoteApp,
+        params: LaunchParams,
+        route: LaunchRoute<'_>,
+        on_send: impl FnOnce() + Send,
+    ) -> Result<RemoteSession, LaunchError> {
         if let (true, Some(home_name)) = (params.create_home, &params.home_name) {
             self.create_home_directory(home_name)
                 .await
@@ -1075,10 +1166,29 @@ impl SealSkinClient {
                     }
                 })?;
         }
+        let mut body = params.body(&app.id);
+        let path = match route {
+            LaunchRoute::Simple => "/companion/api/launch/simple",
+            LaunchRoute::Url(url) => {
+                body["url"] = json!(url);
+                "/companion/api/launch/url"
+            }
+            LaunchRoute::File(uploaded) => {
+                if !valid_upload_id(&uploaded.upload_id) {
+                    return Err(LaunchError::Server("Invalid upload identifier.".into()));
+                }
+                body["filename"] = json!(uploaded.filename);
+                body["upload_id"] = json!(uploaded.upload_id);
+                body["total_chunks"] = json!(uploaded.total_chunks);
+                // The user chose "open this file" (no checkbox, ARCH-028).
+                body["open_file_on_launch"] = json!(true);
+                "/companion/api/launch/file"
+            }
+        };
         let mut request = self
-            .request(Method::POST, "/companion/api/launch/simple")
+            .request(Method::POST, path)
             .timeout(LAUNCH_TIMEOUT)
-            .json(&params.body(&app.id));
+            .json(&body);
         if let Some(launch_id) = &params.launch_id {
             request = request.header("X-Idempotency-Key", launch_id);
         }
@@ -1090,6 +1200,110 @@ impl SealSkinClient {
             response.session_id,
             response.session_url,
         ))
+    }
+
+    /// Uploads `path` for `/launch/file` through SealSkin's chunked upload
+    /// (`/companion/api/upload/initiate`, then `/upload/chunk`), streaming it from disk in
+    /// 1 MiB chunks, one at a time: at most one chunk and its base64 are in memory. `sent`
+    /// counts the bytes sent. A file that changes size while it uploads is refused, and no
+    /// launch follows.
+    pub async fn upload_for_launch(
+        &self,
+        path: &Path,
+        sent: &AtomicU64,
+    ) -> Result<Uploaded, UploadError> {
+        use tokio::io::AsyncReadExt as _;
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| "That isn’t a file Skerry can open.".to_string())?;
+        let unreadable = |error: io::Error| format!("Couldn’t read “{filename}”: {error}");
+        let mut file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+        // The size of the file this handle reads, not of whatever the path names later.
+        let total = file.metadata().await.map_err(unreadable)?.len();
+        let initiated: Initiated = send_with_detail(
+            self.request(Method::POST, "/companion/api/upload/initiate")
+                .json(&json!({ "filename": filename, "total_size": total })),
+        )
+        .await
+        .map_err(|refusal| refusal.upload_error(UploadStep::Initiate, &filename))?;
+        let upload_id = initiated.upload_id;
+        if !valid_upload_id(&upload_id) {
+            return Err(UploadError::Failed(
+                "The server returned an invalid upload identifier.".into(),
+            ));
+        }
+        let changed = || format!("“{filename}” changed while it was uploading.");
+        let mut buffer = vec![0u8; LAUNCH_UPLOAD_CHUNK];
+        let mut done: u64 = 0;
+        let mut index: u64 = 0;
+        while done < total {
+            let want = (total - done).min(LAUNCH_UPLOAD_CHUNK as u64) as usize;
+            let mut filled = 0;
+            while filled < want {
+                let read = file
+                    .read(&mut buffer[filled..want])
+                    .await
+                    .map_err(unreadable)?;
+                if read == 0 {
+                    return Err(changed().into());
+                }
+                filled += read;
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer[..filled]);
+            let _: serde_json::Value = send_with_detail(
+                self.request(Method::POST, "/companion/api/upload/chunk")
+                    .timeout(UPLOAD_CHUNK_TIMEOUT)
+                    .json(&json!({
+                        "upload_id": upload_id,
+                        "chunk_index": index,
+                        "chunk_data_b64": encoded,
+                    })),
+            )
+            .await
+            .map_err(|refusal| refusal.upload_error(UploadStep::Chunk, &filename))?;
+            done += filled as u64;
+            index += 1;
+            sent.store(done, Ordering::Relaxed);
+        }
+        // Bytes past the size measured at the start: the file grew.
+        if file.read(&mut buffer[..1]).await.map_err(unreadable)? != 0 {
+            return Err(changed().into());
+        }
+        Ok(Uploaded {
+            upload_id,
+            total_chunks: index,
+            filename,
+        })
+    }
+
+    /// Hands `url` to a running session (`POST /companion/api/sessions/<id>/open_url`).
+    pub async fn open_url_in_session(
+        &self,
+        session_id: &str,
+        url: &str,
+    ) -> Result<(), OpenUrlError> {
+        if !valid_path_segment(session_id) {
+            return Err(OpenUrlError::Failed("Invalid session identifier.".into()));
+        }
+        let path = format!("/companion/api/sessions/{session_id}/open_url");
+        match send_with_detail::<serde_json::Value>(
+            self.request(Method::POST, &path)
+                .json(&json!({ "url": url })),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(refusal) => Err(match (refusal.key_refusal(), refusal.status) {
+                (Some(error), _) => OpenUrlError::Key(error),
+                (None, Some(StatusCode::NOT_FOUND | StatusCode::CONFLICT)) => {
+                    OpenUrlError::NotTaken
+                }
+                (None, Some(StatusCode::UNPROCESSABLE_ENTITY)) => OpenUrlError::Refused,
+                (None, _) => OpenUrlError::Failed(refusal.message()),
+            }),
+        }
     }
 
     /// Where launch `launch_id` has got to (`GET /companion/api/launch/progress/<id>`).
@@ -1466,6 +1680,101 @@ pub(crate) mod fake {
         let credential = Credential::parse("ssk_id_secret@seal.example").unwrap();
         SealSkinClient::with_base(&credential, base)
     }
+}
+
+/// A request SealSkin refused (with its status and `detail`), or that never got an answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Refusal {
+    /// `None`: the request didn't reach the server or its answer was lost.
+    status: Option<StatusCode>,
+    detail: Option<String>,
+    timed_out: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadStep {
+    Initiate,
+    Chunk,
+}
+
+impl Refusal {
+    /// The general message: the key's problem for 401, else the server's detail.
+    fn message(&self) -> String {
+        match self.status {
+            None if self.timed_out => "The server took too long to answer.".into(),
+            None => "Couldn’t reach the SealSkin server.".into(),
+            Some(StatusCode::UNAUTHORIZED) => {
+                classify(StatusCode::UNAUTHORIZED, self.detail.as_deref()).to_string()
+            }
+            Some(status) => match self.detail.as_deref().map(str::trim) {
+                Some(detail) if !detail.is_empty() => detail.to_string(),
+                _ => format!("SealSkin returned HTTP {}.", status.as_u16()),
+            },
+        }
+    }
+
+    /// The key or account refusal this is, through D's classification (`ARCH-029`).
+    fn key_refusal(&self) -> Option<ApiError> {
+        let status = self
+            .status
+            .filter(|status| matches!(status.as_u16(), 401 | 403))?;
+        Some(classify(status, self.detail.as_deref())).filter(ApiError::is_refusal)
+    }
+
+    fn upload_error(&self, step: UploadStep, filename: &str) -> UploadError {
+        match self.key_refusal() {
+            Some(error) => UploadError::Refused(error),
+            None => UploadError::Failed(self.upload_message(step, filename)),
+        }
+    }
+
+    /// What an upload refusal means, by route and status (`ARCH-028`).
+    fn upload_message(&self, step: UploadStep, filename: &str) -> String {
+        match (step, self.status.map(|status| status.as_u16())) {
+            (UploadStep::Initiate, Some(403)) => {
+                "Your SealSkin storage is full. Free space in Files, then try again.".into()
+            }
+            (UploadStep::Initiate, Some(413)) => {
+                format!("“{filename}” is larger than this account may store.")
+            }
+            (UploadStep::Initiate, Some(429)) => {
+                "Too many uploads are waiting on the server. Try again later.".into()
+            }
+            (UploadStep::Chunk, Some(413)) => {
+                format!("“{filename}” changed while it was uploading.")
+            }
+            (_, Some(401)) => self.message(),
+            _ => format!("The upload stopped: {}", self.message()),
+        }
+    }
+}
+
+/// Sends `request`, keeping the status and SealSkin's `detail` of a refusal, so each caller
+/// maps statuses itself (`send` turns every 403 into a permission message).
+async fn send_with_detail<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, Refusal> {
+    let response = request.send().await.map_err(|error| Refusal {
+        status: None,
+        detail: None,
+        timed_out: error.is_timeout(),
+    })?;
+    let status = response.status();
+    if status.is_success() {
+        return response.json().await.map_err(|_| Refusal {
+            status: Some(status),
+            detail: Some("The server returned an unexpected response.".into()),
+            timed_out: false,
+        });
+    }
+    let detail = response
+        .json::<Failure>()
+        .await
+        .ok()
+        .map(|failure| failure.detail);
+    Err(Refusal {
+        status: Some(status),
+        detail,
+        timed_out: false,
+    })
 }
 
 #[cfg(test)]
@@ -2280,5 +2589,528 @@ mod tests {
             Some("https://seal.example/app/zen/?gpu=intel-gpu&lang=de_DE.UTF-8")
         );
         assert!(api.app_deep_link("../x", &[]).is_none());
+    }
+
+    // ---- Open links and files (ARCH-028) ------------------------------------------------
+
+    /// One request a [`serve`] fake received: its head (lowercased) and its body.
+    #[derive(Clone, Debug)]
+    struct Recorded {
+        head: String,
+        body: Vec<u8>,
+    }
+
+    impl Recorded {
+        fn json(&self) -> serde_json::Value {
+            serde_json::from_slice(&self.body).unwrap_or(serde_json::Value::Null)
+        }
+
+        fn is(&self, method_path: &str) -> bool {
+            self.head.starts_with(&format!("{method_path} "))
+        }
+    }
+
+    type Requests = Arc<std::sync::Mutex<Vec<Recorded>>>;
+
+    /// A fake SealSkin that reads whole requests (head and body) and answers each with
+    /// `respond`, until the test ends.
+    async fn serve(
+        mut respond: impl FnMut(&Recorded, usize) -> String + Send + 'static,
+    ) -> (Url, Requests) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let seen: Requests = Arc::default();
+        let log = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let mut count = 0;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut data = Vec::new();
+                let mut chunk = vec![0u8; 64 * 1024];
+                let head_end = loop {
+                    if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break data.len();
+                    }
+                    data.extend_from_slice(&chunk[..read]);
+                };
+                let head = String::from_utf8_lossy(&data[..head_end]).to_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while data.len() < head_end + length {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&chunk[..read]);
+                }
+                let request = Recorded {
+                    head,
+                    body: data[head_end..].to_vec(),
+                };
+                let response = respond(&request, count);
+                count += 1;
+                log.lock().unwrap().push(request);
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (base, seen)
+    }
+
+    const UPLOAD_ID: &str = "5f0c2b1a-8d3e-4c7f-9a6b-1e2d3c4b5a69";
+
+    fn upload_server(request: &Recorded) -> String {
+        if request.is("post /companion/api/upload/initiate") {
+            reply("200 OK", &format!(r#"{{"upload_id":"{UPLOAD_ID}"}}"#))
+        } else if request.is("post /companion/api/upload/chunk") {
+            reply("200 OK", r#"{"status":"ok","chunk_index":0}"#)
+        } else {
+            reply(
+                "200 OK",
+                r#"{"session_id":"s1","session_url":"/s1/?access_token=t"}"#,
+            )
+        }
+    }
+
+    fn requests_of(seen: &Requests) -> Vec<Recorded> {
+        seen.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn launch_url_body_and_path() {
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let params = LaunchParams {
+            launch_id: Some(LAUNCH_ID.into()),
+            home_name: Some("work".into()),
+            ..LaunchParams::default()
+        };
+        let session = test_client(base)
+            .launch(
+                firefox(),
+                params,
+                LaunchRoute::Url("https://wiki.lan/page"),
+                || {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(session.session_id, "s1");
+        let request = requests_of(&seen).remove(0);
+        assert!(
+            request.is("post /companion/api/launch/url"),
+            "{}",
+            request.head
+        );
+        assert!(request
+            .head
+            .contains(&format!("x-idempotency-key: {LAUNCH_ID}")));
+        assert_eq!(
+            request.json(),
+            json!({
+                "application_id": "firefox",
+                "url": "https://wiki.lan/page",
+                "launch_id": LAUNCH_ID,
+                "home_name": "work",
+                "wayland_mode": true,
+                "launch_in_room_mode": false,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_for_launch_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        let bytes: Vec<u8> = (0..2_621_440u32).map(|n| (n % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let sent = AtomicU64::new(0);
+        let uploaded = test_client(base)
+            .upload_for_launch(&path, &sent)
+            .await
+            .unwrap();
+        assert_eq!(uploaded.total_chunks, 3);
+        assert_eq!(uploaded.filename, "report.pdf");
+        assert_eq!(uploaded.upload_id, UPLOAD_ID);
+        assert_eq!(sent.load(Ordering::Relaxed), 2_621_440);
+        let requests = requests_of(&seen);
+        assert_eq!(
+            requests[0].json(),
+            json!({"filename": "report.pdf", "total_size": 2_621_440})
+        );
+        let mut joined = Vec::new();
+        for (index, chunk) in requests[1..].iter().enumerate() {
+            assert!(chunk.is("post /companion/api/upload/chunk"));
+            let body = chunk.json();
+            assert_eq!(body["upload_id"], json!(UPLOAD_ID));
+            assert_eq!(body["chunk_index"], json!(index));
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(body["chunk_data_b64"].as_str().unwrap())
+                .unwrap();
+            if index < 2 {
+                assert_eq!(data.len(), 1_048_576);
+            }
+            joined.extend(data);
+        }
+        assert_eq!(requests.len(), 4);
+        assert_eq!(joined, bytes);
+    }
+
+    #[tokio::test]
+    async fn an_empty_file_uploads_no_chunks_and_still_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, b"").unwrap();
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let api = test_client(base);
+        let uploaded = api
+            .upload_for_launch(&path, &AtomicU64::new(0))
+            .await
+            .unwrap();
+        assert_eq!(uploaded.total_chunks, 0);
+        api.launch(
+            firefox(),
+            LaunchParams::default(),
+            LaunchRoute::File(&uploaded),
+            || {},
+        )
+        .await
+        .unwrap();
+        let requests = requests_of(&seen);
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].is("post /companion/api/launch/file"));
+        assert_eq!(requests[1].json()["total_chunks"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn launch_file_body() {
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let uploaded = Uploaded {
+            upload_id: UPLOAD_ID.into(),
+            total_chunks: 3,
+            filename: "report.pdf".into(),
+        };
+        test_client(base)
+            .launch(
+                firefox(),
+                LaunchParams::default(),
+                LaunchRoute::File(&uploaded),
+                || {},
+            )
+            .await
+            .unwrap();
+        let request = requests_of(&seen).remove(0);
+        assert!(request.is("post /companion/api/launch/file"));
+        let body = request.json();
+        assert_eq!(body["filename"], json!("report.pdf"));
+        assert_eq!(body["upload_id"], json!(UPLOAD_ID));
+        assert_eq!(body["total_chunks"], json!(3));
+        assert_eq!(body["open_file_on_launch"], json!(true));
+        assert_eq!(body["application_id"], json!("firefox"));
+    }
+
+    #[tokio::test]
+    async fn upload_for_launch_sends_only_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("notes.txt");
+        std::fs::write(&path, b"hello").unwrap();
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        test_client(base)
+            .upload_for_launch(&path, &AtomicU64::new(0))
+            .await
+            .unwrap();
+        assert_eq!(requests_of(&seen)[0].json()["filename"], json!("notes.txt"));
+    }
+
+    #[tokio::test]
+    async fn upload_for_launch_refuses_a_file_that_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.log");
+        std::fs::write(&path, vec![7u8; 1_500_000]).unwrap();
+        let grow = path.clone();
+        let (base, seen) = serve(move |request, _| {
+            if request.is("post /companion/api/upload/chunk") {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&grow)
+                    .unwrap();
+                std::io::Write::write_all(&mut file, &[1u8; 10]).unwrap();
+            }
+            upload_server(request)
+        })
+        .await;
+        let error = test_client(base)
+            .upload_for_launch(&path, &AtomicU64::new(0))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "“growing.log” changed while it was uploading.");
+        assert!(!requests_of(&seen)
+            .iter()
+            .any(|r| r.is("post /companion/api/launch/file")));
+    }
+
+    #[tokio::test]
+    async fn upload_errors_map_by_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"data").unwrap();
+        let cases = [
+            (
+                "initiate",
+                "403 Forbidden",
+                "Your SealSkin storage is full. Free space in Files, then try again.",
+            ),
+            (
+                "initiate",
+                "413 Payload Too Large",
+                "“report.pdf” is larger than this account may store.",
+            ),
+            (
+                "initiate",
+                "429 Too Many Requests",
+                "Too many uploads are waiting on the server. Try again later.",
+            ),
+            (
+                "chunk",
+                "413 Payload Too Large",
+                "“report.pdf” changed while it was uploading.",
+            ),
+            (
+                "chunk",
+                "500 Internal Server Error",
+                "The upload stopped: Disk on fire",
+            ),
+        ];
+        for (step, status, expected) in cases {
+            let (base, _) = serve(move |request, _| {
+                if request.is(&format!("post /companion/api/upload/{step}")) {
+                    reply(status, r#"{"detail":"Disk on fire"}"#)
+                } else {
+                    upload_server(request)
+                }
+            })
+            .await;
+            let error = test_client(base)
+                .upload_for_launch(&path, &AtomicU64::new(0))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected, "{step} {status}");
+        }
+        // Nothing listening: the chunk request never reaches the server.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        drop(listener);
+        let error = test_client(base)
+            .upload_for_launch(&path, &AtomicU64::new(0))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("The upload stopped: "), "{error}");
+    }
+
+    // Multi-threaded: the fake server holds chunk 1 on its own thread while the abort lands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_an_upload_stops_chunks_and_the_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        std::fs::write(&path, vec![3u8; 3 * 1_048_576]).unwrap();
+        let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<()>();
+        let (base, seen) = serve(move |request, _| {
+            if request.is("post /companion/api/upload/chunk")
+                && request.json()["chunk_index"] == json!(1)
+            {
+                let _ = chunk_tx.send(());
+                // Hold chunk 1 so the abort lands while it is outstanding.
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            upload_server(request)
+        })
+        .await;
+        let api = test_client(base);
+        let job = tokio::spawn(async move {
+            let uploaded = api
+                .upload_for_launch(&path, &AtomicU64::new(0))
+                .await
+                .map_err(|e| e.to_string())?;
+            api.launch(
+                firefox(),
+                LaunchParams::default(),
+                LaunchRoute::File(&uploaded),
+                || {},
+            )
+            .await
+            .map_err(|_| "launch failed".to_string())
+        });
+        let abort = job.abort_handle();
+        tokio::task::spawn_blocking(move || chunk_rx.recv().unwrap())
+            .await
+            .unwrap();
+        abort.abort();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let requests = requests_of(&seen);
+        assert!(
+            !requests.iter().any(|r| r.json()["chunk_index"] == json!(2)),
+            "{requests:?}"
+        );
+        assert!(!requests
+            .iter()
+            .any(|r| r.is("post /companion/api/launch/file")));
+    }
+
+    #[tokio::test]
+    async fn open_url_answers_by_status() {
+        let cases: [(&str, Result<(), OpenUrlError>); 5] = [
+            ("200 OK", Ok(())),
+            ("409 Conflict", Err(OpenUrlError::NotTaken)),
+            ("404 Not Found", Err(OpenUrlError::NotTaken)),
+            ("422 Unprocessable Entity", Err(OpenUrlError::Refused)),
+            (
+                "500 Internal Server Error",
+                Err(OpenUrlError::Failed("SealSkin returned HTTP 500.".into())),
+            ),
+        ];
+        for (status, expected) in cases {
+            let (base, seen) = serve(move |_, _| reply(status, r#"{"status":"opened"}"#)).await;
+            let result = test_client(base)
+                .open_url_in_session("abc-123", "https://a.com")
+                .await;
+            assert_eq!(result, expected, "{status}");
+            let request = requests_of(&seen).remove(0);
+            assert!(request.is("post /companion/api/sessions/abc-123/open_url"));
+            assert_eq!(request.json(), json!({"url": "https://a.com"}));
+        }
+        let (base, seen) = serve(|_, _| reply("200 OK", "{}")).await;
+        assert!(matches!(
+            test_client(base)
+                .open_url_in_session("../admin", "https://a.com")
+                .await,
+            Err(OpenUrlError::Failed(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(requests_of(&seen).is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_routes_carry_the_application_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"data").unwrap();
+        let (base, seen) = serve(|request, _| upload_server(request)).await;
+        let api = test_client(base);
+        let uploaded = api
+            .upload_for_launch(&path, &AtomicU64::new(0))
+            .await
+            .unwrap();
+        for route in [
+            LaunchRoute::File(&uploaded),
+            LaunchRoute::Url("https://a.com"),
+        ] {
+            api.launch(firefox(), LaunchParams::default(), route, || {})
+                .await
+                .unwrap();
+        }
+        let _ = api.open_url_in_session("s1", "https://a.com").await;
+        let requests = requests_of(&seen);
+        let paths: Vec<&str> = requests
+            .iter()
+            .map(|r| r.head.split(' ').nth(1).unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/companion/api/upload/initiate",
+                "/companion/api/upload/chunk",
+                "/companion/api/launch/file",
+                "/companion/api/launch/url",
+                "/companion/api/sessions/s1/open_url",
+            ]
+        );
+        for request in requests {
+            assert!(
+                request.head.contains("authorization: bearer ssk_id_secret"),
+                "{}",
+                request.head
+            );
+        }
+    }
+
+    #[test]
+    fn apps_decode_url_support_and_extensions_with_defaults() {
+        let app: RemoteApp = serde_json::from_value(json!({
+            "id": "office", "name": "Office", "url_support": true, "extensions": [".pdf", "docx"],
+        }))
+        .unwrap();
+        assert!(app.url_support);
+        assert_eq!(app.extensions, [".pdf", "docx"]);
+        let bare = firefox();
+        assert!(!bare.url_support);
+        assert!(bare.extensions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_routes_report_a_refused_key_through_the_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"data").unwrap();
+        let (base, _) = serve(|_, _| reply("401 Unauthorized", r#"{"detail":"expired"}"#)).await;
+        let api = test_client(base);
+        assert_eq!(
+            api.upload_for_launch(&path, &AtomicU64::new(0)).await,
+            Err(UploadError::Refused(ApiError::Key(KeyRefusal::Expired)))
+        );
+        assert_eq!(
+            api.open_url_in_session("s1", "https://a.com").await,
+            Err(OpenUrlError::Key(ApiError::Key(KeyRefusal::Expired)))
+        );
+        let launched = api
+            .launch(
+                firefox(),
+                LaunchParams::default(),
+                LaunchRoute::Url("https://a.com"),
+                || {},
+            )
+            .await;
+        assert_eq!(
+            launched.err(),
+            Some(LaunchError::Refused(ApiError::Key(KeyRefusal::Expired)))
+        );
+        // A held account (403) is a refusal; a storage 403 is the upload's own message.
+        let held = format!(r#"{{"detail":"{HELD_DETAIL}"}}"#);
+        let (base, _) = serve(move |_, _| reply("403 Forbidden", &held)).await;
+        assert_eq!(
+            test_client(base)
+                .upload_for_launch(&path, &AtomicU64::new(0))
+                .await,
+            Err(UploadError::Refused(ApiError::Account(AccountBlock::Held)))
+        );
+        let (base, _) =
+            serve(|_, _| reply("403 Forbidden", r#"{"detail":"Storage limit reached."}"#)).await;
+        assert_eq!(
+            test_client(base)
+                .upload_for_launch(&path, &AtomicU64::new(0))
+                .await,
+            Err(UploadError::Failed(
+                "Your SealSkin storage is full. Free space in Files, then try again.".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn upload_ids_are_lowercase_uuids() {
+        assert!(valid_upload_id(UPLOAD_ID));
+        assert!(!valid_upload_id(&UPLOAD_ID.to_uppercase()));
+        assert!(!valid_upload_id("../x"));
     }
 }

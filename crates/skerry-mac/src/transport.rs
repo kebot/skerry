@@ -1234,6 +1234,79 @@ fn transient_status(status: u16) -> bool {
     matches!(status, 404 | 502 | 503 | 504)
 }
 
+/// A session's cookie, from SealSkin's `GET /<id>/?access_token=…` → 303 exchange
+/// (`sessions.py::initial_session_auth`). The token is compared and copied into the cookie,
+/// not used up, so the exchange can repeat while a stream is open (`ARCH-028`).
+pub struct SessionAccess {
+    /// Where the 303 sent us: the session's own path, still with its query.
+    pub redirect: Url,
+    /// `redirect` without query or fragment: the base of the session's routes.
+    pub base: Url,
+    /// Every cookie the exchange set, marked sensitive.
+    pub cookie: reqwest::header::HeaderValue,
+}
+
+const ADDRESS_ERROR: &str =
+    "SealSkin returned an unsupported session address. Open an individual session.";
+const AUTH_ERROR: &str =
+    "Couldn’t authorize the native session. Refresh the launcher and resume again.";
+
+/// The cookie exchange for an individual session URL, on its own client with no
+/// credentials: the application key never goes to a session origin. A collaboration room
+/// (`/room/<id>?token=`) has no `access_token` and is refused.
+pub async fn session_access(url: Url) -> Result<SessionAccess, &'static str> {
+    if !url.query_pairs().any(|(key, _)| key == "access_token") || !url.path().ends_with('/') {
+        return Err(ADDRESS_ERROR);
+    }
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|_| AUTH_ERROR)?;
+    let response = http.get(url.clone()).send().await.map_err(|_| AUTH_ERROR)?;
+    if response.status() != reqwest::StatusCode::SEE_OTHER {
+        return Err(AUTH_ERROR);
+    }
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ADDRESS_ERROR)?;
+    let redirect = url.join(location).map_err(|_| ADDRESS_ERROR)?;
+    if redirect.origin() != url.origin() || redirect.path() != url.path() {
+        return Err(ADDRESS_ERROR);
+    }
+    let cookie = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|value| value.to_str().ok()?.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if cookie.is_empty() {
+        return Err(AUTH_ERROR);
+    }
+    let mut cookie = cookie
+        .parse::<reqwest::header::HeaderValue>()
+        .map_err(|_| AUTH_ERROR)?;
+    cookie.set_sensitive(true);
+    let mut base = redirect.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    Ok(SessionAccess {
+        redirect,
+        base,
+        cookie,
+    })
+}
+
+/// The session's Selkies file routes without a stream: the cookie exchange, then a
+/// `SelkiesClient` under that cookie (the Library's Files button, `ARCH-028`).
+pub async fn selkies_for_session(url: Url) -> Result<selkies::SelkiesClient, &'static str> {
+    let access = session_access(url).await?;
+    selkies::SelkiesClient::new(access.base, access.cookie).map_err(|_| ADDRESS_ERROR)
+}
+
 /// The WebSocket handshake for the session, and the session's file routes under the same
 /// cookie (`ARCH-023`), or `None` when they cannot be built.
 async fn socket_request(
@@ -1245,54 +1318,17 @@ async fn socket_request(
     ),
     &'static str,
 > {
-    let address_error =
-        "SealSkin returned an unsupported session address. Open an individual session.";
-    let auth_error =
-        "Couldn’t authorize the native session. Refresh the launcher and resume again.";
-    if !url.query_pairs().any(|(key, _)| key == "access_token") || !url.path().ends_with('/') {
-        return Err(address_error);
-    }
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|_| auth_error)?;
-    let response = http.get(url.clone()).send().await.map_err(|_| auth_error)?;
-    if response.status() != reqwest::StatusCode::SEE_OTHER {
-        return Err(auth_error);
-    }
-    let location = response
-        .headers()
-        .get("location")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(address_error)?;
-    let redirect = url.join(location).map_err(|_| address_error)?;
-    if redirect.origin() != url.origin() || redirect.path() != url.path() {
-        return Err(address_error);
-    }
-    let cookie = response
-        .headers()
-        .get_all("set-cookie")
-        .iter()
-        .filter_map(|value| value.to_str().ok()?.split(';').next())
-        .collect::<Vec<_>>()
-        .join("; ");
-    if cookie.is_empty() {
-        return Err(auth_error);
-    }
-    let mut websocket = redirect.join("api/websockets").map_err(|_| address_error)?;
-    websocket.set_scheme("wss").map_err(|_| address_error)?;
+    let SessionAccess {
+        redirect,
+        base,
+        cookie,
+    } = session_access(url.clone()).await?;
+    let mut websocket = redirect.join("api/websockets").map_err(|_| ADDRESS_ERROR)?;
+    websocket.set_scheme("wss").map_err(|_| ADDRESS_ERROR)?;
     let mut request = websocket
         .as_str()
         .into_client_request()
-        .map_err(|_| address_error)?;
-    let mut cookie = cookie
-        .parse::<reqwest::header::HeaderValue>()
-        .map_err(|_| auth_error)?;
-    cookie.set_sensitive(true);
-    let mut base = redirect.clone();
-    base.set_query(None);
-    base.set_fragment(None);
+        .map_err(|_| ADDRESS_ERROR)?;
     let access = selkies::SelkiesClient::new(base, cookie.clone()).ok();
     request.headers_mut().insert("cookie", cookie);
     request.headers_mut().insert(
@@ -1300,7 +1336,7 @@ async fn socket_request(
         url.origin()
             .ascii_serialization()
             .parse()
-            .map_err(|_| address_error)?,
+            .map_err(|_| ADDRESS_ERROR)?,
     );
     Ok((request, access))
 }
@@ -1699,5 +1735,101 @@ mod tests {
         assert!(canvas.snapshot().picture.is_some());
         canvas.resize(3, 2).unwrap();
         assert!(canvas.snapshot().picture.is_none());
+    }
+
+    // ---- Session access without a stream (ARCH-028) --------------------------------------
+
+    /// Answers one request per response, in order, and returns each request's head.
+    async fn answer_heads(
+        responses: Vec<String>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                seen.push(String::from_utf8_lossy(&request).to_lowercase());
+            }
+            seen
+        });
+        (address, task)
+    }
+
+    fn see_other(location: &str) -> String {
+        format!(
+            "HTTP/1.1 303 See Other\r\nlocation: {location}\r\nset-cookie: sealskin_session_s1=tok; Path=/s1; HttpOnly\r\nset-cookie: other=2; Path=/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn session_access_exchanges_the_token_for_a_cookie() {
+        let (address, seen) = answer_heads(vec![see_other("/s1/")]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=tok")).unwrap();
+        let access = session_access(url).await.unwrap();
+        assert_eq!(access.base.as_str(), format!("http://{address}/s1/"));
+        assert_eq!(access.base.query(), None);
+        assert_eq!(
+            access.cookie.to_str().unwrap(),
+            "sealskin_session_s1=tok; other=2"
+        );
+        assert!(access.cookie.is_sensitive());
+        assert_eq!(seen.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_access_refuses_what_socket_request_refuses() {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string();
+        let (address, _) = answer_heads(vec![ok]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=t")).unwrap();
+        assert_eq!(session_access(url).await.err(), Some(AUTH_ERROR));
+
+        let (address, _) = answer_heads(vec![see_other("https://evil.test/s1/")]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=t")).unwrap();
+        assert_eq!(session_access(url).await.err(), Some(ADDRESS_ERROR));
+
+        let room = Url::parse("https://seal.example/room/abc?token=t").unwrap();
+        assert_eq!(session_access(room).await.err(), Some(ADDRESS_ERROR));
+    }
+
+    #[tokio::test]
+    async fn session_access_and_selkies_requests_carry_no_authorization() {
+        let listing = r#"{"path":"","entries":[]}"#;
+        let browse = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{listing}",
+            listing.len()
+        );
+        let (address, seen) = answer_heads(vec![see_other("/s1/"), browse]).await;
+        let url = Url::parse(&format!("http://{address}/s1/?access_token=tok")).unwrap();
+        let files = selkies_for_session(url).await.unwrap();
+        files.browse("").await.unwrap();
+        let seen = seen.await.unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].starts_with("get /s1/?access_token=tok "));
+        assert!(
+            seen[1].starts_with("get /s1/api/file-manager/browse"),
+            "{}",
+            seen[1]
+        );
+        assert!(
+            seen[1].contains("cookie: sealskin_session_s1=tok"),
+            "{}",
+            seen[1]
+        );
+        for request in &seen {
+            assert!(!request.contains("authorization:"), "{request}");
+            assert!(!request.contains("x-sealskin-app"), "{request}");
+        }
     }
 }

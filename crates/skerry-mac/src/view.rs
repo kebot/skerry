@@ -29,6 +29,8 @@ use tokio::{
     sync::{mpsc, watch},
 };
 
+/// The key context of a session's remote desktop.
+pub(crate) const DESKTOP_CONTEXT: &str = "SessionDesktop";
 const MENU_SIZE: Pixels = px(32.);
 /// How long a secret the session copied may stay on the Mac (the web core's
 /// `SECRET_CLIPBOARD_TTL_MS`).
@@ -935,10 +937,17 @@ impl Render for Desktop {
             .relative()
             .size_full()
             .overflow_hidden()
+            // The Library's ⌘O / ⌘L are bound to "Library" only, so they never resolve here
+            // and the keys reach the remote app (`ARCH-028`).
+            .key_context(DESKTOP_CONTEXT)
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
                 let stroke = &event.keystroke;
                 if !keys::sends_key_down(stroke.modifiers, desktop.settings.command_as_control) {
+                    // ⌘O / ⌘L: claimed, so the File menu's key equivalents don't fire.
+                    if keys::claims_library_shortcut(stroke.modifiers, &stroke.key) {
+                        cx.stop_propagation();
+                    }
                     return;
                 }
                 let shortcut = stroke.modifiers.control || stroke.modifiers.platform;

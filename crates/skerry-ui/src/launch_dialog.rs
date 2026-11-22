@@ -1,3 +1,5 @@
+use crate::library::OpeningKind;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
@@ -64,6 +66,21 @@ pub struct LaunchDialogProps {
     pub link_copied: bool,
     /// A running session these options would duplicate: the footer offers to open it.
     pub running_match: Option<RunningMatch>,
+    /// The Launch & Open variant: the link or file this launch opens (`ARCH-028`). Copy link
+    /// and the running-session footer hide, since neither carries it.
+    pub opening: Option<OpeningLabel>,
+}
+
+/// What a Launch & Open dialog opens, as its context strip shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpeningLabel {
+    pub kind: OpeningKind,
+    /// The link's label (the real host first) or the file name.
+    pub label: String,
+    /// "PDF · 2.4 MB" (files only).
+    pub detail: Option<String>,
+    /// The full address or path.
+    pub tooltip: Option<String>,
 }
 
 /// The running session the dialog's storage and room flag match (`ARCH-027`).
@@ -326,6 +343,9 @@ pub fn render_card(
         .p_5()
         .v_flex()
         .gap_4()
+        .when_some(props.opening.as_ref(), |body, opening| {
+            body.child(opening_strip(theme, opening))
+        })
         .when_some(selects.storage.as_ref(), |body, state| {
             body.child(select_field(theme, "Storage", state, enabled))
         })
@@ -380,7 +400,14 @@ pub fn render_card(
     let on_launch = Rc::clone(&on_action);
     let on_open = Rc::clone(&on_action);
     let on_launch_new = Rc::clone(&on_action);
-    let running = props.running_match.is_some();
+    let opening = props.opening.is_some();
+    let running = props.running_match.is_some() && !opening;
+    let show_copy_link = props.show_copy_link && !opening;
+    let launch_label = match (props.busy, opening) {
+        (true, _) => "Launching…",
+        (false, true) => "Launch & Open",
+        (false, false) => "Launch",
+    };
     let copy_label = if props.link_copied {
         "Copied"
     } else {
@@ -394,7 +421,7 @@ pub fn render_card(
         .h_flex()
         .items_center()
         .gap_3()
-        .when(props.show_copy_link, |footer| {
+        .when(show_copy_link, |footer| {
             let copy = Button::new("launch-copy-link")
                 .outline()
                 .icon(if props.link_copied {
@@ -444,7 +471,7 @@ pub fn render_card(
                         .primary()
                         .w_full()
                         .icon(IconName::Play)
-                        .label(if props.busy { "Launching…" } else { "Launch" })
+                        .label(launch_label)
                         .disabled(!enabled)
                         .on_click(move |_, window, cx| {
                             on_launch(LaunchDialogAction::Launch, window, cx)
@@ -467,6 +494,58 @@ pub fn render_card(
         .child(header)
         .child(body)
         .child(footer)
+}
+
+/// "Opens “report.pdf”" or "Opens wiki.lan/page", above the fields.
+fn opening_strip(theme: &Theme, opening: &OpeningLabel) -> gpui_kit::Stateful<Div> {
+    let icon = match opening.kind {
+        OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
+        OpeningKind::File => Icon::new(IconName::FileText),
+    };
+    let name = match opening.kind {
+        OpeningKind::File => format!("“{}”", opening.label),
+        OpeningKind::Link => opening.label.clone(),
+    };
+    let tooltip = opening.tooltip.clone();
+    div()
+        .id("launch-opening")
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .text_sm()
+        .child(
+            div()
+                .flex_none()
+                .text_color(theme.muted_foreground)
+                .child(icon.with_size(px(16.))),
+        )
+        .child(div().flex_none().child("Opens"))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(name),
+        )
+        .when_some(opening.detail.clone(), |strip, detail| {
+            strip.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+        })
+        .when_some(tooltip, |strip, tooltip| {
+            strip.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        })
 }
 
 /// The line under the app name: the running match, or that the app is hidden.

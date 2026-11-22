@@ -39,3 +39,7 @@ uuid = { version = "1", default-features = false, features = ["v4"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time", "net"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Checks `open_target` against SealSkin's own URL pattern.
+regex = "1"

@@ -7,7 +7,7 @@
 
 use super::files_model::{size_label, Browser};
 use super::promise;
-use super::session_window::SessionWindow;
+use super::session_window::{OpenFiles, OpenWindows, SessionWindow};
 use crate::pasteboard;
 use crate::selkies::{self, Entry, Policy, Progress, SelkiesClient};
 use gpui_kit::component::{
@@ -18,15 +18,16 @@ use gpui_kit::component::{
 use gpui_kit::{
     actions, div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, Context, Entity,
     ExternalPaths, FocusHandle, PathPromptOptions, ScrollStrategy, Task, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowOptions,
 };
+use reqwest::StatusCode;
 use skerry_ui::files::{
     self as ui, Direction, FilesAction, FilesProps, TransferRow, TransferStatus,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::Handle;
@@ -128,6 +129,8 @@ struct Meter {
     partial: Arc<Mutex<Option<PathBuf>>>,
     /// What the finished transfer row says instead of plain Uploaded / Downloaded.
     note: Arc<Mutex<Option<String>>>,
+    /// The transfer's own route answered 403: the server doesn't allow that direction.
+    forbidden: Arc<AtomicBool>,
 }
 
 struct Transfer {
@@ -176,23 +179,67 @@ pub(super) struct FilesWindow {
     dragging: bool,
     /// The list scrolls to the selection after a keyboard move only, not on every redraw.
     reveal_selection: bool,
-    /// The session window, told when this window closes.
-    owner: (AnyWindowHandle, gpui_kit::WeakEntity<SessionWindow>),
+    /// Who opened the window, told when it closes.
+    owner: FilesOwner,
+    /// This window, to leave the app-wide registry when it closes.
+    handle: Option<AnyWindowHandle>,
 }
 
-/// Drops the session window's hold on the Files window, so the window's entity (and with it every
-/// transfer, `Drop`) goes once the window does. Needed for every way the window closes:
-/// `remove_window` (⌘W, session end) does not run `on_window_should_close`.
-fn release_from_session(
-    owner: &(AnyWindowHandle, gpui_kit::WeakEntity<SessionWindow>),
-    cx: &mut App,
-) {
-    let (session_window, session) = owner.clone();
+/// Who opened a Files window (`ARCH-028`): a session window (it closes with that stream), or
+/// the Library's Files button (no stream; it closes on Stop, Sign Out, or ⌘W).
+#[derive(Clone)]
+pub(super) enum FilesOwner {
+    Session(AnyWindowHandle, WeakEntity<SessionWindow>),
+    Library,
+}
+
+/// Drops every hold on the Files window, so the window's entity (and with it every transfer,
+/// `Drop`) goes once the window does: the session window's, if it owns it, and the app-wide
+/// registry entry. Needed for every way the window closes: `remove_window` (⌘W, session end)
+/// does not run `on_window_should_close`.
+fn release(owner: &FilesOwner, handle: Option<AnyWindowHandle>, cx: &mut App) {
+    let owner = owner.clone();
     cx.defer(move |cx| {
-        let _ = session_window.update(cx, |_, _, cx| {
-            let _ = session.update(cx, |session, _| session.files_window = None);
-        });
+        if let Some(handle) = handle {
+            if cx.has_global::<OpenWindows>() {
+                cx.global_mut::<OpenWindows>().forget_files(handle);
+            }
+        }
+        if let FilesOwner::Session(session_window, session) = owner {
+            let _ = session_window.update(cx, |_, _, cx| {
+                let _ = session.update(cx, |session, _| session.files_window = None);
+            });
+        }
     });
+}
+
+/// Which Selkies route a 403 came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Route {
+    Upload,
+    Download,
+    Browse,
+    Mkdir,
+}
+
+/// The policy after `route` answered `status`. Without the stream's `server_settings`, a
+/// Library-opened window learns the policy from 403s, but only from the direction's own
+/// route: a mkdir or browse 403 says nothing about uploads (`ARCH-028`).
+pub(super) fn policy_after(policy: Policy, route: Route, status: StatusCode) -> Policy {
+    if status != StatusCode::FORBIDDEN {
+        return policy;
+    }
+    match route {
+        Route::Upload => Policy {
+            upload: false,
+            ..policy
+        },
+        Route::Download => Policy {
+            download: false,
+            ..policy
+        },
+        Route::Browse | Route::Mkdir => policy,
+    }
 }
 
 impl Drop for FilesWindow {
@@ -212,11 +259,14 @@ impl Drop for FilesWindow {
 }
 
 impl FilesWindow {
+    /// Opens a Files window placed over `window` (the session window or the Library) and
+    /// registers it app-wide, so there is one per session whoever opened it (`ARCH-028`).
     pub(super) fn open(
         source: FilesSource,
         rt: Handle,
         window: &Window,
-        session: Entity<SessionWindow>,
+        owner: FilesOwner,
+        session_id: String,
         cx: &mut App,
     ) -> gpui_kit::Result<(AnyWindowHandle, Entity<Self>)> {
         let FilesSource {
@@ -225,7 +275,7 @@ impl FilesWindow {
             policy,
             storage,
         } = source;
-        let owner = (window.window_handle(), session.downgrade());
+        let library_owned = matches!(owner, FilesOwner::Library);
         let bounds = window.bounds();
         let window_size = size(px(760.), px(520.));
         let origin = point(bounds.left() + px(40.), bounds.top() + px(60.));
@@ -245,6 +295,7 @@ impl FilesWindow {
             cx,
             move |window, cx| {
                 let close_owner = owner.clone();
+                let own_handle = window.window_handle();
                 let view = cx.new(|cx: &mut Context<Self>| {
                     let folder_name =
                         cx.new(|cx| InputState::new(window, cx).placeholder("untitled folder"));
@@ -289,13 +340,14 @@ impl FilesWindow {
                         dragging: false,
                         reveal_selection: false,
                         owner,
+                        handle: Some(own_handle),
                     };
                     this.reload(cx);
                     this.check_storage(cx);
                     this
                 });
                 window.on_window_should_close(cx, move |_, cx| {
-                    release_from_session(&close_owner, cx);
+                    release(&close_owner, Some(own_handle), cx);
                     true
                 });
                 let focus = view.read(cx).list_focus.clone();
@@ -308,6 +360,12 @@ impl FilesWindow {
             .borrow_mut()
             .take()
             .ok_or_else(|| std::io::Error::other("the Files window has no view"))?;
+        cx.default_global::<OpenWindows>().files.push(OpenFiles {
+            session_id,
+            window: handle,
+            entity: view.downgrade(),
+            library_owned,
+        });
         Ok((handle, view))
     }
 
@@ -321,6 +379,32 @@ impl FilesWindow {
             }
             cx.notify();
         }
+    }
+
+    /// Uploads Mac files into the session's Desktop (the root), as a drop there would: the
+    /// Library's Copy to Desktop and a drop on a session card (`ARCH-028`).
+    pub(super) fn enqueue_upload(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.upload_into(paths, String::new(), cx);
+    }
+
+    /// What a route's error says about the policy (for browse and mkdir: nothing).
+    fn learn_route(&mut self, route: Route, error: &selkies::Error) {
+        if let selkies::Error::Server(status, _) = error {
+            self.policy = policy_after(self.policy, route, *status);
+        }
+    }
+
+    /// The direction a transfer's 403 refused goes off for this window's lifetime.
+    fn learn_forbidden(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        let (route, text) = match direction {
+            Direction::Upload => (Route::Upload, "This session doesn’t allow uploads."),
+            Direction::Download => (Route::Download, "This session doesn’t allow downloads."),
+        };
+        self.learn_route(
+            route,
+            &selkies::Error::Server(StatusCode::FORBIDDEN, String::new()),
+        );
+        self.say(text, true, cx);
     }
 
     // ---- Listing -------------------------------------------------------------------------
@@ -350,7 +434,10 @@ impl FilesWindow {
                         this.error = None;
                         this.browser.set_listing(listing.entries);
                     }
-                    Ok(Err(error)) => this.error = Some(error.to_string()),
+                    Ok(Err(error)) => {
+                        this.learn_route(Route::Browse, &error);
+                        this.error = Some(error.to_string());
+                    }
                     Err(_) => this.error = Some("The listing was interrupted.".into()),
                 }
                 cx.notify();
@@ -540,7 +627,10 @@ impl FilesWindow {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => this.say(error.to_string(), true, cx),
+                    Ok(Err(error)) => {
+                        this.learn_route(Route::Mkdir, &error);
+                        this.say(error.to_string(), true, cx);
+                    }
                     Err(_) => this.say("The folder couldn’t be created.", true, cx),
                 }
                 if this.browser.path() == folder {
@@ -1011,6 +1101,10 @@ impl FilesWindow {
             }
         };
         let made = transfer.made.clone();
+        let direction = transfer.direction;
+        if transfer.meter.forbidden.load(Ordering::Relaxed) {
+            self.learn_forbidden(direction, cx);
+        }
         match after {
             Some(After::Promise(completion)) => completion.finish(failure.as_deref()),
             Some(After::Uploaded(folder)) => {
@@ -1179,7 +1273,7 @@ impl Render for FilesWindow {
                 cx.listener(|this, _: &UploadFiles, window, cx| this.choose_uploads(window, cx)),
             )
             .on_action(cx.listener(|this, _: &CloseFiles, window, cx| {
-                release_from_session(&this.owner, cx);
+                release(&this.owner, this.handle, cx);
                 window.remove_window();
             }))
             .on_action(cx.listener(|this, _: &Cancel, window, cx| {
@@ -1346,7 +1440,10 @@ async fn upload_job(
         access
             .upload(local, remote, &meter.done)
             .await
-            .map_err(|e| format!("{}: {e}", display_name(local)))?;
+            .map_err(|e| {
+                note_forbidden(&meter, &e);
+                format!("{}: {e}", display_name(local))
+            })?;
     }
     Ok(())
 }
@@ -1490,7 +1587,10 @@ async fn download_job(
                     attempt += 1;
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
-                Err(error) => return Err(format!("{}: {error}", display_name(&local))),
+                Err(error) => {
+                    note_forbidden(&meter, &error);
+                    return Err(format!("{}: {error}", display_name(&local)));
+                }
             }
         }
         if let Ok(mut current) = meter.partial.lock() {
@@ -1498,6 +1598,13 @@ async fn download_job(
         }
     }
     Ok(made)
+}
+
+/// Marks the transfer as refused by its own route.
+fn note_forbidden(meter: &Meter, error: &selkies::Error) {
+    if matches!(error, selkies::Error::Server(StatusCode::FORBIDDEN, _)) {
+        meter.forbidden.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Where the Selkies file-manager folder sits in a SealSkin home: `FILE_MANAGER_PATH` defaults
@@ -1708,5 +1815,31 @@ mod tests {
     fn batches_are_named_for_their_one_item_or_their_count() {
         assert_eq!(batch_name(["a".to_owned()].into_iter()), "a");
         assert_eq!(batch_name(["a".into(), "b".into()].into_iter()), "2 items");
+    }
+
+    #[test]
+    fn forbidden_upload_turns_off_upload_only() {
+        let both = Policy::default();
+        let forbidden = StatusCode::FORBIDDEN;
+        assert_eq!(
+            policy_after(both, Route::Upload, forbidden),
+            Policy {
+                upload: false,
+                download: true
+            }
+        );
+        assert_eq!(
+            policy_after(both, Route::Download, forbidden),
+            Policy {
+                upload: true,
+                download: false
+            }
+        );
+        assert_eq!(policy_after(both, Route::Mkdir, forbidden), both);
+        assert_eq!(policy_after(both, Route::Browse, forbidden), both);
+        assert_eq!(
+            policy_after(both, Route::Upload, StatusCode::INTERNAL_SERVER_ERROR),
+            both
+        );
     }
 }

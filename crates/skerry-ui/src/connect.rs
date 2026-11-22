@@ -13,6 +13,9 @@ pub type ConnectHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub struct ConnectProps {
     pub status: Option<String>,
     pub busy: Option<String>,
+    /// Links or files that arrived before a server was connected (`ARCH-028`): "Connect to
+    /// a server to open “report.pdf”."
+    pub pending_open: Option<String>,
     /// The server the problem or recovery is about, shown as the Library's server pill.
     pub server: Option<String>,
     /// SealSkin refused the key or account: an alert above the key field (`ARCH-029`).
@@ -281,6 +284,20 @@ fn key_card(
                     )
                 }),
         )
+        .when_some(props.pending_open.clone(), |view, pending| {
+            view.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.secondary)
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(pending),
+            )
+        })
         // The alert already says what went wrong; the red line is for everything else.
         .when_some(props.status.clone().filter(|_| props.problem.is_none()), |view, status| {
             view.child(div().text_sm().text_color(theme.danger).child(status))

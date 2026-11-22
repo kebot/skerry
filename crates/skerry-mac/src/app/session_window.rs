@@ -5,7 +5,7 @@
 //! of them through the [`OpenWindows`] global.
 
 use super::controls::ControlPanel;
-use super::files_window::{self, FilesWindow};
+use super::files_window::{self, FilesOwner, FilesWindow};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
     ToggleFiles, ToggleFullScreen, ToggleSessionControls, APP_NAME,
@@ -38,6 +38,8 @@ use tokio::runtime::Handle;
 pub(super) struct OpenWindows {
     pub(super) library: Option<(AnyWindowHandle, WeakEntity<Launcher>)>,
     pub(super) sessions: Vec<OpenSession>,
+    /// Every Files window, whoever opened it: one per session (`ARCH-023`, `ARCH-028`).
+    pub(super) files: Vec<OpenFiles>,
 }
 
 impl Global for OpenWindows {}
@@ -48,7 +50,49 @@ pub(super) struct OpenSession {
     pub(super) entity: WeakEntity<SessionWindow>,
 }
 
+pub(super) struct OpenFiles {
+    pub(super) session_id: String,
+    pub(super) window: AnyWindowHandle,
+    pub(super) entity: WeakEntity<FilesWindow>,
+    /// Opened from the Library's Files button, with no stream.
+    pub(super) library_owned: bool,
+}
+
 impl OpenWindows {
+    /// The Files window already open for `session_id`, if any. Windows that have gone are
+    /// dropped.
+    pub(super) fn files_window(
+        &mut self,
+        session_id: &str,
+    ) -> Option<(AnyWindowHandle, WeakEntity<FilesWindow>)> {
+        self.files.retain(|open| open.entity.upgrade().is_some());
+        self.files
+            .iter()
+            .find(|open| open.session_id == session_id)
+            .map(|open| (open.window, open.entity.clone()))
+    }
+
+    pub(super) fn forget_files(&mut self, window: AnyWindowHandle) {
+        self.files.retain(|open| open.window != window);
+    }
+
+    /// The Library-opened Files windows of the sessions `matches` picks, taken out of the
+    /// registry so the caller can close them.
+    pub(super) fn take_library_files(
+        &mut self,
+        matches: impl Fn(&str) -> bool,
+    ) -> Vec<AnyWindowHandle> {
+        let mut taken = Vec::new();
+        self.files.retain(|open| {
+            let take = open.library_owned && matches(&open.session_id);
+            if take {
+                taken.push(open.window);
+            }
+            !take
+        });
+        taken
+    }
+
     /// The window already showing `session_id`, if any. Windows that have gone are dropped.
     pub(super) fn session_window(&mut self, session_id: &str) -> Option<AnyWindowHandle> {
         self.sessions.retain(|open| open.entity.upgrade().is_some());
@@ -345,7 +389,12 @@ impl SessionWindow {
             SessionEvent::Files(access) => self.file_access = Some(access),
             SessionEvent::FilePolicy(policy) => {
                 self.file_policy = Some(policy);
-                if let Some((_, files)) = &self.files_window {
+                // Whichever Files window shows this session, a Library-opened one too.
+                let files = cx
+                    .default_global::<OpenWindows>()
+                    .files_window(&self.remote.session_id)
+                    .and_then(|(_, files)| files.upgrade());
+                if let Some(files) = files {
                     files.update(cx, |files, cx| files.set_policy(policy, cx));
                 }
             }
@@ -700,15 +749,19 @@ impl SessionWindow {
 
     /// Opens the session's Files window, or brings it forward (`ARCH-023`).
     pub(super) fn toggle_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((handle, _)) = &self.files_window {
+        // One Files window per session, whoever opened it (`ARCH-028`).
+        let open = cx
+            .default_global::<OpenWindows>()
+            .files_window(&self.remote.session_id);
+        if let Some((handle, _)) = open {
             if handle
                 .update(cx, |_, window, _| window.activate_window())
                 .is_ok()
             {
                 return;
             }
-            self.files_window = None;
         }
+        self.files_window = None;
         if self.current.is_none() {
             return;
         }
@@ -733,7 +786,18 @@ impl SessionWindow {
         let rt = self.rt.clone();
         let owner_window = Window::window_handle(window);
         let session = cx.entity();
+        let session_id = self.remote.session_id.clone();
         cx.defer(move |cx| {
+            // The Library may have opened this session's Files window since the check above.
+            let open = cx.default_global::<OpenWindows>().files_window(&session_id);
+            if let Some((handle, _)) = open {
+                if handle
+                    .update(cx, |_, window, _| window.activate_window())
+                    .is_ok()
+                {
+                    return;
+                }
+            }
             let _ = owner_window.update(cx, |_, window, cx| {
                 let source = files_window::FilesSource {
                     title,
@@ -741,7 +805,8 @@ impl SessionWindow {
                     policy,
                     storage,
                 };
-                let result = FilesWindow::open(source, rt, window, session.clone(), cx);
+                let owner = FilesOwner::Session(owner_window, session.downgrade());
+                let result = FilesWindow::open(source, rt, window, owner, session_id, cx);
                 session.update(cx, |session, cx| {
                     match result {
                         Ok(files) => session.files_window = Some(files),

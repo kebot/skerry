@@ -31,10 +31,33 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
+  <!-- Finder Open With and Dock drops for any file, never as the default app (ARCH-028). -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Any File</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>public.data</string></array>
+    </dict>
+  </array>
+  <!-- skerry://open?url=<percent-encoded> hands a link to the Library's chooser. -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>${identifier}.open</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>CFBundleURLSchemes</key><array><string>skerry</string></array>
+    </dict>
+  </array>
 </dict>
 </plist>
 PLIST
 
 # Ad-hoc sign so macOS will launch it locally (not notarised).
+plutil -lint "$APP/Contents/Info.plist" >/dev/null || { echo "error: Info.plist is invalid" >&2; exit 1; }
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "warning: ad-hoc codesign failed"
+# Register at once so Open With and skerry: links work without a re-login.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+"$LSREGISTER" -f "$APP" >/dev/null 2>&1 || echo "warning: lsregister failed; Open With may need a re-login"
 echo "built $APP (version $VERSION)"

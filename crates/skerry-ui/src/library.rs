@@ -1,17 +1,20 @@
+use crate::files::Notice;
 use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     input::{Input, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
+    progress::Progress,
     scroll::ScrollableElement as _,
     spinner::Spinner,
     tooltip::Tooltip,
     Disableable as _, Icon, IconName, Sizable as _, StyledExt as _, Theme,
 };
 use gpui_kit::{
-    div, img, prelude::*, px, rgb, AnyElement, App, ClickEvent, Div, Entity, FontWeight, ObjectFit,
-    RenderImage, Rgba, SharedString, Window,
+    div, img, prelude::*, px, rgb, AnyElement, App, ClickEvent, Div, Entity, ExternalPaths,
+    FontWeight, ObjectFit, RenderImage, Rgba, SharedString, Window,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,6 +22,11 @@ pub type ClickHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 pub type ItemHandler = Rc<dyn Fn(String, &mut Window, &mut App)>;
 pub type FilterHandler = Rc<dyn Fn(Filter, &mut Window, &mut App)>;
 pub type FlightHandler = Rc<dyn Fn(String, FlightAction, &mut Window, &mut App)>;
+/// A chooser row or chip: its id and the chooser generation it was drawn for (`ARCH-028`).
+pub type OpeningHandler = Rc<dyn Fn(String, u64, &mut Window, &mut App)>;
+pub type ActionHandler = Rc<dyn Fn(&mut Window, &mut App)>;
+pub type DropHandler = Rc<dyn Fn(Vec<PathBuf>, &mut Window, &mut App)>;
+pub type SessionDropHandler = Rc<dyn Fn(String, Vec<PathBuf>, &mut Window, &mut App)>;
 
 #[derive(Clone, Debug)]
 pub struct AppItem {
@@ -41,6 +49,10 @@ pub struct SessionItem {
     pub storage_label: Option<String>,
     pub thumbnail: Option<Arc<RenderImage>>,
     pub app_icon: Option<Arc<RenderImage>>,
+    /// Offers the Files button (not on a collaboration room, `ARCH-028`).
+    pub files: bool,
+    /// Takes Finder drops: they are copied to its Desktop.
+    pub accepts_drop: bool,
 }
 
 /// An Applications chip. A category is its own variant, so a server category named "All"
@@ -75,6 +87,92 @@ pub struct LaunchingItem {
     /// "Launching · 0:42" or "Launch failed".
     pub status: String,
     pub notice: Option<LaunchNotice>,
+    /// A file going up before the launch request (`/launch/file`, `ARCH-028`).
+    pub upload: Option<UploadProgress>,
+    /// What the launch opens: the link label or the file name, for the card's pill.
+    pub subject: Option<(OpeningKind, String)>,
+    /// Cancel shows (only while the file uploads; the launch request can't be taken back).
+    pub cancellable: bool,
+}
+
+/// The upload row of a file launch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UploadProgress {
+    pub fraction: f32,
+    /// "Uploading 12 MB of 40 MB".
+    pub label: String,
+}
+
+/// What the open chooser is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpeningKind {
+    Link,
+    File,
+}
+
+/// The "Open … in…" chooser under the omnibar (`ARCH-028`).
+#[derive(Clone, Debug)]
+pub struct OpeningProps {
+    pub kind: OpeningKind,
+    /// The link's label (the real host first) or the file's name.
+    pub label: String,
+    /// The full address or path.
+    pub tooltip: Option<String>,
+    /// "PDF · 2.4 MB · 1 of 3".
+    pub detail: Option<String>,
+    /// Clearly a link, but not one SealSkin takes: "Can't open …", no rows.
+    pub rejected: bool,
+    pub sessions: Vec<OpeningSessionRow>,
+    pub apps: Vec<OpeningAppRow>,
+    /// "Show All (n)" was clicked.
+    pub apps_expanded: bool,
+    /// More files wait behind this one: Skip shows and ✕ reads "Cancel All".
+    pub queue_more: bool,
+    /// The running row whose `open_url` is pending.
+    pub pending_session: Option<String>,
+    pub note: Option<Notice>,
+    /// Return acts on the first row (a link typed in the omnibar): draw the ↩ hint.
+    pub enter_hint: bool,
+    /// The chooser generation these rows were built for; a click passes it back.
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpeningSessionRow {
+    pub id: String,
+    pub app_name: String,
+    /// "Started 5 min ago · auto-zen".
+    pub detail: String,
+    pub icon: Option<Arc<RenderImage>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct OpeningAppRow {
+    pub id: String,
+    pub name: String,
+    pub icon: Option<Arc<RenderImage>>,
+    /// The app is launching already (one launch per app): the chip is disabled.
+    pub launching: bool,
+}
+
+/// The chooser shows this many app chips before "Show All (n)".
+pub const OPENING_CHIPS: usize = 8;
+
+/// The omnibar's leading icon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OmnibarIcon {
+    #[default]
+    Search,
+    Link,
+    Rejected,
+}
+
+/// Drop highlights drawn without a live drag, for the workbench and screenshots only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DropPreview {
+    Library,
+    Session(String),
+    FoldersOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,6 +210,8 @@ pub enum FlightAction {
     KeepWaiting,
     Retry,
     Dismiss,
+    /// Stops a file launch while its file uploads.
+    Cancel,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,6 +233,14 @@ pub struct LibraryProps {
     pub selected_filter: Filter,
     pub status: Option<String>,
     pub busy: Option<String>,
+    /// The open chooser, when a link or file is waiting for a place to open.
+    pub opening: Option<OpeningProps>,
+    pub omnibar: OmnibarIcon,
+    /// Sessions whose Files button is waiting for the cookie exchange.
+    pub files_pending: HashSet<String>,
+    /// Takes Finder drops (not while busy).
+    pub accepts_drops: bool,
+    pub drop_preview: Option<DropPreview>,
     /// The header's account menu (`ARCH-029`), and whether it is open.
     pub account: crate::account::AccountProps,
     pub account_open: bool,
@@ -161,6 +269,26 @@ pub struct LibraryHandlers {
     pub on_stop: Option<ItemHandler>,
     pub on_select_filter: FilterHandler,
     pub on_flight_action: FlightHandler,
+    pub open: OpenHandlers,
+}
+
+/// The open chooser's, the drops', and the Files button's handlers (`ARCH-028`).
+#[derive(Clone, Default)]
+pub struct OpenHandlers {
+    /// A running row: open the link there, or copy the file to its Desktop.
+    pub on_open_in_session: Option<OpeningHandler>,
+    /// An app chip: the Launch & Open dialog.
+    pub on_open_with_app: Option<OpeningHandler>,
+    /// ✕: the context and everything queued.
+    pub on_clear_opening: Option<ActionHandler>,
+    pub on_skip_opening: Option<ActionHandler>,
+    pub on_toggle_opening_apps: Option<ActionHandler>,
+    /// A session card's Files button.
+    pub on_files: Option<ItemHandler>,
+    /// Finder items dropped on the Library.
+    pub on_drop: Option<DropHandler>,
+    /// Finder items dropped on one session card.
+    pub on_drop_to_session: Option<SessionDropHandler>,
 }
 
 /// What the Library shows, worked out from the props alone.
@@ -177,6 +305,8 @@ pub struct Arrangement<'a> {
     pub sessions: Vec<&'a SessionItem>,
     /// Launch cards are progress, not results: a search never hides them.
     pub launching: &'a [LaunchingItem],
+    /// A chooser shows: sections the filter leaves empty are hidden, not "no match".
+    pub hide_empty: bool,
 }
 
 /// Favorites and Recent rows (only on All with an empty search), the grid, and the chips
@@ -273,6 +403,7 @@ pub fn arrange(props: &LibraryProps) -> Arrangement<'_> {
         hidden_count,
         sessions,
         launching: &props.launching,
+        hide_empty: props.opening.is_some(),
     }
 }
 
@@ -301,7 +432,9 @@ pub fn tile_id(placement: Placement, app_id: &str) -> String {
 
 /// Creates a borderless omnibar input configured for searching apps or pasting URLs.
 pub fn new_search_input(window: &mut Window, cx: &mut App) -> Entity<InputState> {
-    cx.new(|cx| InputState::new(window, cx).placeholder("Search applications and running sessions"))
+    cx.new(|cx| {
+        InputState::new(window, cx).placeholder("Search applications and sessions, or paste a link")
+    })
 }
 
 /// What every tile needs besides its app.
@@ -334,6 +467,7 @@ pub fn render(
         on_stop,
         on_select_filter,
         on_flight_action,
+        open,
     } = handlers;
     let arranged = arrange(props);
     let tiles = TileContext {
@@ -423,11 +557,17 @@ pub fn render(
         .border_1()
         .border_color(theme.border)
         .bg(theme.popover)
-        .child(
-            div()
+        .child(match props.omnibar {
+            OmnibarIcon::Search => div()
                 .text_color(theme.muted_foreground)
-                .child(IconName::Search),
-        )
+                .child(Icon::new(IconName::Search)),
+            OmnibarIcon::Link => div()
+                .text_color(theme.foreground)
+                .child(Icon::new(gpui_kit::assets::IconName::Link)),
+            OmnibarIcon::Rejected => div()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(gpui_kit::assets::IconName::Ban)),
+        })
         .child(
             div().flex_1().min_w_0().child(
                 Input::new(search_input)
@@ -437,7 +577,10 @@ pub fn render(
             ),
         );
 
+    let hide_sessions =
+        arranged.hide_empty && arranged.sessions.is_empty() && arranged.launching.is_empty();
     let sessions_section = div()
+        .when(hide_sessions, |section| section.hidden())
         .v_flex()
         .gap_3p5()
         .child(
@@ -486,6 +629,8 @@ pub fn render(
                                 enabled,
                                 Rc::clone(&on_resume),
                                 on_stop.clone(),
+                                &open,
+                                props,
                             )
                         })),
                 )
@@ -542,7 +687,9 @@ pub fn render(
             }));
 
     let showing_hidden = arranged.active == Filter::Hidden;
+    let hide_apps = arranged.hide_empty && arranged.grid.is_empty() && !showing_hidden;
     let apps_section = div()
+        .when(hide_apps, |section| section.hidden())
         .v_flex()
         .gap_3p5()
         .child(
@@ -594,10 +741,30 @@ pub fn render(
                 ),
             )
         });
+    let chooser = props
+        .opening
+        .as_ref()
+        .map(|opening| render_chooser(theme, opening, &open, enabled));
+    let drops = props.accepts_drops && enabled;
+    let droppable: Vec<String> = arranged
+        .sessions
+        .iter()
+        .filter(|session| session.accepts_drop)
+        .map(|session| session.id.clone())
+        .collect();
+    let overlay =
+        drops.then(|| render_drop_overlay(theme, props.drop_preview.as_ref(), &droppable));
+    let on_drop = open.on_drop.clone().filter(|_| drops);
     div()
         .size_full()
+        .relative()
         .bg(theme.background)
         .text_color(theme.foreground)
+        .when_some(on_drop, |root, on_drop| {
+            root.on_drop(move |paths: &ExternalPaths, window, cx| {
+                on_drop(paths.paths().to_vec(), window, cx)
+            })
+        })
         .child(
             div()
                 .id("library")
@@ -615,6 +782,7 @@ pub fn render(
                             .gap_6()
                             .child(header)
                             .child(omnibar)
+                            .children(chooser)
                             .when_some(props.busy.clone(), |body, busy| {
                                 body.child(
                                     div()
@@ -650,6 +818,7 @@ pub fn render(
                     ),
                 ),
         )
+        .children(overlay)
 }
 
 fn render_session_card(
@@ -658,8 +827,17 @@ fn render_session_card(
     enabled: bool,
     on_resume: ItemHandler,
     on_stop: Option<ItemHandler>,
+    open: &OpenHandlers,
+    props: &LibraryProps,
 ) -> Div {
     let session_id = session.id.clone();
+    let files_pending = props.files_pending.contains(&session.id);
+    let on_files = open.on_files.clone().filter(|_| session.files);
+    let on_drop = open
+        .on_drop_to_session
+        .clone()
+        .filter(|_| session.accepts_drop && props.accepts_drops && enabled);
+    let previewed = props.drop_preview == Some(DropPreview::Session(session.id.clone()));
     let preview = div()
         .h(px(172.))
         .w_full()
@@ -745,6 +923,19 @@ fn render_session_card(
                         .disabled(!enabled)
                         .on_click(move |_, window, cx| on_resume(session_id.clone(), window, cx)),
                 )
+                .when_some(on_files, |actions, on_files| {
+                    let files_id = session.id.clone();
+                    actions.child(
+                        Button::new(SharedString::from(format!("files-{files_id}")))
+                            .outline()
+                            .small()
+                            .icon(IconName::FolderOpen)
+                            .loading(files_pending)
+                            .tooltip("Files: show this session’s Desktop files")
+                            .disabled(!enabled || files_pending)
+                            .on_click(move |_, window, cx| on_files(files_id.clone(), window, cx)),
+                    )
+                })
                 .when_some(on_stop, |actions, on_stop| {
                     let stop_id = session.id.clone();
                     actions.child(
@@ -760,17 +951,471 @@ fn render_session_card(
                 }),
         );
 
-    div()
+    let group = SharedString::from(session_drop_group(&session.id));
+    let ring = theme.blue;
+    let card = div()
         .w(px(336.))
+        .relative()
         .rounded_xl()
         .overflow_hidden()
         .border_1()
-        .border_color(theme.border)
+        .border_color(if previewed { ring } else { theme.border })
         .bg(theme.popover)
         .v_flex()
         .child(preview)
         // Fill the row height so cards in one row line up even when one card's pills wrap.
-        .child(footer.flex_1())
+        .child(footer.flex_1());
+    let Some(on_drop) = on_drop else {
+        return card;
+    };
+    let session_id = session.id.clone();
+    card.group(group)
+        .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(ring))
+        .on_drop(move |paths: &ExternalPaths, window, cx| {
+            // The Library's own drop must not open the chooser too.
+            cx.stop_propagation();
+            on_drop(session_id.clone(), paths.paths().to_vec(), window, cx)
+        })
+        .child(session_drop_overlay(theme, &session.app_name, previewed))
+}
+
+/// The group a droppable session card carries, so the Library's pill can hide over it.
+fn session_drop_group(session_id: &str) -> String {
+    format!("session-drop-{session_id}")
+}
+
+/// "Copy to <App> Desktop" over a session card while Finder items hover it.
+fn session_drop_overlay(theme: &Theme, app_name: &str, previewed: bool) -> Div {
+    let overlay = div()
+        .absolute()
+        .inset_0()
+        .rounded_xl()
+        .border_2()
+        .border_color(theme.blue)
+        .bg(theme.drop_target)
+        .h_flex()
+        .items_center()
+        .justify_center()
+        .child(drop_pill(
+            theme,
+            gpui_kit::assets::IconName::FolderUp,
+            div()
+                .h_flex()
+                .min_w_0()
+                .child("Copy to ")
+                .child(div().max_w(px(140.)).truncate().child(app_name.to_string()))
+                .child(" Desktop"),
+        ));
+    if previewed {
+        overlay
+    } else {
+        // Shown only while the drag is over this card; the drag_over gives it a hitbox
+        // that doesn't block anything beneath.
+        overlay
+            .invisible()
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.visible())
+    }
+}
+
+fn drop_pill(theme: &Theme, icon: gpui_kit::assets::IconName, text: impl IntoElement) -> Div {
+    div()
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py_2()
+        .rounded_full()
+        .bg(theme.popover)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_md()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme.foreground)
+        .child(Icon::new(icon))
+        .child(text)
+}
+
+/// Whether every dropped item is a folder (`launch/file` takes files).
+fn folders_only(paths: &ExternalPaths) -> bool {
+    let paths = paths.paths();
+    !paths.is_empty() && paths.iter().all(|path| path.is_dir())
+}
+
+/// The Library's drop highlight: a ring inset 8 pt over the visible area and a pill. Stateless:
+/// it shows through `drag_over` while Finder items hover the window, and the pill hides over
+/// a droppable session card, whose own message shows instead.
+fn render_drop_overlay(theme: &Theme, preview: Option<&DropPreview>, droppable: &[String]) -> Div {
+    let muted = theme.muted_foreground;
+    let mut pill = drop_pill(
+        theme,
+        gpui_kit::assets::IconName::FileUp,
+        "Drop to open in a remote app",
+    )
+    .drag_over::<ExternalPaths>(|style, _, _, _| style);
+    for id in droppable {
+        pill = pill
+            .group_drag_over::<ExternalPaths>(session_drop_group(id), |style| style.invisible());
+    }
+    let previewing_session = matches!(preview, Some(DropPreview::Session(_)));
+    let overlay = div()
+        .absolute()
+        .inset(px(8.))
+        .rounded_xl()
+        .border_2()
+        .border_color(theme.blue)
+        .bg(theme.drop_target)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(pill.when(previewing_session, |pill| pill.invisible()));
+    match preview {
+        Some(DropPreview::FoldersOnly) => overlay
+            .border_color(muted)
+            .bg(gpui_kit::transparent_black()),
+        Some(_) => overlay,
+        None => overlay
+            .invisible()
+            .drag_over::<ExternalPaths>(move |style, paths, _, _| {
+                if folders_only(paths) {
+                    style
+                        .visible()
+                        .border_color(muted)
+                        .bg(gpui_kit::transparent_black())
+                } else {
+                    style.visible()
+                }
+            }),
+    }
+}
+
+/// The "Open … in…" chooser (`ARCH-028`): the context, then the running sessions that can
+/// take it, then the apps that can launch with it. Rows pass their generation back, so a
+/// click drawn for an older context is ignored.
+fn render_chooser(
+    theme: &Theme,
+    opening: &OpeningProps,
+    open: &OpenHandlers,
+    enabled: bool,
+) -> Div {
+    let pending = opening.pending_session.is_some();
+    let generation = opening.generation;
+    let icon = if opening.rejected {
+        Icon::new(gpui_kit::assets::IconName::Ban).text_color(theme.muted_foreground)
+    } else {
+        match opening.kind {
+            OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
+            OpeningKind::File => Icon::new(IconName::FileText),
+        }
+    };
+    let name = match opening.kind {
+        OpeningKind::File => format!("“{}”", opening.label),
+        OpeningKind::Link => opening.label.clone(),
+    };
+    let tooltip = opening.tooltip.clone();
+    let title = div()
+        .flex_1()
+        .min_w_0()
+        .h_flex()
+        .items_center()
+        .gap_1()
+        .text_sm()
+        .font_weight(FontWeight::MEDIUM)
+        .child(div().flex_none().child(if opening.rejected {
+            "Can’t open"
+        } else {
+            "Open"
+        }))
+        .child(
+            div()
+                .id("opening-label")
+                .min_w_0()
+                .truncate()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(name)
+                .when_some(tooltip, |label, tooltip| {
+                    label.tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                }),
+        )
+        .when(!opening.rejected, |title| {
+            title.child(div().flex_none().child("in…"))
+        });
+    let on_skip = open.on_skip_opening.clone();
+    let on_clear = open.on_clear_opening.clone();
+    let header = div()
+        .h_flex()
+        .items_center()
+        .gap_2()
+        .child(div().flex_none().child(icon.with_size(px(20.))))
+        .child(title)
+        .when_some(opening.detail.clone(), |header, detail| {
+            header.child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+        })
+        .when_some(on_skip.filter(|_| opening.queue_more), |header, on_skip| {
+            header.child(
+                Button::new("opening-skip")
+                    .ghost()
+                    .xsmall()
+                    .label("Skip")
+                    .tooltip("Skip this file")
+                    .on_click(move |_, window, cx| on_skip(window, cx)),
+            )
+        })
+        .when_some(on_clear, |header, on_clear| {
+            header.child(
+                Button::new("opening-cancel")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Close)
+                    .tooltip(if opening.queue_more {
+                        "Cancel All"
+                    } else {
+                        "Cancel"
+                    })
+                    .on_click(move |_, window, cx| on_clear(window, cx)),
+            )
+        });
+
+    let group_label = |label: &'static str| {
+        div()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.muted_foreground)
+            .child(label)
+    };
+    let (running_label, action_label) = match opening.kind {
+        OpeningKind::Link => ("Open in a running session", "Open Here"),
+        OpeningKind::File => ("Copy to a running session", "Copy to Desktop"),
+    };
+    let key_hint = || {
+        div()
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(theme.border)
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child("↩")
+    };
+    let running = (!opening.sessions.is_empty()).then(|| {
+        let rows = opening.sessions.iter().enumerate().map(|(index, row)| {
+            let this_pending = opening.pending_session.as_deref() == Some(row.id.as_str());
+            let usable = enabled && !pending;
+            let on_open = open.on_open_in_session.clone();
+            let row_id = row.id.clone();
+            let button_id = row.id.clone();
+            let on_button = open.on_open_in_session.clone();
+            let file_tooltip = (opening.kind == OpeningKind::File).then(|| {
+                format!(
+                    "Copy “{}” to this session’s Desktop and show its files",
+                    opening.label
+                )
+            });
+            let mut button = Button::new(SharedString::from(format!("opening-run-btn-{}", row.id)))
+                .outline()
+                .small()
+                .disabled(!usable)
+                .when_some(on_button, |button, on_open| {
+                    button.on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        on_open(button_id.clone(), generation, window, cx)
+                    })
+                });
+            button = if this_pending {
+                button.loading(true).label("Opening…")
+            } else {
+                button.label(action_label)
+            };
+            if let Some(tooltip) = file_tooltip {
+                button = button.tooltip(tooltip);
+            }
+            div()
+                .id(SharedString::from(format!("opening-run-{}", row.id)))
+                .h(px(44.))
+                .px_2()
+                .h_flex()
+                .items_center()
+                .gap_2p5()
+                .when(index > 0, |row| row.border_t_1().border_color(theme.border))
+                .when(pending && !this_pending, |row| row.opacity(0.6))
+                .when(usable, |row| {
+                    row.cursor_pointer().hover(|s| s.bg(theme.secondary))
+                })
+                .when_some(on_open.filter(|_| usable), |row, on_open| {
+                    row.on_click(move |_, window, cx| {
+                        on_open(row_id.clone(), generation, window, cx)
+                    })
+                })
+                .child(app_badge(&row.app_name, row.icon.clone(), px(24.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_flex()
+                        .items_baseline()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_none()
+                                .max_w(px(200.))
+                                .truncate()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(row.app_name.clone()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(row.detail.clone()),
+                        ),
+                )
+                .when(index == 0 && opening.enter_hint, |row| {
+                    row.child(key_hint())
+                })
+                .child(button)
+        });
+        div()
+            .v_flex()
+            .gap_1p5()
+            .child(group_label(running_label))
+            .child(
+                div()
+                    .v_flex()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .children(rows),
+            )
+    });
+
+    let apps = (!opening.apps.is_empty()).then(|| {
+        let shown = if opening.apps_expanded {
+            opening.apps.len()
+        } else {
+            opening.apps.len().min(OPENING_CHIPS)
+        };
+        let hint_first = opening.enter_hint && opening.sessions.is_empty();
+        let chips = opening.apps[..shown]
+            .iter()
+            .enumerate()
+            .map(|(index, app)| {
+                let usable = enabled && !pending && !app.launching;
+                let on_open = open.on_open_with_app.clone();
+                let app_id = app.id.clone();
+                let border_hover = theme.primary;
+                let bg_hover = theme.secondary;
+                let mut chip = div()
+                    .id(SharedString::from(format!("opening-app-{}", app.id)))
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2p5()
+                    .py_1p5()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.popover)
+                    .child(app_badge(&app.name, app.icon.clone(), px(20.)))
+                    .child(
+                        div()
+                            .max_w(px(160.))
+                            .truncate()
+                            .text_sm()
+                            .child(app.name.clone()),
+                    )
+                    .when(index == 0 && hint_first, |chip| chip.child(key_hint()));
+                if usable {
+                    chip = chip
+                        .cursor_pointer()
+                        .hover(move |s| s.border_color(border_hover).bg(bg_hover))
+                        .when_some(on_open, |chip, on_open| {
+                            chip.on_click(move |_, window, cx| {
+                                on_open(app_id.clone(), generation, window, cx)
+                            })
+                        });
+                } else {
+                    chip = chip.opacity(0.6);
+                }
+                if app.launching {
+                    let tooltip = format!("{} is already launching", app.name);
+                    chip = chip
+                        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx));
+                }
+                chip
+            });
+        let more = opening.apps.len() > OPENING_CHIPS;
+        let on_toggle = open.on_toggle_opening_apps.clone();
+        div()
+            .v_flex()
+            .gap_1p5()
+            .child(group_label("Launch a new session"))
+            .child(
+                div()
+                    .h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(chips)
+                    .when_some(on_toggle.filter(|_| more), |row, on_toggle| {
+                        row.child(
+                            Button::new("opening-show-all")
+                                .ghost()
+                                .small()
+                                .label(if opening.apps_expanded {
+                                    "Show Fewer".to_string()
+                                } else {
+                                    format!("Show All ({})", opening.apps.len())
+                                })
+                                .on_click(move |_, window, cx| on_toggle(window, cx)),
+                        )
+                    }),
+            )
+    });
+
+    let note = opening.note.clone().map(|note| {
+        let (icon, tint) = if note.error {
+            (IconName::CircleX, theme.danger)
+        } else {
+            (IconName::Info, theme.muted_foreground)
+        };
+        div()
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .text_sm()
+            .when(note.error, |row| {
+                row.px_2p5()
+                    .py_1p5()
+                    .rounded_md()
+                    .bg(theme.danger.opacity(0.1))
+            })
+            .child(Icon::new(icon).small().text_color(tint))
+            .child(div().flex_1().min_w_0().text_color(tint).child(note.text))
+    });
+
+    div()
+        .w_full()
+        .p_4()
+        .rounded_xl()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .v_flex()
+        .gap_3()
+        .child(header)
+        .children(running)
+        .children(apps)
+        .children(note)
 }
 
 /// An app tile: regular (156 × 142) in the grid, compact (120 × 112) in Favorites and
@@ -1146,13 +1791,73 @@ fn render_launching_card(
             .child(div().pt_1().h_flex().gap_2().children(buttons))
     });
 
+    let upload = item.upload.as_ref().map(|upload| {
+        div()
+            .v_flex()
+            .gap_1()
+            .pb_1()
+            .child(
+                div()
+                    .h(px(24.))
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .size(px(16.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Spinner::new().xsmall()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(upload.label.clone()),
+                    ),
+            )
+            .child(
+                Progress::new(SharedString::from(format!("upload-{}", item.launch_id)))
+                    .value(upload.fraction * 100.),
+            )
+    });
+    let uploading = upload.is_some();
+    let subject = item.subject.clone().map(|(kind, label)| {
+        let icon = match kind {
+            OpeningKind::Link => Icon::new(gpui_kit::assets::IconName::Link),
+            OpeningKind::File => Icon::new(IconName::FileText),
+        };
+        div().pt_2().h_flex().child(
+            div()
+                .max_w_full()
+                .h_flex()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .bg(theme.popover)
+                .border_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(div().flex_none().child(icon.with_size(px(12.))))
+                .child(div().min_w_0().truncate().child(label)),
+        )
+    });
     let top = div()
         .min_h(px(172.))
         .w_full()
         .p_4()
         .bg(theme.secondary)
         .v_flex()
-        .children(rows)
+        .children(upload)
+        .when(!uploading, |top| top.children(rows))
         .when(notice.is_none(), |top| {
             top.when_some(item.detail.clone(), |top, detail| {
                 top.child(
@@ -1165,7 +1870,8 @@ fn render_launching_card(
                 )
             })
         })
-        .children(notice);
+        .children(notice)
+        .children(subject);
 
     let footer = div()
         .p_3p5()
@@ -1199,7 +1905,21 @@ fn render_launching_card(
                         .truncate()
                         .child(item.status.clone()),
                 ),
-        );
+        )
+        .when(item.cancellable, |footer| {
+            let on_action = Rc::clone(&on_action);
+            let id = item.launch_id.clone();
+            footer.child(
+                Button::new(SharedString::from(format!("flight-cancel-{id}")))
+                    .outline()
+                    .small()
+                    .label("Cancel")
+                    .tooltip("Stop the upload")
+                    .on_click(move |_, window, cx| {
+                        on_action(id.clone(), FlightAction::Cancel, window, cx)
+                    }),
+            )
+        });
 
     div()
         .id(SharedString::from(format!("launching-{}", item.launch_id)))
@@ -1496,8 +2216,40 @@ mod tests {
             detail: None,
             status: "Launching · 0:01".into(),
             notice: None,
+            upload: None,
+            subject: None,
+            cancellable: false,
         }];
         p.search_query = "zen".into();
         assert_eq!(arrange(&p).launching.len(), 1);
+    }
+
+    fn opening(kind: OpeningKind) -> OpeningProps {
+        OpeningProps {
+            kind,
+            label: "x".into(),
+            tooltip: None,
+            detail: None,
+            rejected: false,
+            sessions: Vec::new(),
+            apps: Vec::new(),
+            apps_expanded: false,
+            queue_more: false,
+            pending_session: None,
+            note: None,
+            enter_hint: false,
+            generation: 0,
+        }
+    }
+
+    #[test]
+    fn a_chooser_hides_sections_the_filter_leaves_empty() {
+        let mut p = props(vec![app("zen", "")]);
+        p.search_query = "wiki.lan/page".into();
+        assert!(!arrange(&p).hide_empty);
+        p.opening = Some(opening(OpeningKind::Link));
+        let a = arrange(&p);
+        assert!(a.hide_empty);
+        assert!(a.grid.is_empty() && a.sessions.is_empty());
     }
 }
