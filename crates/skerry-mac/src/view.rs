@@ -89,6 +89,9 @@ impl NativeSession {
                 Err(transport::RunError::StartupTimeout) => {
                     let _ = events.send(SessionEvent::StartupTimeout);
                 }
+                Err(transport::RunError::Killed(kill)) => {
+                    let _ = events.send(SessionEvent::Killed(kill));
+                }
                 Err(error) => {
                     let _ = events.send(SessionEvent::Error(error.to_string()));
                 }
@@ -182,6 +185,11 @@ impl NativeSession {
 
     pub fn set_resolution(&self, request: DisplayRequest) {
         let _ = self.input.send(Input::Resolution(request));
+    }
+
+    /// Display 2 sits on `side` now (`ARCH-039`); `request` is its current size, if any.
+    pub fn set_position(&self, side: transport::Side, request: Option<DisplayRequest>) {
+        let _ = self.input.send(Input::Position(side, request));
     }
 
     pub fn set_appearance(&self, dark: bool) {

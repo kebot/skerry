@@ -95,6 +95,8 @@ enum Command {
     GamepadRumble(bool),
     AutoPrint(bool),
     PrintJob(u64, PrintJobAction),
+    /// Add Screen + / Close Screen 2 (`ARCH-039`).
+    SecondDisplay,
     Microphone(bool),
     InputDevice(Option<String>),
     PrivacySettings(Subject),
@@ -344,6 +346,7 @@ impl ControlPanel {
                         Command::StatsStrip(on) => session.set_stats_strip(on, cx),
                         Command::MacShortcuts(active) => session.change_mac_shortcuts(active, cx),
                         Command::CapturePointer => session.request_capture(window, cx),
+                        Command::SecondDisplay => session.toggle_second_display(window, cx),
                         Command::GamepadInput(on) => session.change_gamepad_input(on, cx),
                         Command::GamepadRumble(on) => session.change_gamepad_rumble(on, cx),
                         Command::AutoPrint(on) => session.set_auto_print(on, cx),
@@ -524,6 +527,9 @@ impl ControlPanel {
             ControlsAction::CapturePointer => {
                 Self::send(self.owner.clone(), Command::CapturePointer, cx)
             }
+            ControlsAction::SecondScreen => {
+                Self::send(self.owner.clone(), Command::SecondDisplay, cx)
+            }
             ControlsAction::SetGamepadInput(on) => {
                 Self::send(self.owner.clone(), Command::GamepadInput(on), cx)
             }
@@ -636,6 +642,9 @@ impl ControlPanel {
             dpi_override: session.dpi_override,
             preset_label,
             scale_locally: session.scale_locally,
+            second_screen: session
+                .second
+                .props(session.settings.as_ref().and_then(|s| s.second_screen), cx),
         };
 
         let video_settings = build_video_props(session);

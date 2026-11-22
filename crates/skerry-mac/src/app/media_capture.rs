@@ -87,7 +87,10 @@ impl<M: MicHandle> Default for MediaCapture<M> {
 
 /// Events that end the stream without `end_stream`: they stop capture at once.
 fn ends_stream(event: &SessionEvent) -> bool {
-    matches!(event, SessionEvent::Error(_) | SessionEvent::StartupTimeout)
+    matches!(
+        event,
+        SessionEvent::Error(_) | SessionEvent::StartupTimeout | SessionEvent::Killed(_)
+    )
 }
 
 impl<M: MicHandle> MediaCapture<M> {
@@ -387,6 +390,13 @@ mod tests {
         assert_eq!(log.borrow().dropped, 1, "the thread got Shutdown");
         assert_eq!(capture.badge(), None);
         assert_eq!(capture.state.mic.phase, Phase::Off);
+    }
+
+    #[test]
+    fn a_kill_stops_capture() {
+        let (mut capture, log, _frames, _events) = capturing();
+        capture.on_stream_event(&SessionEvent::Killed(crate::transport::Kill::Superseded));
+        assert_eq!(log.borrow().dropped, 1);
     }
 
     #[test]

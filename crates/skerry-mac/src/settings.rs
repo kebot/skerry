@@ -95,6 +95,9 @@ pub struct Settings {
     pub keyboard_shortcuts: ShortcutPolicy,
     /// The server's gamepad settings (`ARCH-032`).
     pub gamepad: crate::gamepad::GamepadPolicy,
+    /// `second_screen.value`: whether this session allows Display 2 now (`ARCH-039`).
+    /// `None` when the server doesn't say.
+    pub second_screen: Option<bool>,
 }
 
 impl Default for Settings {
@@ -108,6 +111,7 @@ impl Default for Settings {
             audio_bitrate: None,
             keyboard_shortcuts: ShortcutPolicy::default(),
             gamepad: crate::gamepad::GamepadPolicy::default(),
+            second_screen: None,
         }
     }
 }
@@ -150,6 +154,7 @@ impl Settings {
         self.audio_bitrate = AudioBitrate::from_server(&payload[AudioBitrate::WIRE]);
         self.keyboard_shortcuts = ShortcutPolicy::from_server(payload);
         self.gamepad = crate::gamepad::GamepadPolicy::from_server(payload);
+        self.second_screen = payload["second_screen"]["value"].as_bool();
     }
 
     pub fn live(&mut self, payload: &Value) {
@@ -830,6 +835,22 @@ fn save_to(path: &Path, preferences: &Value) -> io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn announce_reads_second_screen() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({"second_screen": {"value": true}}));
+        assert_eq!(settings.second_screen, Some(true));
+        settings.announce(&json!({"second_screen": {"value": false}}));
+        assert_eq!(settings.second_screen, Some(false));
+    }
+
+    #[test]
+    fn second_screen_absent_reads_none() {
+        let mut settings = Settings::default();
+        settings.announce(&json!({}));
+        assert_eq!(settings.second_screen, None);
+    }
 
     #[test]
     fn library_organization_is_absent_from_old_files_and_never_written_empty() {
