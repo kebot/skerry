@@ -742,6 +742,7 @@ mod tests {
                     persistent_storage: true,
                     gpu: true,
                     vpn: true,
+                    ..UserSettings::default()
                 },
                 gpus: vec![
                     gpu("intel-gpu", "i915", None),
@@ -761,6 +762,7 @@ mod tests {
                         },
                     ],
                 }],
+                ..ServerStatus::default()
             },
             homes: vec!["work".into(), "auto-zen".into(), SHARED_FILES_HOME.into()],
         }

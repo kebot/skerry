@@ -705,20 +705,32 @@ impl FilesWindow {
         };
         let selkies = self.access.clone();
         let pending = self.rt.spawn(async move {
-            let ours = selkies.browse("").await.map_err(|e| e.to_string())?;
+            let ours = selkies
+                .browse("")
+                .await
+                .map_err(|e| crate::sealskin::ApiError::Message(e.to_string()))?;
             let theirs = storage
                 .client
                 .storage_names(&storage.home, STORAGE_ROOT)
                 .await?;
-            Ok::<_, String>(same_folder(
+            Ok::<_, crate::sealskin::ApiError>(same_folder(
                 ours.entries.iter().map(|e| e.name.as_str()),
                 theirs.iter().map(String::as_str),
             ))
         });
         cx.spawn(async move |this, cx| {
-            let matches = matches!(pending.await, Ok(Ok(true)));
+            let result = pending.await;
+            let matches = matches!(result, Ok(Ok(true)));
             let _ = this.update(cx, |this, cx| {
                 this.storage_matches = matches;
+                // A refused key shows here; the session and this window stay open. This
+                // window keeps the key it opened with: a key replaced in the Library
+                // reaches it when the session window opens again (`ARCH-029`).
+                if let Ok(Err(error)) = &result {
+                    if error.is_refusal() {
+                        this.say(error.to_string(), true, cx);
+                    }
+                }
                 cx.notify();
             });
         })

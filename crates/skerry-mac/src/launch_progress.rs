@@ -10,8 +10,8 @@
 
 use crate::launch_options::LaunchSelection;
 use crate::sealskin::{
-    session_from_progress, LaunchError, LaunchParams, LaunchProgress, ProgressAnswer, RemoteApp,
-    RemoteSession,
+    session_from_progress, KeyRefusal, LaunchError, LaunchParams, LaunchProgress, ProgressAnswer,
+    RemoteApp, RemoteSession,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
@@ -193,8 +193,8 @@ pub struct Flight {
     prompt_after: Instant,
     poll_errors: u32,
     /// Progress answered 401. Like `failed`, it ends the flight only once no request is
-    /// outstanding; the Library then reports the refused key as a Refresh would.
-    pub signed_out: bool,
+    /// outstanding; the Library then handles the refused key as a Refresh would (`ARCH-029`).
+    pub signed_out: Option<KeyRefusal>,
     pub outcome: Outcome,
 }
 
@@ -225,7 +225,7 @@ impl Flight {
             progress_failed: None,
             prompt_after: now,
             poll_errors: 0,
-            signed_out: false,
+            signed_out: None,
             outcome: Outcome::Running,
         };
         flight.reset(now, now_unix);
@@ -247,7 +247,7 @@ impl Flight {
         self.progress_failed = None;
         self.prompt_after = now + STALL;
         self.poll_errors = 0;
-        self.signed_out = false;
+        self.signed_out = None;
         self.outcome = Outcome::Running;
     }
 
@@ -324,9 +324,9 @@ impl Flight {
                     _ => {}
                 }
             }
-            ProgressAnswer::SignedOut => {
+            ProgressAnswer::SignedOut(refusal) => {
                 // The outstanding request may still succeed; wait for it (as for `failed`).
-                self.signed_out = true;
+                self.signed_out = Some(refusal.clone());
                 self.progress_failed = Some(Some(KEY_REFUSED.into()));
                 self.settle();
             }
@@ -816,19 +816,19 @@ mod tests {
         let t = Instant::now();
         let mut f = flight(t);
         f.begin_attempt();
-        f.observe(&ProgressAnswer::SignedOut, t + secs(5));
-        assert!(f.is_running() && f.signed_out);
+        f.observe(&ProgressAnswer::SignedOut(KeyRefusal::Dormant), t + secs(5));
+        assert!(f.is_running() && f.signed_out.is_some());
         f.posted(Ok(session("new", "firefox", T0)), t + secs(6));
         assert!(matches!(f.outcome, Outcome::Ready(_)));
 
         let mut refused = flight(t);
         refused.begin_attempt();
-        refused.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        refused.observe(&ProgressAnswer::SignedOut(KeyRefusal::Dormant), t + secs(5));
         refused.posted(Err(LaunchError::Server(KEY_REFUSED.into())), t + secs(6));
         assert_eq!(refused.failure_body(), Some(KEY_REFUSED));
         // With no request outstanding, a 401 ends the flight at once.
         let mut idle = flight(t);
-        idle.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        idle.observe(&ProgressAnswer::SignedOut(KeyRefusal::Dormant), t + secs(5));
         assert!(matches!(idle.outcome, Outcome::Failed(_)));
     }
 
