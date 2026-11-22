@@ -55,7 +55,8 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
   - Unresolved frontier (`ARCH-GAP-DC-05`): microphone and webcam capture uplinks with macOS permission prompts and disconnect teardown.
 - `printing-gaming-and-sharing` (unresolved: `ARCH-GAP-DC-04`, `ARCH-GAP-DC-06`, `ARCH-GAP-DC-07`):
   - Remote PDF print job queue (`ARCH-GAP-DC-04`), relative mouse capture and gamepad slots/rumble (`ARCH-GAP-DC-06`), and view-only / player-slot / SealSkin collaboration rooms (`ARCH-GAP-DC-07`).
-- `web-sidebar-panels` (unresolved: `ARCH-GAP-DC-11`, `ARCH-GAP-DC-12`, `ARCH-GAP-DC-13`): the web sidebar's Apps, Shortcuts, and Pelorus panels; `ARCH-020` maps every web panel to its owner.
+- `web-sidebar-panels` (Shortcuts settled in `ARCH-031`; Apps and Pelorus open in `ARCH-GAP-DC-11`, `ARCH-GAP-DC-13`): the web sidebar's Apps, Shortcuts, and Pelorus panels. `ARCH-020` maps every web panel to its owner.
+  - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
   - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
 
 Facets:
