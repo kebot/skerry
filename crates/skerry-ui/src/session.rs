@@ -118,6 +118,33 @@ pub fn print_notices_top(strip_bottom: Option<Pixels>) -> Pixels {
     px(48f32.max((strip / 4.).ceil() * 4.))
 }
 
+/// The capture badge at the top left while the microphone is open (`ARCH-038`): below the
+/// traffic lights at `top` (`print_notices_top`, the same height as the notices on the
+/// right), always dark, and with **no hitbox** (no id, listeners or occlusion), so clicks
+/// reach the remote app's menus under it (`ARCH-031`). The camera's group joins in M2.
+pub fn capture_badge(mic: bool, top: Pixels) -> Div {
+    let group = |color: u32, icon: IconName| {
+        div()
+            .h_flex()
+            .items_center()
+            .gap(px(4.))
+            .child(div().size(px(8.)).rounded_full().bg(rgb(color)))
+            .child(Icon::new(icon).with_size(px(14.)).text_color(rgb(0xffffff)))
+    };
+    div()
+        .absolute()
+        .left(px(12.))
+        .top(top)
+        .h(px(24.))
+        .px(px(8.))
+        .rounded(px(12.))
+        .bg(rgba(0x0000008c))
+        .h_flex()
+        .items_center()
+        .gap(px(8.))
+        .when(mic, |badge| badge.child(group(0xFF9F0A, IconName::Mic)))
+}
+
 /// How many notice cards fit above the hint and banners: 104 pt per card, 112 pt kept at the
 /// bottom, 28 pt for the "+N more" line; at least 1, at most 3.
 pub fn print_notices_shown(window_height: Pixels, top: Pixels) -> usize {

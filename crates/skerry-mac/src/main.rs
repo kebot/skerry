@@ -21,6 +21,8 @@ mod open_target;
 #[cfg(target_os = "macos")]
 mod pasteboard;
 #[cfg(target_os = "macos")]
+mod permissions;
+#[cfg(target_os = "macos")]
 mod persist;
 #[cfg(target_os = "macos")]
 mod print_dialog;

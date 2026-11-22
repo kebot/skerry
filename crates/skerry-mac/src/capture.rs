@@ -97,10 +97,9 @@ pub fn server_reply(text: &str) -> Option<Reply> {
     }
     let rest = text.strip_prefix("CAPTURE_DEMAND ")?;
     let (subject, value) = rest.split_once(' ')?;
-    let subject = match subject {
-        "microphone" => Subject::Microphone,
-        _ => return None,
-    };
+    let subject = [Subject::Microphone]
+        .into_iter()
+        .find(|known| known.wire() == subject)?;
     Some(Reply::Demand(subject, value == "1"))
 }
 

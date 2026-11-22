@@ -183,6 +183,7 @@ fn peak_level(peak: f32) -> u8 {
 }
 
 /// The meter's level for some mono samples.
+#[cfg(test)]
 fn level(mono: &[f32]) -> u8 {
     peak_level(mono.iter().fold(0.0f32, |peak, s| peak.max(s.abs())))
 }
@@ -1435,7 +1436,7 @@ mod tests {
         assert!(packets[5..].iter().all(|p| p.len() >= 20));
         // The sine comes out continuous: steady level, and 440 Hz worth of zero crossings.
         let settled = &decoded[2400..decoded.len() - 480];
-        for window in settled.chunks_exact(480) {
+        for window in settled.as_chunks::<480>().0 {
             let rms = (window.iter().map(|s| s * s).sum::<f32>() / 480.0).sqrt();
             assert!((0.12..=0.32).contains(&rms), "rms {rms}");
         }

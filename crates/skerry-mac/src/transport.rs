@@ -1,4 +1,5 @@
 use crate::audio::{OutputStatus, Playback};
+use crate::capture;
 use crate::clipboard;
 use crate::print_jobs;
 use crate::selkies;
@@ -610,6 +611,35 @@ pub enum SessionEvent {
     PointerCapture(Option<crate::view::CaptureHint>),
     /// The server asked the pad in this slot to rumble (`ARCH-032`).
     Rumble(crate::gamepad::Rumble),
+    /// The capture part of a primary `server_settings` (`ARCH-038`).
+    CapturePolicy(capture::CapturePolicy),
+    /// `MICROPHONE_DISABLED` or `CAPTURE_DEMAND` (`ARCH-038`).
+    Capture(capture::Reply),
+    /// A status from the window's `skerry-mic` thread, tagged with that thread's id so a
+    /// late one from a thread already stopped is ignored. Raised by the window, not the
+    /// server.
+    MicStatus(u64, crate::microphone::MicStatus),
+}
+
+/// A capture reply's event; `None` for any other text.
+fn capture_event(text: &str) -> Option<SessionEvent> {
+    capture::server_reply(text).map(SessionEvent::Capture)
+}
+
+/// An uplink frame as sent: binary, and only once the session is ready.
+fn uplink_message(ready: bool, frame: Vec<u8>) -> Option<Message> {
+    ready.then(|| Message::Binary(frame.into()))
+}
+
+/// The next uplink frame. A closed channel (or none) never yields, and is forgotten.
+async fn uplink(frames: &mut Option<mpsc::Receiver<Vec<u8>>>) -> Vec<u8> {
+    if let Some(receiver) = frames {
+        if let Some(frame) = receiver.recv().await {
+            return frame;
+        }
+    }
+    *frames = None;
+    std::future::pending().await
 }
 
 /// A `system,{"action": "rumble,…"}` frame's rumble; `None` for anything else.
@@ -821,6 +851,9 @@ pub struct SessionOptions {
     pub audio_output: Option<String>,
     /// The saved audio bitrate (bps), requested once ready if the server offers it.
     pub audio_bitrate: Option<u32>,
+    /// `0x02` microphone frames from the window's `skerry-mic` thread (`ARCH-038`). Dropping
+    /// it when the stream ends stops that thread's capture.
+    pub mic: Option<mpsc::Receiver<Vec<u8>>>,
 }
 
 /// Why a stream ended with an error.
@@ -969,6 +1002,7 @@ pub async fn run(
         return Ok(());
     };
     let (template, access) = requested?;
+    let mut mic_frames = options.mic;
     if let Some(access) = access {
         let _ = events.send(SessionEvent::Files(access));
     }
@@ -1215,6 +1249,13 @@ pub async fn run(
                 trace_input(&text);
                 socket.send(text.into()).await.map_err(|_| disconnected)?;
             }
+            // About 80 B every 20 ms: inline after input, before anything received
+            // (`ARCH-038`). Frames before the session is ready are dropped.
+            frame = uplink(&mut mic_frames) => {
+                if let Some(message) = uplink_message(ready, frame) {
+                    socket.send(message).await.map_err(|_| disconnected)?;
+                }
+            }
             incoming = socket.next() => match incoming {
                 Some(Ok(Message::Binary(data))) => {
                     diagnostics.bytes += data.len();
@@ -1318,6 +1359,10 @@ pub async fn run(
                     if text.starts_with("MODE ") && text != "MODE websockets" {
                         return Err("This server requires WebRTC. SealSkin Native currently uses WebSockets.".into());
                     }
+                    if let Some(event) = capture_event(&text) {
+                        let _ = events.send(event);
+                        continue;
+                    }
                     if let Some(finger_scroll) = finger_scroll_capability(&text) {
                         let _ = events.send(SessionEvent::FingerScroll(finger_scroll));
                         continue;
@@ -1357,6 +1402,7 @@ pub async fn run(
                                     let _ = events.send(SessionEvent::ClipboardPolicy(clipboard::Policy::from_server(&data["settings"])));
                                     let _ = events.send(SessionEvent::FilePolicy(selkies::Policy::from_server(&data["settings"])));
                                     let _ = events.send(SessionEvent::PrintPolicy(print_jobs::enabled(&data["settings"])));
+                                    let _ = events.send(SessionEvent::CapturePolicy(capture::CapturePolicy::from_server(&data["settings"])));
                                     resize_allowed = allows_resize(&data["settings"]);
                                     screen_policy = ScreenPolicy::from_server(&data["settings"]);
                                     let _ = events.send(SessionEvent::ScreenPolicy(screen_policy.clone()));
@@ -1759,7 +1805,76 @@ mod tests {
             waiting: String::new(),
             audio_output: None,
             audio_bitrate: None,
+            mic: None,
         }
+    }
+
+    #[test]
+    fn uplink_mic_frames_sent_as_binary_after_ready() {
+        let frame = capture::mic_frame(&[0x68, 0x01]);
+        match uplink_message(true, frame) {
+            Some(Message::Binary(bytes)) => assert_eq!(bytes.as_ref(), [0x02, 0x68, 0x01]),
+            other => panic!("expected a binary frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uplink_dropped_before_ready() {
+        assert!(uplink_message(false, capture::mic_frame(&[1])).is_none());
+    }
+
+    #[tokio::test]
+    async fn uplink_frames_dropped_after_close() {
+        let (sender, receiver) = mpsc::channel(capture::MIC_QUEUE);
+        let mut frames = Some(receiver);
+        sender.try_send(vec![2, 9]).unwrap();
+        assert_eq!(uplink(&mut frames).await, [2, 9]);
+        // The window's sender is gone: nothing more ever comes, and the channel is dropped.
+        drop(sender);
+        let waited = tokio::time::timeout(Duration::from_millis(50), uplink(&mut frames)).await;
+        assert!(waited.is_err());
+        assert!(frames.is_none());
+        // No channel at all (a stream without a microphone) never yields either.
+        let waited = tokio::time::timeout(Duration::from_millis(20), uplink(&mut None)).await;
+        assert!(waited.is_err());
+    }
+
+    #[test]
+    fn capture_replies_become_events() {
+        assert!(matches!(
+            capture_event("MICROPHONE_DISABLED"),
+            Some(SessionEvent::Capture(capture::Reply::Disabled(
+                capture::Subject::Microphone
+            )))
+        ));
+        assert!(matches!(
+            capture_event("CAPTURE_DEMAND microphone 1"),
+            Some(SessionEvent::Capture(capture::Reply::Demand(
+                capture::Subject::Microphone,
+                true
+            )))
+        ));
+        assert!(capture_event("VIDEO_STARTED").is_none());
+        assert!(capture_event(r#"{"type":"server_settings"}"#).is_none());
+    }
+
+    #[test]
+    fn capture_policy_event_on_server_settings() {
+        let data = json!({"type": "server_settings", "settings": {
+            "microphone_enabled": {"value": false, "locked": true}
+        }});
+        assert!(primary_display(&data));
+        let policy = capture::CapturePolicy::from_server(&data["settings"]);
+        assert!(!policy.mic.permitted && policy.mic.locked);
+    }
+
+    #[test]
+    fn capture_policy_emitted_on_live_server_settings_with_display_id() {
+        // Live changes come as `server_settings` with a `displayId`: the primary's count.
+        let live = json!({"type": "server_settings", "displayId": "primary", "settings": {}});
+        assert!(primary_display(&live));
+        let secondary = json!({"type": "server_settings", "displayId": "display2", "settings": {}});
+        assert!(!primary_display(&secondary));
     }
 
     #[test]
