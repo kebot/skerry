@@ -10,7 +10,7 @@ id: 067NC4KG01SKERRY0000000002
 <!-- compose:unresolved id=ARCH-GAP-VS-07 concept="cross-display-drag" question="Second display settled (ARCH-039). Deferred: mapping a drag that crosses between the two display windows." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-02 concept="webrtc-transport" question="Prototype WebRTC signaling, negotiated codecs, ICE/STUN/TURN, data-channel input, and SealSkin session handoff before adding a transport selector alongside WebSockets." -->
 <!-- compose:unresolved id=ARCH-GAP-VS-03 concept="extended-codecs-and-tuning" question="Evaluate VP8/VP9 decode paths where VideoToolbox lacks hardware decode, plus 10-bit, 4:4:4, Turbo, paint-over, and CPU encoder tuning." -->
-<!-- compose:unresolved id=ARCH-GAP-VS-05 concept="session-controls-ux" question="Section memory, scroll position, and dropdown shadow are settled (ARCH-026). Still open: the web sidebar's stream-toggle tile row (ARCH-020)." -->
+<!-- compose:unresolved id=ARCH-GAP-VS-05 concept="stream-toggle-tiles" question="Deferred (ARCH-025): the web sidebar's stream-toggle tile row; every toggle in it is already in Session Controls." -->
 
 ### Goal
 
