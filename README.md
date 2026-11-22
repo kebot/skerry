@@ -39,9 +39,10 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 
 ### Option 2: Install with Homebrew
 
-If you have the repository cloned locally:
 ```sh
-brew install --cask --no-quarantine ./packaging/homebrew/Casks/skerry.rb
+brew tap kebot/skerry https://github.com/kebot/skerry
+brew install --cask kebot/skerry/skerry
+xattr -cr /Applications/Skerry.app
 ```
 
 ---

@@ -39,7 +39,7 @@ Provide a native macOS client (`crates/skerry-mac`, `gpui-kit` `0.10.0`) for Sea
 - `macos-release-pipeline` (`ARCH-040`):
   - `scripts/bundle.sh` produces ad-hoc signed `dist/Skerry.app` (`dev.kebot.skerry`, `assets/icons/Skerry.icns`), `dist/Skerry-<version>-<arch>.dmg`, `dist/Skerry-<version>-<arch>.zip`, and `dist/SHA256SUMS`, with optional `CODESIGN_IDENTITY` and notarization env-var hooks.
   - `.github/workflows/release-macos.yml` builds and publishes macOS `arm64` releases on `v*` tags (GitHub Actions and Forgejo Actions compatible).
-  - `packaging/homebrew/Casks/skerry.rb` and `README.md` provide Homebrew Cask (`--no-quarantine`) and direct DMG (`xattr -cr /Applications/Skerry.app`) installation.
+  - `Casks/skerry.rb` (in-repo Homebrew tap) and `README.md` provide Homebrew Cask (`brew tap kebot/skerry https://github.com/kebot/skerry && brew install --cask kebot/skerry/skerry`) and direct DMG (`xattr -cr /Applications/Skerry.app`) installation.
 - `domain-readiness`:
   - `video-and-screen`: Milestone 1 + H.264/H.265/AV1 settled (H.265/AV1 continuity on Selkies 2.3.0 in `ARCH-012`); second display, WebRTC, and VP8/VP9/advanced encoder options open on the frontier.
   - `launcher-and-sessions`: launch/resume, Library search/icons/filters, Launch Dialog (storage with named homes, GPU, VPN, language, timezone, Wayland, collaborative, remembered per-app options) matching the web launcher (`ARCH-016`), session thumbnails, confirmed Stop (`ARCH-013`), and multi-window sessions (`ARCH-022`) settled; startup progress, one-click launch, Send File, open links/files, favorites/hidden/recents, persistent storage, account recovery, cluster origins, and native Mac app presence (`ARCH-GAP-LS-09`) open on the frontier.

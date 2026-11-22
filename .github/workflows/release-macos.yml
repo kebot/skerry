@@ -96,7 +96,9 @@ jobs:
 
           ### Install via Homebrew
           \`\`\`sh
-          brew install --cask --no-quarantine ./packaging/homebrew/Casks/skerry.rb
+          brew tap kebot/skerry https://github.com/kebot/skerry
+          brew install --cask kebot/skerry/skerry
+          xattr -cr /Applications/Skerry.app
           \`\`\`
 
           ### Install from DMG
