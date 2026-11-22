@@ -7,10 +7,8 @@ id: 067NC4KG01SKERRY0000000003
 # Launcher and Sessions Domain
 
 <!-- compose:status=provisional provenance=compose-managed -->
-<!-- compose:unresolved id=ARCH-GAP-LS-01 concept="launch-options-and-progress" question="Storage (Auto/Cleanroom/named homes), GPU, VPN, language, timezone, Wayland, collaborative, remembered options, and Copy link options are settled (ARCH-013, ARCH-016). Still open: stage progress and cold-pull timeout recovery, and one-click remembered launch." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-02 concept="session-management" question="Thumbnails and Stop with a data-loss confirmation are settled (ARCH-013). Still open: Send File from the launcher." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-03 concept="open-links-and-files" question="Accept pasted URLs in the omnibar and local files via native macOS mechanisms (File -> Open... Cmd+O, window drag-and-drop, and .app bundle CFBundleDocumentTypes / on_open_urls Finder 'Open With' handler — no web-style 'Upload a file' omnibar button), filter apps by declared URL/extension support, and launch with open-or-stage progress via SealSkin 0.5.0 /api/launch/url|file|file_path, or hand a URL to a running session via POST /api/sessions/<id>/open_url; send only http, https, ftp, or space-free magnet addresses." -->
-<!-- compose:unresolved id=ARCH-GAP-LS-04 concept="launcher-library" question="Search (apps and sessions), app icons, category filters (ARCH-013), and per-app saved launch options (ARCH-016) are settled. Still open: recents, favorites and hidden apps (where they are saved, and how a hidden app is shown again), and running-session reuse matching app + storage." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-05 concept="persistent-storage" question="Integrate SealSkin storage APIs for homes, shared files (browse/search/mkdir/upload/download/launch-stored-file), and permitted public links with password/expiry/revocation." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-06 concept="account-and-key-recovery" question="Display signed-in account, effective capabilities, and usage limits; offer browser wake flow for dormant keys and replacement prompt for expired/revoked keys." -->
 <!-- compose:unresolved id=ARCH-GAP-LS-07 concept="cluster-and-session-origins" question="Support Automatic/pool/node placement and validate trusted per-session origins and token handoff while keeping application keys strictly on the control-plane origin." -->
@@ -35,10 +33,17 @@ Manage the complete SealSkin control-plane lifecycle: credential authentication 
   - Loads the library via `POST /companion/api/applications`, `GET /companion/api/sessions`, `POST /companion/api/admin/status` (launch rights, GPUs, VPNs; optional), and `GET /companion/api/homedirs` (with persistent storage), and launches via `POST /companion/api/launch/simple` from the **Launch Dialog**. Escape, the close button, or a backdrop click dismiss it. The backdrop occludes the Library, so a backdrop click never also activates what is underneath.
   - Launch options match SealSkin's web launcher (`ARCH-016`, `launch_options.rs`): **Storage** (Auto, Cleanroom, named homes; hidden without persistent storage; Auto creates and sends `auto-<app>`), **GPU** ("None" plus the GPUs that fit the app; hidden without GPU rights or a fitting GPU), **VPN** and **VPN endpoint** (endpoint only with two or more), searchable **Language** labelled with the Mac's locale names and defaulting to the locale nearest the Mac's, **Collaborative Session**, **Wayland Mode**, the Mac's time zone sent with every launch, and **Copy link** carrying the non-default options. Options are remembered per app after a successful launch and reused where they still hold.
   - Search filters applications and running sessions by name; category chips filter applications. App icons come from `GET /companion/api/app_icon/<id>` (meta apps) or the same-origin `logo` path, decoded with size limits and downscaled to 256 px.
-  - Favorite / Hide are not shown until they are saved somewhere (`ARCH-GAP-LS-04`); the Launch Dialog never offers a control that does nothing.
-  - Unresolved frontier (`ARCH-GAP-LS-01`): startup progress stages and one-click remembered launch.
+  - Library organization (settled: `ARCH-027`):
+    - Favorites, hidden apps and recents (up to 8) are saved per server in the preferences `library` key. The Library shows Running sessions, Favorites, Recent, then Applications.
+    - Hidden apps leave All and the categories but still match a search, and a **Hidden (n)** chip lists them.
+    - Favorite and Hide are offered in the Launch Dialog and in a tile right-click menu.
+    - A running session with the same app, storage and Collaborative flag turns the dialog's primary button into **Open Running Session**.
+  - Launch progress (settled: `ARCH-027`):
+    - Every launch carries a `launch_id`, sent again as `X-Idempotency-Key`. A launching card follows `GET /companion/api/launch/progress/<id>` (Requesting, Pulling image, Starting, Connecting) for up to 960 s.
+    - The card offers Keep Waiting / Retry on a stall and Retry / Dismiss on a failure, without ever starting a second container.
+    - A session window that is still waiting offers Keep Waiting / Retry / Disconnect.
+    - Tiles with remembered options launch in one click (hover ▶ or Option-click).
   - Unresolved frontier (`ARCH-GAP-LS-03`): open pasted URLs and local files in compatible remote apps.
-  - Unresolved frontier (`ARCH-GAP-LS-04`): recents, favorites, hidden apps, and matching session reuse.
 - `running-sessions-supervision` (list/resume/disconnect, thumbnails, and Stop settled in `ARCH-013`; Send File open in `ARCH-GAP-LS-02`):
   - Lists sessions via `GET /companion/api/sessions` and resumes over Selkies WebSocket; disconnecting leaves the remote session running. Session cards show a thumbnail (`GET /companion/api/sessions/<id>/screenshot`, downscaled to 960 px), the app icon, start time, a GPU pill, and a storage pill ("Cleanroom" when the session has no home).
   - **Stop** (labelled button) asks for confirmation that explains the remote app ends and cleanroom data is deleted, then calls the session stop API; Escape or Cancel keeps the session.

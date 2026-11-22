@@ -40,6 +40,10 @@ subject: skerry
   - `audio::tests::*` use the fake `Backend`: following the default, chosen-missing fallback and return, the stall heartbeat (no false stall while muted), backoff and strikes, the probe keeping the fallback playing, and one failed listing keeping a healthy stream.
   - The `AudioBitrate` parsing accepts strings or numbers, and the `SETTINGS` audio_bitrate message is the exact text.
   - A preferences file without audio settings loads.
+- Task B tests pass (`ARCH-027`):
+  - `launch_progress::tests::*`: stages only move forward, a POST success wins, a same-id Retry is offered only after a lost request, a 401 waits for the outstanding POST, and a gateway 5xx counts as lost.
+  - The `library` preferences load tolerantly (a bad entry costs only that entry, lists are capped), and the reuse match is app + storage + Collaborative, oldest first.
+  - A Refresh from before a launch keeps that launch's session.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not
