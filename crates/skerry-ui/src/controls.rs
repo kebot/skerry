@@ -149,6 +149,8 @@ pub enum ControlsAction {
     Disconnect,
     /// Open the session's Files window (`ARCH-023`).
     OpenFiles,
+    /// Open the session's Apps window (`ARCH-035`).
+    OpenApps,
     SetInput {
         id: String,
         enabled: bool,
@@ -467,6 +469,59 @@ pub struct ControlsProps {
     pub gamepads: Option<GamepadsProps>,
     /// The Printing card (`ARCH-033`); `None` hides it.
     pub printing: Option<PrintingProps>,
+    /// The server allows installing apps: the header offers Apps (`ARCH-035`).
+    pub apps_available: bool,
+}
+
+/// The header's action buttons, in order: Mute/Unmute, Pause/Resume, Full Screen, Files,
+/// Apps (only when available), Reconnect, Disconnect.
+pub fn header_actions(props: &ControlsProps) -> Vec<(&'static str, ControlsAction)> {
+    header_actions_for(
+        props.audio,
+        props.video,
+        props.fullscreen,
+        props.apps_available,
+    )
+}
+
+fn header_actions_for(
+    audio: Option<bool>,
+    video: Option<bool>,
+    fullscreen: bool,
+    apps_available: bool,
+) -> Vec<(&'static str, ControlsAction)> {
+    let mut actions = Vec::new();
+    if let Some(enabled) = audio {
+        actions.push((
+            if enabled { "Mute" } else { "Unmute" },
+            ControlsAction::SetAudio(!enabled),
+        ));
+    }
+    if let Some(enabled) = video {
+        actions.push((
+            if enabled {
+                "Pause Video"
+            } else {
+                "Resume Video"
+            },
+            ControlsAction::SetPlayback(!enabled),
+        ));
+    }
+    actions.push((
+        if fullscreen {
+            "Exit Full Screen"
+        } else {
+            "Full Screen"
+        },
+        ControlsAction::ToggleFullScreen,
+    ));
+    actions.push(("Files", ControlsAction::OpenFiles));
+    if apps_available {
+        actions.push(("Apps", ControlsAction::OpenApps));
+    }
+    actions.push(("Reconnect", ControlsAction::Reconnect));
+    actions.push(("Disconnect", ControlsAction::Disconnect));
+    actions
 }
 
 pub fn dpi_label(dpi: u16) -> String {
@@ -497,52 +552,11 @@ pub fn render(
         return_focus: state.return_focus.clone(),
         open: state.open_menu,
     };
-    let actions = div()
-        .h_flex()
-        .flex_wrap()
-        .gap_2()
-        .when_some(props.audio, |row, enabled| {
-            row.child(action_button(
-                if enabled { "Mute" } else { "Unmute" },
-                ControlsAction::SetAudio(!enabled),
-                &on_action,
-            ))
-        })
-        .when_some(props.video, |row, enabled| {
-            row.child(action_button(
-                if enabled {
-                    "Pause Video"
-                } else {
-                    "Resume Video"
-                },
-                ControlsAction::SetPlayback(!enabled),
-                &on_action,
-            ))
-        })
-        .child(action_button(
-            if props.fullscreen {
-                "Exit Full Screen"
-            } else {
-                "Full Screen"
-            },
-            ControlsAction::ToggleFullScreen,
-            &on_action,
-        ))
-        .child(action_button(
-            "Files",
-            ControlsAction::OpenFiles,
-            &on_action,
-        ))
-        .child(action_button(
-            "Reconnect",
-            ControlsAction::Reconnect,
-            &on_action,
-        ))
-        .child(action_button(
-            "Disconnect",
-            ControlsAction::Disconnect,
-            &on_action,
-        ));
+    let actions = div().h_flex().flex_wrap().gap_2().children(
+        header_actions(props)
+            .into_iter()
+            .map(|(label, action)| action_button(label, action, &on_action)),
+    );
 
     let toggle = |section_id: Section| {
         let on_action = Rc::clone(&on_action);
@@ -2130,6 +2144,41 @@ mod tests {
         assert!(!menu_is_current(&built, &now_disabled));
         assert!(!menu_is_current(&built, &same[..1]));
         assert!(!menu_is_current(&[], &same));
+    }
+
+    #[test]
+    fn header_offers_apps_only_when_available() {
+        let labels = |apps: bool| -> Vec<&'static str> {
+            header_actions_for(Some(true), Some(true), false, apps)
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect()
+        };
+        assert_eq!(
+            labels(true),
+            [
+                "Mute",
+                "Pause Video",
+                "Full Screen",
+                "Files",
+                "Apps",
+                "Reconnect",
+                "Disconnect"
+            ]
+        );
+        assert!(header_actions_for(None, None, true, true)
+            .contains(&("Apps", ControlsAction::OpenApps)));
+        assert_eq!(
+            labels(false),
+            [
+                "Mute",
+                "Pause Video",
+                "Full Screen",
+                "Files",
+                "Reconnect",
+                "Disconnect"
+            ]
+        );
     }
 
     #[test]

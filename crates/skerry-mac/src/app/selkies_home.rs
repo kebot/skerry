@@ -806,7 +806,7 @@ impl Launcher {
             direct::screenshot(&server)
                 .await
                 .ok()
-                .and_then(|bytes| decode_image(&bytes, THUMBNAIL_MAX_EDGE))
+                .and_then(|bytes| decode_image(&bytes, THUMBNAIL_MAX_EDGE, super::THUMBNAIL_LIMITS))
         });
         let window = self.window;
         let server_generation = self.server_generation;

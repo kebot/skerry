@@ -52,7 +52,7 @@ Immaterial: build timestamps, local target cache state, and formatting-only edit
 
 Postconditions:
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` pass.
-- No embedded browser is used; Skerry talks directly to SealSkin and Selkies.
+- No embedded browser is used; Skerry talks directly to SealSkin and Selkies. The one exception is the Apps catalog fetch from the Selkies web client's GitHub raw URL, which uses a separate client with no credentials, is size-capped, and is HTTPS only (`ARCH-035`).
 - Session URLs and application keys are never written to preferences files; environment/`.env` keys are never persisted to `~/.config/skerry/config.toml`, and Skerry never reads or writes the macOS Keychain (`ARCH-011`).
 
 ### Continuity
@@ -64,7 +64,7 @@ input-driven
 - `crates/skerry-mac/Cargo.toml` uses `gpui-kit = "0.10.0"` (initialized via `gpui_kit::init(cx)` with `gpui_kit::assets::Assets`; windows opened via `gpui_kit::open_window` are wrapped in `gpui_kit::base::Root`).
 - Cross-window handles must store `(AnyWindowHandle, Entity<T>)` instead of calling `window.window_handle().downcast::<T>()` (since `gpui_kit::open_window` mounts `Root`), and child windows whose initial render reads another entity (session windows opened by the `Launcher`, Session Controls reading its `SessionWindow`) must be opened via `cx.defer(...)` outside that entity's update closures to avoid re-entrant entity lease panics.
 - The multi-threaded Tokio `Runtime` is created in `main` before `Application::run` and kept alive for the lifetime of the app; all network I/O runs on Tokio and communicates with GPUI via `mpsc` / `watch` channels.
-- JPEG frames decoded off the main thread into `RenderImage` must retire previous frames via `window.drop_image(previous)` inside the paint closure to prevent texture leaks (~10 MB/s at 60 fps).
+- JPEG stripes decoded off the main thread into per-stripe `RenderImage`s (`ARCH-034`) must retire replaced stripes via `window.drop_image` inside the paint closure, 4 paints later, to prevent texture leaks (~10 MB/s at 60 fps).
 - Async or long-lived work on an entity that another window also renders (a `SessionWindow` is rendered by its Session Controls) captures `Window::window_handle(window)` and updates through that handle. `gpui-pre`'s `update_in` resolves the entity's *current* window instead (`ARCH-015`).
 - Library images (app icons, session thumbnails) are GPU textures too: every replaced, removed, or stale image is retired with `window.drop_image` on the next Launcher render, and server images are decoded with size limits and downscaled before upload (`ARCH-014`).
 - Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.

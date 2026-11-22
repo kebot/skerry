@@ -1,4 +1,5 @@
 mod account;
+mod apps_window;
 mod controls;
 mod display;
 mod files_model;
@@ -201,6 +202,7 @@ pub fn run() {
                 items: vec![
                     MenuItem::action("Session Controls", ToggleSessionControls),
                     MenuItem::action("Files", ToggleFiles),
+                    MenuItem::action("Apps", ToggleApps),
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
                     // No checkmark: menus are set once, and the strip is per window.
                     MenuItem::action("Toggle Stats Over Stream", ToggleStatsStrip),
@@ -275,6 +277,9 @@ actions!(
         CloseSessionControls,
         ToggleFullScreen,
         ToggleFiles,
+        /// Opens the session's Apps window or brings it forward; never closes it
+        /// (`ARCH-035`). No key chord: installing apps is occasional.
+        ToggleApps,
         OpenFile,
         OpenLocation,
         ToggleStatsStrip,
@@ -289,6 +294,7 @@ actions!(
 pub(crate) fn key_bindings() -> Vec<KeyBinding> {
     let mut bindings = global_bindings();
     bindings.extend(files_window::key_bindings());
+    bindings.extend(apps_window::key_bindings());
     bindings.extend(library_key_bindings());
     bindings.extend(crate::shortcuts::suppress_bindings());
     bindings
@@ -1006,7 +1012,7 @@ impl Launcher {
             let pending = self.rt.spawn(async move {
                 api.app_icon(&app)
                     .await
-                    .and_then(|b| decode_image(&b, ICON_MAX_EDGE))
+                    .and_then(|b| decode_image(&b, ICON_MAX_EDGE, crate::apps::ICON_RASTER_LIMITS))
             });
             cx.spawn(async move |this, cx| {
                 if let Ok(Some(image)) = pending.await {
@@ -1031,7 +1037,7 @@ impl Launcher {
             let pending = self.rt.spawn(async move {
                 api.session_thumbnail(&session_id)
                     .await
-                    .and_then(|b| decode_image(&b, THUMBNAIL_MAX_EDGE))
+                    .and_then(|b| decode_image(&b, THUMBNAIL_MAX_EDGE, THUMBNAIL_LIMITS))
             });
             cx.spawn(async move |this, cx| {
                 if let Ok(Some(image)) = pending.await {
@@ -3214,27 +3220,25 @@ const ICON_MAX_EDGE: u32 = 256;
 /// Longest edge kept for session thumbnails (card is ~470 pt wide @2x).
 const THUMBNAIL_MAX_EDGE: u32 = 960;
 
-/// Decodes server-supplied image bytes with hard size limits and downscales to `max_edge`,
-/// so a huge or hostile image can't exhaust memory or pin a full-size texture.
-fn decode_image(bytes: &[u8], max_edge: u32) -> Option<Arc<RenderImage>> {
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(8192);
-    limits.max_image_height = Some(8192);
-    limits.max_alloc = Some(256 * 1024 * 1024);
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    reader.limits(limits);
-    let mut decoded = reader.decode().ok()?;
-    if decoded.width() > max_edge || decoded.height() > max_edge {
-        decoded = decoded.thumbnail(max_edge, max_edge);
-    }
-    let mut pixels = decoded.into_rgba8();
-    for pixel in pixels.pixels_mut() {
-        pixel.0.swap(0, 2); // RGBA -> BGRA for GPUI RenderImage
-    }
+/// Session thumbnails are whole remote desktops (up to 8K wide), but never need more than a
+/// 64 MB decode.
+const THUMBNAIL_LIMITS: crate::apps::RasterLimits = crate::apps::RasterLimits {
+    max_dimension: 8192,
+    max_alloc: 64 * 1024 * 1024,
+};
+
+/// Decodes server-supplied image bytes under `limits` and downscales to `max_edge`, so a huge
+/// or hostile image can't exhaust memory or pin a full-size texture. App icons use the Apps
+/// window's icon limits (2048 px, 32 MB).
+fn decode_image(
+    bytes: &[u8],
+    max_edge: u32,
+    limits: crate::apps::RasterLimits,
+) -> Option<Arc<RenderImage>> {
+    let pixels = crate::apps::decode_raster(bytes, max_edge, limits)?;
+    let buffer = image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.bgra)?;
     Some(Arc::new(RenderImage::new(smallvec![image::Frame::new(
-        pixels
+        buffer
     )])))
 }
 
@@ -3914,6 +3918,24 @@ mod tests {
             }
         });
         keys
+    }
+
+    #[test]
+    fn apps_has_no_global_chord() {
+        // Apps is occasional: no binding outside the Apps window opens it, and every Apps
+        // window key stays in that window (`ARCH-035`), so `CHORDS` is unchanged.
+        for binding in key_bindings() {
+            let context = binding.predicate().map(|p| p.to_string());
+            if binding.action().name() == "sealskin::ToggleApps" {
+                panic!("ToggleApps is bound under {context:?}");
+            }
+            if binding.action().name().starts_with("apps_window::") {
+                assert!(
+                    matches!(context.as_deref(), Some("AppsWindow" | "AppsGrid")),
+                    "{context:?}"
+                );
+            }
+        }
     }
 
     #[test]

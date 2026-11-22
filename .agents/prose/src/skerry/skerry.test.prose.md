@@ -71,6 +71,20 @@ subject: skerry
   - The `js,c/d/b/a/h` encodings, the W3C mapping, slots per session and slot number, and rumble capped at 5 s.
   - Closing while captured lifts buttons and sends `p,0`.
   - A pending print sheet skips a pending capture.
+- Task I tests pass (`ARCH-034`):
+  - Stripe edges snap to device pixels at scales 2.0, 1.0, 0.77 and 1.5.
+  - Retired stripes are dropped after 4 paints, and every exit retires every stripe.
+  - The bottom stripe presents at once, the settle presents within 2 ms, and the pacer resets.
+  - A JPEG cut inside its headers is rejected, and grayscale decodes.
+- Task J tests pass (`ARCH-035`):
+  - `apps::tests::*`:
+    - the gate sends nothing while disconnected or not allowed
+    - support detection hides Apps after 5 s and a late reply restores it
+    - the YAML budget and the local-repo catalog
+  - SVG refusals (entity, marker, `<use>`, nested paint servers through classes, styles and ancestors, `url()` whitespace variants, `@import`) all complete in under 50 ms. Filters are stripped.
+  - A pattern bomb sent to the worker is killed within 3.5 s and the next icon still decodes.
+  - All 137 fixture icons decode.
+  - The GitHub client sends no credentials and refuses http.
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` succeed on the workspace.
 
 ### Expects Not

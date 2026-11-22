@@ -1,4 +1,5 @@
 pub mod account;
+pub mod apps;
 pub mod assets;
 pub mod components;
 pub mod connect;

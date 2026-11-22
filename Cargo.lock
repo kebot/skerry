@@ -6204,6 +6204,7 @@ dependencies = [
  "futures-util",
  "gpui-kit",
  "image",
+ "libc",
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
@@ -6223,10 +6224,12 @@ dependencies = [
  "rcgen",
  "regex",
  "reqwest",
+ "resvg 0.46.0",
  "ring",
  "rustls",
  "rustls-native-certs",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "skerry-ui",
  "smallvec",
@@ -6237,6 +6240,8 @@ dependencies = [
  "toml_edit 0.25.20+spec-1.1.0",
  "url",
  "uuid",
+ "zune-core 0.5.3",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]

@@ -494,6 +494,59 @@ impl SelkiesClient {
         })
     }
 
+    /// The local repository's catalog document, `api/apps/metadata.yml` (`ARCH-035`).
+    pub fn apps_metadata_url(&self) -> Url {
+        self.url("api/apps/metadata.yml")
+    }
+
+    /// Fetches the local repository's catalog with the session cookie and no `Origin`,
+    /// within [`crate::apps::CATALOG_CAP`] and [`crate::apps::CATALOG_TIMEOUT`].
+    pub async fn apps_metadata(&self) -> Result<Vec<u8>, Error> {
+        self.capped_get(
+            self.apps_metadata_url(),
+            crate::apps::CATALOG_CAP,
+            crate::apps::CATALOG_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Fetches one catalog icon, `icon_path` from [`crate::apps::icon_path`] (already one
+    /// encoded segment), within [`crate::apps::ICON_CAP`] and [`crate::apps::ICON_TIMEOUT`].
+    pub async fn apps_icon(&self, icon_path: &str) -> Result<Vec<u8>, Error> {
+        if icon_path.is_empty() || icon_path.contains('/') {
+            return Err(Error::UnsafeName(icon_path.to_owned()));
+        }
+        self.capped_get(
+            self.url(&format!("api/apps/img/{icon_path}")),
+            crate::apps::ICON_CAP,
+            crate::apps::ICON_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn capped_get(&self, url: Url, cap: usize, timeout: Duration) -> Result<Vec<u8>, Error> {
+        let fetch = async {
+            let mut response = checked(self.request(Method::GET, url).send().await?).await?;
+            if response
+                .content_length()
+                .is_some_and(|length| length > cap as u64)
+            {
+                return Err(Error::Network("the answer is too large".into()));
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if body.len() + chunk.len() > cap {
+                    return Err(Error::Network("the answer is too large".into()));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(body)
+        };
+        tokio::time::timeout(timeout, fetch)
+            .await
+            .map_err(|_| Error::Network("timed out".into()))?
+    }
+
     fn files_url(&self, remote: &str) -> Url {
         let path = remote
             .split('/')
@@ -1093,6 +1146,29 @@ mod tests {
                     let rel = decode(&files["files/".len()..]);
                     download(&mut stream, &fake, &rel, &headers).await
                 }
+                ("GET", "apps/metadata.yml") => {
+                    let body =
+                        b"include:\n  - {name: a, full_name: A, icon: a.svg, description: x}\n";
+                    respond(&mut stream, "200 OK", &[], body).await
+                }
+                ("GET", "apps/img/a.svg") => {
+                    respond(
+                        &mut stream,
+                        "200 OK",
+                        &[],
+                        b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+                    )
+                    .await
+                }
+                ("GET", "apps/img/huge.png") => {
+                    respond(
+                        &mut stream,
+                        "200 OK",
+                        &[],
+                        &vec![0u8; crate::apps::ICON_CAP + 1],
+                    )
+                    .await
+                }
                 ("GET", print) if print.starts_with("print/") => {
                     let name = decode(&print["print/".len()..]);
                     print_document(&mut stream, &fake, &name, &headers).await
@@ -1534,6 +1610,29 @@ mod tests {
             )
             .await;
             (result, local, job_dir)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn apps_catalog_and_icons_carry_the_cookie_and_no_origin() {
+            let server = start().await;
+            let (access, fake) = (&server.access, &server.fake);
+            let catalog = access.apps_metadata().await.unwrap();
+            let apps = crate::apps::parse_catalog(std::str::from_utf8(&catalog).unwrap()).unwrap();
+            assert_eq!(apps[0].name, "a");
+            let icon = access.apps_icon("a.svg").await.unwrap();
+            assert!(icon.starts_with(b"<svg"));
+            assert!(access.apps_icon("huge.png").await.is_err(), "over the cap");
+            assert!(access.apps_icon("../x").await.is_err());
+            let gets = requests(fake, "GET", "/sess-1/api/apps/");
+            assert_eq!(gets.len(), 3, "the refused path never left");
+            for get in &gets {
+                assert_eq!(get.headers["cookie"], COOKIE_VALUE);
+                assert!(!get.headers.contains_key("origin"));
+            }
+            assert_eq!(
+                access.apps_metadata_url().as_str(),
+                format!("{}api/apps/metadata.yml", access.base)
+            );
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
