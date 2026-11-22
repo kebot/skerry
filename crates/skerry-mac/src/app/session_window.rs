@@ -337,7 +337,10 @@ impl SessionWindow {
                 });
             }
             if active {
-                if std::mem::take(&mut this.pending_capture) {
+                // A print sheet about to open on this activation wins: capturing would hide
+                // the cursor over it (`ARCH-032`, `ARCH-033`).
+                let pending = std::mem::take(&mut this.pending_capture);
+                if engages_pending_capture(pending, this.print_sheet_pending(window)) {
                     if let Some(stream) = &this.current {
                         stream.engage_capture(window, cx);
                     }
@@ -910,19 +913,35 @@ impl SessionWindow {
         }
         if gate.key && cx.has_global::<Gamepads>() {
             let (window, slots) = (self.window, self.gamepad_link.announced_slots());
-            let server = self.api.server().to_string();
-            cx.update_global::<Gamepads, _>(|gamepads, _| gamepads.drive(window, &server, &slots));
+            let session = self.gamepad_session();
+            cx.update_global::<Gamepads, _>(|gamepads, _| gamepads.drive(window, &session, &slots));
         }
+    }
+
+    /// The Selkies session whose slot table this window's pads use: each session has its
+    /// own, even on one SealSkin host.
+    fn gamepad_session(&self) -> String {
+        format!("{}|{}", self.api.server(), self.remote.session_id)
+    }
+
+    /// A print sheet is open, opening, or about to open on its own.
+    fn print_sheet_pending(&self, window: &Window) -> bool {
+        let sheet = super::native_window(window)
+            .is_some_and(|native| print_dialog::sheet_attached(&native));
+        sheet
+            || self.print_jobs.opening.is_some()
+            || self.print_jobs.sheet_job.is_some()
+            || (self.preferences.printing.auto_print && self.print_jobs.pending_auto.is_some())
     }
 
     /// Forgets the announced slots another window drives now (`ARCH-032`).
     fn yield_gamepad_slots(&mut self, cx: &App) -> Vec<u8> {
         let window = self.window;
-        let server = self.api.server().to_string();
+        let session = self.gamepad_session();
         match cx.try_global::<Gamepads>() {
             Some(gamepads) => self
                 .gamepad_link
-                .yield_to(&|slot| gamepads.drives(window, &server, slot)),
+                .yield_to(&|slot| gamepads.drives(window, &session, slot)),
             None => Vec::new(),
         }
     }
@@ -1659,6 +1678,11 @@ pub(super) fn saved_label(saved: &std::path::Path) -> String {
     format!("Saved to {folder}")
 }
 
+/// Whether a pending capture engages on activation: not when a print sheet is pending.
+fn engages_pending_capture(pending: bool, print_sheet_pending: bool) -> bool {
+    pending && !print_sheet_pending
+}
+
 /// The chosen device's name to save: when the status answers that choice, lists the device,
 /// and its name differs from the saved one.
 fn output_name_to_save(
@@ -1810,6 +1834,13 @@ impl Render for SessionWindow {
 mod tests {
     use super::*;
     use crate::audio::OutputDevice;
+
+    #[test]
+    fn a_pending_print_sheet_skips_the_pending_capture() {
+        assert!(engages_pending_capture(true, false));
+        assert!(!engages_pending_capture(true, true));
+        assert!(!engages_pending_capture(false, false));
+    }
 
     #[test]
     fn the_chosen_name_is_saved_only_when_it_changes() {

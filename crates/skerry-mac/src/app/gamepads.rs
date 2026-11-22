@@ -18,13 +18,14 @@ pub(crate) struct Gamepads {
     pads: Vec<Pad>,
     /// The key session window, if any: only it sends pads.
     active: Option<SessionHandle>,
-    /// The window that last drove each slot of each server while key. Only it may send
+    /// The window that last drove each slot of each Selkies session while key. Only it may send
     /// that slot's `js,d` (`ARCH-032`).
     drivers: Drivers<AnyWindowHandle>,
 }
 
-/// The window driving each `(server, slot)`. Slot tables are per Selkies server, so slot 0
-/// on one server and slot 0 on another are different Players.
+/// The window driving each `(session, slot)`. Every Selkies session has its own slot table,
+/// even two on one SealSkin host, so slot 0 in one and slot 0 in another are different
+/// Players.
 #[derive(Debug)]
 pub(super) struct Drivers<W>(std::collections::HashMap<(String, u8), W>);
 
@@ -35,16 +36,16 @@ impl<W> Default for Drivers<W> {
 }
 
 impl<W: Copy + PartialEq> Drivers<W> {
-    fn drive(&mut self, window: W, server: &str, slots: &[u8]) {
+    fn drive(&mut self, window: W, session: &str, slots: &[u8]) {
         for &slot in slots {
-            self.0.insert((server.to_string(), slot), window);
+            self.0.insert((session.to_string(), slot), window);
         }
     }
 
-    /// Whether `window` still drives `slot` on `server` (no other window has since).
-    fn drives(&self, window: W, server: &str, slot: u8) -> bool {
+    /// Whether `window` still drives `slot` in `session` (no other window has since).
+    fn drives(&self, window: W, session: &str, slot: u8) -> bool {
         self.0
-            .get(&(server.to_string(), slot))
+            .get(&(session.to_string(), slot))
             .is_none_or(|driver| *driver == window)
     }
 }
@@ -156,14 +157,14 @@ fn hand_over<T>(
 }
 
 impl Gamepads {
-    /// The key window drives the slots it announced on its server.
-    pub(super) fn drive(&mut self, window: AnyWindowHandle, server: &str, slots: &[u8]) {
-        self.drivers.drive(window, server, slots);
+    /// The key window drives the slots it announced in its session.
+    pub(super) fn drive(&mut self, window: AnyWindowHandle, session: &str, slots: &[u8]) {
+        self.drivers.drive(window, session, slots);
     }
 
-    /// Whether `window` still drives `slot` on `server`.
-    pub(super) fn drives(&self, window: AnyWindowHandle, server: &str, slot: u8) -> bool {
-        self.drivers.drives(window, server, slot)
+    /// Whether `window` still drives `slot` in `session`.
+    pub(super) fn drives(&self, window: AnyWindowHandle, session: &str, slot: u8) -> bool {
+        self.drivers.drives(window, session, slot)
     }
 
     fn apply(&mut self, event: PadEvent) {
@@ -273,7 +274,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drivers_are_per_server_and_slot() {
+    fn drivers_are_per_session_and_slot() {
         use crate::gamepad::{Gate, Link, Pad};
         let pad = |id| Pad {
             id,
@@ -287,27 +288,27 @@ mod tests {
             input_on: true,
             key: true,
         };
-        // Window 1 on server A and window 2 on server B both drive slot 0.
+        // One SealSkin host, two sessions: window 1 and window 2 each drive slot 0.
         let mut drivers = Drivers::default();
         let (mut a, mut b) = (Link::default(), Link::default());
         a.sync(&[pad(7)], key);
-        drivers.drive(1u8, "a.example", &a.announced_slots());
+        drivers.drive(1u8, "host|session-a", &a.announced_slots());
         b.sync(&[pad(7)], key);
-        drivers.drive(2u8, "b.example", &b.announced_slots());
-        // Closing window 1 sends js,d to its own server: nothing yielded.
+        drivers.drive(2u8, "host|session-b", &b.announced_slots());
+        // Closing window 1 sends js,d to its own session: nothing yielded.
         assert!(a
-            .yield_to(&|slot| drivers.drives(1, "a.example", slot))
+            .yield_to(&|slot| drivers.drives(1, "host|session-a", slot))
             .is_empty());
         assert_eq!(a.close(), ["js,d,0"]);
         // Window 2's slot stays its own.
         assert!(b
-            .yield_to(&|slot| drivers.drives(2, "b.example", slot))
+            .yield_to(&|slot| drivers.drives(2, "host|session-b", slot))
             .is_empty());
         assert_eq!(b.announced_slots(), [0]);
-        // On the same server, a newer driver takes the slot over.
-        drivers.drive(3u8, "a.example", &[0]);
-        assert!(!drivers.drives(1, "a.example", 0));
-        assert!(drivers.drives(2, "b.example", 0));
+        // In the same session, a newer driver takes the slot over.
+        drivers.drive(3u8, "host|session-a", &[0]);
+        assert!(!drivers.drives(1, "host|session-a", 0));
+        assert!(drivers.drives(2, "host|session-b", 0));
     }
 
     #[test]
