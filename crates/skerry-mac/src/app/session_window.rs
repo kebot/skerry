@@ -8,7 +8,8 @@ use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
-    ToggleFiles, ToggleFullScreen, ToggleSessionControls, ToggleStatsStrip, APP_NAME,
+    ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSessionControls, ToggleStatsStrip,
+    APP_NAME,
 };
 use crate::audio::OutputStatus;
 use crate::input::InputFeature;
@@ -21,7 +22,7 @@ use crate::transport::{
     SOCKET_STARTUP_GRACE,
 };
 use crate::video::Codec;
-use crate::view::NativeSession;
+use crate::view::{CaptureHint, NativeSession};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{
     div, prelude::*, rgb, AnyWindowHandle, App, Context, Entity, Global, ScrollHandle, Task,
@@ -177,6 +178,14 @@ pub(super) struct SessionWindow {
     keep_waiting: bool,
     /// Last seen full-screen state; a change releases held keys (`ARCH-GAP-DC-09`).
     fullscreen: bool,
+    /// Capture Pointer was asked for from Session Controls or the menu while another
+    /// window was key: it engages when this window activates (`ARCH-032`). Any
+    /// deactivation clears it.
+    pending_capture: bool,
+    /// The capture hint over the picture: which, its generation, and whether it is fading.
+    capture_hint: Option<(CaptureHint, u64, bool)>,
+    hint_generation: u64,
+    hint_task: Option<Task<()>>,
 }
 
 impl SessionWindow {
@@ -230,6 +239,10 @@ impl SessionWindow {
             startup_stalled: None,
             keep_waiting: false,
             fullscreen: window.is_fullscreen(),
+            pending_capture: false,
+            capture_hint: None,
+            hint_generation: 0,
+            hint_task: None,
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -245,6 +258,19 @@ impl SessionWindow {
                 this.release_keys(cx);
             }
             this.resize_display(window, cx)
+        })
+        .detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                if std::mem::take(&mut this.pending_capture) {
+                    if let Some(stream) = &this.current {
+                        stream.engage_capture(window, cx);
+                    }
+                }
+            } else {
+                this.pending_capture = false;
+            }
+            cx.notify();
         })
         .detach();
         cx.observe_window_appearance(window, |this, window, cx| {
@@ -422,7 +448,18 @@ impl SessionWindow {
                 self.video = None;
                 self.startup_stalled = Some(self.keep_waiting);
             }
+            SessionEvent::PointerCapture(hint) => {
+                if let Some(hint) = hint {
+                    self.show_capture_hint(hint, cx);
+                }
+            }
             SessionEvent::Error(error) => {
+                // The capture ends with the stream; the banner explains, so no hint.
+                if let Some(stream) = &self.current {
+                    stream.release_capture(cx);
+                }
+                self.capture_hint = None;
+                self.hint_task = None;
                 self.resize_allowed = false;
                 self.settings = None;
                 self.audio = None;
@@ -723,6 +760,68 @@ impl SessionWindow {
         self.status = Some(status);
     }
 
+    /// ⌃⌥⇧Z, View → Capture Pointer, or Session Controls' button (`ARCH-032`). In the key
+    /// session window it toggles at once; otherwise this window is activated and captures
+    /// once it is key.
+    pub(super) fn request_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(stream) = &self.current else {
+            return;
+        };
+        if window.is_window_active() {
+            stream.toggle_capture(window, cx);
+        } else if !stream.pointer_captured(cx) {
+            self.pending_capture = true;
+            window.activate_window();
+        }
+    }
+
+    /// Whether this window holds the pointer (read from the stream, never mirrored).
+    /// Whether the stream has painted a picture yet.
+    pub(super) fn picture_painted(&self, cx: &App) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|stream| stream.picture_painted(cx))
+    }
+
+    pub(super) fn pointer_captured(&self, cx: &App) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|stream| stream.pointer_captured(cx))
+    }
+
+    /// Shows `hint` over the picture, replacing any other. It fades out over its last
+    /// 200 ms, then clears, unless a newer hint replaced it.
+    fn show_capture_hint(&mut self, hint: CaptureHint, cx: &mut Context<Self>) {
+        self.hint_generation += 1;
+        let generation = self.hint_generation;
+        self.capture_hint = Some((hint, generation, false));
+        let shown = hint.text().1;
+        let fade = Duration::from_millis(200);
+        let executor = cx.background_executor().clone();
+        self.hint_task = Some(cx.spawn(async move |this, cx| {
+            executor.timer(shown.saturating_sub(fade)).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some((_, current, fading)) = &mut this.capture_hint {
+                    if *current == generation {
+                        *fading = true;
+                        cx.notify();
+                    }
+                }
+            });
+            executor.timer(fade).await;
+            let _ = this.update(cx, |this, cx| {
+                if this
+                    .capture_hint
+                    .is_some_and(|(_, current, _)| current == generation)
+                {
+                    this.capture_hint = None;
+                    cx.notify();
+                }
+            });
+        }));
+        cx.notify();
+    }
+
     /// Lifts every key the session holds, before something else takes the keyboard.
     fn release_keys(&self, cx: &mut App) {
         if let Some(stream) = &self.current {
@@ -933,6 +1032,9 @@ impl SessionWindow {
         self.stream_info = None;
         self.resize_allowed = false;
         self.resize_task = None;
+        self.pending_capture = false;
+        self.capture_hint = None;
+        self.hint_task = None;
         self.stream_events = None;
         // `release_focus` queues `ku` for held keys; dropping the stream then queues
         // `Input::Close` behind them, so they reach the server before the close frame
@@ -1016,6 +1118,9 @@ impl Render for SessionWindow {
             .on_action(cx.listener(|this, _: &ToggleStatsStrip, _, cx| {
                 this.set_stats_strip(!this.preferences.stats_strip, cx);
             }))
+            .on_action(cx.listener(|this, _: &TogglePointerCapture, window, cx| {
+                this.request_capture(window, cx);
+            }))
             .when_some(self.current.as_ref(), |root, stream| {
                 root.child(stream.view())
             })
@@ -1023,6 +1128,21 @@ impl Render for SessionWindow {
             // desktop and the trigger under it (`ARCH-031`).
             .when_some(strip, |root, strip| {
                 root.child(skerry_ui::stats::strip(&strip, viewport_width))
+            })
+            // Bottom-centre with no hitbox, above a bottom banner when one shows (`ARCH-032`).
+            .when_some(self.capture_hint, |root, (hint, generation, fading)| {
+                let banner = self.status.is_some() || self.startup_stalled.is_some();
+                root.child(session::capture_hint(
+                    &hint.text().0,
+                    session::capture_hint_bottom(banner),
+                    viewport_width,
+                    if fading {
+                        session::HintFade::Out
+                    } else {
+                        session::HintFade::In
+                    },
+                    generation,
+                ))
             })
             .when_some(self.status.clone(), |root, status| {
                 root.child(session::status_banner_with_actions(

@@ -184,6 +184,8 @@ pub fn run() {
                     MenuItem::action("Toggle Full Screen", ToggleFullScreen),
                     // No checkmark: menus are set once, and the strip is per window.
                     MenuItem::action("Toggle Stats Over Stream", ToggleStatsStrip),
+                    // No checkmark either; while captured the menu bar is out of reach.
+                    MenuItem::action("Capture Pointer", TogglePointerCapture),
                 ],
                 disabled: false,
             },
@@ -255,7 +257,8 @@ actions!(
         ToggleFiles,
         OpenFile,
         OpenLocation,
-        ToggleStatsStrip
+        ToggleStatsStrip,
+        TogglePointerCapture
     ]
 );
 
@@ -282,6 +285,7 @@ fn global_bindings() -> Vec<KeyBinding> {
                 ChordId::FullScreen => KeyBinding::new(keys, ToggleFullScreen, None),
                 ChordId::Files => KeyBinding::new(keys, ToggleFiles, None),
                 ChordId::Library => KeyBinding::new(keys, ShowLibrary, None),
+                ChordId::CapturePointer => KeyBinding::new(keys, TogglePointerCapture, None),
                 ChordId::Quit => KeyBinding::new(keys, Quit, None),
             }
         })
@@ -3690,7 +3694,24 @@ mod tests {
             ChordId::FullScreen => "sealskin::ToggleFullScreen",
             ChordId::Files => "sealskin::ToggleFiles",
             ChordId::Library => "sealskin::ShowLibrary",
+            ChordId::CapturePointer => "sealskin::TogglePointerCapture",
             ChordId::Quit => "sealskin::Quit",
+        }
+    }
+
+    #[test]
+    fn capture_chord_matches_option_shift_z() {
+        let keymap = gpui_kit::Keymap::new(key_bindings());
+        // Option turns z into "¸" on a US layout; GPUI matches the key, not the character.
+        let typed = Keystroke {
+            key_char: Some("¸".into()),
+            ..Keystroke::parse("ctrl-alt-shift-z").unwrap()
+        };
+        for contexts in [&MAC, &REMOTE] {
+            assert_eq!(
+                resolve_in(&keymap, &typed, contexts),
+                ["sealskin::TogglePointerCapture"]
+            );
         }
     }
 

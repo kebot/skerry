@@ -1,7 +1,7 @@
 use super::session_window::SessionWindow;
 use super::{
-    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, ToggleSessionControls,
-    ToggleStatsStrip,
+    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, TogglePointerCapture,
+    ToggleSessionControls, ToggleStatsStrip,
 };
 use crate::audio::{OutputProblem, OutputStatus};
 use crate::clipboard::{ClipboardAction, Effective};
@@ -27,8 +27,8 @@ use gpui_kit::{
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
-    self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps, CodecChoice,
-    ControlsAction, ControlsProps, ControlsUiState, ScreenProps, Section, ShortcutRow,
+    self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem, ClipboardProps,
+    CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, Section, ShortcutRow,
     ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
@@ -79,6 +79,8 @@ enum Command {
     AudioBitrate(u32),
     StatsStrip(bool),
     MacShortcuts(bool),
+    /// The session window activates and captures the pointer (`ARCH-032`).
+    CapturePointer,
 }
 
 impl ControlPanel {
@@ -311,6 +313,7 @@ impl ControlPanel {
                         Command::AudioBitrate(bps) => session.change_audio_bitrate(bps, cx),
                         Command::StatsStrip(on) => session.set_stats_strip(on, cx),
                         Command::MacShortcuts(active) => session.change_mac_shortcuts(active, cx),
+                        Command::CapturePointer => session.request_capture(window, cx),
                         Command::Chord(chord) => {
                             session.close_controls(window, cx);
                             if let Some(stream) = &session.current {
@@ -476,6 +479,9 @@ impl ControlPanel {
             ControlsAction::SetMacShortcuts(active) => {
                 Self::send(self.owner.clone(), Command::MacShortcuts(active), cx)
             }
+            ControlsAction::CapturePointer => {
+                Self::send(self.owner.clone(), Command::CapturePointer, cx)
+            }
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -518,7 +524,7 @@ impl ControlPanel {
         .detach();
     }
 
-    fn build_props(&self, session: &SessionWindow, app_name: String) -> ControlsProps {
+    fn build_props(&self, session: &SessionWindow, app_name: String, cx: &App) -> ControlsProps {
         let input = session.preferences.input;
         let input_switches = InputFeature::ALL
             .into_iter()
@@ -605,7 +611,23 @@ impl ControlPanel {
             stats_copied: self.copied.is_some(),
             stats_strip: session.preferences.stats_strip,
             shortcuts: shortcuts_props(session.mac_shortcuts(), session.shortcuts_locked()),
+            capture: capture_props(
+                session.picture_painted(cx) && session.settings.is_some(),
+                session.pointer_captured(cx),
+            ),
         }
+    }
+}
+
+/// The Input card's Capture Pointer button, its glyphs from `shortcuts::CHORDS`.
+fn capture_props(available: bool, captured: bool) -> CaptureProps {
+    let chord = shortcuts::chord(shortcuts::ChordId::CapturePointer);
+    let (modifiers, key) = shortcuts::glyphs(chord.keystroke);
+    CaptureProps {
+        available,
+        captured,
+        modifiers,
+        key,
     }
 }
 
@@ -893,6 +915,7 @@ impl Render for ControlPanel {
         let toggle_owner = owner.clone();
         let fullscreen_owner = owner.clone();
         let strip_owner = owner.clone();
+        let capture_owner = owner.clone();
         let scroll = owner.session.read(cx).controls_scroll.clone();
         let root = div()
             .id("session-controls")
@@ -918,6 +941,10 @@ impl Render for ControlPanel {
                 // View → Toggle Stats Over Stream while the panel is key.
                 let on = !strip_owner.session.read(cx).preferences.stats_strip;
                 Self::send(strip_owner.clone(), Command::StatsStrip(on), cx)
+            })
+            .on_action(move |_: &TogglePointerCapture, _, cx| {
+                // ⌃⌥⇧Z or the menu while the panel is key: the session window captures.
+                Self::send(capture_owner.clone(), Command::CapturePointer, cx)
             });
 
         let session = owner.session.read(cx);
@@ -938,7 +965,7 @@ impl Render for ControlPanel {
         if session.current.is_none() {
             return root;
         }
-        let props = self.build_props(session, session.remote.app_name.clone());
+        let props = self.build_props(session, session.remote.app_name.clone(), cx);
         let entity = cx.entity().clone();
         let handler = Rc::new(
             move |action: ControlsAction, window: &mut Window, cx: &mut App| {

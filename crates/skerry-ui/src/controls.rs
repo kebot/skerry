@@ -1,6 +1,6 @@
 use crate::components::elevated_shadow;
 use gpui_kit::component::{
-    button::Button,
+    button::{Button, ButtonVariants as _},
     collapsible::Collapsible,
     input::{Input, InputState},
     menu::{PopupMenu, PopupMenuItem},
@@ -171,6 +171,20 @@ pub enum ControlsAction {
     SetStatsStrip(bool),
     /// **Mac shortcuts active** (`ARCH-031`).
     SetMacShortcuts(bool),
+    /// Capture Pointer, or release it (`ARCH-032`).
+    CapturePointer,
+}
+
+/// The Input card's Capture Pointer button (`ARCH-032`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureProps {
+    /// A picture is painted and the session is ready.
+    pub available: bool,
+    /// The session window holds the pointer now.
+    pub captured: bool,
+    /// The chord in menu glyphs, from the Mac's chord table: "⌃⌥⇧" and "Z".
+    pub modifiers: String,
+    pub key: String,
 }
 
 /// One row of the Shortcuts card, its chord in macOS menu glyphs.
@@ -353,6 +367,7 @@ pub struct ControlsProps {
     /// The stats strip is shown over the stream.
     pub stats_strip: bool,
     pub shortcuts: ShortcutsProps,
+    pub capture: CaptureProps,
 }
 
 pub fn dpi_label(dpi: u16) -> String {
@@ -467,7 +482,7 @@ pub fn render(
                     theme,
                     "Input",
                     state.input_open,
-                    || render_input(props, &on_action),
+                    || render_input(theme, props, &on_action),
                     toggle(Section::Input),
                 ))
                 .child(section(
@@ -541,7 +556,7 @@ const FIELD_GAP: f32 = 6.;
 const CONTROL_H: f32 = 40.;
 const CONTROL_RADIUS: f32 = 8.;
 
-fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
+fn render_input(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
     div()
         .v_flex()
         .gap(px(STACK_GAP))
@@ -571,6 +586,82 @@ fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
                     ))
                 })),
         ))
+        .child(render_capture(theme, &props.capture, on_action))
+}
+
+/// Capture Pointer: the label with its crosshair, the chord's glyphs on the right, and a
+/// note on how to get out (`ARCH-032`).
+fn render_capture(theme: &Theme, capture: &CaptureProps, on_action: &ControlsHandler) -> Div {
+    let (label, note) = if capture.captured {
+        ("Pointer Captured", "Press ⌃⌥⇧Z to release it.")
+    } else if capture.available {
+        (
+            "Capture Pointer",
+            "⌃⌥⇧Z, ⌘-Tab, or leaving the window releases it.",
+        )
+    } else {
+        ("Capture Pointer", "Available once the picture appears.")
+    };
+    let on_action = Rc::clone(on_action);
+    let button = Button::new("input-capture-pointer")
+        .w_full()
+        .h(px(CONTROL_H))
+        .rounded(px(CONTROL_RADIUS))
+        .disabled(!capture.available && !capture.captured)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .child(Icon::new(gpui_kit::assets::IconName::Crosshair).with_size(px(16.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .text_left()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .w(px(56.))
+                        .flex_none()
+                        .h_flex()
+                        .text_size(px(13.))
+                        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_right()
+                                .whitespace_nowrap()
+                                .when(!capture.captured, |glyphs| {
+                                    glyphs.text_color(theme.muted_foreground)
+                                })
+                                .child(capture.modifiers.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .child(capture.key.clone()),
+                        ),
+                ),
+        )
+        .on_click(move |_, window, cx| on_action(ControlsAction::CapturePointer, window, cx));
+    let button = if capture.captured {
+        button.primary()
+    } else {
+        button.outline()
+    };
+    div().v_flex().gap(px(FIELD_GAP)).child(button).child(
+        div()
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .child(note),
+    )
 }
 
 fn render_clipboard(

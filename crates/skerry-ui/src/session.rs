@@ -337,3 +337,91 @@ fn confirm_modal(
                 ),
         )
 }
+
+/// The Capture Pointer hint's text (`ARCH-032`): `lead`, then the chord in white semibold,
+/// then `tail`. "Pointer captured · " + "⌃⌥⇧Z" + " releases it", or one plain line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureHintText {
+    pub lead: SharedString,
+    pub chord: Option<SharedString>,
+    pub tail: SharedString,
+}
+
+/// How far above the bottom edge the hint sits: 24 pt, or 72 pt over a bottom banner.
+pub fn capture_hint_bottom(banner: bool) -> Pixels {
+    px(if banner { 72. } else { 24. })
+}
+
+/// Fade-in and fade-out of the capture hint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintFade {
+    /// Fully shown (the preview stories).
+    None,
+    In,
+    Out,
+}
+
+/// The Capture Pointer hint: a bottom-centre, always-dark pill over the picture with no
+/// hitbox, so clicks reach the desktop under it (`ARCH-032`). `generation` keys the fade.
+pub fn capture_hint(
+    text: &CaptureHintText,
+    bottom: Pixels,
+    viewport_width: Pixels,
+    fade: HintFade,
+    generation: u64,
+) -> Div {
+    use gpui_kit::{Animation, AnimationExt as _, FontFeatures};
+    use std::sync::Arc;
+    use std::time::Duration;
+    let pill = div()
+        .h_flex()
+        .max_w((viewport_width - px(32.)).max(px(0.)))
+        .px(px(12.))
+        .py(px(6.))
+        .rounded(px(6.))
+        .bg(rgba(0x000000b3))
+        .text_size(px(13.))
+        .line_height(px(17.))
+        .text_color(rgba(0xffffffd9))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(div().min_w_0().text_ellipsis().child(text.lead.clone()))
+        .when_some(text.chord.clone(), |pill, chord| {
+            pill.child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(0xffffff))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                    .child(chord),
+            )
+        })
+        .when(!text.tail.is_empty(), |pill| {
+            pill.child(div().min_w_0().text_ellipsis().child(text.tail.clone()))
+        });
+    let pill = match fade {
+        HintFade::None => pill.into_any_element(),
+        HintFade::In => pill
+            .with_animation(
+                ("capture-hint-in", generation),
+                Animation::new(Duration::from_millis(120)).with_easing(gpui_kit::ease_out_quint()),
+                |pill, delta| pill.opacity(delta),
+            )
+            .into_any_element(),
+        HintFade::Out => pill
+            .with_animation(
+                ("capture-hint-out", generation),
+                Animation::new(Duration::from_millis(200)).with_easing(gpui_kit::ease_out_quint()),
+                |pill, delta| pill.opacity(1. - delta),
+            )
+            .into_any_element(),
+    };
+    div()
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom(bottom)
+        .flex()
+        .justify_center()
+        .child(pill)
+}

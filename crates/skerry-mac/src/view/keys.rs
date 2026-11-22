@@ -64,6 +64,9 @@ pub struct KeyLedger {
     /// ⌘ was down at the last modifier change.
     command_held: bool,
     latch: CommandLatch,
+    /// A local chord's modifiers were retracted (`ARCH-032`): modifier changes send and
+    /// record nothing until the Mac reports none held.
+    muted: bool,
 }
 
 impl KeyLedger {
@@ -112,8 +115,20 @@ impl KeyLedger {
         commands
     }
 
-    /// Moves the held modifiers to `next`, in Shift, Control, Alt order.
+    /// Moves the held modifiers to `next`, in Shift, Control, Alt order. While muted it
+    /// sends and records nothing, until `next` holds no modifier: that ends the mute.
     pub fn set_mods(&mut self, next: Mods) -> Vec<String> {
+        if self.muted {
+            if next == Mods::default() {
+                self.muted = false;
+                self.mods = Mods::default();
+            }
+            return Vec::new();
+        }
+        self.move_mods(next)
+    }
+
+    fn move_mods(&mut self, next: Mods) -> Vec<String> {
         let mut commands = Vec::new();
         for (current, wanted, keysym) in [
             (self.mods.shift, next.shift, SHIFT_L),
@@ -194,8 +209,24 @@ impl KeyLedger {
             .into_values()
             .map(|keysym| format!("ku,{keysym}"))
             .collect();
-        commands.extend(self.set_mods(Mods::default()));
+        // A mute outlives a release: the chord's modifiers are still physically down.
+        commands.extend(self.move_mods(Mods::default()));
         commands
+    }
+
+    /// A local chord (⌃⌥⇧Z) ran after its modifiers already reached the session: once
+    /// [`Self::release_all`] has lifted them, its modifiers going up must not send `kd`
+    /// again on the way (`ARCH-032`). A no-op when `mac` holds no modifier (the menu or
+    /// the panel's button). Keys pressed meanwhile are still sent, without modifiers.
+    pub fn mute_mods_until_clear(&mut self, mac: Modifiers) {
+        if mac.shift || mac.control || mac.alt || mac.platform {
+            self.muted = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_muted(&self) -> bool {
+        self.muted
     }
 
     #[cfg(test)]
@@ -575,6 +606,74 @@ mod tests {
         assert_eq!(virtual_key("9"), Some(0x19));
         assert_eq!(virtual_key("escape"), Some(0x35));
         assert_eq!(virtual_key("f13"), None);
+    }
+
+    #[test]
+    fn a_local_chord_does_not_resend_its_modifiers() {
+        let mut ledger = KeyLedger::default();
+        let chord = mac(true, true, true, false);
+        assert_eq!(
+            ledger.mac_modifiers(chord, false),
+            ["kd,65505", "kd,65507", "kd,65513"]
+        );
+        // ⌃⌥⇧Z resolves locally: lift everything, then mute.
+        assert_eq!(ledger.release_all(), ["ku,65505", "ku,65507", "ku,65513"]);
+        ledger.mute_mods_until_clear(chord);
+        assert!(ledger.is_muted());
+        // Shift lifts first: Control and Alt are not sent down again.
+        assert!(ledger
+            .mac_modifiers(mac(false, true, true, false), false)
+            .is_empty());
+        assert!(ledger
+            .mac_modifiers(mac(false, false, true, false), false)
+            .is_empty());
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn muted_modifiers_resume_after_all_are_released() {
+        let mut ledger = KeyLedger::default();
+        ledger.mac_modifiers(mac(true, true, true, false), false);
+        ledger.release_all();
+        ledger.mute_mods_until_clear(mac(true, true, true, false));
+        assert!(ledger
+            .mac_modifiers(mac(false, false, false, false), false)
+            .is_empty());
+        assert!(!ledger.is_muted());
+        assert_eq!(
+            ledger.mac_modifiers(mac(true, false, false, false), false),
+            ["kd,65505"]
+        );
+        // A release during a mute keeps the mute.
+        ledger.release_all();
+        ledger.mute_mods_until_clear(mac(true, false, false, false));
+        assert!(ledger.release_all().is_empty());
+        assert!(ledger.is_muted());
+    }
+
+    #[test]
+    fn muting_with_no_modifiers_held_does_nothing() {
+        let mut ledger = KeyLedger::default();
+        ledger.mute_mods_until_clear(Modifiers::default());
+        assert!(!ledger.is_muted());
+        assert_eq!(
+            ledger.mac_modifiers(mac(true, false, false, false), false),
+            ["kd,65505"]
+        );
+    }
+
+    #[test]
+    fn keys_pressed_while_muted_are_still_sent() {
+        let mut ledger = KeyLedger::default();
+        ledger.mac_modifiers(mac(true, true, true, false), false);
+        ledger.release_all();
+        ledger.mute_mods_until_clear(mac(true, true, true, false));
+        assert!(ledger
+            .mac_modifiers(mac(true, true, true, false), false)
+            .is_empty());
+        assert_eq!(ledger.press("w".into(), 0x77), ["kd,119"]);
+        assert_eq!(ledger.release("w"), ["ku,119"]);
+        assert!(ledger.is_empty());
     }
 
     #[test]

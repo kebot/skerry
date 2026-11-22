@@ -357,6 +357,9 @@ pub enum SessionEvent {
     Error(String),
     /// The start-up grace ran out with the session still answering like one starting.
     StartupTimeout,
+    /// Capture Pointer started or ended, or couldn't start, and the hint to show if any
+    /// (`ARCH-032`). Raised by the session's view, not the server.
+    PointerCapture(Option<crate::view::CaptureHint>),
 }
 
 #[derive(Clone, Copy)]
@@ -419,11 +422,29 @@ pub enum Input {
     Close,
 }
 
-/// What a closing stream sends before its close frame: a `ku` for every key the session
-/// still holds. No `kr`: on a clean close the server already resets the keyboard of the
-/// departing input owner, and every reset injects Super, Meta and Escape releases.
-fn closing_commands(held: &BTreeSet<u32>) -> Vec<String> {
-    held.iter().map(|key| format!("ku,{key}")).collect()
+/// What a closing stream sends before its close frame: `p,0` and
+/// `SET_NATIVE_CURSOR_RENDERING,0` while the pointer is captured (the server's cursor
+/// compositing is global and outlives this connection, `ARCH-032`), then a `ku` for every
+/// key the session still holds. No `kr`: on a clean close the server already resets the
+/// keyboard of the departing input owner, and every reset injects Super, Meta and Escape
+/// releases.
+fn closing_commands(held: &BTreeSet<u32>, pointer_locked: bool) -> Vec<String> {
+    let mut commands: Vec<String> = Vec::new();
+    if pointer_locked {
+        commands.extend(["p,0".into(), "SET_NATIVE_CURSOR_RENDERING,0".into()]);
+    }
+    commands.extend(held.iter().map(|key| format!("ku,{key}")));
+    commands
+}
+
+/// The pointer lock the server was last told: `Some(true)` for `p,1`, `Some(false)` for
+/// `p,0`, `None` for anything else.
+fn pointer_lock_command(text: &str) -> Option<bool> {
+    match text {
+        "p,1" => Some(true),
+        "p,0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Whether `SKERRY_INPUT_TRACE=1` asks for a trace of key traffic on stderr. Read once.
@@ -432,13 +453,23 @@ fn input_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("SKERRY_INPUT_TRACE").is_ok_and(|value| value == "1"))
 }
 
-/// Logs one key command (`kd`, `ku`, `kh`, `kr`) the transport writes, when tracing.
+/// Logs one input command the transport writes, when tracing: key commands (`kd`, `ku`,
+/// `kh`, `kr`, redacted) and the capture's (`p`, `SET_NATIVE_CURSOR_RENDERING`, `m2`).
 fn trace_input(text: &str) {
     if input_trace_enabled() {
-        if let Some(line) = redact_key_command(text) {
+        if let Some(line) = trace_line(text) {
             eprintln!("skerry input: {line}");
         }
     }
+}
+
+/// The trace line for a command, if it is traced at all.
+fn trace_line(text: &str) -> Option<String> {
+    let verb = text.split(',').next().unwrap_or_default();
+    if matches!(verb, "p" | "SET_NATIVE_CURSOR_RENDERING" | "m2") {
+        return Some(text.into());
+    }
+    redact_key_command(text)
 }
 
 /// Logs a stream event that matters to key traffic (close frame, watchdog abort).
@@ -742,6 +773,8 @@ pub async fn run(
     jpeg_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
+    // The last `p,N` sent: a close while captured restores the server's cursor (`ARCH-032`).
+    let mut pointer_locked = false;
     let mut clipboard_in = clipboard::Receiver::default();
     let mut clipboard_transfer = 0u64;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
@@ -1025,7 +1058,7 @@ pub async fn run(
                     // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
                     // an explicit close: release held keys, then close cleanly.
                     Some(Input::Close) | None => {
-                        for command in closing_commands(&held) {
+                        for command in closing_commands(&held, pointer_locked) {
                             trace_input(&command);
                             let _ = socket.send(command.into()).await;
                         }
@@ -1034,6 +1067,9 @@ pub async fn run(
                         return Ok(());
                     }
                 };
+                if let Some(locked) = pointer_lock_command(&text) {
+                    pointer_locked = locked;
+                }
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
                     held.insert(key);
                 } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
@@ -1518,14 +1554,31 @@ mod tests {
     }
 
     #[test]
+    fn closing_restores_native_cursor_rendering() {
+        let held = BTreeSet::from([0x61]);
+        assert_eq!(
+            closing_commands(&held, true),
+            ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "ku,97"]
+        );
+        assert_eq!(pointer_lock_command("p,1"), Some(true));
+        assert_eq!(pointer_lock_command("p,0"), Some(false));
+        assert_eq!(pointer_lock_command("SET_NATIVE_CURSOR_RENDERING,1"), None);
+        // The capture's commands are traced verbatim; typed text never is.
+        assert_eq!(trace_line("m2,3,-2,1,0").as_deref(), Some("m2,3,-2,1,0"));
+        assert_eq!(trace_line("p,1").as_deref(), Some("p,1"));
+        assert_eq!(trace_line("kd,97").as_deref(), Some("kd,<char>"));
+        assert_eq!(trace_line("m,10,10,0,0"), None);
+    }
+
+    #[test]
     fn closing_releases_every_held_key_then_closes() {
         let held = BTreeSet::from([0x61, 0xffe3]);
-        assert_eq!(closing_commands(&held), ["ku,97", "ku,65507"]);
+        assert_eq!(closing_commands(&held, false), ["ku,97", "ku,65507"]);
     }
 
     #[test]
     fn closing_with_nothing_held_sends_nothing() {
-        assert!(closing_commands(&BTreeSet::new()).is_empty());
+        assert!(closing_commands(&BTreeSet::new(), false).is_empty());
     }
 
     #[test]

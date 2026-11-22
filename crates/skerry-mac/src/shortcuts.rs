@@ -15,6 +15,8 @@ pub enum ChordId {
     FullScreen,
     Files,
     Library,
+    /// Capture Pointer (`ARCH-032`): always on the Mac, the one way out of a capture.
+    CapturePointer,
     Quit,
 }
 
@@ -24,14 +26,14 @@ pub struct SkerryChord {
     pub label: &'static str,
     /// A GPUI binding string, as `KeyBinding::new` reads it.
     pub keystroke: &'static str,
-    /// Never handed to the session (⌘Q).
+    /// Never handed to the session (⌘Q, ⌃⌥⇧Z).
     pub always_local: bool,
 }
 
 /// Every chord that acts in a session window, in the Shortcuts card's order. Library-scoped
 /// chords (⌘O, ⌘L) and the Files / Session Controls windows' own chords are not here: they
 /// never act in a session window.
-pub const CHORDS: [SkerryChord; 5] = [
+pub const CHORDS: [SkerryChord; 6] = [
     SkerryChord {
         id: ChordId::SessionControls,
         label: "Session Controls",
@@ -55,6 +57,14 @@ pub const CHORDS: [SkerryChord; 5] = [
         label: "Library",
         keystroke: "cmd-0",
         always_local: false,
+    },
+    // A capture you can't leave by keyboard is a trap: the menu bar is out of reach while
+    // the cursor is frozen, so this one never goes to the session (`ARCH-032`).
+    SkerryChord {
+        id: ChordId::CapturePointer,
+        label: "Capture Pointer",
+        keystroke: "ctrl-alt-shift-z",
+        always_local: true,
     },
     SkerryChord {
         id: ChordId::Quit,
@@ -135,6 +145,14 @@ pub fn passes_to_session(keystroke: &Keystroke, mac_active: bool) -> bool {
                 .iter()
                 .any(|binding| binding.match_keystrokes(&[keystroke]) == Some(false))
         })
+}
+
+/// The chord with this id.
+pub fn chord(id: ChordId) -> &'static SkerryChord {
+    CHORDS
+        .iter()
+        .find(|chord| chord.id == id)
+        .expect("every ChordId is in CHORDS")
 }
 
 /// A chord as macOS menus write it: the modifiers in ⌃⌥⇧⌘ order, and the key.
@@ -225,6 +243,7 @@ mod tests {
         }
         for other in [
             "cmd-q",
+            "ctrl-alt-shift-z",
             "cmd-c",
             "cmd-shift-n",
             "ctrl-shift-m",
@@ -259,10 +278,25 @@ mod tests {
     #[test]
     fn quit_is_never_suppressed() {
         let suppressed = suppress_bindings();
-        assert_eq!(suppressed.len(), CHORDS.len() - 1);
+        assert_eq!(suppressed.len(), CHORDS.len() - 2);
         assert!(suppressed
             .iter()
             .all(|binding| binding.match_keystrokes(&[typed("cmd-q")]).is_none()));
+    }
+
+    #[test]
+    fn capture_chord_is_listed_and_always_local() {
+        let capture = chord(ChordId::CapturePointer);
+        assert_eq!(capture.label, "Capture Pointer");
+        assert_eq!(capture.keystroke, "ctrl-alt-shift-z");
+        assert!(capture.always_local);
+        // Directly before Quit: the two always-local rows sit together at the bottom.
+        let ids: Vec<ChordId> = CHORDS.iter().map(|chord| chord.id).collect();
+        assert_eq!(&ids[4..], [ChordId::CapturePointer, ChordId::Quit]);
+        assert_eq!(glyphs(capture.keystroke), ("⌃⌥⇧".into(), "Z".into()));
+        assert!(suppress_bindings().iter().all(|binding| binding
+            .match_keystrokes(&[typed(capture.keystroke)])
+            .is_none()));
     }
 
     #[test]

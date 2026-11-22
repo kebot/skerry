@@ -17,9 +17,10 @@ use skerry_ui::{
         RecoveryKind, RecoveryProps,
     },
     controls::{
-        self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps,
-        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, ShortcutRow,
-        ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+        self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem,
+        ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps,
+        ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl,
+        VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -111,6 +112,9 @@ enum Story {
     ControlsShortcutsLocked,
     ControlsStatsStripOn,
     ControlsStatsWaiting,
+    ControlsInputCapture,
+    ControlsInputCaptureOn,
+    ControlsInputCaptureUnavailable,
     AudioDefault,
     AudioChosen,
     AudioMissing,
@@ -128,6 +132,12 @@ enum Story {
     SessionStatsStripLight,
     SessionStatsStripWithBanner,
     SessionStatsStripFullScreen,
+    SessionCaptureHint,
+    SessionReleaseHint,
+    SessionCaptureHintWithStrip,
+    SessionCaptureHintWithBanner,
+    SessionCaptureHintNarrow,
+    SessionCaptureHintLight,
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
@@ -198,6 +208,9 @@ impl Story {
         Story::ControlsShortcutsLocked,
         Story::ControlsStatsStripOn,
         Story::ControlsStatsWaiting,
+        Story::ControlsInputCapture,
+        Story::ControlsInputCaptureOn,
+        Story::ControlsInputCaptureUnavailable,
         Story::AudioDefault,
         Story::AudioChosen,
         Story::AudioMissing,
@@ -215,6 +228,12 @@ impl Story {
         Story::SessionStatsStripLight,
         Story::SessionStatsStripWithBanner,
         Story::SessionStatsStripFullScreen,
+        Story::SessionCaptureHint,
+        Story::SessionReleaseHint,
+        Story::SessionCaptureHintWithStrip,
+        Story::SessionCaptureHintWithBanner,
+        Story::SessionCaptureHintNarrow,
+        Story::SessionCaptureHintLight,
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
@@ -284,7 +303,10 @@ impl Story {
             | Story::ControlsShortcutsOff
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
-            | Story::ControlsStatsWaiting => "Session Controls",
+            | Story::ControlsStatsWaiting
+            | Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable => "Session Controls",
             Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -301,7 +323,13 @@ impl Story {
             | Story::SessionStatsStripNarrow
             | Story::SessionStatsStripLight
             | Story::SessionStatsStripWithBanner
-            | Story::SessionStatsStripFullScreen => "Session Overlays",
+            | Story::SessionStatsStripFullScreen
+            | Story::SessionCaptureHint
+            | Story::SessionReleaseHint
+            | Story::SessionCaptureHintWithStrip
+            | Story::SessionCaptureHintWithBanner
+            | Story::SessionCaptureHintNarrow
+            | Story::SessionCaptureHintLight => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
         }
     }
@@ -371,6 +399,9 @@ impl Story {
             Story::ControlsShortcutsLocked => "Shortcuts · Locked",
             Story::ControlsStatsStripOn => "Stats · Strip On",
             Story::ControlsStatsWaiting => "Stats · Waiting",
+            Story::ControlsInputCapture => "Input · Capture Pointer",
+            Story::ControlsInputCaptureOn => "Input · Pointer Captured",
+            Story::ControlsInputCaptureUnavailable => "Input · Capture Unavailable",
             Story::AudioDefault => "Default",
             Story::AudioChosen => "Chosen Device",
             Story::AudioMissing => "Saved Device Missing",
@@ -388,6 +419,12 @@ impl Story {
             Story::SessionStatsStripLight => "Stats Strip · Light",
             Story::SessionStatsStripWithBanner => "Stats Strip + Banner",
             Story::SessionStatsStripFullScreen => "Stats Strip · Full Screen",
+            Story::SessionCaptureHint => "Capture Hint",
+            Story::SessionReleaseHint => "Release Hint",
+            Story::SessionCaptureHintWithStrip => "Capture Hint + Strip",
+            Story::SessionCaptureHintWithBanner => "Capture Hint + Banner",
+            Story::SessionCaptureHintNarrow => "Capture Hint · Narrow",
+            Story::SessionCaptureHintLight => "Capture Hint · Light",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
@@ -459,6 +496,9 @@ impl Story {
             Story::ControlsShortcutsLocked => "story-controls-shortcuts-locked",
             Story::ControlsStatsStripOn => "story-controls-stats-strip-on",
             Story::ControlsStatsWaiting => "story-controls-stats-waiting",
+            Story::ControlsInputCapture => "story-controls-input-capture",
+            Story::ControlsInputCaptureOn => "story-controls-input-capture-on",
+            Story::ControlsInputCaptureUnavailable => "story-controls-input-capture-unavailable",
             Story::AudioDefault => "story-audio-default",
             Story::AudioChosen => "story-audio-chosen",
             Story::AudioMissing => "story-audio-missing",
@@ -476,6 +516,12 @@ impl Story {
             Story::SessionStatsStripLight => "story-session-stats-strip-light",
             Story::SessionStatsStripWithBanner => "story-session-stats-strip-banner",
             Story::SessionStatsStripFullScreen => "story-session-stats-strip-fullscreen",
+            Story::SessionCaptureHint => "story-session-capture-hint",
+            Story::SessionReleaseHint => "story-session-release-hint",
+            Story::SessionCaptureHintWithStrip => "story-session-capture-hint-strip",
+            Story::SessionCaptureHintWithBanner => "story-session-capture-hint-banner",
+            Story::SessionCaptureHintNarrow => "story-session-capture-hint-narrow",
+            Story::SessionCaptureHintLight => "story-session-capture-hint-light",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
@@ -543,6 +589,9 @@ impl Story {
                 | Story::ControlsShortcutsLocked
                 | Story::ControlsStatsStripOn
                 | Story::ControlsStatsWaiting
+                | Story::ControlsInputCapture
+                | Story::ControlsInputCaptureOn
+                | Story::ControlsInputCaptureUnavailable
         ) || self.is_audio()
     }
 
@@ -643,6 +692,10 @@ impl Story {
                 .with_sections([false, true, false, false, false, false, false]),
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
                 .with_sections([false, false, false, false, false, false, true]),
+            Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable => ControlsUiState::default()
+                .with_sections([true, false, false, false, false, false, false]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()
@@ -983,7 +1036,10 @@ impl PreviewApp {
         if story == Story::LibraryLongServer {
             self.canvas_width = Some(700.);
         }
-        if story == Story::SessionStatsStripLight {
+        if matches!(
+            story,
+            Story::SessionStatsStripLight | Story::SessionCaptureHintLight
+        ) {
             // The pill stays dark whatever the theme.
             self.appearance = Appearance::Light;
             Theme::change(ThemeMode::Light, Some(window), cx);
@@ -1861,6 +1917,12 @@ impl PreviewApp {
             ControlsAction::ToggleSection(section) => {
                 self.controls_ui.toggle(section);
             }
+            ControlsAction::CapturePointer => {
+                let capture = &mut self.controls_props.capture;
+                if capture.available {
+                    capture.captured = !capture.captured;
+                }
+            }
             ControlsAction::SetAudio(enabled) => self.controls_props.audio = Some(enabled),
             ControlsAction::SetPlayback(enabled) => self.controls_props.video = Some(enabled),
             ControlsAction::ToggleFullScreen => {
@@ -2142,6 +2204,7 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                capture: Self::fixture_capture(true, false),
             },
             Story::ControlsServerLocked => ControlsProps {
                 app_name: "Locked Enterprise Desktop".into(),
@@ -2173,6 +2236,7 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                capture: Self::fixture_capture(true, false),
             },
             _ if story.is_audio() => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
@@ -2197,6 +2261,16 @@ impl PreviewApp {
                     Story::ControlsShortcutsLocked => Self::fixture_shortcuts(false, true),
                     _ => Self::fixture_shortcuts(true, false),
                 };
+                props
+            }
+            Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.capture = Self::fixture_capture(
+                    story != Story::ControlsInputCaptureUnavailable,
+                    story == Story::ControlsInputCaptureOn,
+                );
                 props
             }
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => {
@@ -2299,6 +2373,7 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                capture: Self::fixture_capture(true, false),
             },
         }
     }
@@ -2450,9 +2525,50 @@ impl PreviewApp {
                 row("Full Screen", "⌃⌘", "F", Some("Ctrl+F")),
                 row("Files", "⇧⌘", "F", Some("Ctrl+Shift+F")),
                 row("Library", "⌘", "0", Some("Ctrl+0")),
+                row("Capture Pointer", "⌃⌥⇧", "Z", None),
                 row("Quit", "⌘", "Q", None),
             ],
         }
+    }
+
+    /// The Input card's Capture Pointer button.
+    fn fixture_capture(available: bool, captured: bool) -> CaptureProps {
+        CaptureProps {
+            available,
+            captured,
+            modifiers: "⌃⌥⇧".into(),
+            key: "Z".into(),
+        }
+    }
+
+    /// The capture hint over a session frame (`ARCH-032`).
+    fn capture_hint_overlay(hint: &str, width: f32, banner: bool) -> gpui_kit::Div {
+        let text = if hint == "captured" {
+            session::CaptureHintText {
+                lead: "Pointer captured · ".into(),
+                chord: Some("⌃⌥⇧Z".into()),
+                tail: " releases it".into(),
+            }
+        } else if hint == "unavailable" {
+            session::CaptureHintText {
+                lead: "Capture Pointer is available once the picture appears".into(),
+                chord: None,
+                tail: "".into(),
+            }
+        } else {
+            session::CaptureHintText {
+                lead: "Pointer released".into(),
+                chord: None,
+                tail: "".into(),
+            }
+        };
+        session::capture_hint(
+            &text,
+            session::capture_hint_bottom(banner),
+            px(width),
+            session::HintFade::None,
+            0,
+        )
     }
 
     /// The strip over the stream: all good, or the warn case (throttled, over target,
@@ -2870,6 +2986,9 @@ impl PreviewApp {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable
             | Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -3056,6 +3175,55 @@ impl PreviewApp {
                         ));
                 }
                 Self::strip_stage(frame)
+            }
+            Story::SessionCaptureHint
+            | Story::SessionReleaseHint
+            | Story::SessionCaptureHintWithStrip
+            | Story::SessionCaptureHintWithBanner
+            | Story::SessionCaptureHintLight => {
+                let strip = Self::fixture_strip(false);
+                let strip = if self.story == Story::SessionCaptureHintWithStrip {
+                    strip
+                } else {
+                    stats::StripProps {
+                        marks: Vec::new(),
+                        figures: Vec::new(),
+                    }
+                };
+                let hint = match self.story {
+                    Story::SessionReleaseHint => "released",
+                    Story::SessionCaptureHintWithBanner => "unavailable",
+                    _ => "captured",
+                };
+                let banner = self.story == Story::SessionCaptureHintWithBanner;
+                let mut frame = Self::session_frame(1280., 800., &strip);
+                if self.story == Story::SessionCaptureHintWithStrip {
+                    frame = frame.child(session::controls_trigger(
+                        point(px(1240.), px(8.)),
+                        px(32.),
+                        |_, _, _| {},
+                    ));
+                }
+                if banner {
+                    frame = frame.child(session::startup_banner(
+                        theme,
+                        "Firefox hasn’t answered yet. It may still be starting.",
+                        |_, _, _| {},
+                        |_, _, _| {},
+                        |_, _, _| {},
+                    ));
+                }
+                Self::strip_stage(frame.child(Self::capture_hint_overlay(hint, 1280., banner)))
+            }
+            Story::SessionCaptureHintNarrow => {
+                let strip = stats::StripProps {
+                    marks: Vec::new(),
+                    figures: Vec::new(),
+                };
+                Self::strip_stage(
+                    Self::session_frame(360., 400., &strip)
+                        .child(Self::capture_hint_overlay("captured", 360., false)),
+                )
             }
             Story::SessionStatsStripNarrow => {
                 let strip = Self::fixture_strip(false);

@@ -5,7 +5,7 @@ use std::borrow::Cow;
 
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
-    [Trash, FolderPlus, LogOut, Circle, Hourglass, Link, FileUp, FolderUp, Ban, Info]
+    [Trash, FolderPlus, LogOut, Circle, Hourglass, Link, FileUp, FolderUp, Ban, Info, Crosshair]
 );
 
 /// gpui-kit's default icons, the Files window's Trash and New Folder icons, and Sign Out's
@@ -47,6 +47,7 @@ mod tests {
             gpui_kit::assets::IconName::FolderUp,
             gpui_kit::assets::IconName::Ban,
             gpui_kit::assets::IconName::Info,
+            gpui_kit::assets::IconName::Crosshair,
         ] {
             let path = icon.path();
             assert!(
