@@ -316,6 +316,7 @@ impl FilesWindow {
             storage,
         } = source;
         let library_owned = matches!(owner, FilesOwner::Library);
+        let registry_owner = owner.clone();
         let bounds = window.bounds();
         let window_size = size(px(760.), px(520.));
         let origin = point(bounds.left() + px(40.), bounds.top() + px(60.));
@@ -366,12 +367,14 @@ impl FilesWindow {
             .borrow_mut()
             .take()
             .ok_or_else(|| std::io::Error::other("the Files window has no view"))?;
-        cx.default_global::<OpenWindows>().files.push(OpenFiles {
-            session_id,
-            window: handle,
-            entity: view.downgrade(),
-            library_owned,
-        });
+        if registers_in_files(&registry_owner) {
+            cx.default_global::<OpenWindows>().files.push(OpenFiles {
+                session_id,
+                window: handle,
+                entity: view.downgrade(),
+                library_owned,
+            });
+        }
         Ok((handle, view))
     }
 
@@ -1856,7 +1859,9 @@ async fn download_job(
     }
     for (remote, local, expected) in files {
         let partial = selkies::partial_path(&local);
-        let _ = tokio::fs::remove_file(&partial).await;
+        if !keeps_partial(&access, expected) {
+            let _ = tokio::fs::remove_file(&partial).await;
+        }
         if let Ok(mut current) = meter.partial.lock() {
             *current = Some(partial);
         }
@@ -1892,6 +1897,21 @@ fn note_forbidden(meter: &Meter, error: &BackendError) {
     if error.forbidden() {
         meter.forbidden.store(true, Ordering::Relaxed);
     }
+}
+
+/// Whether a download resumes the partial an earlier, failed download of the same file left
+/// (`ARCH-037`): storage downloads do, since they resume at a whole chunk and check the final
+/// size against the listing. A failed transfer keeps its partial for this; a cancelled one
+/// removes it.
+fn keeps_partial(access: &FilesBackend, expected: Option<u64>) -> bool {
+    access.storage().is_some() && expected.is_some()
+}
+
+/// The decision a session Files window registers itself under, by owner: the Storage
+/// window's pane never does, so nothing that looks Files windows up by session finds it
+/// (`ARCH-037`).
+pub(super) fn registers_in_files(owner: &FilesOwner) -> bool {
+    !matches!(owner, FilesOwner::Storage)
 }
 
 /// What the Storage window says when something would land in a home's `Desktop/files`.
@@ -2157,6 +2177,27 @@ mod tests {
         assert_eq!(
             deletable_paths(&StoragePlace::Shared, &[desktop]),
             ["/Desktop"]
+        );
+    }
+
+    #[test]
+    fn storage_pane_is_not_in_the_files_registry() {
+        // `pane()` never pushes to `OpenWindows.files`; `open()` asks this before it does.
+        assert!(!registers_in_files(&FilesOwner::Storage));
+        assert!(registers_in_files(&FilesOwner::Library));
+    }
+
+    #[test]
+    fn a_failed_storage_download_keeps_its_partial_to_resume() {
+        let client = crate::sealskin::fake::client("http://127.0.0.1:1/".parse().unwrap());
+        let storage = FilesBackend::Storage(super::super::files_backend::StorageBackend {
+            client,
+            place: StoragePlace::Shared,
+        });
+        assert!(keeps_partial(&storage, Some(10)));
+        assert!(
+            !keeps_partial(&storage, None),
+            "no size to check a splice against"
         );
     }
 

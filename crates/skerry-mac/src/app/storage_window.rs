@@ -459,14 +459,26 @@ impl StorageWindow {
             }
             // 2. Again, now: the confirmation may have stayed up for minutes.
             let used = in_use(&client, &rt, &home, cx).await;
-            match used {
-                Some(used) if !used.any() => {}
+            let busy = this
+                .update(cx, |this, cx| this.pane.read(cx).busy_homes().contains(&home))
+                .unwrap_or(true);
+            match storage::after_confirm(used, busy) {
+                storage::DeleteStep::Delete => {}
                 other => {
                     let _ = this.update_in(cx, |this, window, cx| {
                         this.deleting = None;
                         match other {
-                            Some(used) => show_in_use(&home, &used, window, cx),
-                            None => {
+                            storage::DeleteStep::InUse(used) => {
+                                show_in_use(&home, &used, window, cx)
+                            }
+                            storage::DeleteStep::Busy => drop(window.prompt(
+                                gpui_kit::PromptLevel::Warning,
+                                &format!("“{home}” has transfers in progress."),
+                                Some("Wait for them to finish or cancel them, then delete the home."),
+                                &[gpui_kit::PromptButton::cancel("OK")],
+                                cx,
+                            )),
+                            _ => {
                                 drop(window.prompt(
                                     gpui_kit::PromptLevel::Warning,
                                     &format!("Couldn’t check whether “{home}” is in use."),

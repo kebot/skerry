@@ -206,7 +206,16 @@ impl FilesBackend {
                 let mut found = Vec::new();
                 let mut pending = vec![(dir.trim_matches('/').to_owned(), String::new())];
                 while let Some((remote, relative)) = pending.pop() {
-                    for entry in self.browse(&remote).await?.entries {
+                    let browsed = self.browse(&remote).await?;
+                    // A partial listing would copy part of the folder and report success.
+                    if browsed.truncated {
+                        let name = remote.rsplit('/').next().unwrap_or(&remote);
+                        let name = if name.is_empty() { "That folder" } else { name };
+                        return Err(BackendError::Storage(StorageError::Invalid(format!(
+                            "“{name}” holds too many items to download at once."
+                        ))));
+                    }
+                    for entry in browsed.entries {
                         let name = selkies::local_name(&entry.name)
                             .ok_or_else(|| selkies::Error::UnsafeName(entry.name.clone()))?
                             .to_owned();
@@ -288,6 +297,33 @@ mod tests {
             error,
             BackendError::Selkies(selkies::Error::UnsafeName(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn storage_walk_fails_on_a_truncated_folder() {
+        use crate::sealskin::fake;
+        let (base, _) = fake::serve(|target| {
+            let page = target
+                .split("page=")
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .unwrap_or("1")
+                .to_string();
+            let items: Vec<String> = (0..200)
+                .map(|n| format!(r#"{{"name":"f{page}-{n}","is_dir":false,"size":1,"mtime":0}}"#))
+                .collect();
+            fake::reply(
+                "200 OK",
+                &format!(r#"{{"items":[{}],"total":20000}}"#, items.join(",")),
+            )
+        })
+        .await;
+        let backend = storage_backend(base, StoragePlace::Shared);
+        let error = backend.walk("Big").await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "“Big” holds too many items to download at once."
+        );
     }
 
     #[test]

@@ -622,7 +622,7 @@ struct DownloadChunk {
 /// Whether a home name is one Skerry must never delete: Shared Files (every session's
 /// `Desktop/files`) and Cleanroom, in any case (`ARCH-037`).
 pub fn undeletable_home(name: &str) -> bool {
-    name == SHARED_FILES_HOME || name.eq_ignore_ascii_case("cleanroom")
+    name.eq_ignore_ascii_case(SHARED_FILES_HOME) || name.eq_ignore_ascii_case("cleanroom")
 }
 
 /// A server name for one path segment (a file or folder name inside a folder).
@@ -2252,7 +2252,14 @@ async fn send_with_detail<T: DeserializeOwned>(request: RequestBuilder) -> Resul
     })?;
     let status = response.status();
     if status.is_success() {
-        return response.json().await.map_err(|_| Refusal {
+        // A body cut off on the way (a reset, the timeout mid-body) is a lost answer, so
+        // retries and resume run; only a whole body that isn't the JSON expected is a refusal.
+        let body = response.bytes().await.map_err(|error| Refusal {
+            status: None,
+            detail: None,
+            timed_out: error.is_timeout(),
+        })?;
+        return serde_json::from_slice(&body).map_err(|_| Refusal {
             status: Some(status),
             detail: Some("The server returned an unexpected response.".into()),
             timed_out: false,
@@ -4095,6 +4102,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_chunk_cut_off_mid_body_is_a_network_error_and_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("a.bin");
+        let data: Vec<u8> = (0..3_000_000u32).map(|n| (n % 239) as u8).collect();
+        let indexes = Indexes::default();
+        let mut whole = chunk_server(data.clone(), Arc::clone(&indexes));
+        let cuts = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&cuts);
+        let (base, _) = serve(move |request, n| {
+            let answer = whole(request, n);
+            // The second chunk's first answer promises its length but stops halfway.
+            if answer.contains("\"is_last_chunk\":true")
+                && counter.fetch_add(1, Ordering::Relaxed) == 0
+            {
+                let cut = answer.len() / 2;
+                return answer[..cut].to_string();
+            }
+            answer
+        })
+        .await;
+        let client = test_client(base);
+        let progress = AtomicU64::new(0);
+        let error = client
+            .download_storage("work", "/a.bin", &destination, Some(3_000_000), &progress)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StorageError::Network(_)), "{error}");
+        // The retry resumes at the whole first chunk and finishes.
+        client
+            .download_storage("work", "/a.bin", &destination, Some(3_000_000), &progress)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+        assert_eq!(*indexes.lock().unwrap(), [0, 1, 1]);
+    }
+
+    #[tokio::test]
     async fn storage_download_refuses_an_oversized_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let destination = dir.path().join("a");
@@ -4181,6 +4225,7 @@ mod tests {
         let client = test_client(base);
         for name in [
             "_sealskin_shared_files",
+            "_SEALSKIN_SHARED_FILES",
             "cleanroom",
             "CleanRoom",
             "../x",

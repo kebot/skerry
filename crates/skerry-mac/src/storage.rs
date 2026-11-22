@@ -258,6 +258,28 @@ pub fn sessions_using(
     used
 }
 
+/// What Delete Home does once Delete Home was clicked, from the sessions read again then
+/// (`None`: they couldn't be read) and whether a transfer moves to or from the home.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeleteStep {
+    Delete,
+    /// Something started using the home while the confirmation was up: the in-use alert.
+    InUse(InUse),
+    /// Sessions couldn't be read: nothing is sent.
+    Unchecked,
+    /// A transfer started meanwhile.
+    Busy,
+}
+
+pub fn after_confirm(recheck: Option<InUse>, transfers: bool) -> DeleteStep {
+    match recheck {
+        None => DeleteStep::Unchecked,
+        Some(used) if used.any() => DeleteStep::InUse(used),
+        Some(_) if transfers => DeleteStep::Busy,
+        Some(_) => DeleteStep::Delete,
+    }
+}
+
 /// The in-use alert's title.
 pub fn in_use_title(home: &str, used: &InUse) -> String {
     match used.apps.as_slice() {
@@ -525,6 +547,28 @@ mod tests {
         let used = sessions_using("auto-zen", &unknown, &apps, &[]);
         assert!(used.unsure && used.any());
         assert!(!sessions_using("work", &unknown, &apps, &[]).any());
+    }
+
+    #[test]
+    fn delete_home_rechecks_sessions_after_confirm() {
+        // Free before the confirm; a session started meanwhile: the DELETE is not sent.
+        let sessions = [session("zen", "Zen", "work")];
+        let apps = [app("zen", "Zen", false)];
+        assert!(!sessions_using("work", &[], &apps, &[]).any());
+        let recheck = sessions_using("work", &sessions, &apps, &[]);
+        assert_eq!(
+            after_confirm(Some(recheck.clone()), false),
+            DeleteStep::InUse(recheck)
+        );
+        assert_eq!(after_confirm(None, false), DeleteStep::Unchecked);
+        assert_eq!(
+            after_confirm(Some(InUse::default()), true),
+            DeleteStep::Busy
+        );
+        assert_eq!(
+            after_confirm(Some(InUse::default()), false),
+            DeleteStep::Delete
+        );
     }
 
     #[test]
