@@ -6,7 +6,7 @@
 //! be tested without a window.
 
 use gpui_kit::Modifiers;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SHIFT_L: u32 = 0xffe1;
 pub const CONTROL_L: u32 = 0xffe3;
@@ -31,11 +31,39 @@ impl Mods {
     }
 }
 
+/// "⌘ means Control" for a forwarded Skerry chord (`ARCH-031`), held until ⌘ itself lifts,
+/// so releasing Shift mid-chord doesn't drop Control early.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandLatch(bool);
+
+impl CommandLatch {
+    pub fn engage(&mut self) {
+        self.0 = true;
+    }
+
+    /// Clears the latch once ⌘ is up.
+    pub fn observe(&mut self, modifiers: Modifiers) {
+        if !modifiers.platform {
+            self.0 = false;
+        }
+    }
+
+    pub fn as_control(&self, command_as_control: bool) -> bool {
+        command_as_control || self.0
+    }
+}
+
 #[derive(Default)]
 pub struct KeyLedger {
     /// Held keys by GPUI key name, so a key-up finds the keysym its key-down sent.
     keys: BTreeMap<String, u32>,
     mods: Mods,
+    /// Held keys that went down while ⌘ was held. AppKit sends no key-up for them while ⌘
+    /// is down, so they are released when ⌘ lifts (`ARCH-031`).
+    command_keys: BTreeSet<String>,
+    /// ⌘ was down at the last modifier change.
+    command_held: bool,
+    latch: CommandLatch,
 }
 
 impl KeyLedger {
@@ -45,6 +73,11 @@ impl KeyLedger {
     /// first keysym, or it would stay down on the server.
     pub fn press(&mut self, code: String, keysym: u32) -> Vec<String> {
         let mut commands = Vec::new();
+        if self.command_held {
+            self.command_keys.insert(code.clone());
+        } else {
+            self.command_keys.remove(&code);
+        }
         if let Some(previous) = self.keys.insert(code, keysym) {
             if previous != keysym {
                 commands.push(format!("ku,{previous}"));
@@ -56,6 +89,7 @@ impl KeyLedger {
 
     /// A key came up; only a key this ledger holds is released.
     pub fn release(&mut self, code: &str) -> Vec<String> {
+        self.command_keys.remove(code);
         self.keys
             .remove(code)
             .map(|keysym| vec![format!("ku,{keysym}")])
@@ -83,8 +117,44 @@ impl KeyLedger {
         commands
     }
 
-    /// Lifts every held key, then every modifier. Calling it again sends nothing.
+    /// Latches "⌘ means Control" until ⌘ lifts: a Skerry chord is being forwarded.
+    pub fn latch_command(&mut self) {
+        self.latch.engage();
+    }
+
+    /// Follows the Mac's modifiers. When ⌘ lifts, first every key pressed under it is
+    /// released (AppKit never sent their key-ups), then the latch clears and the modifiers
+    /// move, so Control comes up last.
+    pub fn mac_modifiers(&mut self, next: Modifiers, command_as_control: bool) -> Vec<String> {
+        let mut commands = if self.command_held && !next.platform {
+            self.release_command_keys()
+        } else {
+            Vec::new()
+        };
+        self.command_held = next.platform;
+        self.latch.observe(next);
+        commands.extend(self.set_mods(Mods::from_mac(
+            next,
+            self.latch.as_control(command_as_control),
+        )));
+        commands
+    }
+
+    /// Releases the held keys that went down while ⌘ was held.
+    pub fn release_command_keys(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.command_keys)
+            .into_iter()
+            .filter_map(|code| self.keys.remove(&code))
+            .map(|keysym| format!("ku,{keysym}"))
+            .collect()
+    }
+
+    /// Lifts every held key, then every modifier, and clears the latch. Calling it again
+    /// sends nothing.
     pub fn release_all(&mut self) -> Vec<String> {
+        self.command_keys.clear();
+        self.command_held = false;
+        self.latch = CommandLatch::default();
         let mut commands: Vec<String> = std::mem::take(&mut self.keys)
             .into_values()
             .map(|keysym| format!("ku,{keysym}"))
@@ -263,6 +333,72 @@ mod tests {
         assert!(commands.contains(&"ku,65307".to_string()));
         assert_eq!(commands.last().map(String::as_str), Some("ku,65507"));
         assert!(!ledger.control());
+    }
+
+    #[test]
+    fn a_forwarded_chord_holds_control_until_command_lifts() {
+        let mut latch = CommandLatch::default();
+        assert!(!latch.as_control(false));
+        latch.engage();
+        latch.observe(mac(true, false, false, true));
+        assert!(latch.as_control(false));
+        // Shift lifts first: ⌘ is still down, so Control stays.
+        latch.observe(mac(false, false, false, true));
+        assert!(latch.as_control(false));
+        let mods = Mods::from_mac(mac(false, false, false, true), latch.as_control(false));
+        assert!(mods.control && !mods.shift);
+        latch.observe(mac(false, false, false, false));
+        assert!(!latch.as_control(false));
+        assert!(latch.as_control(true));
+
+        let mut ledger = KeyLedger::default();
+        let mut commands = ledger.mac_modifiers(mac(true, false, false, true), false);
+        assert_eq!(commands, ["kd,65505"]);
+        ledger.latch_command();
+        commands.extend(ledger.mac_modifiers(mac(true, false, false, true), false));
+        commands.extend(ledger.press("m".into(), 109));
+        commands.extend(ledger.mac_modifiers(mac(false, false, false, true), false));
+        commands.extend(ledger.mac_modifiers(mac(false, false, false, false), false));
+        assert_eq!(
+            commands,
+            ["kd,65505", "kd,65507", "kd,109", "ku,65505", "ku,109", "ku,65507"]
+        );
+        for command in commands {
+            for keysym in SUPER_AND_META {
+                assert!(!command.ends_with(&format!(",{keysym}")), "{command}");
+            }
+        }
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn a_command_chord_key_is_released_when_command_lifts() {
+        let mut ledger = KeyLedger::default();
+        ledger.mac_modifiers(mac(true, false, false, true), false);
+        ledger.latch_command();
+        ledger.mac_modifiers(mac(true, false, false, true), false);
+        ledger.press("m".into(), 109);
+        // No key-up for m: ⌘ lifts with Shift.
+        assert_eq!(
+            ledger.mac_modifiers(mac(false, false, false, false), false),
+            ["ku,109", "ku,65505", "ku,65507"]
+        );
+        assert!(ledger.is_empty());
+        // A key pressed without ⌘ stays held when ⌘ goes down and up.
+        ledger.press("a".into(), 0x61);
+        ledger.mac_modifiers(mac(false, false, false, true), false);
+        assert!(ledger
+            .mac_modifiers(mac(false, false, false, false), false)
+            .is_empty());
+        assert_eq!(ledger.release("a"), ["ku,97"]);
+        // A key that came up normally isn't released again.
+        ledger.mac_modifiers(mac(false, false, false, true), true);
+        ledger.press("c".into(), 0x63);
+        assert_eq!(ledger.release("c"), ["ku,99"]);
+        assert_eq!(
+            ledger.mac_modifiers(mac(false, false, false, false), true),
+            ["ku,65507"]
+        );
     }
 
     #[test]

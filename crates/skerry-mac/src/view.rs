@@ -6,6 +6,7 @@ use crate::clipboard::{ClipboardSettings, Content, Effective, Incoming, Policy};
 use crate::input::{commit_command, InputSettings, RemoteChord};
 use crate::pasteboard;
 use crate::settings::{Key, ScreenChange};
+use crate::shortcuts;
 use crate::transport::{
     self, DisplayRequest, Frame, Input, Picture, Pointer, RemoteCursor, Resolution, SessionEvent,
     SessionOptions,
@@ -244,6 +245,18 @@ impl NativeSession {
         });
     }
 
+    /// **Mac shortcuts active** changed (or a server lock arrived): the desktop's key context
+    /// follows on the next render, and nothing stays held across the switch.
+    pub fn set_mac_shortcuts(&self, active: bool, cx: &mut App) {
+        self.view.update(cx, |desktop, cx| {
+            if desktop.mac_shortcuts != active {
+                desktop.release_input();
+                desktop.mac_shortcuts = active;
+                cx.notify();
+            }
+        });
+    }
+
     pub fn set_stats(&self, open: bool) {
         let _ = self.input.send(Input::Stats(open));
     }
@@ -312,6 +325,8 @@ struct Desktop {
     /// The pointer is in the top-left corner, so the window's own buttons are shown.
     buttons_corner: bool,
     clipboard: ClipboardBridge,
+    /// **Mac shortcuts active** (`ARCH-031`): off, Skerry's own chords go to the session.
+    mac_shortcuts: bool,
 }
 
 /// The Mac side of clipboard sync (`ARCH-017`).
@@ -421,6 +436,7 @@ impl Desktop {
             hot_corner: false,
             buttons_corner: false,
             clipboard: ClipboardBridge::default(),
+            mac_shortcuts: true,
         }
     }
 
@@ -606,8 +622,9 @@ impl Desktop {
     }
 
     fn modifiers(&mut self, next: Modifiers) {
-        let next = keys::Mods::from_mac(next, self.settings.command_as_control);
-        let commands = self.keys.set_mods(next);
+        let commands = self
+            .keys
+            .mac_modifiers(next, self.settings.command_as_control);
         self.commands(commands);
     }
 
@@ -938,12 +955,27 @@ impl Render for Desktop {
             .size_full()
             .overflow_hidden()
             // The Library's ⌘O / ⌘L are bound to "Library" only, so they never resolve here
-            // and the keys reach the remote app (`ARCH-028`).
-            .key_context(DESKTOP_CONTEXT)
+            // and the keys reach the remote app (`ARCH-028`). With Mac shortcuts off, the
+            // flag lets `shortcuts::suppress_bindings` hand Skerry's chords to the session
+            // (`ARCH-031`).
+            .key_context(if self.mac_shortcuts {
+                DESKTOP_CONTEXT
+            } else {
+                shortcuts::REMOTE_DESKTOP_CONTEXT
+            })
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|desktop, event: &KeyDownEvent, _, cx| {
                 let stroke = &event.keystroke;
-                if !keys::sends_key_down(stroke.modifiers, desktop.settings.command_as_control) {
+                // A Skerry chord GPUI suppressed: forwarded with ⌘ as Control, and always
+                // claimed, or AppKit's menu key equivalent would run it locally.
+                let pass = shortcuts::passes_to_session(stroke, desktop.mac_shortcuts);
+                if pass {
+                    cx.stop_propagation();
+                    desktop.keys.latch_command();
+                } else if !keys::sends_key_down(
+                    stroke.modifiers,
+                    desktop.settings.command_as_control,
+                ) {
                     // ⌘O / ⌘L: claimed, so the File menu's key equivalents don't fire.
                     if keys::claims_library_shortcut(stroke.modifiers, &stroke.key) {
                         cx.stop_propagation();
