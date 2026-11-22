@@ -3,6 +3,7 @@ mod controls;
 mod display;
 mod files_model;
 mod files_window;
+mod gamepads;
 mod promise;
 mod session_window;
 
@@ -87,6 +88,8 @@ pub fn run() {
     application.run(move |cx: &mut App| {
         gpui_kit::init(cx);
         cx.set_global(OpenWindows::default());
+        // Connected controllers and their Player slots, app-wide (`ARCH-032`).
+        gamepads::init(cx);
         // Every preference and key write goes through this one queue (`persist`).
         cx.set_global(persist::start(&handle));
         // GPUI gives quit futures 200 ms; wait for queued writes (at most 1 s) before

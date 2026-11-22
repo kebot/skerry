@@ -22,6 +22,7 @@ pub type ControlsHandler = Rc<dyn Fn(ControlsAction, &mut Window, &mut App)>;
 pub enum Section {
     Input,
     Shortcuts,
+    Gamepads,
     Clipboard,
     Screen,
     Video,
@@ -31,9 +32,10 @@ pub enum Section {
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Input,
         Self::Shortcuts,
+        Self::Gamepads,
         Self::Clipboard,
         Self::Screen,
         Self::Video,
@@ -46,6 +48,7 @@ impl Section {
 pub struct ControlsUiState {
     pub input_open: bool,
     pub shortcuts_open: bool,
+    pub gamepads_open: bool,
     pub clipboard_open: bool,
     pub screen_open: bool,
     pub video_open: bool,
@@ -64,6 +67,7 @@ impl Default for ControlsUiState {
         Self {
             input_open: false,
             shortcuts_open: false,
+            gamepads_open: false,
             clipboard_open: false,
             screen_open: true,
             video_open: false,
@@ -81,6 +85,7 @@ impl ControlsUiState {
         match section {
             Section::Input => self.input_open,
             Section::Shortcuts => self.shortcuts_open,
+            Section::Gamepads => self.gamepads_open,
             Section::Clipboard => self.clipboard_open,
             Section::Screen => self.screen_open,
             Section::Video => self.video_open,
@@ -94,6 +99,7 @@ impl ControlsUiState {
         let open = match section {
             Section::Input => &mut self.input_open,
             Section::Shortcuts => &mut self.shortcuts_open,
+            Section::Gamepads => &mut self.gamepads_open,
             Section::Clipboard => &mut self.clipboard_open,
             Section::Screen => &mut self.screen_open,
             Section::Video => &mut self.video_open,
@@ -105,12 +111,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 7] {
+    pub fn sections(&self) -> [bool; 8] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 7]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 8]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -173,6 +179,44 @@ pub enum ControlsAction {
     SetMacShortcuts(bool),
     /// Capture Pointer, or release it (`ARCH-032`).
     CapturePointer,
+    /// **Gamepad input** (`ARCH-032`).
+    SetGamepadInput(bool),
+    /// **Rumble** (`ARCH-032`).
+    SetGamepadRumble(bool),
+}
+
+/// Whether a pad in a slot reaches the session (`ARCH-032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadStatus {
+    Sending,
+    /// Input is on but the session window isn't key.
+    Ready,
+    NotSent,
+}
+
+/// One connected pad in a Player slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PadRow {
+    pub name: String,
+    pub status: PadStatus,
+    /// The pad has haptics.
+    pub rumble: bool,
+}
+
+/// The Gamepads card (`ARCH-032`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadsProps {
+    pub input: bool,
+    /// The server's `gamepad_on_start` lock holds the input switch.
+    pub input_locked: bool,
+    pub rumble: bool,
+    pub server_off: bool,
+    /// The session window is key.
+    pub key: bool,
+    /// Players 1 to 4 (wire slots 0 to 3).
+    pub slots: [Option<PadRow>; 4],
+    /// Connected pads with no slot left.
+    pub overflow: usize,
 }
 
 /// The Input card's Capture Pointer button (`ARCH-032`).
@@ -368,6 +412,8 @@ pub struct ControlsProps {
     pub stats_strip: bool,
     pub shortcuts: ShortcutsProps,
     pub capture: CaptureProps,
+    /// The Gamepads card; `None` hides it (`ui_sidebar_show_gamepads`, or no settings yet).
+    pub gamepads: Option<GamepadsProps>,
 }
 
 pub fn dpi_label(dpi: u16) -> String {
@@ -492,6 +538,15 @@ pub fn render(
                     || render_shortcuts(theme, &props.shortcuts, &on_action),
                     toggle(Section::Shortcuts),
                 ))
+                .when_some(props.gamepads.as_ref(), |cards, gamepads| {
+                    cards.child(section(
+                        theme,
+                        "Gamepads",
+                        state.gamepads_open,
+                        || render_gamepads(theme, gamepads, &on_action),
+                        toggle(Section::Gamepads),
+                    ))
+                })
                 .child(section(
                     theme,
                     "Clipboard",
@@ -1190,6 +1245,147 @@ fn render_shortcuts(theme: &Theme, shortcuts: &ShortcutsProps, on_action: &Contr
         })
 }
 
+/// Gamepads: the two switches, one note at most, then four Player rows (`ARCH-032`).
+fn render_gamepads(theme: &Theme, gamepads: &GamepadsProps, on_action: &ControlsHandler) -> Div {
+    let muted_line = |icon: Option<IconName>, text: String| {
+        div()
+            .h_flex()
+            .items_start()
+            .gap(px(6.))
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .when_some(icon, |line, icon| {
+                line.child(div().pt(px(2.)).child(Icon::new(icon).with_size(px(12.))))
+            })
+            .child(div().flex_1().min_w_0().child(text))
+    };
+    let note = if gamepads.server_off {
+        Some("Turned off by the server.")
+    } else if gamepads.input && !gamepads.key {
+        Some(
+            "Paused while another window is in front, including this one. Click the session \
+             to play.",
+        )
+    } else {
+        None
+    };
+    let rows = gamepads.slots.iter().enumerate().map(|(index, slot)| {
+        let number = index + 1;
+        let badge = div()
+            .size(px(22.))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+            .child(number.to_string());
+        let badge = match slot.as_ref().map(|pad| pad.status) {
+            Some(PadStatus::Sending) => badge.bg(theme.accent).text_color(gpui_kit::white()),
+            Some(PadStatus::Ready) => badge
+                .border_1()
+                .border_color(theme.accent)
+                .text_color(theme.accent),
+            _ => badge
+                .border_1()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground),
+        };
+        let middle = match slot {
+            Some(pad) => {
+                let status = match pad.status {
+                    PadStatus::Sending => "Sending",
+                    PadStatus::Ready => "Ready",
+                    PadStatus::NotSent => "Not sent",
+                };
+                let status = if pad.rumble {
+                    status.to_string()
+                } else {
+                    format!("{status} · No rumble")
+                };
+                div()
+                    .v_flex()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(pad.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(status),
+                    )
+            }
+            None => div()
+                .text_size(px(13.))
+                .text_color(theme.muted_foreground)
+                .child("No controller"),
+        };
+        div()
+            .h(px(44.))
+            .px(px(4.))
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .child(badge)
+            .child(div().flex_1().min_w_0().child(middle))
+    });
+    let empty = gamepads.slots.iter().all(Option::is_none);
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_row_with_detail(
+            theme,
+            "Gamepad input",
+            Some("Send controllers to this session while its window is in front.".into()),
+            gamepads.input,
+            gamepads.server_off || gamepads.input_locked,
+            ControlsAction::SetGamepadInput(!gamepads.input),
+            on_action,
+        ))
+        .child(switch_row_with_detail(
+            theme,
+            "Rumble",
+            Some("Let the session's games vibrate your controllers.".into()),
+            gamepads.rumble && gamepads.input,
+            gamepads.server_off || !gamepads.input,
+            ControlsAction::SetGamepadRumble(!gamepads.rumble),
+            on_action,
+        ))
+        .when_some(note, |panel, note| {
+            panel.child(muted_line(Some(IconName::Info), note.to_string()))
+        })
+        .child(
+            div()
+                .v_flex()
+                .gap(px(FIELD_GAP))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Players"))
+                .child(div().v_flex().gap(px(4.)).children(rows)),
+        )
+        .when(empty, |panel| {
+            panel.child(muted_line(
+                None,
+                "Pair a controller in System Settings › Bluetooth.".into(),
+            ))
+        })
+        .when(gamepads.overflow > 0, |panel| {
+            let text = if gamepads.overflow == 1 {
+                "1 more controller isn't sent: all four players are in use.".to_string()
+            } else {
+                format!(
+                    "{} more controllers aren't sent: all four players are in use.",
+                    gamepads.overflow
+                )
+            };
+            panel.child(muted_line(Some(IconName::TriangleAlert), text))
+        })
+}
+
 fn action_button(
     label: &'static str,
     action: ControlsAction,
@@ -1686,16 +1882,17 @@ mod tests {
 
     #[test]
     fn sections_round_trip_in_section_order() {
-        // Input, Shortcuts, Video and Audio open, Screen closed.
-        let open = [true, true, false, false, true, true, false];
+        // Input, Shortcuts, Gamepads, Video and Audio open, Screen closed.
+        let open = [true, true, true, false, false, true, true, false];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
         assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
-        assert!(state.shortcuts_open);
+        assert!(state.shortcuts_open && state.gamepads_open);
         assert_eq!(Section::ALL[1], Section::Shortcuts);
+        assert_eq!(Section::ALL[2], Section::Gamepads);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, false, true, false, false, false]
+            [false, false, false, false, true, false, false, false]
         );
     }
 }

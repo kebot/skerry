@@ -360,6 +360,15 @@ pub enum SessionEvent {
     /// Capture Pointer started or ended, or couldn't start, and the hint to show if any
     /// (`ARCH-032`). Raised by the session's view, not the server.
     PointerCapture(Option<crate::view::CaptureHint>),
+    /// The server asked the pad in this slot to rumble (`ARCH-032`).
+    Rumble(crate::gamepad::Rumble),
+}
+
+/// A `system,{"action": "rumble,…"}` frame's rumble; `None` for anything else.
+fn system_rumble(text: &str) -> Option<crate::gamepad::Rumble> {
+    let json = text.strip_prefix("system,")?;
+    let data: Value = serde_json::from_str(json).ok()?;
+    crate::gamepad::Rumble::parse(data["action"].as_str()?)
 }
 
 #[derive(Clone, Copy)]
@@ -428,8 +437,13 @@ pub enum Input {
 /// key the session still holds. No `kr`: on a clean close the server already resets the
 /// keyboard of the departing input owner, and every reset injects Super, Meta and Escape
 /// releases.
-fn closing_commands(held: &BTreeSet<u32>, pointer_locked: bool) -> Vec<String> {
-    let mut commands: Vec<String> = Vec::new();
+fn closing_commands(
+    held: &BTreeSet<u32>,
+    pointer_locked: bool,
+    pads: &mut crate::gamepad::JsTracker,
+) -> Vec<String> {
+    // Every announced gamepad slot first (`ARCH-032`).
+    let mut commands: Vec<String> = pads.closing();
     if pointer_locked {
         commands.extend(["p,0".into(), "SET_NATIVE_CURSOR_RENDERING,0".into()]);
     }
@@ -466,7 +480,10 @@ fn trace_input(text: &str) {
 /// The trace line for a command, if it is traced at all.
 fn trace_line(text: &str) -> Option<String> {
     let verb = text.split(',').next().unwrap_or_default();
-    if matches!(verb, "p" | "SET_NATIVE_CURSOR_RENDERING" | "m2") {
+    if matches!(verb, "p" | "SET_NATIVE_CURSOR_RENDERING" | "m2")
+        || text.starts_with("js,c,")
+        || text.starts_with("js,d,")
+    {
         return Some(text.into());
     }
     redact_key_command(text)
@@ -775,6 +792,10 @@ pub async fn run(
     let mut held = BTreeSet::new();
     // The last `p,N` sent: a close while captured restores the server's cursor (`ARCH-032`).
     let mut pointer_locked = false;
+    // Gamepad slots announced on this stream, and `js,h` while any is off rest.
+    let mut pads = crate::gamepad::JsTracker::default();
+    let mut pad_heartbeat = tokio::time::interval(crate::gamepad::HEARTBEAT);
+    pad_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clipboard_in = clipboard::Receiver::default();
     let mut clipboard_transfer = 0u64;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
@@ -844,6 +865,16 @@ pub async fn run(
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
+                    if text.starts_with("system,") {
+                        // Only rumble is used; other system actions are ignored.
+                        if let Some(rumble) = system_rumble(&text) {
+                            if input_trace_enabled() {
+                                eprintln!("skerry input: {text}");
+                            }
+                            let _ = events.send(SessionEvent::Rumble(rumble));
+                        }
+                        continue;
+                    }
                     if let Some(cursor) = text.strip_prefix("cursor,") {
                         if let Some(cursor) = RemoteCursor::parse(cursor) {
                             let _ = events.send(SessionEvent::Cursor(cursor));
@@ -1058,7 +1089,7 @@ pub async fn run(
                     // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
                     // an explicit close: release held keys, then close cleanly.
                     Some(Input::Close) | None => {
-                        for command in closing_commands(&held, pointer_locked) {
+                        for command in closing_commands(&held, pointer_locked, &mut pads) {
                             trace_input(&command);
                             let _ = socket.send(command.into()).await;
                         }
@@ -1070,6 +1101,7 @@ pub async fn run(
                 if let Some(locked) = pointer_lock_command(&text) {
                     pointer_locked = locked;
                 }
+                pads.observe(&text);
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
                     held.insert(key);
                 } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
@@ -1077,6 +1109,11 @@ pub async fn run(
                 }
                 trace_input(&text);
                 socket.send(text.into()).await.map_err(|_| disconnected)?;
+            }
+            _ = pad_heartbeat.tick(), if pads.active() => {
+                for text in pads.heartbeat() {
+                    socket.send(text.into()).await.map_err(|_| disconnected)?;
+                }
             }
             _ = heartbeat.tick(), if !held.is_empty() => {
                 let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
@@ -1557,7 +1594,7 @@ mod tests {
     fn closing_restores_native_cursor_rendering() {
         let held = BTreeSet::from([0x61]);
         assert_eq!(
-            closing_commands(&held, true),
+            closing_commands(&held, true, &mut Default::default()),
             ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "ku,97"]
         );
         assert_eq!(pointer_lock_command("p,1"), Some(true));
@@ -1573,12 +1610,75 @@ mod tests {
     #[test]
     fn closing_releases_every_held_key_then_closes() {
         let held = BTreeSet::from([0x61, 0xffe3]);
-        assert_eq!(closing_commands(&held, false), ["ku,97", "ku,65507"]);
+        assert_eq!(
+            closing_commands(&held, false, &mut Default::default()),
+            ["ku,97", "ku,65507"]
+        );
     }
 
     #[test]
     fn closing_with_nothing_held_sends_nothing() {
-        assert!(closing_commands(&BTreeSet::new(), false).is_empty());
+        assert!(closing_commands(&BTreeSet::new(), false, &mut Default::default()).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_runs_only_while_a_slot_is_off_rest() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,UGFk,4,17");
+        assert!(!pads.active());
+        pads.observe("js,a,0,1,-0.5");
+        assert!(pads.active());
+        assert_eq!(pads.heartbeat(), ["js,h,0"]);
+        // Key commands never count.
+        pads.observe("kd,97");
+        assert_eq!(pads.heartbeat(), ["js,h,0"]);
+    }
+
+    #[test]
+    fn rest_values_stop_the_heartbeat() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,1,UGFk,4,17");
+        pads.observe("js,b,1,0,1");
+        pads.observe("js,b,1,7,0.25");
+        pads.observe("js,b,1,0,0");
+        assert!(pads.active());
+        pads.observe("js,b,1,7,0");
+        assert!(!pads.active());
+        assert!(pads.heartbeat().is_empty());
+        // A disconnected slot stops too.
+        pads.observe("js,b,1,3,1");
+        pads.observe("js,d,1");
+        assert!(!pads.active());
+    }
+
+    #[test]
+    fn closing_disconnects_announced_slots() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,UGFk,4,17");
+        pads.observe("js,c,2,UGFk,4,17");
+        pads.observe("js,d,0");
+        assert_eq!(
+            closing_commands(&BTreeSet::from([0x61]), false, &mut pads),
+            ["js,d,2", "ku,97"]
+        );
+        assert!(closing_commands(&BTreeSet::new(), false, &mut pads).is_empty());
+    }
+
+    #[test]
+    fn system_frame_with_rumble_becomes_an_event() {
+        let rumble =
+            system_rumble(r#"system,{"action":"rumble,1,0.800,0.200,250"}"#).expect("rumble");
+        assert_eq!(rumble.slot, 1);
+        assert_eq!((rumble.strong, rumble.weak), (0.8, 0.2));
+        assert_eq!(rumble.duration, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn other_system_actions_are_ignored() {
+        assert!(system_rumble(r#"system,{"action":"reload"}"#).is_none());
+        assert!(system_rumble(r#"system,{"action":"rumble,9,1,1,10"}"#).is_none());
+        assert!(system_rumble("system,not json").is_none());
+        assert!(system_rumble(r#"{"action":"rumble,0,1,1,10"}"#).is_none());
     }
 
     #[test]

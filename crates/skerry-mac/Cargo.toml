@@ -18,9 +18,11 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["NSApplication", "NSButton", "NSControl", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSEvent", "NSFilePromiseProvider", "NSGraphics", "NSImage", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSView", "NSWindow", "NSWorkspace", "block2", "objc2-uniform-type-identifiers"] }
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFDictionary", "CFNumber", "objc2"] }
 objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGDirectDisplay", "CGError", "CGRemoteOperation", "libc"] }
+objc2-core-haptics = { version = "0.3.2", default-features = false, features = ["std", "CHHapticEngine", "CHHapticEvent", "CHHapticParameter", "CHHapticPattern", "CHHapticPatternPlayer"] }
 objc2-core-media = { version = "0.3.2", default-features = false, features = ["CMBase", "CMBlockBuffer", "CMFormatDescription", "CMSampleBuffer", "CMTime", "objc2"] }
 objc2-core-video = { version = "0.3.2", default-features = false, features = ["CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "objc2", "objc2-io-surface"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSLocale", "NSProcessInfo", "NSString", "NSTimeZone", "NSURL", "NSUserDefaults", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSGeometry", "NSLocale", "NSNotification", "NSOperation", "NSProcessInfo", "NSSet", "NSString", "block2", "NSTimeZone", "NSURL", "NSUserDefaults", "NSValue"] }
+objc2-game-controller = { version = "0.3.2", default-features = false, features = ["std", "block2", "GCController", "GCControllerAxisInput", "GCControllerButtonInput", "GCControllerDirectionPad", "GCControllerElement", "GCDevice", "GCDeviceHaptics", "GCExtendedGamepad", "GCPhysicalInputProfile"] }
 # Enable the CF type implementation required by Core Video's IOSurface getter.
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["UTType"] }
 objc2-io-surface = { version = "0.3.2", default-features = false, features = ["objc2-core-foundation"] }

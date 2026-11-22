@@ -262,6 +262,13 @@ impl NativeSession {
         });
     }
 
+    /// Sends each command in order (the gamepads' `js,…`).
+    pub fn send_commands(&self, commands: Vec<String>) {
+        for command in commands {
+            let _ = self.input.send(Input::Command(command));
+        }
+    }
+
     pub fn set_stats(&self, open: bool) {
         let _ = self.input.send(Input::Stats(open));
     }

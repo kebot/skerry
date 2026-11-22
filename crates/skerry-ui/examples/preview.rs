@@ -18,9 +18,9 @@ use skerry_ui::{
     },
     controls::{
         self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem,
-        ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps,
-        ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl,
-        VideoSettingRow,
+        ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps,
+        PadRow, PadStatus, ScreenProps, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem,
+        VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -115,6 +115,12 @@ enum Story {
     ControlsInputCapture,
     ControlsInputCaptureOn,
     ControlsInputCaptureUnavailable,
+    GamepadsEmpty,
+    GamepadsSending,
+    GamepadsReady,
+    GamepadsFull,
+    GamepadsInputOff,
+    GamepadsServerOff,
     AudioDefault,
     AudioChosen,
     AudioMissing,
@@ -211,6 +217,12 @@ impl Story {
         Story::ControlsInputCapture,
         Story::ControlsInputCaptureOn,
         Story::ControlsInputCaptureUnavailable,
+        Story::GamepadsEmpty,
+        Story::GamepadsSending,
+        Story::GamepadsReady,
+        Story::GamepadsFull,
+        Story::GamepadsInputOff,
+        Story::GamepadsServerOff,
         Story::AudioDefault,
         Story::AudioChosen,
         Story::AudioMissing,
@@ -306,7 +318,13 @@ impl Story {
             | Story::ControlsStatsWaiting
             | Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
-            | Story::ControlsInputCaptureUnavailable => "Session Controls",
+            | Story::ControlsInputCaptureUnavailable
+            | Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff => "Session Controls",
             Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing
@@ -402,6 +420,12 @@ impl Story {
             Story::ControlsInputCapture => "Input · Capture Pointer",
             Story::ControlsInputCaptureOn => "Input · Pointer Captured",
             Story::ControlsInputCaptureUnavailable => "Input · Capture Unavailable",
+            Story::GamepadsEmpty => "Gamepads · Empty",
+            Story::GamepadsSending => "Gamepads · Sending",
+            Story::GamepadsReady => "Gamepads · Ready",
+            Story::GamepadsFull => "Gamepads · Full",
+            Story::GamepadsInputOff => "Gamepads · Input Off",
+            Story::GamepadsServerOff => "Gamepads · Server Off",
             Story::AudioDefault => "Default",
             Story::AudioChosen => "Chosen Device",
             Story::AudioMissing => "Saved Device Missing",
@@ -499,6 +523,12 @@ impl Story {
             Story::ControlsInputCapture => "story-controls-input-capture",
             Story::ControlsInputCaptureOn => "story-controls-input-capture-on",
             Story::ControlsInputCaptureUnavailable => "story-controls-input-capture-unavailable",
+            Story::GamepadsEmpty => "story-controls-gamepads-empty",
+            Story::GamepadsSending => "story-controls-gamepads-sending",
+            Story::GamepadsReady => "story-controls-gamepads-ready",
+            Story::GamepadsFull => "story-controls-gamepads-full",
+            Story::GamepadsInputOff => "story-controls-gamepads-input-off",
+            Story::GamepadsServerOff => "story-controls-gamepads-server-off",
             Story::AudioDefault => "story-audio-default",
             Story::AudioChosen => "story-audio-chosen",
             Story::AudioMissing => "story-audio-missing",
@@ -592,6 +622,12 @@ impl Story {
                 | Story::ControlsInputCapture
                 | Story::ControlsInputCaptureOn
                 | Story::ControlsInputCaptureUnavailable
+                | Story::GamepadsEmpty
+                | Story::GamepadsSending
+                | Story::GamepadsReady
+                | Story::GamepadsFull
+                | Story::GamepadsInputOff
+                | Story::GamepadsServerOff
         ) || self.is_audio()
     }
 
@@ -683,19 +719,26 @@ impl Story {
         match self {
             // Input, Shortcuts and Video open, Screen closed: what a server remembered.
             Story::ControlsRestoredSections => ControlsUiState::default()
-                .with_sections([true, true, false, false, true, false, false]),
+                .with_sections([true, true, true, false, false, true, false, false]),
             _ if self.is_audio() => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, true, false]),
+                .with_sections([false, false, false, false, false, false, true, false]),
             Story::ControlsShortcutsActive
             | Story::ControlsShortcutsOff
             | Story::ControlsShortcutsLocked => ControlsUiState::default()
-                .with_sections([false, true, false, false, false, false, false]),
+                .with_sections([false, true, false, false, false, false, false, false]),
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, true]),
+                .with_sections([false, false, false, false, false, false, false, true]),
+            Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff => ControlsUiState::default()
+                .with_sections([false, false, true, false, false, false, false, false]),
             Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
             | Story::ControlsInputCaptureUnavailable => ControlsUiState::default()
-                .with_sections([true, false, false, false, false, false, false]),
+                .with_sections([true, false, false, false, false, false, false, false]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()
@@ -1917,6 +1960,16 @@ impl PreviewApp {
             ControlsAction::ToggleSection(section) => {
                 self.controls_ui.toggle(section);
             }
+            ControlsAction::SetGamepadInput(on) => {
+                if let Some(gamepads) = self.controls_props.gamepads.as_mut() {
+                    gamepads.input = on;
+                }
+            }
+            ControlsAction::SetGamepadRumble(on) => {
+                if let Some(gamepads) = self.controls_props.gamepads.as_mut() {
+                    gamepads.rumble = on;
+                }
+            }
             ControlsAction::CapturePointer => {
                 let capture = &mut self.controls_props.capture;
                 if capture.available {
@@ -2205,6 +2258,7 @@ impl PreviewApp {
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
                 capture: Self::fixture_capture(true, false),
+                gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
             },
             Story::ControlsServerLocked => ControlsProps {
                 app_name: "Locked Enterprise Desktop".into(),
@@ -2237,6 +2291,7 @@ impl PreviewApp {
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
                 capture: Self::fixture_capture(true, false),
+                gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
             },
             _ if story.is_audio() => {
                 let mut props = Self::fixture_controls(Story::ControlsHardware);
@@ -2261,6 +2316,16 @@ impl PreviewApp {
                     Story::ControlsShortcutsLocked => Self::fixture_shortcuts(false, true),
                     _ => Self::fixture_shortcuts(true, false),
                 };
+                props
+            }
+            Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.gamepads = Some(Self::fixture_gamepads(story));
                 props
             }
             Story::ControlsInputCapture
@@ -2374,6 +2439,7 @@ impl PreviewApp {
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
                 capture: Self::fixture_capture(true, false),
+                gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
             },
         }
     }
@@ -2528,6 +2594,50 @@ impl PreviewApp {
                 row("Capture Pointer", "⌃⌥⇧", "Z", None),
                 row("Quit", "⌘", "Q", None),
             ],
+        }
+    }
+
+    /// The Gamepads card for a story.
+    fn fixture_gamepads(story: Story) -> GamepadsProps {
+        let pad = |name: &str, status, rumble| {
+            Some(PadRow {
+                name: name.into(),
+                status,
+                rumble,
+            })
+        };
+        let status = match story {
+            Story::GamepadsReady => PadStatus::Ready,
+            Story::GamepadsInputOff | Story::GamepadsServerOff => PadStatus::NotSent,
+            _ => PadStatus::Sending,
+        };
+        let two = [
+            pad("DualSense Wireless Controller", status, true),
+            pad("Xbox Wireless Controller", status, false),
+            None,
+            None,
+        ];
+        let (slots, overflow) = match story {
+            Story::GamepadsEmpty => ([None, None, None, None], 0),
+            Story::GamepadsFull => (
+                [
+                    pad("DualSense Wireless Controller", status, true),
+                    pad("Xbox Wireless Controller", status, false),
+                    pad("Pro Controller", status, true),
+                    pad("8BitDo Ultimate", status, false),
+                ],
+                1,
+            ),
+            _ => (two, 0),
+        };
+        GamepadsProps {
+            input: story != Story::GamepadsInputOff,
+            input_locked: false,
+            rumble: true,
+            server_off: story == Story::GamepadsServerOff,
+            key: story != Story::GamepadsReady,
+            slots,
+            overflow,
         }
     }
 
@@ -2989,6 +3099,12 @@ impl PreviewApp {
             | Story::ControlsInputCapture
             | Story::ControlsInputCaptureOn
             | Story::ControlsInputCaptureUnavailable
+            | Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff
             | Story::AudioDefault
             | Story::AudioChosen
             | Story::AudioMissing

@@ -1,3 +1,4 @@
+use super::gamepads::Gamepads;
 use super::session_window::SessionWindow;
 use super::{
     native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, TogglePointerCapture,
@@ -28,8 +29,9 @@ use gpui_kit::{
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
     self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem, ClipboardProps,
-    CodecChoice, ControlsAction, ControlsProps, ControlsUiState, ScreenProps, Section, ShortcutRow,
-    ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
+    CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps, PadRow, PadStatus,
+    ScreenProps, Section, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps,
+    VideoSettingControl, VideoSettingRow,
 };
 use std::rc::Rc;
 
@@ -81,6 +83,8 @@ enum Command {
     MacShortcuts(bool),
     /// The session window activates and captures the pointer (`ARCH-032`).
     CapturePointer,
+    GamepadInput(bool),
+    GamepadRumble(bool),
 }
 
 impl ControlPanel {
@@ -314,6 +318,8 @@ impl ControlPanel {
                         Command::StatsStrip(on) => session.set_stats_strip(on, cx),
                         Command::MacShortcuts(active) => session.change_mac_shortcuts(active, cx),
                         Command::CapturePointer => session.request_capture(window, cx),
+                        Command::GamepadInput(on) => session.change_gamepad_input(on, cx),
+                        Command::GamepadRumble(on) => session.change_gamepad_rumble(on, cx),
                         Command::Chord(chord) => {
                             session.close_controls(window, cx);
                             if let Some(stream) = &session.current {
@@ -482,6 +488,12 @@ impl ControlPanel {
             ControlsAction::CapturePointer => {
                 Self::send(self.owner.clone(), Command::CapturePointer, cx)
             }
+            ControlsAction::SetGamepadInput(on) => {
+                Self::send(self.owner.clone(), Command::GamepadInput(on), cx)
+            }
+            ControlsAction::SetGamepadRumble(on) => {
+                Self::send(self.owner.clone(), Command::GamepadRumble(on), cx)
+            }
             ControlsAction::CopyStats => {
                 let session = self.owner.session.read(cx);
                 let history: Vec<_> = session.stats_history.iter().cloned().collect();
@@ -615,7 +627,55 @@ impl ControlPanel {
                 session.picture_painted(cx) && session.settings.is_some(),
                 session.pointer_captured(cx),
             ),
+            gamepads: gamepads_props(session, cx),
         }
+    }
+}
+
+/// The Gamepads card (`ARCH-032`): hidden until the server's settings arrive, and when
+/// `ui_sidebar_show_gamepads` is off. Reads the global, never updates it.
+fn gamepads_props(session: &SessionWindow, cx: &App) -> Option<GamepadsProps> {
+    let policy = session
+        .settings
+        .as_ref()
+        .map(|settings| settings.gamepad)
+        .filter(|policy| policy.show_panel)?;
+    let input = session.gamepad_input();
+    let key = session.window_active();
+    let pads = cx
+        .try_global::<Gamepads>()
+        .map(|gamepads| gamepads.pads())
+        .unwrap_or_default();
+    let status = pad_state(input, policy.enabled, key);
+    let slots = std::array::from_fn(|slot| {
+        pads.iter()
+            .find(|pad| pad.slot == Some(slot as u8))
+            .map(|pad| PadRow {
+                name: pad.name.clone(),
+                status,
+                rumble: pad.rumble,
+            })
+    });
+    Some(GamepadsProps {
+        input,
+        input_locked: policy.on_start_locked,
+        rumble: session.preferences.gamepads.rumble,
+        server_off: !policy.enabled,
+        key,
+        slots,
+        overflow: pads.iter().filter(|pad| pad.slot.is_none()).count(),
+    })
+}
+
+/// Whether a pad with a Player reaches the session: not when the server or the switch has
+/// gamepads off, ready while another window is key, sending otherwise.
+fn pad_state(input_on: bool, server_on: bool, key: bool) -> PadStatus {
+    if !server_on || !input_on {
+        PadStatus::NotSent
+    } else if !key {
+        PadStatus::Ready
+    } else {
+        PadStatus::Sending
     }
 }
 
@@ -1242,6 +1302,22 @@ mod tests {
 
     fn at(y: f32) -> Point<Pixels> {
         point(px(0.), px(y))
+    }
+
+    #[test]
+    fn pad_state_rules() {
+        assert_eq!(pad_state(true, true, true), PadStatus::Sending);
+        assert_eq!(pad_state(true, true, false), PadStatus::Ready);
+        assert_eq!(pad_state(false, true, true), PadStatus::NotSent);
+        assert_eq!(pad_state(true, false, true), PadStatus::NotSent);
+        assert_eq!(pad_state(false, false, false), PadStatus::NotSent);
+    }
+
+    #[test]
+    fn capture_props_take_the_chord_from_chords() {
+        let props = capture_props(true, false);
+        assert_eq!((props.modifiers.as_str(), props.key.as_str()), ("⌃⌥⇧", "Z"));
+        assert!(props.available && !props.captured);
     }
 
     #[test]

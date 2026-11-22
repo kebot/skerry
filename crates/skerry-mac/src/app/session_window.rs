@@ -6,6 +6,7 @@
 
 use super::controls::ControlPanel;
 use super::files_window::{self, FilesOwner, FilesWindow};
+use super::gamepads::Gamepads;
 use super::{
     dark_appearance, display, session_chrome, DisconnectSession, DisplayMode, Launcher,
     ToggleFiles, ToggleFullScreen, TogglePointerCapture, ToggleSessionControls, ToggleStatsStrip,
@@ -186,6 +187,10 @@ pub(super) struct SessionWindow {
     capture_hint: Option<(CaptureHint, u64, bool)>,
     hint_generation: u64,
     hint_task: Option<Task<()>>,
+    /// What this stream told the server about its gamepad slots (`ARCH-032`).
+    gamepad_link: crate::gamepad::Link,
+    /// This window is key: only then does it send pads, or capture the pointer.
+    window_active: bool,
 }
 
 impl SessionWindow {
@@ -243,6 +248,8 @@ impl SessionWindow {
             capture_hint: None,
             hint_generation: 0,
             hint_task: None,
+            gamepad_link: crate::gamepad::Link::default(),
+            window_active: window.is_window_active(),
         };
         let owner = cx.weak_entity();
         window.on_window_should_close(cx, move |window, cx| {
@@ -261,7 +268,31 @@ impl SessionWindow {
         })
         .detach();
         cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
+            let active = window.is_window_active();
+            this.window_active = active;
+            // Pads follow the key window: the global only records it (this window holds its
+            // own lease), this window syncs itself, and the one that lost key is synced
+            // after this update (`ARCH-015`).
+            let handle = Window::window_handle(window);
+            let entity = cx.weak_entity();
+            let lost = cx
+                .try_global::<Gamepads>()
+                .is_some()
+                .then(|| {
+                    cx.update_global::<Gamepads, _>(|gamepads, _| {
+                        gamepads.set_active(handle, entity, active)
+                    })
+                })
+                .flatten();
+            this.sync_gamepads(cx);
+            if let Some((other, session)) = lost {
+                cx.defer(move |cx| {
+                    let _ = other.update(cx, |_, _, cx| {
+                        session.update(cx, |session, cx| session.sync_gamepads(cx))
+                    });
+                });
+            }
+            if active {
                 if std::mem::take(&mut this.pending_capture) {
                     if let Some(stream) = &this.current {
                         stream.engage_capture(window, cx);
@@ -382,6 +413,7 @@ impl SessionWindow {
                 self.keep_waiting = false;
                 self.shortcut_policy = Some(settings.keyboard_shortcuts);
                 self.settings = Some(settings);
+                self.sync_gamepads(cx);
                 // The server's keyboard_shortcuts, possibly locked (`ARCH-031`).
                 if let Some(stream) = &self.current {
                     stream.set_mac_shortcuts(self.mac_shortcuts(), cx);
@@ -447,6 +479,13 @@ impl SessionWindow {
                 self.audio = None;
                 self.video = None;
                 self.startup_stalled = Some(self.keep_waiting);
+            }
+            SessionEvent::Rumble(rumble) => {
+                if self.window_active && self.gamepad_input() && self.preferences.gamepads.rumble {
+                    if let Some(gamepads) = cx.try_global::<Gamepads>() {
+                        gamepads.rumble(&rumble);
+                    }
+                }
             }
             SessionEvent::PointerCapture(hint) => {
                 if let Some(hint) = hint {
@@ -775,6 +814,69 @@ impl SessionWindow {
         }
     }
 
+    /// Whether this window is key.
+    pub(super) fn window_active(&self) -> bool {
+        self.window_active
+    }
+
+    /// **Gamepad input**: the saved choice, else the server's `gamepad_on_start`. Off until
+    /// the server's settings arrive.
+    pub(super) fn gamepad_input(&self) -> bool {
+        self.settings.as_ref().is_some_and(|settings| {
+            crate::gamepad::input_on(settings.gamepad, self.preferences.gamepads.input)
+        })
+    }
+
+    /// Brings the server up to date with the pads (`ARCH-032`): only while the server
+    /// allows it, input is on, and this window is key; at rest otherwise.
+    pub(super) fn sync_gamepads(&mut self, cx: &mut Context<Self>) {
+        let Some(stream) = &self.current else {
+            return;
+        };
+        let gate = crate::gamepad::Gate {
+            ready_and_enabled: self
+                .settings
+                .as_ref()
+                .is_some_and(|settings| settings.gamepad.enabled),
+            input_on: self.gamepad_input(),
+            key: self.window_active,
+        };
+        let commands = match cx.try_global::<Gamepads>() {
+            Some(gamepads) => self.gamepad_link.sync(gamepads.pads(), gate),
+            None => self.gamepad_link.sync(&[], gate),
+        };
+        stream.send_commands(commands);
+    }
+
+    /// **Gamepad input** switched; saved for this server.
+    pub(super) fn change_gamepad_input(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.preferences.gamepads.input = Some(on);
+        self.save(
+            "the gamepad preference",
+            move |p| p.gamepads.input = Some(on),
+            cx,
+        );
+        if !on {
+            if let Some(gamepads) = cx.try_global::<Gamepads>() {
+                gamepads.stop_rumble();
+            }
+        }
+        self.sync_gamepads(cx);
+        cx.notify();
+    }
+
+    /// **Rumble** switched; saved for this server. Off stops what plays.
+    pub(super) fn change_gamepad_rumble(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.preferences.gamepads.rumble = on;
+        self.save("the rumble preference", move |p| p.gamepads.rumble = on, cx);
+        if !on {
+            if let Some(gamepads) = cx.try_global::<Gamepads>() {
+                gamepads.stop_rumble();
+            }
+        }
+        cx.notify();
+    }
+
     /// Whether this window holds the pointer (read from the stream, never mirrored).
     /// Whether the stream has painted a picture yet.
     pub(super) fn picture_painted(&self, cx: &App) -> bool {
@@ -1036,6 +1138,16 @@ impl SessionWindow {
         self.capture_hint = None;
         self.hint_task = None;
         self.stream_events = None;
+        // Announced pads leave before the key releases and the close frame (`ARCH-032`).
+        if let Some(stream) = &self.current {
+            stream.send_commands(self.gamepad_link.close());
+            if self.window_active {
+                if let Some(gamepads) = cx.try_global::<Gamepads>() {
+                    gamepads.stop_rumble();
+                }
+            }
+        }
+        self.gamepad_link.reset();
         // `release_focus` queues `ku` for held keys; dropping the stream then queues
         // `Input::Close` behind them, so they reach the server before the close frame
         // (`ARCH-GAP-DC-09`).
