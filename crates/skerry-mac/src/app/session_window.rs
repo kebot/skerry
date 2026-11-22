@@ -510,6 +510,10 @@ impl SessionWindow {
                 if let Some(stream) = &self.current {
                     stream.set_mac_shortcuts(self.mac_shortcuts(), cx);
                 }
+                // `second_screen` may turn true after the first picture (`ARCH-039`).
+                if self.video == Some(true) {
+                    self.second_on_picture(cx);
+                }
             }
             SessionEvent::Stats(sample) => {
                 if self.stats_interest.wanted() {
@@ -641,6 +645,8 @@ impl SessionWindow {
                 self.audio_output = None;
                 self.video = None;
                 self.status = Some(error);
+                // A failed or KILLed primary: Display 2 waits for the next one (`ARCH-039`).
+                self.second.on_primary_end(cx);
             }
         }
     }
@@ -891,6 +897,8 @@ impl SessionWindow {
         if self.current.is_none() {
             return;
         }
+        // A HiDPI or mode change reaches an open Display 2 (`ARCH-039`).
+        self.second.follow_mode(self.display_mode, cx);
         let scale = window.scale_factor();
         let resolution = self
             .resize_allowed
@@ -993,15 +1001,27 @@ impl SessionWindow {
             let _ = window.update(cx, |_, _, cx| {
                 this.update(cx, |this, cx| {
                     this.key_handoff = None;
-                    if !this.session_key() {
-                        if let Some(gamepads) = cx.try_global::<Gamepads>() {
-                            gamepads.stop_rumble();
-                        }
+                    if !this.session_key() && cx.has_global::<Gamepads>() {
+                        // The resign the observer held back: the global forgets this
+                        // session as key (it stops what plays).
+                        let (handle, entity) = (this.window, cx.weak_entity());
+                        cx.update_global::<Gamepads, _>(|gamepads, _| {
+                            gamepads.set_active(handle, entity, false);
+                        });
                     }
                     this.sync_gamepads(cx);
                 })
             });
         }));
+    }
+
+    /// [`Self::second_setup`], only while the primary shows a picture and the server
+    /// allows a second display: Display 2's Reconnect never opens a lone stream.
+    pub(super) fn second_setup_when_streaming(&self) -> Option<StreamSetup> {
+        let allowed = self.settings.as_ref().and_then(|s| s.second_screen) == Some(true);
+        (self.video == Some(true) && allowed)
+            .then(|| self.second_setup())
+            .flatten()
     }
 
     /// What Display 2's stream starts with, read now (`ARCH-039`).

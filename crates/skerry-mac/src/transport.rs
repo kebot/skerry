@@ -1177,9 +1177,11 @@ async fn stream(
                     Some(Input::Position(side, request)) => {
                         if socket.role().is_primary() { continue; }
                         socket.set_side(side);
-                        let settings = request.map_or_else(|| json!({}), DisplayRequest::settings);
-                        socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
+                        // Without a size, only later frames carry the side: a size-less
+                        // SETTINGS would re-seat display2 without its size.
                         if let Some(request) = request {
+                            let settings = request.settings();
+                            socket.send(format!("SETTINGS,{settings}")).await.map_err(|_| disconnected)?;
                             let command = socket.role().resize_command(request.resolution);
                             socket.send(command).await.map_err(|_| disconnected)?;
                         }
@@ -1916,9 +1918,14 @@ mod tests {
         ]
     }
 
+    /// The input that tells the fake server every earlier input has been read.
+    const INPUTS_DONE: &str = "qa-inputs-done";
+
     /// Runs `role`'s stream against a fake Selkies on plain TCP: the server sends
-    /// `script`, the stream gets `inputs`, then the server sends `last` (a `KILL`, say) and
-    /// closes with `close` (1008 for a refusal), and every text frame it read is returned.
+    /// `script` (then an Apps frame that marks its end), the stream gets `inputs` once it
+    /// has read the whole script, then the server sends `last` (a `KILL`, say) once it has
+    /// read every input, and closes with `close` (1008 for a refusal). Every text frame it
+    /// read is returned. No fixed sleeps: each step waits on the one before.
     async fn play(
         role: StreamRole,
         script: Vec<String>,
@@ -1930,7 +1937,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (go_tx, go) = tokio::sync::oneshot::channel::<()>();
+        let scripted = !script.is_empty();
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
@@ -1939,19 +1946,23 @@ mod tests {
             if let Some(Ok(Message::Text(text))) = ws.next().await {
                 received.push(text.to_string());
             }
-            for message in script {
-                ws.send(Message::text(message)).await.unwrap();
-            }
-            let reader = async {
-                while let Some(Ok(message)) = ws.next().await {
-                    if let Message::Text(text) = message {
-                        received.push(text.to_string());
-                    }
+            if scripted {
+                for message in script {
+                    ws.send(Message::text(message)).await.unwrap();
                 }
-            };
-            tokio::select! {
-                _ = reader => return received,
-                _ = go => {}
+                // Raises an Apps event in either role: the stream has read the script.
+                ws.send(Message::text(r#"system,{"action":"apps_state"}"#))
+                    .await
+                    .unwrap();
+            }
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Text(text))) if text.as_str() == INPUTS_DONE => break,
+                    Some(Ok(Message::Text(text))) => received.push(text.to_string()),
+                    Some(Ok(_)) => {}
+                    // The stream closed or ended by itself.
+                    _ => return received,
+                }
             }
             if let Some(last) = last {
                 let _ = ws.send(Message::text(last)).await;
@@ -1979,7 +1990,9 @@ mod tests {
         let (frames, _frames_rx) = watch::channel(Frame::default());
         let (input_tx, input) = mpsc::unbounded_channel();
         let (_pointer_tx, pointer) = watch::channel(None);
-        let (events, mut events_rx) = mpsc::unbounded_channel();
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let events_rx = tokio::sync::Mutex::new(events_rx);
+        let seen = std::cell::RefCell::new(Vec::new());
         let (_cancel_tx, cancel) = watch::channel(false);
         let options = SessionOptions {
             muted: false,
@@ -1989,12 +2002,21 @@ mod tests {
             ..test_options()
         };
         let driver = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            if scripted {
+                // Wait for the script's end marker.
+                loop {
+                    let event = events_rx.lock().await.recv().await;
+                    match event {
+                        Some(SessionEvent::Apps(_)) => break,
+                        Some(event) => seen.borrow_mut().push(event),
+                        None => std::future::pending::<()>().await,
+                    }
+                }
+            }
             for input in inputs {
                 let _ = input_tx.send(input);
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            let _ = go_tx.send(());
+            let _ = input_tx.send(Input::Command(INPUTS_DONE.into()));
             std::future::pending::<()>().await;
         };
         let ended = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2006,7 +2028,8 @@ mod tests {
         .await
         .expect("the stream ends");
         drop(events);
-        let mut seen = Vec::new();
+        let mut seen = seen.into_inner();
+        let mut events_rx = events_rx.into_inner();
         while let Ok(event) = events_rx.try_recv() {
             seen.push(event);
         }

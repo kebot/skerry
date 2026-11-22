@@ -235,6 +235,9 @@ fn note_text(state: &SecondState, side: Side, layout: Option<&DisplayConfig>) ->
 fn banner_text(state: &SecondState) -> Option<String> {
     match state {
         SecondState::Ended => Some("Display 2 disconnected.".into()),
+        SecondState::Refused(reason) if reason.trim().is_empty() => {
+            Some("Display 2 isn’t available.".into())
+        }
         SecondState::Refused(reason) => {
             let reason = reason.trim();
             let stop = if reason.ends_with(['.', '!', '?']) {
@@ -297,6 +300,8 @@ pub(super) struct SecondHost {
     layout: Option<DisplayConfig>,
     /// Display 2 was resumed (or opened streaming) on this primary stream.
     resumed: bool,
+    /// The mode Display 2 was last given.
+    mode: Option<DisplayMode>,
     /// The bottom pill: text, generation, fading.
     pill: Option<(&'static str, u64, bool)>,
     pill_generation: u64,
@@ -312,11 +317,31 @@ impl SecondHost {
         self.layout = Some(config);
     }
 
-    /// The primary stream ended: Display 2 waits for the next one.
+    /// The primary stream ended (closed, failed, or KILLed): Display 2 waits for the next
+    /// one, and resumes on its first picture.
     pub(super) fn on_primary_end(&mut self, cx: &mut App) {
+        if self.primary_ended() {
+            self.update_display(cx, |display, window, cx| display.suspend(window, cx));
+        }
+    }
+
+    /// The pure half of [`Self::on_primary_end`]: whether a Display 2 needs suspending.
+    fn primary_ended(&mut self) -> bool {
         self.resumed = false;
         self.layout = None;
-        self.update_display(cx, |display, window, cx| display.suspend(window, cx));
+        self.display.is_some() || self.opening
+    }
+
+    /// The primary's display mode changed: Display 2 follows it (HiDPI or Match Window).
+    pub(super) fn follow_mode(&mut self, primary: DisplayMode, cx: &mut App) {
+        let mode = second_mode(primary);
+        if self.mode == Some(mode) {
+            return;
+        }
+        self.mode = Some(mode);
+        self.update_display(cx, move |display, window, cx| {
+            display.set_mode(mode, window, cx)
+        });
     }
 
     /// Whether the primary's first picture should resume Display 2: it is wanted and
@@ -504,11 +529,9 @@ impl SessionWindow {
             }
         };
         // Streams at once when the primary already shows a picture; waits otherwise.
-        let setup = (self.video == Some(true)
-            && self.settings.as_ref().and_then(|s| s.second_screen) == Some(true))
-        .then(|| self.second_setup())
-        .flatten();
+        let setup = self.second_setup_when_streaming();
         self.second.resumed = setup.is_some();
+        self.second.mode = Some(second_mode(self.display_mode));
         self.second.wanted = Some(side);
         self.second.opening = true;
         self.release_second_keys(cx);
@@ -890,6 +913,12 @@ impl DisplayWindow {
         self.end(SecondState::Waiting, window, cx);
     }
 
+    /// The primary's mode changed: resize to the new one now.
+    fn set_mode(&mut self, mode: DisplayMode, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = mode;
+        self.resize(window, cx);
+    }
+
     fn resume(&mut self, setup: StreamSetup, window: &mut Window, cx: &mut Context<Self>) {
         if self.current.is_none() {
             self.open_stream(setup, window, cx);
@@ -1006,9 +1035,10 @@ impl DisplayWindow {
         let handle = self.window;
         self.state = SecondState::Connecting;
         cx.defer(move |cx| {
+            // Only while the primary shows a picture: otherwise Display 2 waits for it.
             let setup = owner_window
                 .update(cx, |_, _, cx| {
-                    session.read_with(cx, |session, _| session.second_setup())
+                    session.read_with(cx, |session, _| session.second_setup_when_streaming())
                 })
                 .ok()
                 .and_then(Result::ok)
@@ -1292,6 +1322,44 @@ mod tests {
         assert!(host.take_resume(true, Some(true)));
         // Once per primary stream.
         assert!(!host.take_resume(true, Some(true)));
+    }
+
+    #[test]
+    fn display_two_resumes_when_allowed_after_the_picture() {
+        let mut host = SecondHost {
+            wanted: Some(Side::Right),
+            ..Default::default()
+        };
+        // The picture came first, with the server not yet saying.
+        assert!(!host.take_resume(true, None));
+        // A later server_settings allows it: the Settings arm resumes once.
+        assert!(host.take_resume(true, Some(true)));
+        assert!(!host.take_resume(true, Some(true)));
+    }
+
+    #[test]
+    fn a_primary_error_or_kill_suspends_display_two() {
+        let mut host = SecondHost {
+            wanted: Some(Side::Right),
+            opening: true,
+            ..Default::default()
+        };
+        assert!(host.take_resume(true, Some(true)));
+        // The primary's Error arm (KILL routes through it) ends the primary for Display 2.
+        assert!(host.primary_ended());
+        assert!(host.layout.is_none());
+        // Its next picture resumes Display 2 again.
+        assert!(host.take_resume(true, Some(true)));
+        // Nothing to suspend without a Display 2.
+        assert!(!SecondHost::default().primary_ended());
+    }
+
+    #[test]
+    fn a_bare_kill_reads_without_stray_punctuation() {
+        assert_eq!(
+            banner_text(&SecondState::Refused(String::new())).unwrap(),
+            "Display 2 isn’t available."
+        );
     }
 
     #[test]
