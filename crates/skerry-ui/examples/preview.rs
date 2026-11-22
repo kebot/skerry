@@ -23,12 +23,16 @@ use skerry_ui::{
     },
     launch_dialog::{
         self, LaunchDialogAction, LaunchDialogProps, LaunchDialogSelects, LaunchOption,
-        LaunchOptions, LaunchSelect,
+        LaunchOptions, LaunchSelect, RunningMatch,
     },
-    library::{self, AppItem, LibraryHandlers, LibraryProps, SessionItem},
+    library::{
+        self, AppItem, Filter, LaunchNotice, LaunchingItem, LibraryHandlers, LibraryProps,
+        SessionItem, StageRow, StageState,
+    },
     session::{self, KeySourceLabel},
     stats,
 };
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -54,6 +58,16 @@ enum Story {
     LibraryToast,
     LibraryLaunchDialogCopied,
     LibraryLongServer,
+    LibraryOrganized,
+    LibraryHiddenChip,
+    LibrarySearchHidden,
+    LibraryContextMenu,
+    LibraryLaunching,
+    LibraryLaunchingPull,
+    LibraryLaunchStalled,
+    LibraryLaunchFailed,
+    LibraryLaunchDialogRunning,
+    LibraryLaunchDialogHidden,
     ControlsHardware,
     ControlsJpeg,
     ControlsServerLocked,
@@ -82,6 +96,16 @@ impl Story {
         Story::LibraryToast,
         Story::LibraryLaunchDialogCopied,
         Story::LibraryLongServer,
+        Story::LibraryOrganized,
+        Story::LibraryHiddenChip,
+        Story::LibrarySearchHidden,
+        Story::LibraryContextMenu,
+        Story::LibraryLaunching,
+        Story::LibraryLaunchingPull,
+        Story::LibraryLaunchStalled,
+        Story::LibraryLaunchFailed,
+        Story::LibraryLaunchDialogRunning,
+        Story::LibraryLaunchDialogHidden,
         Story::ControlsHardware,
         Story::ControlsJpeg,
         Story::ControlsServerLocked,
@@ -107,7 +131,17 @@ impl Story {
             | Story::LibrarySignOutUnsaved
             | Story::LibraryToast
             | Story::LibraryLaunchDialogCopied
-            | Story::LibraryLongServer => "Library",
+            | Story::LibraryLongServer
+            | Story::LibraryOrganized
+            | Story::LibraryHiddenChip
+            | Story::LibrarySearchHidden
+            | Story::LibraryContextMenu
+            | Story::LibraryLaunching
+            | Story::LibraryLaunchingPull
+            | Story::LibraryLaunchStalled
+            | Story::LibraryLaunchFailed
+            | Story::LibraryLaunchDialogRunning
+            | Story::LibraryLaunchDialogHidden => "Library",
             Story::ControlsHardware
             | Story::ControlsJpeg
             | Story::ControlsServerLocked
@@ -135,6 +169,16 @@ impl Story {
             Story::LibraryToast => "Toast · Library refreshed",
             Story::LibraryLaunchDialogCopied => "Launch Dialog · Copied",
             Story::LibraryLongServer => "Long server name",
+            Story::LibraryOrganized => "Organized",
+            Story::LibraryHiddenChip => "Hidden Chip",
+            Story::LibrarySearchHidden => "Search Finds Hidden",
+            Story::LibraryContextMenu => "Tile Menu",
+            Story::LibraryLaunching => "Launching",
+            Story::LibraryLaunchingPull => "Pulling Image",
+            Story::LibraryLaunchStalled => "Launch Stalled",
+            Story::LibraryLaunchFailed => "Launch Failed",
+            Story::LibraryLaunchDialogRunning => "Launch Dialog · Running",
+            Story::LibraryLaunchDialogHidden => "Launch Dialog · Hidden",
             Story::ControlsHardware => "Hardware H.265",
             Story::ControlsJpeg => "JPEG + Paint-Over",
             Story::ControlsServerLocked => "Server Locked",
@@ -164,6 +208,16 @@ impl Story {
             Story::LibraryToast => "story-library-toast",
             Story::LibraryLaunchDialogCopied => "story-library-launch-dialog-copied",
             Story::LibraryLongServer => "story-library-long-server",
+            Story::LibraryOrganized => "story-library-organized",
+            Story::LibraryHiddenChip => "story-library-hidden-chip",
+            Story::LibrarySearchHidden => "story-library-search-hidden",
+            Story::LibraryContextMenu => "story-library-context-menu",
+            Story::LibraryLaunching => "story-library-launching",
+            Story::LibraryLaunchingPull => "story-library-launching-pull",
+            Story::LibraryLaunchStalled => "story-library-launch-stalled",
+            Story::LibraryLaunchFailed => "story-library-launch-failed",
+            Story::LibraryLaunchDialogRunning => "story-library-launch-dialog-running",
+            Story::LibraryLaunchDialogHidden => "story-library-launch-dialog-hidden",
             Story::ControlsHardware => "story-controls-hardware",
             Story::ControlsJpeg => "story-controls-jpeg",
             Story::ControlsServerLocked => "story-controls-locked",
@@ -183,7 +237,38 @@ impl Story {
             Story::LibraryLaunchDialog
                 | Story::LibraryLaunchDialogMinimal
                 | Story::LibraryLaunchDialogCopied
+                | Story::LibraryLaunchDialogRunning
+                | Story::LibraryLaunchDialogHidden
         )
+    }
+
+    /// The chip a story opens on.
+    fn filter(self) -> Filter {
+        if self == Story::LibraryHiddenChip {
+            Filter::Hidden
+        } else {
+            Filter::All
+        }
+    }
+
+    /// The search a story opens with.
+    fn query(self) -> &'static str {
+        if self == Story::LibrarySearchHidden {
+            "o"
+        } else {
+            ""
+        }
+    }
+
+    /// The note in the workbench's top bar when the story opens.
+    fn note(self) -> Option<&'static str> {
+        (self == Story::LibraryContextMenu).then_some("Right-click a tile to open its menu")
+    }
+
+    /// Krita and Obsidian are the hidden apps (Krita a favorite too); elsewhere two others
+    /// are hidden so Krita and Obsidian can fill the Recent row.
+    fn hides_krita(self) -> bool {
+        matches!(self, Story::LibraryHiddenChip | Story::LibrarySearchHidden)
     }
 
     /// Stories drawn with the Session Controls panel.
@@ -271,7 +356,7 @@ struct PreviewApp {
     assets: PreviewAssets,
     key_input: Entity<InputState>,
     search_input: Entity<InputState>,
-    selected_filter: String,
+    selected_filter: Filter,
     launch_dialog: Option<(LaunchDialogProps, LaunchDialogSelects)>,
     controls_ui: ControlsUiState,
     controls_props: ControlsProps,
@@ -359,17 +444,11 @@ impl PreviewApp {
             .ok()
             .and_then(|id| Story::ALL.iter().copied().find(|story| story.id() == id))
             .unwrap_or(Story::LibraryLaunchDialog);
-        let mut initial_dialog = Self::fixture_launch_dialog(
-            "zen",
-            "Zen",
-            Some(Arc::clone(&assets.icon_zen)),
-            story == Story::LibraryLaunchDialogMinimal,
-        );
-        initial_dialog.link_copied = story == Story::LibraryLaunchDialogCopied;
-        let initial_selects = Self::bind_launch_selects(&initial_dialog, window, cx);
-        let initial_dialog = story
-            .has_launch_dialog()
-            .then_some((initial_dialog, initial_selects));
+        let initial_dialog = Self::story_dialog(story, &assets).map(|dialog| {
+            let selects = Self::bind_launch_selects(&dialog, window, cx);
+            (dialog, selects)
+        });
+        search_input.update(cx, |state, cx| state.set_value(story.query(), window, cx));
         // `SKERRY_PREVIEW_APPEARANCE=light|dark` and `SKERRY_PREVIEW_CANVAS_W=<pt>` set the
         // appearance and canvas width at launch (for screenshots).
         let appearance = match std::env::var("SKERRY_PREVIEW_APPEARANCE").as_deref() {
@@ -390,11 +469,11 @@ impl PreviewApp {
         Self {
             story,
             appearance,
-            last_event: None,
+            last_event: story.note().map(Into::into),
             assets,
             key_input,
             search_input,
-            selected_filter: "All".into(),
+            selected_filter: story.filter(),
             launch_dialog: initial_dialog,
             controls_ui: story.controls_ui(),
             controls_props: Self::fixture_controls(story),
@@ -548,19 +627,17 @@ impl PreviewApp {
     fn select_story(&mut self, story: Story, window: &mut Window, cx: &mut Context<Self>) {
         self.story = story;
         self.files_props = Self::fixture_files(story);
-        self.last_event = None;
-        if story.has_launch_dialog() {
-            let mut dialog = Self::fixture_launch_dialog(
-                "zen",
-                "Zen",
-                Some(Arc::clone(&self.assets.icon_zen)),
-                story == Story::LibraryLaunchDialogMinimal,
-            );
-            dialog.link_copied = story == Story::LibraryLaunchDialogCopied;
+        self.last_event = story.note().map(Into::into);
+        if let Some(dialog) = Self::story_dialog(story, &self.assets) {
             let selects = Self::bind_launch_selects(&dialog, window, cx);
             self.launch_dialog = Some((dialog, selects));
         } else if story.group() == "Library" {
             self.launch_dialog = None;
+        }
+        if story.group() == "Library" {
+            self.selected_filter = story.filter();
+            self.search_input
+                .update(cx, |state, cx| state.set_value(story.query(), window, cx));
         }
         if story == Story::LibraryLongServer {
             self.canvas_width = Some(700.);
@@ -572,6 +649,33 @@ impl PreviewApp {
             self.height.update(cx, |s, cx| s.set_value("", window, cx));
         }
         cx.notify();
+    }
+
+    /// The Launch Dialog a story opens with, if any.
+    fn story_dialog(story: Story, assets: &PreviewAssets) -> Option<LaunchDialogProps> {
+        if !story.has_launch_dialog() {
+            return None;
+        }
+        let mut dialog = if story == Story::LibraryLaunchDialogHidden {
+            let mut dialog = Self::fixture_launch_dialog("krita", "Krita", None, false);
+            dialog.hidden = true;
+            dialog
+        } else {
+            Self::fixture_launch_dialog(
+                "zen",
+                "Zen",
+                Some(Arc::clone(&assets.icon_zen)),
+                story == Story::LibraryLaunchDialogMinimal,
+            )
+        };
+        dialog.link_copied = story == Story::LibraryLaunchDialogCopied;
+        if story == Story::LibraryLaunchDialogRunning {
+            dialog.favorite = true;
+            dialog.running_match = Some(RunningMatch {
+                started_label: Some("started 12m ago".into()),
+            });
+        }
+        Some(dialog)
     }
 
     /// A Launch Dialog as a SealSkin server on Kubernetes fills it: named homes, an Intel GPU
@@ -637,8 +741,9 @@ impl PreviewApp {
             wayland: true,
             busy: false,
             show_copy_link: true,
-            show_organize: true,
+            show_organize: !minimal,
             link_copied: false,
+            running_match: None,
         }
     }
 
@@ -761,8 +866,256 @@ impl PreviewApp {
                     self.launch_dialog = None;
                 }
             }
+            LaunchDialogAction::OpenRunning => {
+                self.last_event = Some("Dialog: Open Running Session".into());
+            }
         }
         cx.notify();
+    }
+
+    fn app_item(&self, id: &str, name: &str, category: &str) -> AppItem {
+        let icon = match id {
+            "lightcraft" => Some(&self.assets.icon_lightcraft),
+            "weixin" => Some(&self.assets.icon_weixin),
+            "zen" => Some(&self.assets.icon_zen),
+            "vscode" => Some(&self.assets.icon_vscode),
+            "firefox" => Some(&self.assets.icon_firefox),
+            _ => None,
+        };
+        AppItem {
+            id: id.into(),
+            name: name.into(),
+            categories: vec![category.into()],
+            favorite: false,
+            hidden: false,
+            remembered: false,
+            icon: icon.map(Arc::clone),
+        }
+    }
+
+    /// The Library each Library story draws.
+    fn fixture_library(&self, server: &str, cx: &App) -> LibraryProps {
+        let story = self.story;
+        let organized = !matches!(
+            story,
+            Story::LibraryPopulated
+                | Story::LibraryLaunchDialog
+                | Story::LibraryLaunchDialogMinimal
+                | Story::LibrarySignOut
+                | Story::LibrarySignOutEnv
+                | Story::LibrarySignOutDotEnv
+                | Story::LibrarySignOutUnsaved
+                | Story::LibraryToast
+                | Story::LibraryLaunchDialogCopied
+                | Story::LibraryLongServer
+        );
+        let mut apps = vec![
+            self.app_item("lightcraft", "LightCraft", "app"),
+            self.app_item("weixin", "Weixin", "app"),
+            self.app_item("zen", "Zen", "browser"),
+            self.app_item("vscode", "VS Code", "app"),
+            self.app_item("firefox", "Firefox", "browser"),
+        ];
+        let (mut favorites, mut recent) = (Vec::new(), Vec::new());
+        if organized {
+            apps.push(self.app_item("krita", "Krita", "app"));
+            apps.push(self.app_item("obsidian", "Obsidian", "app"));
+            let hidden: &[&str] = if story.hides_krita() {
+                &["krita", "obsidian"]
+            } else {
+                apps.push(self.app_item("blender", "Blender", "app"));
+                apps.push(self.app_item("inkscape", "Inkscape", "app"));
+                &["blender", "inkscape"]
+            };
+            favorites = if story.hides_krita() {
+                vec!["zen".to_string(), "krita".to_string()]
+            } else {
+                vec![
+                    "zen".to_string(),
+                    "vscode".to_string(),
+                    "firefox".to_string(),
+                ]
+            };
+            recent = ["zen", "lightcraft", "weixin", "krita", "obsidian"]
+                .map(String::from)
+                .to_vec();
+            for app in &mut apps {
+                app.favorite = favorites.contains(&app.id);
+                app.hidden = hidden.contains(&app.id.as_str());
+                app.remembered = app.id == "zen";
+            }
+        }
+        let session =
+            |id: &str, name: &str, storage: &str, thumb: &Arc<RenderImage>, icon| SessionItem {
+                id: id.into(),
+                app_name: name.into(),
+                started_label: Some("Started 2 days ago".into()),
+                gpu: true,
+                storage_label: Some(storage.into()),
+                thumbnail: Some(Arc::clone(thumb)),
+                app_icon: Some(Arc::clone(icon)),
+            };
+        let sessions: Vec<SessionItem> = match story {
+            Story::LibraryLaunching | Story::LibraryLaunchingPull | Story::LibraryLaunchFailed => {
+                Vec::new()
+            }
+            Story::LibraryLaunchStalled => vec![session(
+                "sess-zen",
+                "Zen",
+                "auto-zen",
+                &self.assets.thumb_zen,
+                &self.assets.icon_zen,
+            )],
+            _ => vec![
+                session(
+                    "sess-zen",
+                    "Zen",
+                    "auto-zen",
+                    &self.assets.thumb_zen,
+                    &self.assets.icon_zen,
+                ),
+                session(
+                    "sess-lightcraft",
+                    "LightCraft",
+                    "auto-lightcraft",
+                    &self.assets.thumb_lightcraft,
+                    &self.assets.icon_lightcraft,
+                ),
+            ],
+        };
+        let (launching, launching_apps) = self.fixture_launching();
+        LibraryProps {
+            app_name: "SealSkin Native".into(),
+            server: server.into(),
+            apps: apps.into(),
+            sessions: sessions.into(),
+            favorites,
+            recent,
+            launching,
+            launching_apps,
+            search_query: self.search_input.read(cx).value().to_string(),
+            selected_filter: self.selected_filter.clone(),
+            status: None,
+            busy: None,
+        }
+    }
+
+    /// The launch cards of the Launching stories, and their tiles' status lines.
+    fn fixture_launching(&self) -> (Vec<LaunchingItem>, HashMap<String, SharedString>) {
+        let row = |label: &str, time: Option<&str>, state| StageRow {
+            label: label.into(),
+            time: time.map(Into::into),
+            state,
+        };
+        let firefox = Some(Arc::clone(&self.assets.icon_firefox));
+        let hint = "The first launch of an app on a server downloads it, which can take several minutes. Later launches are fast.";
+        let card =
+            |id: &str, name: &str, icon, stages, detail: Option<&str>, status: &str, notice| {
+                LaunchingItem {
+                    launch_id: id.into(),
+                    app_name: name.into(),
+                    app_icon: icon,
+                    stages,
+                    detail: detail.map(Into::into),
+                    status: status.into(),
+                    notice,
+                }
+            };
+        let (cards, tiles): (Vec<LaunchingItem>, Vec<(&str, &str)>) = match self.story {
+            Story::LibraryLaunching => (
+                vec![card(
+                    "l1",
+                    "Firefox",
+                    firefox,
+                    vec![
+                        row("Requesting", Some("2 s"), StageState::Done),
+                        row("Starting", Some("14 s"), StageState::Current),
+                        row("Connecting", None, StageState::Pending),
+                    ],
+                    Some("Waiting for the desktop to respond"),
+                    "Launching · 0:16",
+                    None,
+                )],
+                vec![("firefox", "Starting…")],
+            ),
+            Story::LibraryLaunchingPull => (
+                vec![
+                    card(
+                        "l2",
+                        "VS Code",
+                        Some(Arc::clone(&self.assets.icon_vscode)),
+                        vec![
+                            row("Requesting", Some("1 s"), StageState::Current),
+                            row("Starting", None, StageState::Pending),
+                            row("Connecting", None, StageState::Pending),
+                        ],
+                        Some("Checking limits and choosing a node"),
+                        "Launching · 0:01",
+                        None,
+                    ),
+                    card(
+                        "l1",
+                        "Firefox",
+                        firefox,
+                        vec![
+                            row("Requesting", Some("3 s"), StageState::Done),
+                            row("Pulling image", Some("48 s"), StageState::Current),
+                            row("Starting", None, StageState::Pending),
+                            row("Connecting", None, StageState::Pending),
+                        ],
+                        Some("Downloading the application image"),
+                        "Launching · 0:51",
+                        None,
+                    ),
+                ],
+                vec![("firefox", "Pulling image…"), ("vscode", "Requesting…")],
+            ),
+            Story::LibraryLaunchStalled => (
+                vec![card(
+                    "l1",
+                    "Firefox",
+                    firefox,
+                    vec![
+                        row("Requesting", Some("3 s"), StageState::Done),
+                        row("Pulling image", Some("3:04"), StageState::Stalled),
+                        row("Starting", None, StageState::Pending),
+                        row("Connecting", None, StageState::Pending),
+                    ],
+                    Some("Downloading the application image"),
+                    "Launching · 3:07",
+                    Some(LaunchNotice::Stalled {
+                        message: "Still pulling the image after 3 min.".into(),
+                        hint: Some(hint.into()),
+                        can_retry: true,
+                    }),
+                )],
+                vec![("firefox", "Pulling image…")],
+            ),
+            Story::LibraryLaunchFailed => (
+                vec![card(
+                    "l1",
+                    "Firefox",
+                    firefox,
+                    vec![
+                        row("Requesting", Some("2 s"), StageState::Done),
+                        row("Starting", Some("41 s"), StageState::Failed),
+                    ],
+                    None,
+                    "Launch failed",
+                    Some(LaunchNotice::Failed {
+                        headline: "Couldn’t launch Firefox".into(),
+                        body: "No GPU is free on any node.".into(),
+                    }),
+                )],
+                Vec::new(),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        let tiles = tiles
+            .into_iter()
+            .map(|(id, label)| (id.to_string(), SharedString::from(label)))
+            .collect();
+        (cards, tiles)
     }
 
     fn record_event(&mut self, event: impl Into<String>, cx: &mut Context<Self>) {
@@ -1423,7 +1776,17 @@ impl PreviewApp {
             | Story::LibrarySignOutUnsaved
             | Story::LibraryToast
             | Story::LibraryLaunchDialogCopied
-            | Story::LibraryLongServer => {
+            | Story::LibraryLongServer
+            | Story::LibraryOrganized
+            | Story::LibraryHiddenChip
+            | Story::LibrarySearchHidden
+            | Story::LibraryContextMenu
+            | Story::LibraryLaunching
+            | Story::LibraryLaunchingPull
+            | Story::LibraryLaunchStalled
+            | Story::LibraryLaunchFailed
+            | Story::LibraryLaunchDialogRunning
+            | Story::LibraryLaunchDialogHidden => {
                 let server = if self.story == Story::LibraryLongServer {
                     "analytics-gpu-cluster-07.eu-central.sealskin.example.internal"
                 } else {
@@ -1442,73 +1805,7 @@ impl PreviewApp {
                     leaving: false,
                 });
                 let sign_out = self.story.sign_out();
-                let props = LibraryProps {
-                    app_name: "SealSkin Native".into(),
-                    server: server.into(),
-                    apps: vec![
-                        AppItem {
-                            id: "lightcraft".into(),
-                            name: "LightCraft".into(),
-                            categories: vec!["app".into()],
-                            recent: true,
-                            icon: Some(Arc::clone(&self.assets.icon_lightcraft)),
-                        },
-                        AppItem {
-                            id: "weixin".into(),
-                            name: "Weixin".into(),
-                            categories: vec!["app".into()],
-                            recent: false,
-                            icon: Some(Arc::clone(&self.assets.icon_weixin)),
-                        },
-                        AppItem {
-                            id: "zen".into(),
-                            name: "Zen".into(),
-                            categories: vec!["browser".into()],
-                            recent: true,
-                            icon: Some(Arc::clone(&self.assets.icon_zen)),
-                        },
-                        AppItem {
-                            id: "vscode".into(),
-                            name: "VS Code".into(),
-                            categories: vec!["app".into()],
-                            recent: true,
-                            icon: Some(Arc::clone(&self.assets.icon_vscode)),
-                        },
-                        AppItem {
-                            id: "firefox".into(),
-                            name: "Firefox".into(),
-                            categories: vec!["browser".into()],
-                            recent: false,
-                            icon: Some(Arc::clone(&self.assets.icon_firefox)),
-                        },
-                    ]
-                    .into(),
-                    sessions: vec![
-                        SessionItem {
-                            id: "sess-zen".into(),
-                            app_name: "Zen".into(),
-                            started_label: Some("Started 2 days ago".into()),
-                            gpu: true,
-                            storage_label: Some("auto-zen".into()),
-                            thumbnail: Some(Arc::clone(&self.assets.thumb_zen)),
-                            app_icon: Some(Arc::clone(&self.assets.icon_zen)),
-                        },
-                        SessionItem {
-                            id: "sess-lightcraft".into(),
-                            app_name: "LightCraft".into(),
-                            started_label: Some("Started 2 days ago".into()),
-                            gpu: true,
-                            storage_label: Some("auto-lightcraft".into()),
-                            thumbnail: Some(Arc::clone(&self.assets.thumb_lightcraft)),
-                            app_icon: Some(Arc::clone(&self.assets.icon_lightcraft)),
-                        },
-                    ]
-                    .into(),
-                    search_query: self.search_input.read(cx).value().to_string(),
-                    selected_filter: self.selected_filter.clone(),
-                    status: None,
-                    busy: None,
-                };
+                let props = self.fixture_library(server, cx);
                 let dialog_entity = entity.clone();
                 div()
                     .size_full()
@@ -1554,6 +1851,7 @@ impl PreviewApp {
                     selected_filter: self.selected_filter.clone(),
                     status: None,
                     busy: None,
+                    ..LibraryProps::default()
                 };
                 library::render(theme, &props, &self.search_input, self.library_handlers(cx))
             }
@@ -1562,18 +1860,16 @@ impl PreviewApp {
                     app_name: "SealSkin Native".into(),
                     server: "sealskin.example.internal".into(),
                     apps: vec![AppItem {
-                        id: "zen".into(),
-                        name: "Zen".into(),
-                        categories: vec!["browser".into()],
-                        recent: true,
                         icon: None,
+                        ..self.app_item("zen", "Zen", "browser")
                     }]
                     .into(),
                     sessions: Rc::from([]),
                     search_query: self.search_input.read(cx).value().to_string(),
                     selected_filter: self.selected_filter.clone(),
-                    status: Some("Previous launch timed out; retrying connection.".into()),
-                    busy: Some("Launching Zen…".into()),
+                    status: Some("Couldn’t save your Library changes.".into()),
+                    busy: Some("Refreshing…".into()),
+                    ..LibraryProps::default()
                 };
                 library::render(theme, &props, &self.search_input, self.library_handlers(cx))
             }
@@ -1713,7 +2009,31 @@ impl PreviewApp {
         let on_resume_entity = cx.entity().clone();
         let on_stop_entity = cx.entity().clone();
         let on_filter_entity = cx.entity().clone();
+        let on_quick_entity = cx.entity().clone();
+        let on_favorite_entity = cx.entity().clone();
+        let on_hidden_entity = cx.entity().clone();
+        let on_flight_entity = cx.entity().clone();
         LibraryHandlers {
+            on_quick_launch: Rc::new(move |id, _, cx| {
+                on_quick_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Quick Launch: {id}"), cx);
+                });
+            }),
+            on_toggle_favorite: Rc::new(move |id, _, cx| {
+                on_favorite_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Toggle Favorite: {id}"), cx);
+                });
+            }),
+            on_toggle_hidden: Rc::new(move |id, _, cx| {
+                on_hidden_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Toggle Hidden: {id}"), cx);
+                });
+            }),
+            on_flight_action: Rc::new(move |id, action, _, cx| {
+                on_flight_entity.update(cx, |this, cx| {
+                    this.record_event(format!("Flight: {action:?} ({id})"), cx);
+                });
+            }),
             on_refresh: Box::new(move |_, _, cx| {
                 on_refresh_entity.update(cx, |this, cx| {
                     this.record_event("Library: Refresh", cx);
@@ -1734,6 +2054,8 @@ impl PreviewApp {
                         "zen" => ("Zen", Some(Arc::clone(&this.assets.icon_zen))),
                         "vscode" => ("VS Code", Some(Arc::clone(&this.assets.icon_vscode))),
                         "firefox" => ("Firefox", Some(Arc::clone(&this.assets.icon_firefox))),
+                        "krita" => ("Krita", None),
+                        "obsidian" => ("Obsidian", None),
                         other => (other, None),
                     };
                     let dialog = Self::fixture_launch_dialog(&id, name, icon, false);
@@ -1754,8 +2076,8 @@ impl PreviewApp {
             })),
             on_select_filter: Rc::new(move |filter, _, cx| {
                 on_filter_entity.update(cx, |this, cx| {
-                    this.selected_filter = filter.clone();
-                    this.record_event(format!("Library: Filter `{filter}`"), cx);
+                    this.record_event(format!("Library: Filter `{filter:?}`"), cx);
+                    this.selected_filter = filter;
                 });
             }),
         }

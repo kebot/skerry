@@ -3,10 +3,10 @@
 use gpui_kit::{AssetSource, Result, SharedString};
 use std::borrow::Cow;
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [Trash, FolderPlus, LogOut]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [Trash, FolderPlus, LogOut, Circle]);
 
 /// gpui-kit's default icons, the Files window's Trash and New Folder icons, and Sign Out's
-/// LogOut icon.
+/// LogOut icon, and the launch checklist's Circle.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SkerryAssets;
 
@@ -36,6 +36,7 @@ mod tests {
             gpui_kit::assets::IconName::Trash,
             gpui_kit::assets::IconName::FolderPlus,
             gpui_kit::assets::IconName::LogOut,
+            gpui_kit::assets::IconName::Circle,
         ] {
             let path = icon.path();
             assert!(

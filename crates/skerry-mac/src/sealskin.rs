@@ -481,14 +481,6 @@ pub enum LaunchError {
     Server(String),
 }
 
-impl LaunchError {
-    pub fn message(&self) -> &str {
-        match self {
-            Self::Network(message) | Self::Server(message) => message,
-        }
-    }
-}
-
 /// The ceiling on one launch request: the server's 900 s pending limit plus a margin. A
 /// launch that outlives it is still followed through progress.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(960);
