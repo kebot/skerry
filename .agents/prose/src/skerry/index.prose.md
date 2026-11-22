@@ -53,7 +53,7 @@ Immaterial: build timestamps, local target cache state, and formatting-only edit
 Postconditions:
 - `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check` pass.
 - No embedded browser is used; Skerry talks directly to SealSkin and Selkies. The one exception is the Apps catalog fetch from the Selkies web client's GitHub raw URL, which uses a separate client with no credentials, is size-capped, and is HTTPS only (`ARCH-035`).
-- Session URLs and application keys are never written to preferences files; environment/`.env` keys are never persisted to `~/.config/skerry/config.toml`, and Skerry never reads or writes the macOS Keychain (`ARCH-011`).
+- Session URLs and application keys are never written to preferences files; environment/`.env` keys are never persisted to `~/.config/skerry/config.toml`, and Skerry never reads or writes the macOS Keychain (`ARCH-011`). Direct Selkies credentials and certificate pins are the one other secret kept there, in `[[selkies]]` entries (`ARCH-036`).
 
 ### Continuity
 
@@ -70,6 +70,7 @@ input-driven
 - Hardware-decoded VideoToolbox frames use IOSurface-backed `CVPixelBuffer`s painted directly with `window.paint_surface` with zero copy.
 - The application key is attached only to requests whose resolved path is under `/companion/api/`; every other fetch (logos, icons) uses a client with no key (`ARCH-026`).
 - Preference and key files are written only by the `persist.rs` queue, never from the GPUI main thread (`ARCH-026`).
+- TLS uses rustls with the ring provider only; aws-lc-rs must not enter the dependency tree (`ARCH-036`).
 - Skerry supports SealSkin `0.5.0` or newer (`ARCH-009`): it refuses to connect to a server whose `GET /companion/api/ui/version` reports an older or unparseable version, or that has no such route. Changing the minimum is a new superseding `ARCH-*` decision.
 
 ### Execution
