@@ -362,6 +362,18 @@ pub enum SessionEvent {
     Error(String),
     /// The start-up grace ran out with the session still answering like one starting.
     StartupTimeout,
+    /// Capture Pointer started or ended, or couldn't start, and the hint to show if any
+    /// (`ARCH-032`). Raised by the session's view, not the server.
+    PointerCapture(Option<crate::view::CaptureHint>),
+    /// The server asked the pad in this slot to rumble (`ARCH-032`).
+    Rumble(crate::gamepad::Rumble),
+}
+
+/// A `system,{"action": "rumble,…"}` frame's rumble; `None` for anything else.
+fn system_rumble(text: &str) -> Option<crate::gamepad::Rumble> {
+    let json = text.strip_prefix("system,")?;
+    let data: Value = serde_json::from_str(json).ok()?;
+    crate::gamepad::Rumble::parse(data["action"].as_str()?)
 }
 
 #[derive(Clone, Copy)]
@@ -420,15 +432,72 @@ pub enum Input {
     Clipboard(clipboard::Content),
     /// Subscribe to (or drop) the server's `stream_stats` (`_stats,1` / `_stats,0`).
     Stats(bool),
+    /// Gamepad slots another window drives now: forgotten here, nothing sent (`ARCH-032`).
+    ForgetPads(Vec<u8>),
     /// End the stream: release every held key, then send a close frame (`ARCH-GAP-DC-09`).
     Close,
 }
 
-/// What a closing stream sends before its close frame: a `ku` for every key the session
-/// still holds. No `kr`: on a clean close the server already resets the keyboard of the
-/// departing input owner, and every reset injects Super, Meta and Escape releases.
-fn closing_commands(held: &BTreeSet<u32>) -> Vec<String> {
-    held.iter().map(|key| format!("ku,{key}")).collect()
+/// What a closing stream sends before its close frame: `p,0` and
+/// `SET_NATIVE_CURSOR_RENDERING,0` while the pointer is captured (the server's cursor
+/// compositing is global and outlives this connection, `ARCH-032`), then a `ku` for every
+/// key the session still holds. No `kr`: on a clean close the server already resets the
+/// keyboard of the departing input owner, and every reset injects Super, Meta and Escape
+/// releases.
+fn closing_commands(
+    held: &BTreeSet<u32>,
+    pointer: PointerLock,
+    pads: &mut crate::gamepad::JsTracker,
+) -> Vec<String> {
+    // Every announced gamepad slot first (`ARCH-032`).
+    let mut commands: Vec<String> = pads.closing();
+    if pointer.locked {
+        commands.extend(["p,0".into(), "SET_NATIVE_CURSOR_RENDERING,0".into()]);
+        if pointer.buttons != 0 {
+            commands.push("m2,0,0,0,0".into());
+        }
+    }
+    commands.extend(held.iter().map(|key| format!("ku,{key}")));
+    commands
+}
+
+/// The capture as the server was last told it: `p,1` and the buttons the last relative
+/// `m2` held (`ARCH-032`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PointerLock {
+    locked: bool,
+    buttons: u8,
+}
+
+impl PointerLock {
+    fn observe(&mut self, text: &str) {
+        if let Some(locked) = pointer_lock_command(text) {
+            *self = Self { locked, buttons: 0 };
+        } else if self.locked {
+            if let Some(buttons) = m2_buttons(text) {
+                self.buttons = buttons;
+            }
+        }
+    }
+}
+
+/// The buttons an `m2,dx,dy,mask,0` holds; wheel pulses (a magnitude) leave them alone.
+fn m2_buttons(text: &str) -> Option<u8> {
+    let mut parts = text.strip_prefix("m2,")?.split(',');
+    let (_, _, mask, magnitude) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    (magnitude == "0")
+        .then(|| mask.parse::<u8>().ok())
+        .flatten()
+}
+
+/// The pointer lock the server was last told: `Some(true)` for `p,1`, `Some(false)` for
+/// `p,0`, `None` for anything else.
+fn pointer_lock_command(text: &str) -> Option<bool> {
+    match text {
+        "p,1" => Some(true),
+        "p,0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Whether `SKERRY_INPUT_TRACE=1` asks for a trace of key traffic on stderr. Read once.
@@ -437,13 +506,26 @@ fn input_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("SKERRY_INPUT_TRACE").is_ok_and(|value| value == "1"))
 }
 
-/// Logs one key command (`kd`, `ku`, `kh`, `kr`) the transport writes, when tracing.
+/// Logs one input command the transport writes, when tracing: key commands (`kd`, `ku`,
+/// `kh`, `kr`, redacted) and the capture's (`p`, `SET_NATIVE_CURSOR_RENDERING`, `m2`).
 fn trace_input(text: &str) {
     if input_trace_enabled() {
-        if let Some(line) = redact_key_command(text) {
+        if let Some(line) = trace_line(text) {
             eprintln!("skerry input: {line}");
         }
     }
+}
+
+/// The trace line for a command, if it is traced at all.
+fn trace_line(text: &str) -> Option<String> {
+    let verb = text.split(',').next().unwrap_or_default();
+    if matches!(verb, "p" | "SET_NATIVE_CURSOR_RENDERING" | "m2")
+        || text.starts_with("js,c,")
+        || text.starts_with("js,d,")
+    {
+        return Some(text.into());
+    }
+    redact_key_command(text)
 }
 
 /// Logs a stream event that matters to key traffic (close frame, watchdog abort).
@@ -753,6 +835,12 @@ pub async fn run(
     jpeg_flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pointer = pointer;
     let mut held = BTreeSet::new();
+    // The last `p,N` sent: a close while captured restores the server's cursor (`ARCH-032`).
+    let mut pointer_lock = PointerLock::default();
+    // Gamepad slots announced on this stream, and `js,h` while any is off rest.
+    let mut pads = crate::gamepad::JsTracker::default();
+    let mut pad_heartbeat = tokio::time::interval(crate::gamepad::HEARTBEAT);
+    pad_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut clipboard_in = clipboard::Receiver::default();
     let mut clipboard_transfer = 0u64;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
@@ -822,6 +910,16 @@ pub async fn run(
                     }
                 },
                 Some(Ok(Message::Text(text))) => {
+                    if text.starts_with("system,") {
+                        // Only rumble is used; other system actions are ignored.
+                        if let Some(rumble) = system_rumble(&text) {
+                            if input_trace_enabled() {
+                                eprintln!("skerry input: {text}");
+                            }
+                            let _ = events.send(SessionEvent::Rumble(rumble));
+                        }
+                        continue;
+                    }
                     if let Some(cursor) = text.strip_prefix("cursor,") {
                         if let Some(cursor) = RemoteCursor::parse(cursor) {
                             let _ = events.send(SessionEvent::Cursor(cursor));
@@ -1033,6 +1131,12 @@ pub async fn run(
                         }
                         continue;
                     }
+                    Some(Input::ForgetPads(slots)) => {
+                        for slot in slots {
+                            pads.forget(slot);
+                        }
+                        continue;
+                    }
                     Some(Input::Stats(on)) => {
                         if on == diagnostics.stats_on { continue; }
                         diagnostics.set_stats(on);
@@ -1042,7 +1146,7 @@ pub async fn run(
                     // Every sender gone (rare: `Desktop` and the pinch monitor hold clones) or
                     // an explicit close: release held keys, then close cleanly.
                     Some(Input::Close) | None => {
-                        for command in closing_commands(&held) {
+                        for command in closing_commands(&held, pointer_lock, &mut pads) {
                             trace_input(&command);
                             let _ = socket.send(command.into()).await;
                         }
@@ -1051,6 +1155,8 @@ pub async fn run(
                         return Ok(());
                     }
                 };
+                pointer_lock.observe(&text);
+                pads.observe(&text);
                 if let Some(key) = text.strip_prefix("kd,").and_then(|key| key.parse::<u32>().ok()) {
                     held.insert(key);
                 } else if let Some(key) = text.strip_prefix("ku,").and_then(|key| key.parse::<u32>().ok()) {
@@ -1058,6 +1164,11 @@ pub async fn run(
                 }
                 trace_input(&text);
                 socket.send(text.into()).await.map_err(|_| disconnected)?;
+            }
+            _ = pad_heartbeat.tick(), if pads.active() => {
+                for text in pads.heartbeat() {
+                    socket.send(text.into()).await.map_err(|_| disconnected)?;
+                }
             }
             _ = heartbeat.tick(), if !held.is_empty() => {
                 let keys = held.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
@@ -1549,14 +1660,128 @@ mod tests {
     }
 
     #[test]
+    fn closing_restores_native_cursor_rendering() {
+        let held = BTreeSet::from([0x61]);
+        assert_eq!(
+            closing_commands(
+                &held,
+                PointerLock {
+                    locked: true,
+                    buttons: 0
+                },
+                &mut Default::default()
+            ),
+            ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "ku,97"]
+        );
+        assert_eq!(pointer_lock_command("p,1"), Some(true));
+        assert_eq!(pointer_lock_command("p,0"), Some(false));
+        assert_eq!(pointer_lock_command("SET_NATIVE_CURSOR_RENDERING,1"), None);
+        // The capture's commands are traced verbatim; typed text never is.
+        assert_eq!(trace_line("m2,3,-2,1,0").as_deref(), Some("m2,3,-2,1,0"));
+        assert_eq!(trace_line("p,1").as_deref(), Some("p,1"));
+        assert_eq!(trace_line("kd,97").as_deref(), Some("kd,<char>"));
+        assert_eq!(trace_line("m,10,10,0,0"), None);
+    }
+
+    #[test]
     fn closing_releases_every_held_key_then_closes() {
         let held = BTreeSet::from([0x61, 0xffe3]);
-        assert_eq!(closing_commands(&held), ["ku,97", "ku,65507"]);
+        assert_eq!(
+            closing_commands(&held, PointerLock::default(), &mut Default::default()),
+            ["ku,97", "ku,65507"]
+        );
     }
 
     #[test]
     fn closing_with_nothing_held_sends_nothing() {
-        assert!(closing_commands(&BTreeSet::new()).is_empty());
+        assert!(closing_commands(
+            &BTreeSet::new(),
+            PointerLock::default(),
+            &mut Default::default()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn closing_while_captured_lifts_held_buttons() {
+        let mut lock = PointerLock::default();
+        // Buttons before a capture are the absolute path's, not tracked here.
+        lock.observe("m2,0,0,1,0");
+        assert_eq!(lock.buttons, 0);
+        lock.observe("p,1");
+        lock.observe("m2,0,0,4,0");
+        lock.observe("m2,3,-1,4,0");
+        // A wheel pulse carries the wheel bit and a magnitude: buttons unchanged.
+        lock.observe("m2,0,0,20,1");
+        assert_eq!(lock.buttons, 4);
+        assert_eq!(
+            closing_commands(&BTreeSet::new(), lock, &mut Default::default()),
+            ["p,0", "SET_NATIVE_CURSOR_RENDERING,0", "m2,0,0,0,0"]
+        );
+        // Released by the view first: nothing more at close.
+        lock.observe("m2,0,0,0,0");
+        lock.observe("p,0");
+        assert!(closing_commands(&BTreeSet::new(), lock, &mut Default::default()).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_runs_only_while_a_slot_is_off_rest() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,UGFk,4,17");
+        assert!(!pads.active());
+        pads.observe("js,a,0,1,-0.5");
+        assert!(pads.active());
+        assert_eq!(pads.heartbeat(), ["js,h,0"]);
+        // Key commands never count.
+        pads.observe("kd,97");
+        assert_eq!(pads.heartbeat(), ["js,h,0"]);
+    }
+
+    #[test]
+    fn rest_values_stop_the_heartbeat() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,1,UGFk,4,17");
+        pads.observe("js,b,1,0,1");
+        pads.observe("js,b,1,7,0.25");
+        pads.observe("js,b,1,0,0");
+        assert!(pads.active());
+        pads.observe("js,b,1,7,0");
+        assert!(!pads.active());
+        assert!(pads.heartbeat().is_empty());
+        // A disconnected slot stops too.
+        pads.observe("js,b,1,3,1");
+        pads.observe("js,d,1");
+        assert!(!pads.active());
+    }
+
+    #[test]
+    fn closing_disconnects_announced_slots() {
+        let mut pads = crate::gamepad::JsTracker::default();
+        pads.observe("js,c,0,UGFk,4,17");
+        pads.observe("js,c,2,UGFk,4,17");
+        pads.observe("js,d,0");
+        assert_eq!(
+            closing_commands(&BTreeSet::from([0x61]), PointerLock::default(), &mut pads),
+            ["js,d,2", "ku,97"]
+        );
+        assert!(closing_commands(&BTreeSet::new(), PointerLock::default(), &mut pads).is_empty());
+    }
+
+    #[test]
+    fn system_frame_with_rumble_becomes_an_event() {
+        let rumble =
+            system_rumble(r#"system,{"action":"rumble,1,0.800,0.200,250"}"#).expect("rumble");
+        assert_eq!(rumble.slot, 1);
+        assert_eq!((rumble.strong, rumble.weak), (0.8, 0.2));
+        assert_eq!(rumble.duration, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn other_system_actions_are_ignored() {
+        assert!(system_rumble(r#"system,{"action":"reload"}"#).is_none());
+        assert!(system_rumble(r#"system,{"action":"rumble,9,1,1,10"}"#).is_none());
+        assert!(system_rumble("system,not json").is_none());
+        assert!(system_rumble(r#"{"action":"rumble,0,1,1,10"}"#).is_none());
     }
 
     #[test]

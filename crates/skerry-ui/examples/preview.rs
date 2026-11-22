@@ -17,10 +17,10 @@ use skerry_ui::{
         RecoveryKind, RecoveryProps,
     },
     controls::{
-        self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps,
-        CodecChoice, ControlsAction, ControlsProps, ControlsUiState, PrintJobRow, PrintRowKind,
-        PrintingProps, ScreenProps, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem,
-        VideoProps, VideoSettingControl, VideoSettingRow,
+        self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem,
+        ClipboardProps, CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps,
+        PadRow, PadStatus, PrintJobRow, PrintRowKind, PrintingProps, ScreenProps, ShortcutRow,
+        ShortcutsProps, SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
     },
     files::{
         self as files_ui, Crumb, Direction, FileRow, FilesAction, FilesProps, Notice, SortColumn,
@@ -112,6 +112,15 @@ enum Story {
     ControlsShortcutsLocked,
     ControlsStatsStripOn,
     ControlsStatsWaiting,
+    ControlsInputCapture,
+    ControlsInputCaptureOn,
+    ControlsInputCaptureUnavailable,
+    GamepadsEmpty,
+    GamepadsSending,
+    GamepadsReady,
+    GamepadsFull,
+    GamepadsInputOff,
+    GamepadsServerOff,
     ControlsPrintingEmpty,
     ControlsPrintingJobs,
     ControlsPrintingOff,
@@ -132,6 +141,12 @@ enum Story {
     SessionStatsStripLight,
     SessionStatsStripWithBanner,
     SessionStatsStripFullScreen,
+    SessionCaptureHint,
+    SessionReleaseHint,
+    SessionCaptureHintWithStrip,
+    SessionCaptureHintWithBanner,
+    SessionCaptureHintNarrow,
+    SessionCaptureHintLight,
     FilesBrowsing,
     FilesEmpty,
     FilesDownloadOnly,
@@ -207,6 +222,15 @@ impl Story {
         Story::ControlsShortcutsLocked,
         Story::ControlsStatsStripOn,
         Story::ControlsStatsWaiting,
+        Story::ControlsInputCapture,
+        Story::ControlsInputCaptureOn,
+        Story::ControlsInputCaptureUnavailable,
+        Story::GamepadsEmpty,
+        Story::GamepadsSending,
+        Story::GamepadsReady,
+        Story::GamepadsFull,
+        Story::GamepadsInputOff,
+        Story::GamepadsServerOff,
         Story::ControlsPrintingEmpty,
         Story::ControlsPrintingJobs,
         Story::ControlsPrintingOff,
@@ -227,6 +251,12 @@ impl Story {
         Story::SessionStatsStripLight,
         Story::SessionStatsStripWithBanner,
         Story::SessionStatsStripFullScreen,
+        Story::SessionCaptureHint,
+        Story::SessionReleaseHint,
+        Story::SessionCaptureHintWithStrip,
+        Story::SessionCaptureHintWithBanner,
+        Story::SessionCaptureHintNarrow,
+        Story::SessionCaptureHintLight,
         Story::FilesBrowsing,
         Story::FilesEmpty,
         Story::FilesDownloadOnly,
@@ -302,6 +332,15 @@ impl Story {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable
+            | Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff
             | Story::ControlsPrintingEmpty
             | Story::ControlsPrintingJobs
             | Story::ControlsPrintingOff => "Session Controls",
@@ -321,7 +360,13 @@ impl Story {
             | Story::SessionStatsStripNarrow
             | Story::SessionStatsStripLight
             | Story::SessionStatsStripWithBanner
-            | Story::SessionStatsStripFullScreen => "Session Overlays",
+            | Story::SessionStatsStripFullScreen
+            | Story::SessionCaptureHint
+            | Story::SessionReleaseHint
+            | Story::SessionCaptureHintWithStrip
+            | Story::SessionCaptureHintWithBanner
+            | Story::SessionCaptureHintNarrow
+            | Story::SessionCaptureHintLight => "Session Overlays",
             Story::FilesBrowsing | Story::FilesEmpty | Story::FilesDownloadOnly => "Session Files",
             Story::PrintNoticeStates
             | Story::PrintNoticeLongName
@@ -396,6 +441,15 @@ impl Story {
             Story::ControlsShortcutsLocked => "Shortcuts · Locked",
             Story::ControlsStatsStripOn => "Stats · Strip On",
             Story::ControlsStatsWaiting => "Stats · Waiting",
+            Story::ControlsInputCapture => "Input · Capture Pointer",
+            Story::ControlsInputCaptureOn => "Input · Pointer Captured",
+            Story::ControlsInputCaptureUnavailable => "Input · Capture Unavailable",
+            Story::GamepadsEmpty => "Gamepads · Empty",
+            Story::GamepadsSending => "Gamepads · Sending",
+            Story::GamepadsReady => "Gamepads · Ready",
+            Story::GamepadsFull => "Gamepads · Full",
+            Story::GamepadsInputOff => "Gamepads · Input Off",
+            Story::GamepadsServerOff => "Gamepads · Server Off",
             Story::AudioDefault => "Default",
             Story::AudioChosen => "Chosen Device",
             Story::AudioMissing => "Saved Device Missing",
@@ -413,6 +467,12 @@ impl Story {
             Story::SessionStatsStripLight => "Stats Strip · Light",
             Story::SessionStatsStripWithBanner => "Stats Strip + Banner",
             Story::SessionStatsStripFullScreen => "Stats Strip · Full Screen",
+            Story::SessionCaptureHint => "Capture Hint",
+            Story::SessionReleaseHint => "Release Hint",
+            Story::SessionCaptureHintWithStrip => "Capture Hint + Strip",
+            Story::SessionCaptureHintWithBanner => "Capture Hint + Banner",
+            Story::SessionCaptureHintNarrow => "Capture Hint · Narrow",
+            Story::SessionCaptureHintLight => "Capture Hint · Light",
             Story::FilesBrowsing => "Browsing + Transfers",
             Story::FilesEmpty => "Empty Folder + New Folder",
             Story::FilesDownloadOnly => "Download Only + Error",
@@ -492,6 +552,15 @@ impl Story {
             Story::ControlsShortcutsLocked => "story-controls-shortcuts-locked",
             Story::ControlsStatsStripOn => "story-controls-stats-strip-on",
             Story::ControlsStatsWaiting => "story-controls-stats-waiting",
+            Story::ControlsInputCapture => "story-controls-input-capture",
+            Story::ControlsInputCaptureOn => "story-controls-input-capture-on",
+            Story::ControlsInputCaptureUnavailable => "story-controls-input-capture-unavailable",
+            Story::GamepadsEmpty => "story-controls-gamepads-empty",
+            Story::GamepadsSending => "story-controls-gamepads-sending",
+            Story::GamepadsReady => "story-controls-gamepads-ready",
+            Story::GamepadsFull => "story-controls-gamepads-full",
+            Story::GamepadsInputOff => "story-controls-gamepads-input-off",
+            Story::GamepadsServerOff => "story-controls-gamepads-server-off",
             Story::AudioDefault => "story-audio-default",
             Story::AudioChosen => "story-audio-chosen",
             Story::AudioMissing => "story-audio-missing",
@@ -509,6 +578,12 @@ impl Story {
             Story::SessionStatsStripLight => "story-session-stats-strip-light",
             Story::SessionStatsStripWithBanner => "story-session-stats-strip-banner",
             Story::SessionStatsStripFullScreen => "story-session-stats-strip-fullscreen",
+            Story::SessionCaptureHint => "story-session-capture-hint",
+            Story::SessionReleaseHint => "story-session-release-hint",
+            Story::SessionCaptureHintWithStrip => "story-session-capture-hint-strip",
+            Story::SessionCaptureHintWithBanner => "story-session-capture-hint-banner",
+            Story::SessionCaptureHintNarrow => "story-session-capture-hint-narrow",
+            Story::SessionCaptureHintLight => "story-session-capture-hint-light",
             Story::FilesBrowsing => "story-files-browsing",
             Story::FilesEmpty => "story-files-empty",
             Story::FilesDownloadOnly => "story-files-download-only",
@@ -584,6 +659,15 @@ impl Story {
                 | Story::ControlsShortcutsLocked
                 | Story::ControlsStatsStripOn
                 | Story::ControlsStatsWaiting
+                | Story::ControlsInputCapture
+                | Story::ControlsInputCaptureOn
+                | Story::ControlsInputCaptureUnavailable
+                | Story::GamepadsEmpty
+                | Story::GamepadsSending
+                | Story::GamepadsReady
+                | Story::GamepadsFull
+                | Story::GamepadsInputOff
+                | Story::GamepadsServerOff
                 | Story::ControlsPrintingEmpty
                 | Story::ControlsPrintingJobs
                 | Story::ControlsPrintingOff
@@ -678,21 +762,32 @@ impl Story {
         match self {
             // Input, Shortcuts, Printing and Video open, Screen closed: what a server remembered.
             Story::ControlsRestoredSections => ControlsUiState::default()
-                .with_sections([true, true, false, true, false, true, false, false]),
+                .with_sections([true, true, true, false, true, false, true, false, false]),
             Story::ControlsPrintingEmpty | Story::ControlsPrintingJobs => {
                 ControlsUiState::default()
-                    .with_sections([false, false, true, true, false, false, false, false])
+                    .with_sections([false, false, false, true, true, false, false, false, false])
             }
             Story::ControlsPrintingOff => ControlsUiState::default()
-                .with_sections([false, false, true, false, false, false, false, false]),
+                .with_sections([false, false, false, true, false, false, false, false, false]),
             _ if self.is_audio() => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, true, false]),
+                .with_sections([false, false, false, false, false, false, false, true, false]),
             Story::ControlsShortcutsActive
             | Story::ControlsShortcutsOff
             | Story::ControlsShortcutsLocked => ControlsUiState::default()
-                .with_sections([false, true, false, false, false, false, false, false]),
+                .with_sections([false, true, false, false, false, false, false, false, false]),
             Story::ControlsStatsStripOn | Story::ControlsStatsWaiting => ControlsUiState::default()
-                .with_sections([false, false, false, false, false, false, false, true]),
+                .with_sections([false, false, false, false, false, false, false, false, true]),
+            Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff => ControlsUiState::default()
+                .with_sections([false, false, true, false, false, false, false, false, false]),
+            Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable => ControlsUiState::default()
+                .with_sections([true, false, false, false, false, false, false, false, false]),
             Story::ControlsDropdownOpen => ControlsUiState {
                 open_menu: Some("preset-picker"),
                 ..ControlsUiState::default()
@@ -1033,7 +1128,10 @@ impl PreviewApp {
         if story == Story::LibraryLongServer {
             self.canvas_width = Some(700.);
         }
-        if story == Story::SessionStatsStripLight {
+        if matches!(
+            story,
+            Story::SessionStatsStripLight | Story::SessionCaptureHintLight
+        ) {
             // The pill stays dark whatever the theme.
             self.appearance = Appearance::Light;
             Theme::change(ThemeMode::Light, Some(window), cx);
@@ -1911,6 +2009,22 @@ impl PreviewApp {
             ControlsAction::ToggleSection(section) => {
                 self.controls_ui.toggle(section);
             }
+            ControlsAction::SetGamepadInput(on) => {
+                if let Some(gamepads) = self.controls_props.gamepads.as_mut() {
+                    gamepads.input = on;
+                }
+            }
+            ControlsAction::SetGamepadRumble(on) => {
+                if let Some(gamepads) = self.controls_props.gamepads.as_mut() {
+                    gamepads.rumble = on;
+                }
+            }
+            ControlsAction::CapturePointer => {
+                let capture = &mut self.controls_props.capture;
+                if capture.available {
+                    capture.captured = !capture.captured;
+                }
+            }
             ControlsAction::SetAudio(enabled) => self.controls_props.audio = Some(enabled),
             ControlsAction::SetPlayback(enabled) => self.controls_props.video = Some(enabled),
             ControlsAction::ToggleFullScreen => {
@@ -2203,6 +2317,8 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                capture: Self::fixture_capture(true, false),
+                gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
                 printing: Some(Self::fixture_printing(true, false)),
             },
             Story::ControlsServerLocked => ControlsProps {
@@ -2235,6 +2351,8 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                capture: Self::fixture_capture(true, false),
+                gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
                 printing: Some(Self::fixture_printing(true, false)),
             },
             _ if story.is_audio() => {
@@ -2260,6 +2378,26 @@ impl PreviewApp {
                     Story::ControlsShortcutsLocked => Self::fixture_shortcuts(false, true),
                     _ => Self::fixture_shortcuts(true, false),
                 };
+                props
+            }
+            Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.gamepads = Some(Self::fixture_gamepads(story));
+                props
+            }
+            Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable => {
+                let mut props = Self::fixture_controls(Story::ControlsHardware);
+                props.capture = Self::fixture_capture(
+                    story != Story::ControlsInputCaptureUnavailable,
+                    story == Story::ControlsInputCaptureOn,
+                );
                 props
             }
             Story::ControlsPrintingEmpty
@@ -2373,6 +2511,8 @@ impl PreviewApp {
                 stats_copied: false,
                 stats_strip: false,
                 shortcuts: Self::fixture_shortcuts(true, false),
+                capture: Self::fixture_capture(true, false),
+                gamepads: Some(Self::fixture_gamepads(Story::GamepadsSending)),
                 printing: Some(Self::fixture_printing(true, false)),
             },
         }
@@ -2525,9 +2665,94 @@ impl PreviewApp {
                 row("Full Screen", "⌃⌘", "F", Some("Ctrl+F")),
                 row("Files", "⇧⌘", "F", Some("Ctrl+Shift+F")),
                 row("Library", "⌘", "0", Some("Ctrl+0")),
+                row("Capture Pointer", "⌃⌥⇧", "Z", None),
                 row("Quit", "⌘", "Q", None),
             ],
         }
+    }
+
+    /// The Gamepads card for a story.
+    fn fixture_gamepads(story: Story) -> GamepadsProps {
+        let pad = |name: &str, status, rumble| {
+            Some(PadRow {
+                name: name.into(),
+                status,
+                rumble,
+            })
+        };
+        let status = match story {
+            Story::GamepadsReady => PadStatus::Ready,
+            Story::GamepadsInputOff | Story::GamepadsServerOff => PadStatus::NotSent,
+            _ => PadStatus::Sending,
+        };
+        let two = [
+            pad("DualSense Wireless Controller", status, true),
+            pad("Xbox Wireless Controller", status, false),
+            None,
+            None,
+        ];
+        let (slots, overflow) = match story {
+            Story::GamepadsEmpty => ([None, None, None, None], 0),
+            Story::GamepadsFull => (
+                [
+                    pad("DualSense Wireless Controller", status, true),
+                    pad("Xbox Wireless Controller", status, false),
+                    pad("Pro Controller", status, true),
+                    pad("8BitDo Ultimate", status, false),
+                ],
+                1,
+            ),
+            _ => (two, 0),
+        };
+        GamepadsProps {
+            input: story != Story::GamepadsInputOff,
+            input_locked: false,
+            rumble: true,
+            server_off: story == Story::GamepadsServerOff,
+            key: story != Story::GamepadsReady,
+            slots,
+            overflow,
+        }
+    }
+
+    /// The Input card's Capture Pointer button.
+    fn fixture_capture(available: bool, captured: bool) -> CaptureProps {
+        CaptureProps {
+            available,
+            captured,
+            modifiers: "⌃⌥⇧".into(),
+            key: "Z".into(),
+        }
+    }
+
+    /// The capture hint over a session frame (`ARCH-032`).
+    fn capture_hint_overlay(hint: &str, width: f32, banner: bool) -> gpui_kit::Div {
+        let text = if hint == "captured" {
+            session::CaptureHintText {
+                lead: "Pointer captured · ".into(),
+                chord: Some("⌃⌥⇧Z".into()),
+                tail: " releases it".into(),
+            }
+        } else if hint == "unavailable" {
+            session::CaptureHintText {
+                lead: "Capture Pointer is available once the picture appears".into(),
+                chord: None,
+                tail: "".into(),
+            }
+        } else {
+            session::CaptureHintText {
+                lead: "Pointer released".into(),
+                chord: None,
+                tail: "".into(),
+            }
+        };
+        session::capture_hint(
+            &text,
+            session::capture_hint_bottom(banner),
+            px(width),
+            session::HintFade::None,
+            0,
+        )
     }
 
     /// The strip over the stream: all good, or the warn case (throttled, over target,
@@ -3138,6 +3363,15 @@ impl PreviewApp {
             | Story::ControlsShortcutsLocked
             | Story::ControlsStatsStripOn
             | Story::ControlsStatsWaiting
+            | Story::ControlsInputCapture
+            | Story::ControlsInputCaptureOn
+            | Story::ControlsInputCaptureUnavailable
+            | Story::GamepadsEmpty
+            | Story::GamepadsSending
+            | Story::GamepadsReady
+            | Story::GamepadsFull
+            | Story::GamepadsInputOff
+            | Story::GamepadsServerOff
             | Story::ControlsPrintingEmpty
             | Story::ControlsPrintingJobs
             | Story::ControlsPrintingOff
@@ -3327,6 +3561,55 @@ impl PreviewApp {
                         ));
                 }
                 Self::strip_stage(frame)
+            }
+            Story::SessionCaptureHint
+            | Story::SessionReleaseHint
+            | Story::SessionCaptureHintWithStrip
+            | Story::SessionCaptureHintWithBanner
+            | Story::SessionCaptureHintLight => {
+                let strip = Self::fixture_strip(false);
+                let strip = if self.story == Story::SessionCaptureHintWithStrip {
+                    strip
+                } else {
+                    stats::StripProps {
+                        marks: Vec::new(),
+                        figures: Vec::new(),
+                    }
+                };
+                let hint = match self.story {
+                    Story::SessionReleaseHint => "released",
+                    Story::SessionCaptureHintWithBanner => "unavailable",
+                    _ => "captured",
+                };
+                let banner = self.story == Story::SessionCaptureHintWithBanner;
+                let mut frame = Self::session_frame(1280., 800., &strip);
+                if self.story == Story::SessionCaptureHintWithStrip {
+                    frame = frame.child(session::controls_trigger(
+                        point(px(1240.), px(8.)),
+                        px(32.),
+                        |_, _, _| {},
+                    ));
+                }
+                if banner {
+                    frame = frame.child(session::startup_banner(
+                        theme,
+                        "Firefox hasn’t answered yet. It may still be starting.",
+                        |_, _, _| {},
+                        |_, _, _| {},
+                        |_, _, _| {},
+                    ));
+                }
+                Self::strip_stage(frame.child(Self::capture_hint_overlay(hint, 1280., banner)))
+            }
+            Story::SessionCaptureHintNarrow => {
+                let strip = stats::StripProps {
+                    marks: Vec::new(),
+                    figures: Vec::new(),
+                };
+                Self::strip_stage(
+                    Self::session_frame(360., 400., &strip)
+                        .child(Self::capture_hint_overlay("captured", 360., false)),
+                )
             }
             Story::PrintNoticeStates => {
                 // Every state, three frames side by side; each frame shows its notices whole.

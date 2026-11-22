@@ -23,6 +23,7 @@ pub type ControlsHandler = Rc<dyn Fn(ControlsAction, &mut Window, &mut App)>;
 pub enum Section {
     Input,
     Shortcuts,
+    Gamepads,
     Clipboard,
     Printing,
     Screen,
@@ -33,9 +34,10 @@ pub enum Section {
 
 impl Section {
     /// Every section, top to bottom; the order of `ControlsUiState::sections`.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Input,
         Self::Shortcuts,
+        Self::Gamepads,
         Self::Clipboard,
         Self::Printing,
         Self::Screen,
@@ -49,6 +51,7 @@ impl Section {
 pub struct ControlsUiState {
     pub input_open: bool,
     pub shortcuts_open: bool,
+    pub gamepads_open: bool,
     pub clipboard_open: bool,
     pub printing_open: bool,
     pub screen_open: bool,
@@ -68,6 +71,7 @@ impl Default for ControlsUiState {
         Self {
             input_open: false,
             shortcuts_open: false,
+            gamepads_open: false,
             clipboard_open: false,
             printing_open: false,
             screen_open: true,
@@ -86,6 +90,7 @@ impl ControlsUiState {
         match section {
             Section::Input => self.input_open,
             Section::Shortcuts => self.shortcuts_open,
+            Section::Gamepads => self.gamepads_open,
             Section::Clipboard => self.clipboard_open,
             Section::Printing => self.printing_open,
             Section::Screen => self.screen_open,
@@ -100,6 +105,7 @@ impl ControlsUiState {
         let open = match section {
             Section::Input => &mut self.input_open,
             Section::Shortcuts => &mut self.shortcuts_open,
+            Section::Gamepads => &mut self.gamepads_open,
             Section::Clipboard => &mut self.clipboard_open,
             Section::Printing => &mut self.printing_open,
             Section::Screen => &mut self.screen_open,
@@ -112,12 +118,12 @@ impl ControlsUiState {
     }
 
     /// Which sections are open, in `Section::ALL` order.
-    pub fn sections(&self) -> [bool; 8] {
+    pub fn sections(&self) -> [bool; 9] {
         Section::ALL.map(|section| self.is_open(section))
     }
 
     /// This state with the sections opened as `open` says, in `Section::ALL` order.
-    pub fn with_sections(mut self, open: [bool; 8]) -> Self {
+    pub fn with_sections(mut self, open: [bool; 9]) -> Self {
         for (section, open) in Section::ALL.into_iter().zip(open) {
             if self.is_open(section) != open {
                 self.toggle(section);
@@ -178,10 +184,62 @@ pub enum ControlsAction {
     SetStatsStrip(bool),
     /// **Mac shortcuts active** (`ARCH-031`).
     SetMacShortcuts(bool),
+    /// Capture Pointer, or release it (`ARCH-032`).
+    CapturePointer,
+    /// **Gamepad input** (`ARCH-032`).
+    SetGamepadInput(bool),
+    /// **Rumble** (`ARCH-032`).
+    SetGamepadRumble(bool),
     /// **Open Print Dialog Automatically** (`ARCH-033`).
     SetAutoPrint(bool),
     /// A Printing card row's button.
     PrintJob(u64, PrintJobAction),
+}
+
+/// Whether a pad in a slot reaches the session (`ARCH-032`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadStatus {
+    Sending,
+    /// Input is on but the session window isn't key.
+    Ready,
+    NotSent,
+}
+
+/// One connected pad in a Player slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PadRow {
+    pub name: String,
+    pub status: PadStatus,
+    /// The pad has haptics.
+    pub rumble: bool,
+}
+
+/// The Gamepads card (`ARCH-032`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GamepadsProps {
+    pub input: bool,
+    /// The server's `gamepad_on_start` lock holds the input switch.
+    pub input_locked: bool,
+    pub rumble: bool,
+    pub server_off: bool,
+    /// The session window is key.
+    pub key: bool,
+    /// Players 1 to 4 (wire slots 0 to 3).
+    pub slots: [Option<PadRow>; 4],
+    /// Connected pads with no slot left.
+    pub overflow: usize,
+}
+
+/// The Input card's Capture Pointer button (`ARCH-032`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureProps {
+    /// A picture is painted and the session is ready.
+    pub available: bool,
+    /// The session window holds the pointer now.
+    pub captured: bool,
+    /// The chord in menu glyphs, from the Mac's chord table: "⌃⌥⇧" and "Z".
+    pub modifiers: String,
+    pub key: String,
 }
 
 /// A print job's state in the Printing card (`ARCH-033`).
@@ -404,6 +462,9 @@ pub struct ControlsProps {
     /// The stats strip is shown over the stream.
     pub stats_strip: bool,
     pub shortcuts: ShortcutsProps,
+    pub capture: CaptureProps,
+    /// The Gamepads card; `None` hides it (`ui_sidebar_show_gamepads`, or no settings yet).
+    pub gamepads: Option<GamepadsProps>,
     /// The Printing card (`ARCH-033`); `None` hides it.
     pub printing: Option<PrintingProps>,
 }
@@ -520,7 +581,7 @@ pub fn render(
                     theme,
                     "Input",
                     state.input_open,
-                    || render_input(props, &on_action),
+                    || render_input(theme, props, &on_action),
                     toggle(Section::Input),
                 ))
                 .child(section(
@@ -530,6 +591,15 @@ pub fn render(
                     || render_shortcuts(theme, &props.shortcuts, &on_action),
                     toggle(Section::Shortcuts),
                 ))
+                .when_some(props.gamepads.as_ref(), |cards, gamepads| {
+                    cards.child(section(
+                        theme,
+                        "Gamepads",
+                        state.gamepads_open,
+                        || render_gamepads(theme, gamepads, &on_action),
+                        toggle(Section::Gamepads),
+                    ))
+                })
                 .child(section(
                     theme,
                     "Clipboard",
@@ -609,7 +679,7 @@ const FIELD_GAP: f32 = 6.;
 const CONTROL_H: f32 = 40.;
 const CONTROL_RADIUS: f32 = 8.;
 
-fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
+fn render_input(theme: &Theme, props: &ControlsProps, on_action: &ControlsHandler) -> Div {
     div()
         .v_flex()
         .gap(px(STACK_GAP))
@@ -639,6 +709,86 @@ fn render_input(props: &ControlsProps, on_action: &ControlsHandler) -> Div {
                     ))
                 })),
         ))
+        .child(render_capture(theme, &props.capture, on_action))
+}
+
+/// Capture Pointer: the label with its crosshair, the chord's glyphs on the right, and a
+/// note on how to get out (`ARCH-032`).
+fn render_capture(theme: &Theme, capture: &CaptureProps, on_action: &ControlsHandler) -> Div {
+    let chord = format!("{}{}", capture.modifiers, capture.key);
+    let (label, note) = if capture.captured {
+        ("Pointer Captured", format!("Press {chord} to release it."))
+    } else if capture.available {
+        (
+            "Capture Pointer",
+            format!("{chord}, ⌘-Tab, or leaving the window releases it."),
+        )
+    } else {
+        (
+            "Capture Pointer",
+            "Available once the picture appears.".to_string(),
+        )
+    };
+    let on_action = Rc::clone(on_action);
+    let button = Button::new("input-capture-pointer")
+        .w_full()
+        .h(px(CONTROL_H))
+        .rounded(px(CONTROL_RADIUS))
+        .disabled(!capture.available && !capture.captured)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_flex()
+                .items_center()
+                .gap(px(8.))
+                .child(Icon::new(gpui_kit::assets::IconName::Crosshair).with_size(px(16.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(px(13.))
+                        .text_left()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .w(px(56.))
+                        .flex_none()
+                        .h_flex()
+                        .text_size(px(13.))
+                        .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_right()
+                                .whitespace_nowrap()
+                                .when(!capture.captured, |glyphs| {
+                                    glyphs.text_color(theme.muted_foreground)
+                                })
+                                .child(capture.modifiers.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .child(capture.key.clone()),
+                        ),
+                ),
+        )
+        .on_click(move |_, window, cx| on_action(ControlsAction::CapturePointer, window, cx));
+    let button = if capture.captured {
+        button.primary()
+    } else {
+        button.outline()
+    };
+    div().v_flex().gap(px(FIELD_GAP)).child(button).child(
+        div()
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .child(note),
+    )
 }
 
 fn render_clipboard(
@@ -1373,6 +1523,141 @@ fn render_shortcuts(theme: &Theme, shortcuts: &ShortcutsProps, on_action: &Contr
         })
 }
 
+/// Gamepads: the two switches, one note at most, then four Player rows (`ARCH-032`).
+fn render_gamepads(theme: &Theme, gamepads: &GamepadsProps, on_action: &ControlsHandler) -> Div {
+    let muted_line = |icon: Option<IconName>, text: String| {
+        div()
+            .h_flex()
+            .items_start()
+            .gap(px(6.))
+            .text_size(px(12.))
+            .text_color(theme.muted_foreground)
+            .when_some(icon, |line, icon| {
+                line.child(div().pt(px(2.)).child(Icon::new(icon).with_size(px(12.))))
+            })
+            .child(div().flex_1().min_w_0().child(text))
+    };
+    let note = if gamepads.server_off {
+        Some("Turned off by the server.")
+    } else if gamepads.input && !gamepads.key {
+        Some(
+            "Paused while another window is in front, including this one. Click the session \
+             to play.",
+        )
+    } else {
+        None
+    };
+    let rows = gamepads.slots.iter().enumerate().map(|(index, slot)| {
+        let number = index + 1;
+        let badge = div()
+            .size(px(22.))
+            .flex_none()
+            .rounded_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(12.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .font_features(FontFeatures(Arc::new(vec![("tnum".into(), 1)])))
+            .child(number.to_string());
+        let badge = match slot.as_ref().map(|pad| pad.status) {
+            Some(PadStatus::Sending) => badge.bg(theme.accent).text_color(gpui_kit::white()),
+            Some(PadStatus::Ready) => badge
+                .border_1()
+                .border_color(theme.accent)
+                .text_color(theme.accent),
+            _ => badge
+                .border_1()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground),
+        };
+        let middle = match slot {
+            Some(pad) => {
+                let status = match pad.status {
+                    PadStatus::Sending => "Sending",
+                    PadStatus::Ready => "Ready",
+                    PadStatus::NotSent => "Not sent",
+                };
+                let status = if pad.rumble {
+                    status.to_string()
+                } else {
+                    format!("{status} · No rumble")
+                };
+                div()
+                    .v_flex()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(pad.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(status),
+                    )
+            }
+            None => div()
+                .text_size(px(13.))
+                .text_color(theme.muted_foreground)
+                .child("No controller"),
+        };
+        div()
+            .h(px(44.))
+            .px(px(4.))
+            .h_flex()
+            .items_center()
+            .gap(px(10.))
+            .child(badge)
+            .child(div().flex_1().min_w_0().child(middle))
+    });
+    let empty = gamepads.slots.iter().all(Option::is_none);
+    div()
+        .v_flex()
+        .gap(px(STACK_GAP))
+        .child(switch_row_with_detail(
+            theme,
+            "Gamepad input",
+            Some("Send controllers to this session while its window is in front.".into()),
+            gamepads.input,
+            gamepads.server_off || gamepads.input_locked,
+            ControlsAction::SetGamepadInput(!gamepads.input),
+            on_action,
+        ))
+        .child(switch_row_with_detail(
+            theme,
+            "Rumble",
+            Some("Let the session's games vibrate your controllers.".into()),
+            gamepads.rumble && gamepads.input,
+            gamepads.server_off || !gamepads.input,
+            ControlsAction::SetGamepadRumble(!gamepads.rumble),
+            on_action,
+        ))
+        .when_some(note, |panel, note| {
+            panel.child(muted_line(Some(IconName::Info), note.to_string()))
+        })
+        .child(field("Players", div().v_flex().gap(px(4.)).children(rows)))
+        .when(empty, |panel| {
+            panel.child(muted_line(
+                None,
+                "Pair a controller in System Settings › Bluetooth.".into(),
+            ))
+        })
+        .when(gamepads.overflow > 0, |panel| {
+            let text = if gamepads.overflow == 1 {
+                "1 more controller isn't sent: all four players are in use.".to_string()
+            } else {
+                format!(
+                    "{} more controllers aren't sent: all four players are in use.",
+                    gamepads.overflow
+                )
+            };
+            panel.child(muted_line(Some(IconName::TriangleAlert), text))
+        })
+}
+
 fn action_button(
     label: &'static str,
     action: ControlsAction,
@@ -1869,16 +2154,17 @@ mod tests {
 
     #[test]
     fn sections_round_trip_in_section_order() {
-        // Input, Shortcuts, Video and Audio open, Screen closed.
-        let open = [true, true, false, false, false, true, true, false];
+        // Input, Shortcuts, Gamepads, Printing, Video and Audio open, Screen closed.
+        let open = [true, true, true, false, true, false, true, true, false];
         let state = ControlsUiState::default().with_sections(open);
         assert_eq!(state.sections(), open);
         assert!(state.input_open && state.video_open && state.audio_open && !state.screen_open);
-        assert!(state.shortcuts_open);
+        assert!(state.shortcuts_open && state.gamepads_open && state.printing_open);
         assert_eq!(Section::ALL[1], Section::Shortcuts);
+        assert_eq!(Section::ALL[2], Section::Gamepads);
         assert_eq!(
             ControlsUiState::default().sections(),
-            [false, false, false, false, true, false, false, false]
+            [false, false, false, false, false, true, false, false, false]
         );
     }
 
@@ -1899,7 +2185,7 @@ mod tests {
         let printing = Section::ALL.iter().position(|s| *s == Section::Printing);
         assert_eq!(printing, clipboard.map(|index| index + 1));
         let state = ControlsUiState::default()
-            .with_sections([false, false, false, true, false, false, false, false]);
+            .with_sections([false, false, false, false, true, false, false, false, false]);
         assert!(state.printing_open && !state.screen_open);
     }
 }

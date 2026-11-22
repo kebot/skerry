@@ -1,7 +1,8 @@
+use super::gamepads::Gamepads;
 use super::session_window::SessionWindow;
 use super::{
-    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, ToggleSessionControls,
-    ToggleStatsStrip,
+    native_window, CloseSessionControls, DisplayMode, ToggleFullScreen, TogglePointerCapture,
+    ToggleSessionControls, ToggleStatsStrip,
 };
 use crate::audio::{OutputProblem, OutputStatus};
 use crate::clipboard::{ClipboardAction, Effective};
@@ -28,10 +29,10 @@ use gpui_kit::{
 };
 use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowOrderingMode};
 use skerry_ui::controls::{
-    self, AudioBitrateProps, AudioOutputItem, AudioProps, ChordItem, ClipboardProps, CodecChoice,
-    ControlsAction, ControlsProps, ControlsUiState, PrintJobRow, PrintRowKind, PrintingProps,
-    ScreenProps, Section, ShortcutRow, ShortcutsProps, SliderUnit, SwitchItem, VideoProps,
-    VideoSettingControl, VideoSettingRow,
+    self, AudioBitrateProps, AudioOutputItem, AudioProps, CaptureProps, ChordItem, ClipboardProps,
+    CodecChoice, ControlsAction, ControlsProps, ControlsUiState, GamepadsProps, PadRow, PadStatus,
+    PrintJobRow, PrintRowKind, PrintingProps, ScreenProps, Section, ShortcutRow, ShortcutsProps,
+    SliderUnit, SwitchItem, VideoProps, VideoSettingControl, VideoSettingRow,
 };
 use skerry_ui::session::PrintJobAction;
 use std::rc::Rc;
@@ -84,6 +85,10 @@ enum Command {
     AudioBitrate(u32),
     StatsStrip(bool),
     MacShortcuts(bool),
+    /// The session window activates and captures the pointer (`ARCH-032`).
+    CapturePointer,
+    GamepadInput(bool),
+    GamepadRumble(bool),
     AutoPrint(bool),
     PrintJob(u64, PrintJobAction),
 }
@@ -330,6 +335,9 @@ impl ControlPanel {
                         Command::AudioBitrate(bps) => session.change_audio_bitrate(bps, cx),
                         Command::StatsStrip(on) => session.set_stats_strip(on, cx),
                         Command::MacShortcuts(active) => session.change_mac_shortcuts(active, cx),
+                        Command::CapturePointer => session.request_capture(window, cx),
+                        Command::GamepadInput(on) => session.change_gamepad_input(on, cx),
+                        Command::GamepadRumble(on) => session.change_gamepad_rumble(on, cx),
                         Command::AutoPrint(on) => session.set_auto_print(on, cx),
                         Command::PrintJob(id, action) => {
                             session.print_action(id, action, window, cx)
@@ -499,6 +507,15 @@ impl ControlPanel {
             ControlsAction::SetMacShortcuts(active) => {
                 Self::send(self.owner.clone(), Command::MacShortcuts(active), cx)
             }
+            ControlsAction::CapturePointer => {
+                Self::send(self.owner.clone(), Command::CapturePointer, cx)
+            }
+            ControlsAction::SetGamepadInput(on) => {
+                Self::send(self.owner.clone(), Command::GamepadInput(on), cx)
+            }
+            ControlsAction::SetGamepadRumble(on) => {
+                Self::send(self.owner.clone(), Command::GamepadRumble(on), cx)
+            }
             ControlsAction::SetAutoPrint(on) => {
                 Self::send(self.owner.clone(), Command::AutoPrint(on), cx)
             }
@@ -547,7 +564,7 @@ impl ControlPanel {
         .detach();
     }
 
-    fn build_props(&self, session: &SessionWindow, app_name: String) -> ControlsProps {
+    fn build_props(&self, session: &SessionWindow, app_name: String, cx: &App) -> ControlsProps {
         let input = session.preferences.input;
         let input_switches = InputFeature::ALL
             .into_iter()
@@ -634,6 +651,11 @@ impl ControlPanel {
             stats_copied: self.copied.is_some(),
             stats_strip: session.preferences.stats_strip,
             shortcuts: shortcuts_props(session.mac_shortcuts(), session.shortcuts_locked()),
+            capture: capture_props(
+                session.picture_painted(cx) && session.settings.is_some(),
+                session.pointer_captured(cx),
+            ),
+            gamepads: gamepads_props(session, cx),
             printing: (session.print_policy == Some(true)).then(|| {
                 printing_props(
                     &session.print_jobs,
@@ -642,6 +664,65 @@ impl ControlPanel {
                 )
             }),
         }
+    }
+}
+
+/// The Gamepads card (`ARCH-032`): hidden until the server's settings arrive, and when
+/// `ui_sidebar_show_gamepads` is off. Reads the global, never updates it.
+fn gamepads_props(session: &SessionWindow, cx: &App) -> Option<GamepadsProps> {
+    let policy = session
+        .settings
+        .as_ref()
+        .map(|settings| settings.gamepad)
+        .filter(|policy| policy.show_panel)?;
+    let input = session.gamepad_input();
+    let key = session.window_active();
+    let pads = cx
+        .try_global::<Gamepads>()
+        .map(|gamepads| gamepads.pads())
+        .unwrap_or_default();
+    let status = pad_state(input, policy.enabled, key);
+    let slots = std::array::from_fn(|slot| {
+        pads.iter()
+            .find(|pad| pad.slot == Some(slot as u8))
+            .map(|pad| PadRow {
+                name: pad.name.clone(),
+                status,
+                rumble: pad.rumble,
+            })
+    });
+    Some(GamepadsProps {
+        input,
+        input_locked: policy.on_start_locked,
+        rumble: session.preferences.gamepads.rumble,
+        server_off: !policy.enabled,
+        key,
+        slots,
+        overflow: pads.iter().filter(|pad| pad.slot.is_none()).count(),
+    })
+}
+
+/// Whether a pad with a Player reaches the session: not when the server or the switch has
+/// gamepads off, ready while another window is key, sending otherwise.
+fn pad_state(input_on: bool, server_on: bool, key: bool) -> PadStatus {
+    if !server_on || !input_on {
+        PadStatus::NotSent
+    } else if !key {
+        PadStatus::Ready
+    } else {
+        PadStatus::Sending
+    }
+}
+
+/// The Input card's Capture Pointer button, its glyphs from `shortcuts::CHORDS`.
+fn capture_props(available: bool, captured: bool) -> CaptureProps {
+    let chord = shortcuts::chord(shortcuts::ChordId::CapturePointer);
+    let (modifiers, key) = shortcuts::glyphs(chord.keystroke);
+    CaptureProps {
+        available,
+        captured,
+        modifiers,
+        key,
     }
 }
 
@@ -995,6 +1076,7 @@ impl Render for ControlPanel {
         let toggle_owner = owner.clone();
         let fullscreen_owner = owner.clone();
         let strip_owner = owner.clone();
+        let capture_owner = owner.clone();
         let scroll = owner.session.read(cx).controls_scroll.clone();
         let root = div()
             .id("session-controls")
@@ -1020,6 +1102,10 @@ impl Render for ControlPanel {
                 // View → Toggle Stats Over Stream while the panel is key.
                 let on = !strip_owner.session.read(cx).preferences.stats_strip;
                 Self::send(strip_owner.clone(), Command::StatsStrip(on), cx)
+            })
+            .on_action(move |_: &TogglePointerCapture, _, cx| {
+                // ⌃⌥⇧Z or the menu while the panel is key: the session window captures.
+                Self::send(capture_owner.clone(), Command::CapturePointer, cx)
             });
 
         // "+N more" while the panel is open: show the Printing card (`ARCH-033`).
@@ -1049,7 +1135,7 @@ impl Render for ControlPanel {
         if session.current.is_none() {
             return root;
         }
-        let props = self.build_props(session, session.remote.app_name.clone());
+        let props = self.build_props(session, session.remote.app_name.clone(), cx);
         let entity = cx.entity().clone();
         let handler = Rc::new(
             move |action: ControlsAction, window: &mut Window, cx: &mut App| {
@@ -1371,6 +1457,22 @@ mod tests {
 
     fn at(y: f32) -> Point<Pixels> {
         point(px(0.), px(y))
+    }
+
+    #[test]
+    fn pad_state_rules() {
+        assert_eq!(pad_state(true, true, true), PadStatus::Sending);
+        assert_eq!(pad_state(true, true, false), PadStatus::Ready);
+        assert_eq!(pad_state(false, true, true), PadStatus::NotSent);
+        assert_eq!(pad_state(true, false, true), PadStatus::NotSent);
+        assert_eq!(pad_state(false, false, false), PadStatus::NotSent);
+    }
+
+    #[test]
+    fn capture_props_take_the_chord_from_chords() {
+        let props = capture_props(true, false);
+        assert_eq!((props.modifiers.as_str(), props.key.as_str()), ("⌃⌥⇧", "Z"));
+        assert!(props.available && !props.captured);
     }
 
     #[test]

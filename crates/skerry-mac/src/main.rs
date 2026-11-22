@@ -5,6 +5,8 @@ mod audio;
 #[cfg(target_os = "macos")]
 mod clipboard;
 #[cfg(target_os = "macos")]
+mod gamepad;
+#[cfg(target_os = "macos")]
 mod input;
 #[cfg(target_os = "macos")]
 mod launch_options;

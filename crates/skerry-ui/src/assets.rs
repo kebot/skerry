@@ -7,7 +7,7 @@ gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
         Trash, FolderPlus, LogOut, Circle, Hourglass, Link, FileUp, FolderUp, Ban, Info, Printer,
-        Download, FileX
+        Download, FileX, Crosshair
     ]
 );
 
@@ -51,6 +51,7 @@ mod tests {
             gpui_kit::assets::IconName::FolderUp,
             gpui_kit::assets::IconName::Ban,
             gpui_kit::assets::IconName::Info,
+            gpui_kit::assets::IconName::Crosshair,
             gpui_kit::assets::IconName::Printer,
             gpui_kit::assets::IconName::Download,
             gpui_kit::assets::IconName::FileX,
