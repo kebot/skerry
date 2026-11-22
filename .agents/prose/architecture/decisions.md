@@ -251,6 +251,8 @@
 
 ## ARCH-021: Decoded Frames Are Presented as They Arrive, Not on a 30 Hz Tick
 
+- **Amended by `ARCH-034`:** JPEG frames are presented on their bottom stripe or after a 2 ms settle, as per-stripe images, instead of an 8 ms full-canvas flush.
+
 - **Status:** settled — amends the presentation pacing of `ARCH-003` (`codec-and-rate-control`)
 - **Finding (2026-11-21):** the Stats FPS graph (`ARCH-019`) showed the client at 30 fps while the server encoded 60. `transport::run` handed frames to the window only on its 33 ms `present` tick, which the first client (`e0835a5`) used to gather a JPEG frame's stripes into one picture. A hardware frame decoded between ticks waited in `decoded`, and a second one replaced it unseen, so H.264/H.265/AV1 were shown, and counted, at 30 fps at most.
 - **Decision:**
@@ -616,6 +618,29 @@
   - Not verified (screen locked, no controller): capture and warp on screen, `kill -9` while captured, real pads and haptics, and the server's display restart.
 - **Affected Rust:** `view/capture.rs` (new), `gamepad/` (new, `native.rs`), `view.rs`, `view/keys.rs`, `transport.rs`, `settings.rs`, `shortcuts.rs`, `app.rs`, `app/session_window.rs`, `app/controls.rs`, `crates/skerry-ui/src/{controls.rs,session.rs,assets.rs}`, `Cargo.toml`, `examples/preview.rs`.
 
+## ARCH-034: JPEG Stripes as Their Own Images, Presented per Frame (Task I)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-VS-04`. Amends `ARCH-021`: JPEG frames are now presented on the bottom stripe, or after a 2 ms settle, not flushed every 8 ms. Amends `ARCH-003`: the JPEG path no longer composites into a full canvas.
+- **Process:** plan → (no visible UI, so design N/A) → review (8 required changes) → build → QA (3 medium, 1 low, against targets) → fix round → code review (3 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-i-jpeg`.
+- **Findings:**
+  - Since `ARCH-021`, the whole 11 MB canvas was cloned every 8 ms, and each flush built a new full-size RenderImage. That meant a new Metal texture and an 11 MB upload, even when one stripe changed.
+  - VideoToolbox JPEG decoding is not hardware on Apple Silicon: it moves the work to VTDecoderXPCService. ImageIO was slower than zune-jpeg.
+  - libjpeg-turbo needs cmake, which isn't available.
+- **Decision:**
+  - Each stripe becomes its own RenderImage. Only changed stripes are uploaded, and the canvas buffer is gone.
+  - Decoding: zune-jpeg decodes to RGB with NEON into a reused scratch buffer, then one NEON pass makes BGRA. It compiles only on aarch64, with a scalar fallback elsewhere. Grayscale stripes are accepted.
+  - Each stripe gets one padding row top and bottom, and every edge is snapped to whole device pixels, so there are no seams at any scale.
+  - Replaced stripes are retired with `window.drop_image` 4 paints later, because GPUI does not wait for the GPU (`metal_renderer.rs`). Every exit (resize, codec switch, fallback, stream end, reconnect) goes through the retirer.
+  - **Presentation:** a frame shows as soon as its bottom stripe arrives, since pixelflux sends stripes top to bottom. Otherwise it shows 2 ms after the last stripe, with the timer armed early to absorb tokio's rounding. The pacer resets on hardware frames, codec switch, and resize.
+  - The transport's biased select runs input, gamepad heartbeat, key heartbeat, socket, then settle, so stripes never starve input.
+  - `SKERRY_PRESENT_TRACE=1` logs each present's reason, delay, frame id, and stripe rows.
+- **Measured** (QA's headless harness: the real transport against a fake server replaying real stripes; release builds; excludes GPUI/Metal, so the removed 11 MB texture upload per flush is extra savings on top):
+  - Motion: instructions −27 %, cycles −27 to −30 %, CPU median about 27 % → 17–29 % (noisy).
+  - Typing: cycles −38 %, and last-stripe-to-present p50 1.6 ms against a 0.7–1.9 ms baseline (target ≤ baseline + 1 ms, met).
+  - Footprint 55 MB → 12–35 MB.
+- **Not verified live** (screen locked): real-app CPU, WindowServer and VTDecoder deltas, GPU memory, visual seams and tearing, and the top-to-bottom stripe order on a live server (use the trace).
+- **Affected Rust:** `transport.rs`, `view.rs`, `view/stripes.rs` (new), `Cargo.toml` (zune-jpeg 0.5).
+
 ---
 
 ## Active & Deferred Constraint Frontier (`ARCH-GAP-*`)
@@ -644,7 +669,7 @@
 | `ARCH-GAP-DC-06` | `desktop-and-collaboration` | `gaming-controls` | settled (`ARCH-032`) | Pointer capture with ⌃⌥⇧Z and `m2` relative motion; GameController pads on slots 0–3 per session with rumble; custom chords dropped. |
 | `ARCH-GAP-DC-07` | `desktop-and-collaboration` | `session-sharing-and-rooms` | unresolved (todo) | Selkies view-only / player-slot roles and SealSkin collaboration room evaluation (against 0.5.0 rooms, whose media/cursor messages carry only the sender's alias). |
 | `ARCH-GAP-DC-08` | `desktop-and-collaboration` | `multitouch-trackpad` | deferred | Revisit raw multitouch contact forwarding only when Chrome gesture-to-display latency matches native macOS pinch/pan. |
-| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | unresolved (todo) | JPEG mode uses 36–65 % CPU (software decode + full-canvas copy every 33 ms). |
+| `ARCH-GAP-VS-04` | `video-and-screen` | `jpeg-cpu-cost` | settled (`ARCH-034`) | Per-stripe RenderImages, NEON decode, present on the bottom stripe or after a 2 ms settle; about 27–30 % fewer cycles. |
 | `ARCH-GAP-VS-05` | `video-and-screen` | `session-controls-ux` | mostly settled (`ARCH-018`, `ARCH-026`) | Settled: web-sidebar cards, section memory per server, scroll per window, theme-aware dropdown shadow. Open: the web's stream-toggle tile row (`ARCH-020`). |
 | `ARCH-GAP-LS-10` | `launcher-and-sessions` | `launcher-polish` | settled (`ARCH-026`) | Sign Out… with confirmation, 1200 pt Library column, success toasts, live "Started … ago". |
 | `ARCH-GAP-LS-13` | `launcher-and-sessions` | `direct-selkies-sessions` | unresolved (goal) | Connect to a standalone Selkies server with no SealSkin, through `SelkiesClient` alone (`ARCH-024`). |
