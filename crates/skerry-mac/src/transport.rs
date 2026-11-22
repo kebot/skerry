@@ -506,6 +506,17 @@ impl From<&'static str> for RunError {
     }
 }
 
+/// Whether a failed WebSocket attempt looks like a session still starting: `None` is an
+/// attempt that timed out (the session accepts TCP but hangs, R7), like a refusal or a
+/// proxy's 404/5xx.
+fn attempt_transient(failure: Result<(), Option<&tokio_tungstenite::tungstenite::Error>>) -> bool {
+    match failure {
+        Ok(()) => false,
+        Err(None) => true,
+        Err(Some(error)) => transient_socket_error(error),
+    }
+}
+
 /// What to do after one failed WebSocket attempt during start-up.
 #[derive(Debug, PartialEq, Eq)]
 enum Retry {
@@ -634,9 +645,8 @@ pub async fn run(
         };
         let transient = match attempt {
             Ok(Ok((socket, _))) => break socket,
-            // An attempt that timed out is a session still booting, like a refusal.
-            Err(_) => true,
-            Ok(Err(error)) => transient_socket_error(&error),
+            Ok(Err(error)) => attempt_transient(Err(Some(&error))),
+            Err(_) => attempt_transient(Err(None)),
         };
         match retry_decision(transient, Instant::now(), give_up) {
             Retry::Again => {
@@ -1255,6 +1265,26 @@ mod tests {
             startup_grace: SOCKET_STARTUP_GRACE,
             waiting: String::new(),
         }
+    }
+
+    #[test]
+    fn an_attempt_timeout_is_retried_then_becomes_a_startup_timeout() {
+        use tokio_tungstenite::tungstenite::Error;
+        // The attempt's own 10 s timeout maps to transient, as a refused connection does.
+        assert!(attempt_transient(Err(None)));
+        let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(attempt_transient(Err(Some(&refused))));
+        assert!(!attempt_transient(Err(Some(&Error::Utf8(String::new())))));
+        let start = Instant::now();
+        let give_up = start + SOCKET_STARTUP_GRACE;
+        assert_eq!(
+            retry_decision(attempt_transient(Err(None)), start, give_up),
+            Retry::Again
+        );
+        assert_eq!(
+            retry_decision(attempt_transient(Err(None)), give_up, give_up),
+            Retry::Timeout
+        );
     }
 
     #[test]

@@ -264,6 +264,9 @@ struct Launcher {
     /// with this window: closing the Library abandons them (the server still finishes,
     /// and the session shows under Running sessions when the Library opens again).
     flights: Vec<Flight>,
+    /// Sessions a launch added locally, and when: a Refresh fetched before then must not
+    /// drop them (the server list it brings predates the launch).
+    launched_at: HashMap<String, Instant>,
     app_icons: HashMap<String, Arc<RenderImage>>,
     session_thumbnails: HashMap<String, Arc<RenderImage>>,
     launch_dialog: Option<(RemoteApp, LaunchDialogProps, LaunchDialogSelects)>,
@@ -332,6 +335,7 @@ impl Launcher {
             search_input,
             selected_filter: Filter::All,
             flights: Vec::new(),
+            launched_at: HashMap::new(),
             app_icons: HashMap::new(),
             session_thumbnails: HashMap::new(),
             launch_dialog: None,
@@ -468,6 +472,7 @@ impl Launcher {
         let client = api.clone();
         let pending = self.rt.spawn(async move { client.library().await });
         let saved_startup_key = connecting && save.is_none();
+        let requested = Instant::now();
         cx.spawn(async move |this, cx| {
             let result = pending.await.unwrap_or_else(|_| {
                 Err(LibraryError::Failed(
@@ -481,7 +486,15 @@ impl Launcher {
                 }
                 this.busy = None;
                 match result {
-                    Ok(library) => {
+                    Ok(mut library) => {
+                        if let Some(old) = &this.library {
+                            merge_fresh_sessions(
+                                &mut library.sessions,
+                                &old.sessions,
+                                &mut this.launched_at,
+                                requested,
+                            );
+                        }
                         let apps = library.apps.clone();
                         let sessions = library.sessions.clone();
                         if save.is_some() {
@@ -828,9 +841,7 @@ impl Launcher {
         }
         self.launch_dialog = None;
         self.pending_stop = None;
-        // Their poll and request tasks find no flight and end; the server still finishes
-        // each launch, which shows at the next sign-in.
-        self.flights.clear();
+        drop_flights(&mut self.flights, &mut self.launched_at);
     }
 
     fn find_app(&self, app_id: &str) -> Option<RemoteApp> {
@@ -1286,6 +1297,13 @@ impl Launcher {
                     cx,
                 );
             }
+        } else if self
+            .flights
+            .iter()
+            .any(|flight| flight.launch_id == launch_id && flight.signed_out && !flight.in_flight())
+        {
+            // Reported as a Refresh reports a refused key.
+            self.status = Some(launch_progress::KEY_REFUSED.into());
         }
         cx.notify();
     }
@@ -1300,6 +1318,8 @@ impl Launcher {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.launched_at
+            .insert(session.session_id.clone(), Instant::now());
         self.edit_library(|library| {
             if !library
                 .sessions
@@ -1394,7 +1414,15 @@ impl Launcher {
                 dialog.hidden = hidden;
             }
         }
-        if self.selected_filter == Filter::Hidden && self.preferences.library.hidden.is_empty() {
+        // Ids of apps the server no longer lists don't count: with no listed app hidden,
+        // the Hidden chip is gone, so the selection goes back to All.
+        let any_hidden = self.library.as_ref().is_some_and(|library| {
+            library
+                .apps
+                .iter()
+                .any(|app| self.preferences.library.is_hidden(&app.id))
+        });
+        if self.selected_filter == Filter::Hidden && !any_hidden {
             self.selected_filter = Filter::All;
         }
         if toast {
@@ -1978,6 +2006,34 @@ fn organize(
     items.invalidate();
 }
 
+/// Leaving a server ends every launch: their poll and request tasks find no flight and
+/// end (the server still finishes each launch, which shows at the next sign-in).
+fn drop_flights(flights: &mut Vec<Flight>, launched_at: &mut HashMap<String, Instant>) {
+    flights.clear();
+    launched_at.clear();
+}
+
+/// Keeps sessions a launch added after a Refresh was requested: that Refresh's list
+/// predates them. Entries the server now lists, or older than the request (stopped since),
+/// are forgotten.
+fn merge_fresh_sessions(
+    fetched: &mut Vec<RemoteSession>,
+    shown: &[RemoteSession],
+    launched_at: &mut HashMap<String, Instant>,
+    requested: Instant,
+) {
+    let listed: HashSet<String> = fetched.iter().map(|s| s.session_id.clone()).collect();
+    for session in shown.iter().rev() {
+        let fresh = launched_at
+            .get(&session.session_id)
+            .is_some_and(|at| *at >= requested);
+        if fresh && !listed.contains(&session.session_id) {
+            fetched.insert(0, session.clone());
+        }
+    }
+    launched_at.retain(|id, at| *at >= requested && !listed.contains(id));
+}
+
 /// At most one launch per app is in flight; its tile and menu are disabled meanwhile.
 fn can_start(flights: &[Flight], app_id: &str) -> bool {
     !flights
@@ -2248,11 +2304,40 @@ mod tests {
 
     #[test]
     fn leave_server_drops_flights() {
-        // `leave_server` clears the flights; their tasks then find nothing and end.
-        let mut flights = vec![test_flight("zen")];
-        let id = flights[0].launch_id.clone();
-        flights.clear();
-        assert!(!flights.iter().any(|flight| flight.launch_id == id));
+        let mut flights = vec![test_flight("zen"), test_flight("firefox")];
+        let mut launched = HashMap::from([("s1".to_string(), Instant::now())]);
+        drop_flights(&mut flights, &mut launched);
+        assert!(flights.is_empty());
+        assert!(launched.is_empty());
+        // Nothing holds the apps any more.
+        assert!(can_start(&flights, "zen"));
+    }
+
+    fn listed(id: &str) -> RemoteSession {
+        serde_json::from_value(serde_json::json!({
+            "session_id": id, "app_id": "zen", "app_name": "Zen", "session_url": "/x/",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_refresh_from_before_a_launch_keeps_its_session() {
+        let requested = Instant::now();
+        let later = requested + Duration::from_secs(1);
+        let earlier = requested - Duration::from_secs(1);
+        let shown = [listed("new"), listed("stopped"), listed("old")];
+        let mut launched =
+            HashMap::from([("new".to_string(), later), ("stopped".to_string(), earlier)]);
+        let mut fetched = vec![listed("old")];
+        merge_fresh_sessions(&mut fetched, &shown, &mut launched, requested);
+        let ids: Vec<&str> = fetched.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["new", "old"]);
+        assert!(launched.contains_key("new") && !launched.contains_key("stopped"));
+        // Once the server lists it, it is forgotten.
+        let mut fetched = vec![listed("new"), listed("old")];
+        merge_fresh_sessions(&mut fetched, &shown, &mut launched, requested);
+        assert_eq!(fetched.len(), 2);
+        assert!(launched.is_empty());
     }
 
     #[test]

@@ -249,6 +249,8 @@ impl SessionWindow {
             Ok(stream) => {
                 self.audio = None;
                 self.status = None;
+                // A new stream replaces whatever the start-up banner was about.
+                self.startup_stalled = None;
                 if !self.scale_locally {
                     stream.scale_locally(false, cx);
                 }
@@ -284,7 +286,11 @@ impl SessionWindow {
             SessionEvent::Audio(enabled) => self.audio = Some(enabled),
             SessionEvent::AudioUnavailable(reason) => self.audio_unavailable = Some(reason),
             SessionEvent::Video(enabled) => self.video = Some(enabled),
-            SessionEvent::Settings(settings) => self.settings = Some(settings),
+            SessionEvent::Settings(settings) => {
+                // The session answered: later reconnects get the normal 45 s grace.
+                self.keep_waiting = false;
+                self.settings = Some(settings);
+            }
             SessionEvent::Stats(sample) => {
                 if self.stats_open {
                     if self.stats_history.len() == stats::HISTORY_MAX {
@@ -355,12 +361,15 @@ impl SessionWindow {
     /// for {App} to start…"; Retry starts a fresh 45 s window.
     fn retry_startup(&mut self, keep_waiting: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.startup_stalled = None;
+        self.end_stream(window, cx);
         self.keep_waiting = keep_waiting;
-        self.reconnect(window, cx);
+        self.open(window, cx);
         cx.notify();
     }
 
     pub(super) fn reconnect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Only the start-up banner's Keep Waiting extends the grace.
+        self.keep_waiting = false;
         // Keep Session Controls open across codec / HiDPI reconnects; it re-renders from
         // the new stream's settings once they arrive.
         self.end_stream(window, cx);

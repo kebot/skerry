@@ -76,6 +76,8 @@ pub const STALL_HINT: &str = "The first launch of an app on a server downloads i
 pub const LOST_BODY: &str =
     "The launch request didn’t reach the server. Check your connection, then try again.";
 pub const NO_REASON: &str = "The server didn’t say why.";
+/// Progress answered 401: the key no longer works.
+pub const KEY_REFUSED: &str = "The server didn’t accept this application key.";
 
 /// The Library's stage for a server stage. `client` runs after the container is up, so it
 /// is Starting; only `image` and `baking` are Pulling image (Kubernetes never reports
@@ -190,6 +192,9 @@ pub struct Flight {
     progress_failed: Option<Option<String>>,
     prompt_after: Instant,
     poll_errors: u32,
+    /// Progress answered 401. Like `failed`, it ends the flight only once no request is
+    /// outstanding; the Library then reports the refused key as a Refresh would.
+    pub signed_out: bool,
     pub outcome: Outcome,
 }
 
@@ -220,6 +225,7 @@ impl Flight {
             progress_failed: None,
             prompt_after: now,
             poll_errors: 0,
+            signed_out: false,
             outcome: Outcome::Running,
         };
         flight.reset(now, now_unix);
@@ -241,6 +247,7 @@ impl Flight {
         self.progress_failed = None;
         self.prompt_after = now + STALL;
         self.poll_errors = 0;
+        self.signed_out = false;
         self.outcome = Outcome::Running;
     }
 
@@ -318,9 +325,10 @@ impl Flight {
                 }
             }
             ProgressAnswer::SignedOut => {
-                self.outcome = Outcome::Failed(Some(
-                    "The server didn’t accept this application key.".into(),
-                ));
+                // The outstanding request may still succeed; wait for it (as for `failed`).
+                self.signed_out = true;
+                self.progress_failed = Some(Some(KEY_REFUSED.into()));
+                self.settle();
             }
         }
     }
@@ -801,6 +809,27 @@ mod tests {
         assert!(f.is_running());
         f.posted(Err(LaunchError::Server("refused".into())), t + secs(6));
         assert_eq!(f.failure_body(), Some("No GPU is free on any node."));
+    }
+
+    #[test]
+    fn a_401_while_the_post_is_outstanding_waits_for_it() {
+        let t = Instant::now();
+        let mut f = flight(t);
+        f.begin_attempt();
+        f.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        assert!(f.is_running() && f.signed_out);
+        f.posted(Ok(session("new", "firefox", T0)), t + secs(6));
+        assert!(matches!(f.outcome, Outcome::Ready(_)));
+
+        let mut refused = flight(t);
+        refused.begin_attempt();
+        refused.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        refused.posted(Err(LaunchError::Server(KEY_REFUSED.into())), t + secs(6));
+        assert_eq!(refused.failure_body(), Some(KEY_REFUSED));
+        // With no request outstanding, a 401 ends the flight at once.
+        let mut idle = flight(t);
+        idle.observe(&ProgressAnswer::SignedOut, t + secs(5));
+        assert!(matches!(idle.outcome, Outcome::Failed(_)));
     }
 
     #[test]

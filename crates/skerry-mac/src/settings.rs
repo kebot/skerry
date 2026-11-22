@@ -331,13 +331,59 @@ pub const LIST_CAP: usize = 512;
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct LibraryOrganization {
     /// App ids, oldest favorite first.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "capped_oldest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub favorites: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "capped_oldest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub hidden: Vec<String>,
     /// App ids, newest launch first, at most [`RECENT_MAX`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "capped_newest_first",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub recent: Vec<String>,
+}
+
+/// The ids in a saved list: entries that aren't strings are dropped one by one (a list
+/// that isn't a list reads as empty), and duplicates go.
+fn read_ids<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|id| id.as_str().map(str::to_string))
+        .filter(|id| seen.insert(id.clone()))
+        .collect())
+}
+
+/// Favorites and hidden apps, capped on load at the newest [`LIST_CAP`].
+fn capped_oldest_first<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut ids = read_ids(deserializer)?;
+    if ids.len() > LIST_CAP {
+        ids.drain(..ids.len() - LIST_CAP);
+    }
+    Ok(ids)
+}
+
+/// Recents, capped on load at the newest [`RECENT_MAX`].
+fn capped_newest_first<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    let mut ids = read_ids(deserializer)?;
+    ids.truncate(RECENT_MAX);
+    Ok(ids)
 }
 
 impl LibraryOrganization {
@@ -622,6 +668,34 @@ mod tests {
         assert_eq!(prefs.codec, Codec::Hevc);
         assert_eq!(prefs.video.get(&Key::Jpeg), Some(&45));
         assert_eq!(prefs.video.len(), 1);
+    }
+
+    #[test]
+    fn a_bad_library_entry_costs_only_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.json");
+        std::fs::write(
+            &path,
+            r#"{"library": {"favorites": ["a", 5, "b", "a"], "hidden": ["z"], "recent": "x"}}"#,
+        )
+        .unwrap();
+        let loaded = load_at(&path);
+        assert_eq!(loaded.library.favorites, ["a", "b"]);
+        assert_eq!(loaded.library.hidden, ["z"]);
+        assert!(loaded.library.recent.is_empty());
+    }
+
+    #[test]
+    fn library_lists_are_capped_on_load() {
+        let ids: Vec<String> = (0..600).map(|n| format!("app{n}")).collect();
+        let prefs: Preferences = serde_json::from_value(
+            json!({"library": {"favorites": ids, "hidden": ids, "recent": ids}}),
+        )
+        .unwrap();
+        assert_eq!(prefs.library.favorites.len(), LIST_CAP);
+        assert_eq!(prefs.library.favorites[0], "app88");
+        assert_eq!(prefs.library.hidden.len(), LIST_CAP);
+        assert_eq!(prefs.library.recent, ids[..RECENT_MAX]);
     }
 
     #[test]
