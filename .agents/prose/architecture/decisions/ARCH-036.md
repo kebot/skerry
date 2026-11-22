@@ -1,0 +1,38 @@
+# ARCH-036: Direct Selkies Servers, with No SealSkin in Front (Task K)
+
+- **Status:** settled 2026-11-22. Settles `ARCH-GAP-LS-13`. Amends `ARCH-011`: Selkies credentials may be kept in the same `0600` `config.toml`, never the Keychain. Amends `ARCH-009`: Selkies reports no version, so a capability gate replaces the version check.
+- **Process:** plan → design → review (15 required changes) → build (live against a stock Selkies container) → QA (2 medium, against a local container) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-k-selkies`.
+- **Decision:**
+  - **Connect card:**
+    - A **SealSkin | Selkies** segmented switch. The Selkies side takes the browser link (a `#token=` fragment becomes the token, form-decoded), Username and Password, **Remember on this Mac**, and Recent Servers (up to 5).
+    - Pasting a URL into the key field switches tabs.
+    - Prior art: Windows App splits Add Workspace from Add PC, and Finder ⌘K and Screens use an address plus a login.
+  - **Storage:**
+    - Up to 5 `[[selkies]]` entries in `config.toml` (`url`, `username`, `password`, `token`, `certificate_sha256`), newest first, with a warning comment above them. One connection at a time.
+    - The certificate pin is saved even when Remember is off.
+    - `SKERRY_SELKIES_URL` and `SKERRY_SELKIES_CERT_SHA256` are read for QA and never saved.
+  - **Auth:**
+    - Basic is sent on HTTP requests and on the WebSocket upgrade.
+    - A token goes as Bearer on HTTP, and on the WebSocket as the `selkies.token.` subprotocol plus the `selkies_token` cookie.
+    - No Origin header.
+    - Credentials go only to the configured origin, with redirects off.
+    - A token from a pasted link is dropped when the address changes to another host.
+  - **TLS:**
+    - HTTPS only, plus plain HTTP to loopback. Userinfo is refused, and so is port 0.
+    - The stock container makes its own certificate per install, so it is trusted once by the SHA-256 of the leaf certificate. The Mac's trust store and the hostname are checked first, and the pin is tried only when they fail. Signature checks stay with rustls.
+    - A changed certificate is a hard stop, including on the session socket, with no startup retry.
+    - rustls is ring-only (`default-features = false`, `builder_with_provider`). aws-lc-rs would make the SealSkin tungstenite connector panic, and `cargo tree -i aws-lc-rs` is empty.
+  - **Gate (instead of a version):**
+    - The open `GET /api/status` must report WebSockets mode. A WebRTC-mode server is refused with its own message.
+    - A logged-in `GET /api/sessions` must answer 200.
+    - `GET /api/tokens` tells secure mode apart, and a token is checked on its own with Bearer.
+    - 401 bodies tell "needs password", "wrong password" and "needs token" apart.
+    - A bad token shows up as Close 4001 after the upgrade, and is fatal, never retried.
+  - **Library:**
+    - One Desktop card (thumbnail from `api/screenshot`, login, an "n other pages connected" line, Files, and Open).
+    - A server menu replaces the account menu: Address, Login, Security, Mode, Open in Browser (hidden for token-only servers), Disconnect, and Forget This Server… with a confirmation.
+    - There is no catalog, launch, Stop, account, or Delete in Files (`ARCH-024`).
+    - Stream, audio, clipboard, gamepads, printing, Files and Apps all work.
+    - Connecting to Selkies clears SealSkin recovery, pending saves, and queued opens. A Refresh that fails on the network keeps the Library.
+- **QA (live):** run against `selkies/desktop:latest-ubuntu26.04` on a remote host by the builder, and against a local Selkies 2.2.1 by QA. Basic login, Files, first-trust pin, pin mismatch after the container was recreated, wrong password, needs-token, bad token (no loop), WebRTC refused, and the `config.toml` rules all passed. No request reached another origin under redirects. Not verified: anything on screen (screen locked), and plain-HTTP localhost.
+- **Affected Rust:** `tls.rs` (new), `config_store.rs` (moved out of `sealskin.rs`), `direct.rs`, `app/selkies_home.rs`, `selkies.rs`, `transport.rs`, `persist.rs`, `app.rs`, `app/session_window.rs`, `crates/skerry-ui/src/{connect.rs,selkies.rs,library.rs}`, `Cargo.toml`, `examples/preview.rs`.

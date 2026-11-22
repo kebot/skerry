@@ -1,0 +1,8 @@
+# ARCH-015: Async Launcher Updates Resolve Their Window by Handle
+
+- **Status:** settled
+- **Finding (QA 2026-11-21, RT-BUG-1 / BUG-8 / RT-BUG-2):** In `gpui-pre 0.3.12`, `WeakEntity::update_in` and `AsyncWindowContext::update_window_entity` do not use the window the task was spawned in. They resolve the entity's *current window* (`App::with_window(entity_id)`), which is the last window that rendered or updated it. Session Controls renders the `Launcher`, so after it opened, the session-event task's `ScreenPolicy` / `ResizeAllowed` handlers ran `resize_display` against the 388×680 pt panel. That sent `r,776x1360` after codec reconnects, and Force Aligned Resolution turned it into 768×1360. It also made UI Scaling read the panel's display. Debug traces showed `resize viewport=388×680 from app.rs:786/792`.
+- **Decision:** Long-lived or async work on an entity that another window renders must capture `Window::window_handle(window)` up front and run `handle.update(cx, |_, window, cx| entity.update(cx, …))`. Never use `update_in` for it. `Launcher::open` (session events) and `Launcher::launch_with_options` follow this. Force Aligned Resolution also re-requests the desired resolution after toggling (`ARCH-014`), so turning it off restores the exact size.
+- **Evidence:** final retest on a 1267×1392 pt window (1966×2160 remote): H.264 → H.265 → AV1 → JPEG → H.264 with Session Controls open kept 1966×2160 with the stream running. Force Aligned Resolution on gave 1952×2160; off went back to 1966×2160 with no Reset. UI Scaling stayed at 200 % throughout. Run record: `runs/2026-11-21-qa/`.
+- **Affected Contracts:** `src/skerry/index.prose.md` (Invariants)
+- **Affected Rust:** `crates/skerry-mac/src/app.rs`

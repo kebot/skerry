@@ -10,6 +10,7 @@ id: 067NC4KG01SKERRY0000000004
 <!-- compose:unresolved id=ARCH-GAP-DC-14 concept="session-file-mount" question="Future scope: mount the session's files in Finder through a File Provider extension, a local WebDAV server, or a local NFS server. Not started; revisit after the Files window ships." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-15 concept="remote-rename-move" question="Delete is settled through SealSkin home storage (ARCH-024). Neither Selkies 715df7c nor SealSkin has a rename or move file route, and Cleanroom or direct Selkies sessions have no delete at all; revisit when a server offers them." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-16 concept="mic-echo-cancellation" question="Deferred: echo cancellation needs VoiceProcessingIO to own playback, which conflicts with ARCH-030." -->
+<!-- compose:unresolved id=ARCH-GAP-DC-17 concept="multichannel-surround-audio" question="Decode Selkies/pcmflux multistream Opus surround audio (5.1 / 6ch and 7.1 / 8ch via --audio-channels) over WebSocket (and multiopus if WebRTC lands), open matching multichannel Core Audio output streams with proper channel mapping, and downmix gracefully to stereo/mono devices." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-07 concept="session-sharing-and-rooms" question="Support Selkies view-only and player-slot roles and evaluate SealSkin collaboration rooms (room API, token handoff, control transfer)." -->
 <!-- compose:unresolved id=ARCH-GAP-DC-08 concept="multitouch-trackpad" question="Keep raw multitouch contact forwarding deferred until gesture-to-display latency in Chrome matches native macOS pinch/pan and contact release on focus loss is proven." -->
 
@@ -58,7 +59,8 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
     - The rate adapts to the uplink so input stays responsive, and keyframes come on request (capped).
     - It follows the same start rules, permission gate, and stop on every stream end as the mic.
   - Echo cancellation is deferred (`ARCH-GAP-DC-16`).
-- `printing-gaming-and-sharing` (unresolved: `ARCH-GAP-DC-04`, `ARCH-GAP-DC-06`, `ARCH-GAP-DC-07`):
+  - Multichannel surround audio (5.1 / 7.1 via Selkies `pcmflux` multistream Opus) is open on the frontier (`ARCH-GAP-DC-17`).
+- `printing-gaming-and-sharing` (gaming settled in `ARCH-032`; printing in `ARCH-033`; sharing deferred in `ARCH-GAP-DC-07`):
   - Gaming (settled: `ARCH-032`):
     - **Capture Pointer** (⌃⌥⇧Z, the Input card, the View menu) locks and hides the Mac cursor, sends relative `m2` motion with `p,1`, and releases on the chord, blur, child windows, full screen, and disconnect. The transport always sends `p,0` on close.
     - GameController pads take slots 0–3 per Selkies session, with W3C mapping, changes only, and a 100 ms `js,h` heartbeat.
@@ -68,14 +70,13 @@ Integrate the remote Selkies desktop seamlessly with macOS input, trackpad gestu
     - Each job shows a notice with Print… (the PDFKit print sheet on the session window), Open, and Save…, and the Printing card lists the session's jobs.
     - **Open Print Dialog Automatically** (per server) opens only while the window is key, and after a reconnect only the newest job under 5 minutes old.
     - The cache is cleaned on remove, on close, on quit, and after 24 h. `printing_enabled` hides it all.
-  - Remote PDF print job queue (`ARCH-GAP-DC-04`), relative mouse capture and gamepad slots/rumble (`ARCH-GAP-DC-06`), and view-only / player-slot / SealSkin collaboration rooms (`ARCH-GAP-DC-07`).
+  - Session sharing: view-only / player-slot roles and SealSkin collaboration rooms remain deferred (`ARCH-GAP-DC-07`).
 - `web-sidebar-panels` (Shortcuts settled in `ARCH-031`, Apps in `ARCH-035`; Pelorus excluded in `ARCH-035`): the web sidebar's Apps, Shortcuts, and Pelorus panels. `ARCH-020` maps every web panel to its owner.
   - Apps (settled: `ARCH-035`):
     - A per-session **Apps** window drives `apps,{op}` (install, remove, update, open, cancel) with a live job console. It is shown only when `command_enabled` is on and the server answers `list` within 5 s.
     - The catalog comes from GitHub with no credentials, or from the session's local repository.
     - Icons are checked and then rasterised in a sandboxed `--skerry-svg-worker` child process.
     - Pelorus is not surfaced.
-  - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
   - Shortcuts (settled: `ARCH-031`): a Session Controls card lists `shortcuts::CHORDS`. **Mac shortcuts active** (server default and lock honoured, saved per server) hands those chords to the session as Ctrl chords when off, and ⌘Q always stays local. When ⌘ lifts, any held key that is physically up is released (HID key state).
 
 Facets:

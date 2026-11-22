@@ -25,4 +25,4 @@ kind: function
 - If a design boundary is genuinely ambiguous, run `prose compose` to settle the constraint with the architect before writing code.
 - Implement the change in `crates/skerry-mac/src/` with unit tests covering defaults, locks, bounds, and protocol parsing.
 - Run `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --check`.
-- Promote the resolved concept in its domain `.prose.md` contract from `unresolved` to `settled`, remove the `<!-- compose:unresolved -->` marker, and record the `ARCH-*` decision in `.agents/prose/architecture/decisions.md`.
+- Promote the resolved concept in its domain `.prose.md` contract from `unresolved` to `settled`, remove the `<!-- compose:unresolved -->` marker, and record the `ARCH-*` decision in `.agents/prose/architecture/decisions/ARCH-NNN.md` and `.agents/prose/architecture/decisions/index.md`.

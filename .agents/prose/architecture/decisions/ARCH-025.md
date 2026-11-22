@@ -1,0 +1,28 @@
+# ARCH-025: Frontier Build Plan of 2026-11-22 (PM Triage)
+
+- **Status:** settled 2026-11-22 (planning decision; each task settles its own `ARCH-*` when it ships).
+- **Asked by the person:** "check the rest of missing feature, build them, decide for me", with every task run as PLAN → design → review → build → QA → code review in subagents and the main agent acting only as PM.
+- **Process:** work lands on the integration branch `frontier-2026-11-22`; each task is built on its own branch in a worktree and merged into the integration branch only after its code review passes. Product questions inside a task are decided by the PM and recorded in that task's `ARCH-*` entry.
+- **Build order (tasks, each one `ARCH-*` when settled):**
+  - **A. Polish and hardening:** `ARCH-GAP-LS-10`, `ARCH-GAP-LS-11`, `ARCH-GAP-VS-05`, `ARCH-GAP-DC-09`.
+  - **B. Library organization and quick launch:** `ARCH-GAP-LS-04` (favorites, hidden, recents, session reuse) and `ARCH-GAP-LS-01` (startup progress, one-click remembered launch).
+  - **C. Open links and files, Send File:** `ARCH-GAP-LS-03`, `ARCH-GAP-LS-02`.
+  - **D. Account and key recovery:** `ARCH-GAP-LS-06`.
+  - **E. Audio devices and quality:** `ARCH-GAP-DC-03`.
+  - **F. Stats overlay and Shortcuts panel:** `ARCH-GAP-VS-06`, `ARCH-GAP-DC-12`.
+  - **G. Gaming controls:** `ARCH-GAP-DC-06`.
+  - **H. Remote printing:** `ARCH-GAP-DC-04` (only if the pinned Selkies sends print jobs; otherwise recorded as blocked by the server).
+  - **I. JPEG CPU cost:** `ARCH-GAP-VS-04`.
+  - **J. Pelorus and Apps catalog:** `ARCH-GAP-DC-13`, `ARCH-GAP-DC-11`.
+  - **K. Direct Selkies sessions:** `ARCH-GAP-LS-13`.
+  - **L. Persistent storage and shares:** `ARCH-GAP-LS-05`.
+  - **M. Microphone and webcam:** `ARCH-GAP-DC-05`.
+  - **N. Second display:** `ARCH-GAP-VS-01`.
+- **Deferred by the PM (not built in this plan):** `ARCH-GAP-VS-02` WebRTC (a second transport stack, needs a prototype before it can be designed); `ARCH-GAP-VS-03` VP8/VP9 software decode, 10-bit, and 4:4:4 (VideoToolbox has no hardware path; the hardware codecs already cover the need); `ARCH-GAP-DC-07` rooms and viewer roles (SealSkin 0.5.0 room messages carry only the sender alias, so control handoff can't be built cleanly); `ARCH-GAP-DC-08` raw multitouch (kept deferred on its own condition); `ARCH-GAP-DC-14` Finder mount (needs a signed File Provider extension); `ARCH-GAP-DC-15` rename and move (blocked: no server route); `ARCH-GAP-LS-07` cluster placement and per-session origins (no test cluster to verify against); `ARCH-GAP-LS-09` native per-app Dock presence (needs code-signing and a helper-process design of its own).
+- **Outcome (2026-11-22, all 14 tasks merged into `frontier-2026-11-22`):** A `ARCH-026`, B `ARCH-027`, C `ARCH-028`, D `ARCH-029`, E `ARCH-030`, F `ARCH-031`, G `ARCH-032`, H `ARCH-033`, I `ARCH-034`, J `ARCH-035`, K `ARCH-036`, L1 `ARCH-037`, M1 and M2 `ARCH-038`, N `ARCH-039`.
+  - Gates: 870 + 53 tests, clippy `-D warnings`, `fmt --check`; no aws-lc-rs.
+  - **Deferred during the build:** public share links (`ARCH-GAP-LS-14`), mic echo cancellation (`ARCH-GAP-DC-16`), and cross-display drag (`ARCH-GAP-VS-07`).
+  - **Excluded:** Pelorus (`ARCH-GAP-DC-13`).
+  - **Deferred by the PM at close:** the web sidebar's stream-toggle tile row, the last part of `ARCH-GAP-VS-05`. Every toggle in it is already in Session Controls.
+  - **Not yet done for any task:** a visual check of the new UI in Light and Dark, because the screen was locked or in use during every QA run.
+- **Rationale:** the order puts small, low-risk, client-only work first, then the launcher features people use every day, then in-session media and input. Tasks that need a second protocol stack, signing infrastructure, or a server we can't test against are deferred, so that what ships can be verified.

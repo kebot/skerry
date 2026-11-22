@@ -1,0 +1,39 @@
+# ARCH-037: Storage Window for SealSkin Homes and Shared Files (Task L1; public links deferred)
+
+- **Status:** L1 settled 2026-11-22. `ARCH-GAP-LS-05` stays open only for public share links (L2), now tracked as `ARCH-GAP-LS-14`.
+- **Process:** plan → design → review (17 required changes) → build → QA (1 medium) → code review (2 rounds, MERGE) by subagents (`ARCH-025`). Branch `task-l-storage`.
+- **Server facts (SealSkin 0.5.0):**
+  - There is no search route, so Skerry filters the folder shown, as the web UI does.
+  - Transfers are 2 MiB base64 chunks, and uploads never overwrite.
+  - `launch/file_path` opens only top-level Shared Files (`_sealskin_shared_files`) and refuses Cleanroom.
+  - `DELETE /homedirs/_sealskin_shared_files` would wipe Shared Files.
+  - A bad home name answers 409, not 422.
+  - There is no upload-abort route, so a cancelled upload holds one of the 16 upload slots for 24 h.
+- **Decision:**
+  - **Window:** one **Storage** window per SealSkin server, hidden for direct Selkies servers (`ARCH-036`). It opens from a Library header button, **Manage Storage…** in the account menu, or Window → Storage ⇧⌘I (Library only).
+    - The sidebar shows Shared Files, Homes, App Homes (with the `auto-` prefix hidden), and a quota meter.
+    - The right side is the session Files pane, with its I/O behind `FilesBackend` (Selkies or SealSkin storage), so transfers, Quick Look, drags and ⌘C carry over.
+    - The pane stays out of `OpenWindows.files`, and the window closes on Sign Out.
+  - **Safety:**
+    - No DELETE is ever sent for Shared Files or Cleanroom (names compared ignoring case, refused before any request).
+    - Delete Home re-reads sessions and transfers both before and after the confirm, counting meta-app and in-flight launch homes, and refuses while a session uses the home.
+    - Uploads into a home's `/Desktop/files` go to Shared Files, and mkdir there is refused.
+    - Storage 403s (quota, storage off) never turn uploads off.
+  - **Transfers:**
+    - Streamed in chunks of at most 2 MiB. A retried upload finalize carries `X-Idempotency-Key = upload_id`.
+    - A download cut off mid-body is treated as a network error and resumes.
+    - A kept partial resumes only when its `com.skerry.partial` xattr (home, path, size, server mtime) matches the listing, and the final size is checked.
+    - A folder whose listing is truncated (over 10,000 entries) fails rather than downloading part of it.
+  - **Open in…:** Shared Files top level only, through `ARCH-028`'s chooser and Launch Dialog. It offers only apps with `home_directories`, or meta apps, then calls `launch/file_path` with a `launch_id` (`ARCH-027`).
+  - **Public links (L2) deferred (`ARCH-GAP-LS-14`):** split off at review to keep L1 reviewable. A link would serve a copy of the file as it was when made, with password, expiry and revoke, where the server permits.
+- **QA (live, harness):**
+  - A QA home was created, filled and deleted.
+  - Uploads: 2.6 MB in 0.48 s and 200 MB in 29.9 s (debug build), plus a nested folder, and cancel followed by upload.
+  - Downloads ran at 21.5 MB/s with matching md5.
+  - Quota matched `admin/status?storage=1`.
+  - Open in… a PDF reached the session's `Desktop/files`.
+  - Delete Home was refused while a session ran on the home.
+  - A 571-request log had no Shared Files DELETE.
+  - The session Files window still uploads and downloads (md5 checked).
+  - Not verified: anything on screen.
+- **Affected Rust:** `storage.rs`, `app/files_backend.rs`, `app/storage_window.rs` (new), `sealskin.rs`, `app/files_window.rs`, `app/account.rs`, `app.rs`, `crates/skerry-ui/src/{storage.rs,files.rs,library.rs,account.rs}`, `examples/preview.rs`.

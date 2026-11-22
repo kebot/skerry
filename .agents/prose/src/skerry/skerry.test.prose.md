@@ -121,7 +121,7 @@ subject: skerry
 
 - Any companion API request other than `GET /companion/api/ui/version` reaching a SealSkin server older than `0.5.0`, or a string/lexicographic comparison in place of numeric SemVer ordering (which would misorder `0.10.0` before `0.5.0`).
 
-- Separate non-Prose markdown ticket directories (`docs/` or `.agents/prose/specs/skerry-mac/tickets/`) acting as a parallel source of truth outside `.prose.md` contracts and `architecture/decisions.md`.
+- Separate non-Prose markdown ticket directories (`docs/` or `.agents/prose/specs/skerry-mac/tickets/`) acting as a parallel source of truth outside `.prose.md` contracts and `architecture/decisions/`.
 - Storing session URLs or application keys inside per-server JSON preferences.
 - A test that reads or writes the person's general pasteboard (`ARCH-017`), or clipboard contents in any log line.
 - Any `security-framework` / macOS Keychain read or write in `crates/skerry-mac` (`ARCH-011`).
